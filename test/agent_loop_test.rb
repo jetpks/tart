@@ -1,0 +1,178 @@
+# frozen_string_literal: true
+
+require_relative "test_helper"
+require_relative "support/mock_llm_server"
+require "tmpdir"
+require "fileutils"
+
+module RaspberryPi
+  # The agent loop on the I02 kernel (AC1/AC3): multi-turn tool round-trip
+  # against the real ruby_llm client over a local mock OpenAI-compatible
+  # endpoint, kernel-interrupt cancellation, schema gating, approval gating.
+  class AgentLoopTest < Test
+    EVENTS = %i[agent_start turn_start message_start message_update message_end
+                tool_execution_start tool_execution_end turn_end agent_end].freeze
+
+    def setup
+      @server = MockLLMServer.new.start
+      @dir = Dir.mktmpdir("raspberry-pi-agent-")
+    end
+
+    def teardown
+      @server.stop
+      FileUtils.rm_rf(@dir)
+    end
+
+    def test_multi_turn_tool_round_trip_on_the_kernel
+      File.write(File.join(@dir, "fixture.txt"), "x")
+      @server.script([
+        {type: :stream, content: "listing", tool_calls: [{id: "call_1", name: "ls", arguments: {path: "."}}]},
+        {type: :message, content: "the listing is above"},
+      ])
+      tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
+      agent, events = agent_on_kernel(tools:)
+      result = run_agent(agent, "list the files")
+
+      # pi's loop shape: user message -> assistant (tool calls) -> tool
+      # result -> assistant -> completion.
+      assert_equal %i[user assistant tool assistant], result.map(&:role)
+      assert_equal "the listing is above", result.last.content
+      assert agent_newly_complete?(agent)
+
+      # Tool results return into the context: the second request's messages
+      # carry the ls output as a tool message joined to the call id.
+      requests = @server.captured_requests
+      assert_equal 2, requests.size
+      tool_message = requests.last["messages"].find { |m| m["role"] == "tool" }
+      assert_equal "call_1", tool_message["tool_call_id"]
+      assert_includes tool_message["content"], "fixture.txt"
+
+      # Event lifecycle: every phase present, in order.
+      types = events.map { |e| e[:type] }
+      %i[agent_start turn_start tool_execution_start tool_execution_end turn_end agent_end].each do |type|
+        assert_includes types, type
+      end
+      assert types.index(:tool_execution_end) < types.rindex(:agent_end)
+      deltas = events.select { |e| e[:type] == :message_update }
+      assert deltas.any? { |e| e[:chunk].content == "listing" }, "streamed text deltas must flow"
+    end
+
+    def test_schema_gating_disabled_tools_never_reach_the_model
+      @server.script([{type: :message, content: "ok"}])
+      tools = Tools::Registry.build(selected: %w[read ls], cwd: @dir) # bash/edit/write/find/grep disabled
+      agent, _events = agent_on_kernel(tools:, script_enabled: false)
+      run_agent(agent, "hi")
+
+      request = @server.captured_requests.first
+      names = request["tools"].map { |t| t["function"]["name"] }
+      assert_equal %w[ls read], names.sort,
+        "a disabled tool must never appear in the tool declarations sent to the model"
+      assert request["tools"].all? { |t| t["type"] == "function" }
+      assert request["tools"].all? { |t| t["function"]["parameters"].is_a?(Hash) }
+    end
+
+    def test_denied_approval_produces_error_tool_result_and_model_continues
+      @server.script([
+        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo destructive"}}]},
+        {type: :message, content: "understood"},
+      ])
+      approval_fibers = Queue.new
+      agent, events = agent_on_kernel(
+        tools: Tools::Registry.build(selected: %w[bash], cwd: @dir),
+        approval: ->(tool_call) { approval_fibers << Fiber.current; false }
+      )
+      result = run_agent(agent, "run it")
+
+      assert_equal "understood", result.last.content
+      requests = @server.captured_requests
+      tool_message = requests.last["messages"].find { |m| m["role"] == "tool" }
+      assert_includes tool_message["content"], "The user denied the bash tool call."
+
+      # The approval callback ran on the kernel reactor fiber (interruptible).
+      decided_on = approval_fibers.pop
+      refute_equal Fiber.current, decided_on
+
+      types = events.map { |e| e[:type] }
+      refute_includes types, :tool_execution_start, "a denied call must never execute"
+    end
+
+    def test_approved_tool_executes
+      @server.script([
+        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo approved-output"}}]},
+        {type: :message, content: "done"},
+      ])
+      agent, events = agent_on_kernel(
+        tools: Tools::Registry.build(selected: %w[bash], cwd: @dir),
+        approval: ->(_tool_call) { true }
+      )
+      run_agent(agent, "run it")
+
+      requests = @server.captured_requests
+      tool_message = requests.last["messages"].find { |m| m["role"] == "tool" }
+      assert_includes tool_message["content"], "approved-output"
+    end
+
+    def test_queued_message_continues_the_outer_loop
+      @server.script([
+        {type: :message, content: "first answer"},
+        {type: :message, content: "second answer"},
+      ])
+      agent, _events = agent_on_kernel
+      agent.push_message("second")
+      result = run_agent(agent, "first")
+
+      assert_equal "second answer", result.last.content
+      requests = @server.captured_requests
+      assert_equal 2, requests.size
+      assert_equal "second", requests.last["messages"].select { |m| m["role"] == "user" }.last["content"]
+    end
+
+    def test_kernel_interrupt_cancels_in_flight_turn
+      @server.script([{type: :slow_stream, content: "x" * 40}])
+      session = ScriptedSession.new
+      session.push_native(TUI.key_event("c", modifiers: ["ctrl"]))
+      agent, events = agent_on_kernel(session:)
+
+      kernel = Core::Loop.new(session:)
+      kernel.run { agent.run("long stream") }
+
+      assert kernel.interrupted?
+      types = events.map { |e| e[:type] }
+      assert_includes types, :agent_end
+      assert events.find { |e| e[:type] == :agent_end }[:interrupted],
+        "interrupt must be observable through the agent_end event"
+      assert agent.interrupted?
+      refute kernel.poller&.thread&.alive?, "no orphan poller after interrupt"
+    end
+
+    private
+
+    def agent_on_kernel(session: ScriptedSession.new, tools: empty_tools, approval: nil,
+                        on_event: nil, script_enabled: true)
+      events = []
+      events_mutex = Mutex.new
+      sink = lambda do |event|
+        events_mutex.synchronize { events << event }
+      end
+      chat = TestChat.build(@server, tools: tools.values, system_prompt: "test prompt")
+      [Agent::Loop.new(chat:, tools:, on_event: on_event || sink, approval:), events]
+    end
+
+    def empty_tools
+      {}
+    end
+
+    # Runs the agent as the kernel work subtree (the documented usage).
+    def run_agent(agent, prompt)
+      result = nil
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      kernel.run { result = agent.run(prompt) }
+      yield if block_given?
+      result
+    end
+
+    def agent_newly_complete?(agent)
+      agent.new_messages.last.role == :assistant
+    end
+  end
+end

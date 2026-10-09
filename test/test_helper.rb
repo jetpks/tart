@@ -6,6 +6,17 @@ require_relative "../lib/raspberry_pi"
 module RaspberryPi
   # Shared base class for the minitest suite.
   class Test < Minitest::Test
+    # Runs until the block is satisfied, then returns. Fails after 5 s
+    # rather than hanging.
+    def wait_until
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+      until yield
+        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+          raise "work condition never satisfied"
+        end
+        sleep 0.005
+      end
+    end
     # A scripted session double at the TUI seam: lets kernel tests drive the
     # real poller thread + Async::Queue + frame loop headlessly, without any
     # ratatui_ruby involvement (real crossterm polls fail without a tty, and

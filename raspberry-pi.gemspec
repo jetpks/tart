@@ -24,6 +24,10 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   spec.add_dependency "async", "~> 2.46"
+  # Line diffs for the edit tool's details (pi uses the jsdiff package).
+  spec.add_dependency "diff-lcs", "~> 1.6"
+  # LLM conversation loop (BRIEF §2: >= 2.1.0).
+  spec.add_dependency "ruby_llm", "~> 2.1"
   # Pinned exactly: the poller thread's GVL-releasing poll_event is verified
   # for 1.5.0 only (I01 seam spike finding).
   spec.add_dependency "ratatui_ruby", "1.5.0"
