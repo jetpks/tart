@@ -1,0 +1,257 @@
+# frozen_string_literal: true
+
+require "async"
+
+require_relative "poller"
+
+module RaspberryPi
+  module Core
+    # The event-loop kernel (Design B, BRIEF §4/§4.1).
+    #
+    # One +Async+ reactor owns all reactor-side work — timers, socket/pipe
+    # readers, the frame loop. A dedicated {Poller} thread polls the TUI and
+    # bridges native events over the thread-safe +Async::Queue+. Synthetic
+    # events cross threads via +SyntheticEvents.push+ (through the TUI
+    # module) and are drained each frame in-loop.
+    #
+    # Ctrl+C is handled in-band: in raw mode byte 0x03 arrives as a Key event
+    # ("c" + ctrl), which cancels the in-flight work task subtree via
+    # +Task#stop+. A +Signal.trap("INT")+ net routes through the same
+    # in-band interrupt — it only cancels tasks, never relies on SIGINT
+    # default behavior.
+    #
+    # Pacing is adaptive: while an animation window is open ({#animate}),
+    # frames are deadline-paced at the frame rate (sleep until the next frame
+    # deadline, not fixed sleep); with no window open the loop is
+    # event-driven — it blocks on the event queue and does not wake.
+    #
+    # Cross-thread state: everything crosses threads via the sanctioned seams
+    # (+Async::Queue+, +SyntheticEvents+) except the stop flag, which is
+    # mutex-guarded. All other mutable state (@work_task, @tasks,
+    # @animation_deadline, stats) is touched only by reactor fibers on the
+    # main thread.
+    class Loop
+      WAKE = :wake # sentinel: unblock the idle loop (drain synthetic etc.)
+      STOP = :stop # sentinel: exit the frame loop
+      INTERRUPT = :interrupt # sentinel: the Signal.trap net
+
+      # Wake this long before a frame deadline; the remainder is spun out
+      # cooperatively because a reactor sleep overshoots by ~2ms.
+      SPIN_MARGIN = 0.002
+
+      # @param session [TUI::Session or duck-type: #draw, #poll_event,
+      #   #push_event, #drain_synthetic, #synthetic_pending?]
+      # @param renderer [Proc, nil] called once per draw; returns the status
+      #   text rendered as a Paragraph in a Block.
+      # @param on_event [Proc, nil] called as +(event, source)+ for every
+      #   dispatched event; +source+ is +:native+ or +:synthetic+.
+      # @param frame_rate [Numeric] animation-window frame rate (Hz).
+      def initialize(session:, renderer: nil, on_event: nil, frame_rate: 60)
+        @session = session
+        @renderer = renderer
+        @on_event = on_event
+        @frame_interval = 1.0 / frame_rate
+
+        @events = Async::Queue.new
+        @stop_mutex = Mutex.new
+        @stop = false
+        @interrupted = false
+        @work_error = nil
+
+        # Reactor-thread-only state (no mutex needed; see class comment).
+        @work_task = nil
+        @tasks = []
+        @animation_deadline = nil
+        @dirty = false
+        @draws = 0
+        @wakes = 0
+
+        @running = false
+      end
+
+      # Runs the kernel until the work block completes or the loop is
+      # stopped/interrupted. The terminal lifecycle is the caller's: wrap in
+      # +TUI.run+ (its ensure restores the terminal even on raise).
+      #
+      # @yield the work block, run as a reactor task subtree; Ctrl+C cancels
+      #   exactly this subtree (and re-raises any error it raised, after
+      #   the terminal is restored).
+      def run(&work)
+        raise "loop already running" if @running
+        @running = true
+        install_trap_net
+
+        Async do |root|
+          @work_task = root.async(&work) if work
+          poller = Poller.new(@session, queue: @events, frame_interval: @frame_interval, stop_flag: self)
+          poller.start
+          supervisor = root.async { supervise(@work_task) }
+          frame_loop
+          @tasks.each(&:stop)
+          @work_task&.stop
+          supervisor.stop
+          poller.stop
+        end
+
+        raise @work_error if @work_error
+        self
+      end
+
+      # Opens an animation window: frames are deadline-paced at the frame
+      # rate until +duration+ seconds elapse. May be called from any reactor
+      # fiber; wakes an idle loop.
+      def animate(duration:)
+        @animation_deadline = now + duration
+        @events << WAKE
+      end
+
+      # @return [Boolean] whether an animation window is open.
+      def animating?
+        @animation_deadline && now < @animation_deadline
+      end
+
+      # Spawns a task on the reactor. Reactor context only (call from the
+      # work block or tasks it spawned).
+      def async(&block)
+        task = Async::Task.current.async(&block)
+        @tasks << task
+        task
+      end
+
+      # Periodic timer on the reactor: fires +ticks+ times, +period+ seconds
+      # apart, on an absolute schedule (no cumulative drift). Yields the
+      # tick number (1-based).
+      def every(period, ticks:, &block)
+        async do
+          t0 = now
+          ticks.times do |i|
+            block.call(i + 1)
+            d = t0 + (i + 1) * period - now
+            sleep d if d > 0
+          end
+        end
+      end
+
+      # Requests shutdown from any thread: sets the stop flag (mutex-guarded)
+      # and wakes the idle loop.
+      def stop!
+        request_stop
+        @events << STOP
+      end
+
+      # @return [Boolean] whether shutdown was requested. Thread-safe; the
+      #   poller thread polls this every frame.
+      def stop_requested?
+        @stop_mutex.synchronize { @stop }
+      end
+
+      # @return [Boolean] whether a Ctrl+C interrupt was seen this run.
+      def interrupted?
+        @interrupted
+      end
+
+      # @return [Hash] run statistics (draws, event-driven wakes, interruption).
+      def stats
+        {draws: @draws, wakes: @wakes, interrupted: @interrupted}
+      end
+
+      private
+
+      # Cancels the in-flight work task subtree on Ctrl+C. With no live work,
+      # the interrupt stops the loop.
+      def interrupt!
+        @interrupted = true
+        work = @work_task
+        if work&.alive?
+          work.stop
+        else
+          stop!
+        end
+      end
+
+      # Runs the work subtree; any exit path eventually stops the loop.
+      def supervise(work_task)
+        return unless work_task
+        begin
+          work_task.wait
+        rescue Async::Cancel
+          # Expected after a Ctrl+C interrupt or loop teardown.
+        rescue StandardError => e
+          @work_error = e
+        ensure
+          @events << STOP
+        end
+      end
+
+      def frame_loop
+        next_deadline = nil
+        until stop_requested?
+          @session.drain_synthetic { |event| process(event, :synthetic) }
+          drain_native
+          draw_frame
+          if animating?
+            next_deadline ||= now + @frame_interval
+            delta = next_deadline - now
+            # Reactor sleep overshoots ~2ms on this platform (measured:
+            # sleep(1/60) returns at ~18.7ms), so sleep to just short of the
+            # deadline, then cooperatively spin out the remainder.
+            sleep(delta - SPIN_MARGIN) if delta > SPIN_MARGIN
+            sleep(0) while now < next_deadline
+            next_deadline += @frame_interval
+            # Re-anchor instead of bursting if a frame fell far behind.
+            next_deadline = now + @frame_interval if next_deadline < now
+          else
+            next_deadline = nil
+            process(@events.pop, :native) # event-driven: no fixed-rate wake
+            @wakes += 1
+          end
+        end
+      end
+
+      def drain_native
+        until @events.empty?
+          process(@events.pop, :native)
+        end
+      end
+
+      # Handles one queue item or synthetic event: control sentinels,
+      # in-band Ctrl+C, or dispatch to the handler.
+      def process(event, source)
+        case event
+        when STOP then request_stop
+        when INTERRUPT then interrupt!
+        when WAKE then nil # wake only; the synthetic drain does the work
+        else
+          if TUI.ctrl_c?(event)
+            interrupt!
+          else
+            @on_event&.call(event, source)
+            @dirty = true
+          end
+        end
+      end
+
+      # Sets the stop flag (mutex-guarded). The STOP sentinel that wakes the
+      # idle loop is pushed by whoever asks for the stop.
+      def request_stop
+        @stop_mutex.synchronize { @stop = true }
+      end
+
+      def draw_frame
+        return unless @dirty || animating?
+        @dirty = false
+        return unless @renderer
+        @session.draw(TUI.status_panel(@renderer.call))
+        @draws += 1
+      end
+
+      def install_trap_net
+        Signal.trap("INT") { @events << INTERRUPT }
+      end
+
+      def now
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+    end
+  end
+end
