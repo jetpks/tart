@@ -88,6 +88,9 @@ def run_in_pty
     end
     sleep 0.05
   end
+  # Bounded drain join (I02 carry-in): a stuck pty drain must not wedge the
+  # parent past the deadline.
+  drain.join(5)
   pty_tail = drain.value.to_s[-2000..]
   master.close rescue nil
 
@@ -129,6 +132,7 @@ def run_workload
     inject_ts: Queue.new,  # injection timestamps (thread-safe)
     draw_ts: Queue.new,    # renderer invocation timestamps
     ticks: 0,
+    native_seen: 0,        # native events seen by on_event (I02 carry-in: initialized)
     kill_probe: {},
     pids: [],
     reapers: [],
@@ -288,11 +292,14 @@ ensure
 end
 
 # Timeout-kill probe: `sleep 600` in its own process group, killed by
-# negative-pid Process.kill after ~1 s, reaped, verified zombie-free.
+# negative-pid Process.kill after ~1 s, reaped, verified zombie-free. All
+# stdio is redirected (I02 carry-in): the probe must not hold the pty slave
+# in its own process group.
 def spawn_timeout_kill_probe(state)
   Thread.new do
     sleep 1.0
-    kpid = Process.spawn("sleep", "600", pgroup: true)
+    kpid = Process.spawn("sleep", "600", pgroup: true,
+                         in: File::NULL, out: File::NULL, err: File::NULL)
     state[:mutex].synchronize { state[:pids] << kpid }
     sleep 1.0
     t_kill = mono_now
@@ -336,6 +343,15 @@ end
 
 def finish(state)
   extras = state[:mutex].synchronize { state[:extras] }
+  # I02 carry-in: if the workload never completed, extras is nil — report
+  # the failure (the workload error already printed) instead of crashing on
+  # nil and masking it.
+  unless extras
+    write_report(ENV.fetch("SEAM_BENCH_RESULTS"), {},
+      "SEAM_BENCH_FAIL: workload did not complete (see workload error above)")
+    puts "SEAM_BENCH_FAIL: workload did not complete; extras missing"
+    exit 1
+  end
   wall = mono_now - extras[:t_start]
   tms = Process.times
 

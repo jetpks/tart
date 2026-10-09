@@ -2,6 +2,9 @@
 
 module RaspberryPi
   module Core
+    # The poller thread failed to terminate after stop (I02 carry-in).
+    class PollerLingerError < StandardError; end
+
     # Dedicated thread bridging native TUI input into the reactor (Design B).
     #
     # Loops {Session#poll_event} — crossterm releases the GVL while blocked,
@@ -29,9 +32,23 @@ module RaspberryPi
       end
 
       # Joins the poller; it returns within ~one frame of the stop flag.
+      # Raises when the poller thread did not terminate within the join
+      # budget (I02 carry-in: a missed join must surface, not vanish — an
+      # orphaned poller would keep polling a restored terminal).
+      #
+      # @return [Thread, nil] the poller thread.
       def stop
-        @thread&.join(1)
+        return unless @thread
+
+        @thread.join(1)
+        if @thread.alive?
+          raise PollerLingerError, "poller thread did not terminate within 1s of stop"
+        end
+        @thread
       end
+
+      # @return [Thread, nil] the poller thread (for orphan assertions).
+      attr_reader :thread
 
       private
 

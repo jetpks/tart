@@ -73,24 +73,51 @@ module RaspberryPi
       # stopped/interrupted. The terminal lifecycle is the caller's: wrap in
       # +TUI.run+ (its ensure restores the terminal even on raise).
       #
+      # Without a block this is the documented event-only mode: the loop
+      # runs until {#stop!} or an interrupt arrives — there is no work task
+      # to supervise, so nothing pushes STOP on its own.
+      #
+      # Teardown is exception-safe (I02 carry-in): whatever the work block
+      # or an event handler raises, the poller is stopped and the SIGINT
+      # trap net is restored to its pre-run handler. A {Loop} is single-use;
+      # build a new one to run again.
+      #
       # @yield the work block, run as a reactor task subtree; Ctrl+C cancels
       #   exactly this subtree (and re-raises any error it raised, after
       #   the terminal is restored).
       def run(&work)
         raise "loop already running" if @running
         @running = true
-        install_trap_net
+        previous_trap = install_trap_net
 
-        Async do |root|
-          @work_task = root.async(&work) if work
-          poller = Poller.new(@session, queue: @events, frame_interval: @frame_interval, stop_flag: self)
-          poller.start
-          supervisor = root.async { supervise(@work_task) }
-          frame_loop
-          @tasks.each(&:stop)
-          @work_task&.stop
-          supervisor.stop
-          poller.stop
+        begin
+          Async do |root|
+            begin
+              @work_task = root.async(&work) if work
+              poller = Poller.new(@session, queue: @events, frame_interval: @frame_interval, stop_flag: self)
+              poller.start
+              supervisor = root.async { supervise(@work_task) }
+              frame_loop
+            rescue StandardError => e
+              # An error from the frame loop itself (an event handler, the
+              # renderer) must surface after teardown: async 2.x does not
+              # re-raise the root task body's exception, it only logs it.
+              @work_error = e
+            ensure
+              # Exception-safe teardown (I02 carry-in): whatever raised — the
+              # work subtree, an event handler, the renderer — the poller must
+              # see the stop flag before it is joined, or it lingers (and the
+              # linger error would mask the original failure).
+              request_stop
+              @tasks.each(&:stop)
+              @work_task&.stop
+              supervisor&.stop
+              @poller = poller
+              poller&.stop
+            end
+          end
+        ensure
+          Signal.trap("INT", previous_trap)
         end
 
         raise @work_error if @work_error
@@ -102,7 +129,7 @@ module RaspberryPi
       # fiber; wakes an idle loop.
       def animate(duration:)
         @animation_deadline = now + duration
-        @events << WAKE
+        signal(WAKE)
       end
 
       # @return [Boolean] whether an animation window is open.
@@ -136,8 +163,12 @@ module RaspberryPi
       # and wakes the idle loop.
       def stop!
         request_stop
-        @events << STOP
+        signal(STOP)
       end
+
+      # @return [Boolean] whether the poller thread is still alive. Used by
+      #   tests to prove teardown leaves no orphan poller.
+      attr_reader :poller
 
       # @return [Boolean] whether shutdown was requested. Thread-safe; the
       #   poller thread polls this every frame.
@@ -146,13 +177,17 @@ module RaspberryPi
       end
 
       # @return [Boolean] whether a Ctrl+C interrupt was seen this run.
+      #   Thread-safe (I02 carry-in).
       def interrupted?
-        @interrupted
+        @stop_mutex.synchronize { @interrupted }
       end
 
       # @return [Hash] run statistics (draws, event-driven wakes, interruption).
+      # Thread-safe (I02 carry-in: readable from any thread).
       def stats
-        {draws: @draws, wakes: @wakes, interrupted: @interrupted}
+        @stop_mutex.synchronize do
+          {draws: @draws, wakes: @wakes, interrupted: @interrupted}
+        end
       end
 
       private
@@ -160,7 +195,7 @@ module RaspberryPi
       # Cancels the in-flight work task subtree on Ctrl+C. With no live work,
       # the interrupt stops the loop.
       def interrupt!
-        @interrupted = true
+        @stop_mutex.synchronize { @interrupted = true }
         work = @work_task
         if work&.alive?
           work.stop
@@ -179,8 +214,21 @@ module RaspberryPi
         rescue StandardError => e
           @work_error = e
         ensure
-          @events << STOP
+          signal(STOP)
         end
+      end
+
+      # Wakes the frame loop with a sentinel from reactor-side code (a
+      # fiber). The push crosses a thread boundary: Async::Queue delegates
+      # to ::Queue, and a push from another fiber on this thread can fail to
+      # wake a fiber blocked in #pop — the wakeup relies on the scheduler's
+      # unblock, which reliably writes the selector's wakeup pipe only from
+      # another thread (measured lost wakeups on async 2.46 / ruby 4.0;
+      # cross-thread pushes — the poller, stop! from a foreign thread — are
+      # the proven path).
+      def signal(item)
+        Thread.new { @events << item }.join
+        self
       end
 
       def frame_loop
@@ -245,6 +293,8 @@ module RaspberryPi
         @draws += 1
       end
 
+      # Installs the SIGINT trap net; returns the previous handler so run's
+      # teardown can restore it.
       def install_trap_net
         Signal.trap("INT") { @events << INTERRUPT }
       end

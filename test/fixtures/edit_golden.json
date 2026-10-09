@@ -1,0 +1,379 @@
+{
+ "generated_by": "pi sources (packages/coding-agent/src/core/tools) via node --experimental-strip-types",
+ "workdir_basename": "$WORKDIR_NAME",
+ "read_cases": [
+  {
+   "name": "trailing_ws",
+   "ok": true,
+   "value": {
+    "content": [
+     {
+      "type": "text",
+      "text": "line one  \nline two\t\n"
+     }
+    ],
+    "structuredContent": "line one  \nline two\t\n"
+   }
+  },
+  {
+   "name": "bom_crlf",
+   "ok": true,
+   "value": "﻿a\r\nb\r\n"
+  },
+  {
+   "name": "offset_limit",
+   "ok": true,
+   "value": "line two\t\n\n[1 more lines in file. Use offset=3 to continue.]"
+  },
+  {
+   "name": "offset_beyond_eof",
+   "ok": false,
+   "error": "Offset 99 is beyond end of file (3 lines total)"
+  },
+  {
+   "name": "missing_file",
+   "ok": false,
+   "error": "ENOENT: no such file or directory, access '$WORKDIR/nope.txt'"
+  },
+  {
+   "name": "many_lines",
+   "ok": true,
+   "value": "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25\nl26\nl27\nl28\nl29\nl30\nl31\nl32\nl33\nl34\nl35\nl36\nl37\nl38\nl39\nl40\nl41\nl42\nl43\nl44\nl45\nl46\nl47\nl48\nl49\nl50\nl51\nl52\nl53\nl54\nl55\nl56\nl57\nl58\nl59\nl60\nl61\nl62\nl63\nl64\nl65\nl66\nl67\nl68\nl69\nl70\nl71\nl72\nl73\nl74\nl75\nl76\nl77\nl78\nl79\nl80\nl81\nl82\nl83\nl84\nl85\nl86\nl87\nl88\nl89\nl90\nl91\nl92\nl93\nl94\nl95\nl96\nl97\nl98\nl99\nl100\nl101\nl102\nl103\nl104\nl105\nl106\nl107\nl108\nl109\nl110\nl111\nl112\nl113\nl114\nl115\nl116\nl117\nl118\nl119\nl120\nl121\nl122\nl123\nl124\nl125\nl126\nl127\nl128\nl129\nl130\nl131\nl132\nl133\nl134\nl135\nl136\nl137\nl138\nl139\nl140\nl141\nl142\nl143\nl144\nl145\nl146\nl147\nl148\nl149\nl150\nl151\nl152\nl153\nl154\nl155\nl156\nl157\nl158\nl159\nl160\nl161\nl162\nl163\nl164\nl165\nl166\nl167\nl168\nl169\nl170\nl171\nl172\nl173\nl174\nl175\nl176\nl177\nl178\nl179\nl180\nl181\nl182\nl183\nl184\nl185\nl186\nl187\nl188\nl189\nl190\nl191\nl192\nl193\nl194\nl195\nl196\nl197\nl198\nl199\nl200\nl201\nl202\nl203\nl204\nl205\nl206\nl207\nl208\nl209\nl210\nl211\nl212\nl213\nl214\nl215\nl216\nl217\nl218\nl219\nl220\nl221\nl222\nl223\nl224\nl225\nl226\nl227\nl228\nl229\nl230\nl231\nl232\nl233\nl234\nl235\nl236\nl237\nl238\nl239\nl240\nl241\nl242\nl243\nl244\nl245\nl246\nl247\nl248\nl249\nl250\nl251\nl252\nl253\nl254\nl255\nl256\nl257\nl258\nl259\nl260\nl261\nl262\nl263\nl264\nl265\nl266\nl267\nl268\nl269\nl270\nl271\nl272\nl273\nl274\nl275\nl276\nl277\nl278\nl279\nl280\nl281\nl282\nl283\nl284\nl285\nl286\nl287\nl288\nl289\nl290\nl291\nl292\nl293\nl294\nl295\nl296\nl297\nl298\nl299\nl300\nl301\nl302\nl303\nl304\nl305\nl306\nl307\nl308\nl309\nl310\nl311\nl312\nl313\nl314\nl315\nl316\nl317\nl318\nl319\nl320\nl321\nl322\nl323\nl324\nl325\nl326\nl327\nl328\nl329\nl330\nl331\nl332\nl333\nl334\nl335\nl336\nl337\nl338\nl339\nl340\nl341\nl342\nl343\nl344\nl345\nl346\nl347\nl348\nl349\nl350\nl351\nl352\nl353\nl354\nl355\nl356\nl357\nl358\nl359\nl360\nl361\nl362\nl363\nl364\nl365\nl366\nl367\nl368\nl369\nl370\nl371\nl372\nl373\nl374\nl375\nl376\nl377\nl378\nl379\nl380\nl381\nl382\nl383\nl384\nl385\nl386\nl387\nl388\nl389\nl390\nl391\nl392\nl393\nl394\nl395\nl396\nl397\nl398\nl399\nl400\nl401\nl402\nl403\nl404\nl405\nl406\nl407\nl408\nl409\nl410\nl411\nl412\nl413\nl414\nl415\nl416\nl417\nl418\nl419\nl420\nl421\nl422\nl423\nl424\nl425\nl426\nl427\nl428\nl429\nl430\nl431\nl432\nl433\nl434\nl435\nl436\nl437\nl438\nl439\nl440\nl441\nl442\nl443\nl444\nl445\nl446\nl447\nl448\nl449\nl450\nl451\nl452\nl453\nl454\nl455\nl456\nl457\nl458\nl459\nl460\nl461\nl462\nl463\nl464\nl465\nl466\nl467\nl468\nl469\nl470\nl471\nl472\nl473\nl474\nl475\nl476\nl477\nl478\nl479\nl480\nl481\nl482\nl483\nl484\nl485\nl486\nl487\nl488\nl489\nl490\nl491\nl492\nl493\nl494\nl495\nl496\nl497\nl498\nl499\nl500\nl501\nl502\nl503\nl504\nl505\nl506\nl507\nl508\nl509\nl510\nl511\nl512\nl513\nl514\nl515\nl516\nl517\nl518\nl519\nl520\nl521\nl522\nl523\nl524\nl525\nl526\nl527\nl528\nl529\nl530\nl531\nl532\nl533\nl534\nl535\nl536\nl537\nl538\nl539\nl540\nl541\nl542\nl543\nl544\nl545\nl546\nl547\nl548\nl549\nl550\nl551\nl552\nl553\nl554\nl555\nl556\nl557\nl558\nl559\nl560\nl561\nl562\nl563\nl564\nl565\nl566\nl567\nl568\nl569\nl570\nl571\nl572\nl573\nl574\nl575\nl576\nl577\nl578\nl579\nl580\nl581\nl582\nl583\nl584\nl585\nl586\nl587\nl588\nl589\nl590\nl591\nl592\nl593\nl594\nl595\nl596\nl597\nl598\nl599\nl600\nl601\nl602\nl603\nl604\nl605\nl606\nl607\nl608\nl609\nl610\nl611\nl612\nl613\nl614\nl615\nl616\nl617\nl618\nl619\nl620\nl621\nl622\nl623\nl624\nl625\nl626\nl627\nl628\nl629\nl630\nl631\nl632\nl633\nl634\nl635\nl636\nl637\nl638\nl639\nl640\nl641\nl642\nl643\nl644\nl645\nl646\nl647\nl648\nl649\nl650\nl651\nl652\nl653\nl654\nl655\nl656\nl657\nl658\nl659\nl660\nl661\nl662\nl663\nl664\nl665\nl666\nl667\nl668\nl669\nl670\nl671\nl672\nl673\nl674\nl675\nl676\nl677\nl678\nl679\nl680\nl681\nl682\nl683\nl684\nl685\nl686\nl687\nl688\nl689\nl690\nl691\nl692\nl693\nl694\nl695\nl696\nl697\nl698\nl699\nl700\nl701\nl702\nl703\nl704\nl705\nl706\nl707\nl708\nl709\nl710\nl711\nl712\nl713\nl714\nl715\nl716\nl717\nl718\nl719\nl720\nl721\nl722\nl723\nl724\nl725\nl726\nl727\nl728\nl729\nl730\nl731\nl732\nl733\nl734\nl735\nl736\nl737\nl738\nl739\nl740\nl741\nl742\nl743\nl744\nl745\nl746\nl747\nl748\nl749\nl750\nl751\nl752\nl753\nl754\nl755\nl756\nl757\nl758\nl759\nl760\nl761\nl762\nl763\nl764\nl765\nl766\nl767\nl768\nl769\nl770\nl771\nl772\nl773\nl774\nl775\nl776\nl777\nl778\nl779\nl780\nl781\nl782\nl783\nl784\nl785\nl786\nl787\nl788\nl789\nl790\nl791\nl792\nl793\nl794\nl795\nl796\nl797\nl798\nl799\nl800\nl801\nl802\nl803\nl804\nl805\nl806\nl807\nl808\nl809\nl810\nl811\nl812\nl813\nl814\nl815\nl816\nl817\nl818\nl819\nl820\nl821\nl822\nl823\nl824\nl825\nl826\nl827\nl828\nl829\nl830\nl831\nl832\nl833\nl834\nl835\nl836\nl837\nl838\nl839\nl840\nl841\nl842\nl843\nl844\nl845\nl846\nl847\nl848\nl849\nl850\nl851\nl852\nl853\nl854\nl855\nl856\nl857\nl858\nl859\nl860\nl861\nl862\nl863\nl864\nl865\nl866\nl867\nl868\nl869\nl870\nl871\nl872\nl873\nl874\nl875\nl876\nl877\nl878\nl879\nl880\nl881\nl882\nl883\nl884\nl885\nl886\nl887\nl888\nl889\nl890\nl891\nl892\nl893\nl894\nl895\nl896\nl897\nl898\nl899\nl900\nl901\nl902\nl903\nl904\nl905\nl906\nl907\nl908\nl909\nl910\nl911\nl912\nl913\nl914\nl915\nl916\nl917\nl918\nl919\nl920\nl921\nl922\nl923\nl924\nl925\nl926\nl927\nl928\nl929\nl930\nl931\nl932\nl933\nl934\nl935\nl936\nl937\nl938\nl939\nl940\nl941\nl942\nl943\nl944\nl945\nl946\nl947\nl948\nl949\nl950\nl951\nl952\nl953\nl954\nl955\nl956\nl957\nl958\nl959\nl960\nl961\nl962\nl963\nl964\nl965\nl966\nl967\nl968\nl969\nl970\nl971\nl972\nl973\nl974\nl975\nl976\nl977\nl978\nl979\nl980\nl981\nl982\nl983\nl984\nl985\nl986\nl987\nl988\nl989\nl990\nl991\nl992\nl993\nl994\nl995\nl996\nl997\nl998\nl999\nl1000\nl1001\nl1002\nl1003\nl1004\nl1005\nl1006\nl1007\nl1008\nl1009\nl1010\nl1011\nl1012\nl1013\nl1014\nl1015\nl1016\nl1017\nl1018\nl1019\nl1020\nl1021\nl1022\nl1023\nl1024\nl1025\nl1026\nl1027\nl1028\nl1029\nl1030\nl1031\nl1032\nl1033\nl1034\nl1035\nl1036\nl1037\nl1038\nl1039\nl1040\nl1041\nl1042\nl1043\nl1044\nl1045\nl1046\nl1047\nl1048\nl1049\nl1050\nl1051\nl1052\nl1053\nl1054\nl1055\nl1056\nl1057\nl1058\nl1059\nl1060\nl1061\nl1062\nl1063\nl1064\nl1065\nl1066\nl1067\nl1068\nl1069\nl1070\nl1071\nl1072\nl1073\nl1074\nl1075\nl1076\nl1077\nl1078\nl1079\nl1080\nl1081\nl1082\nl1083\nl1084\nl1085\nl1086\nl1087\nl1088\nl1089\nl1090\nl1091\nl1092\nl1093\nl1094\nl1095\nl1096\nl1097\nl1098\nl1099\nl1100\nl1101\nl1102\nl1103\nl1104\nl1105\nl1106\nl1107\nl1108\nl1109\nl1110\nl1111\nl1112\nl1113\nl1114\nl1115\nl1116\nl1117\nl1118\nl1119\nl1120\nl1121\nl1122\nl1123\nl1124\nl1125\nl1126\nl1127\nl1128\nl1129\nl1130\nl1131\nl1132\nl1133\nl1134\nl1135\nl1136\nl1137\nl1138\nl1139\nl1140\nl1141\nl1142\nl1143\nl1144\nl1145\nl1146\nl1147\nl1148\nl1149\nl1150\nl1151\nl1152\nl1153\nl1154\nl1155\nl1156\nl1157\nl1158\nl1159\nl1160\nl1161\nl1162\nl1163\nl1164\nl1165\nl1166\nl1167\nl1168\nl1169\nl1170\nl1171\nl1172\nl1173\nl1174\nl1175\nl1176\nl1177\nl1178\nl1179\nl1180\nl1181\nl1182\nl1183\nl1184\nl1185\nl1186\nl1187\nl1188\nl1189\nl1190\nl1191\nl1192\nl1193\nl1194\nl1195\nl1196\nl1197\nl1198\nl1199\nl1200\nl1201\nl1202\nl1203\nl1204\nl1205\nl1206\nl1207\nl1208\nl1209\nl1210\nl1211\nl1212\nl1213\nl1214\nl1215\nl1216\nl1217\nl1218\nl1219\nl1220\nl1221\nl1222\nl1223\nl1224\nl1225\nl1226\nl1227\nl1228\nl1229\nl1230\nl1231\nl1232\nl1233\nl1234\nl1235\nl1236\nl1237\nl1238\nl1239\nl1240\nl1241\nl1242\nl1243\nl1244\nl1245\nl1246\nl1247\nl1248\nl1249\nl1250\nl1251\nl1252\nl1253\nl1254\nl1255\nl1256\nl1257\nl1258\nl1259\nl1260\nl1261\nl1262\nl1263\nl1264\nl1265\nl1266\nl1267\nl1268\nl1269\nl1270\nl1271\nl1272\nl1273\nl1274\nl1275\nl1276\nl1277\nl1278\nl1279\nl1280\nl1281\nl1282\nl1283\nl1284\nl1285\nl1286\nl1287\nl1288\nl1289\nl1290\nl1291\nl1292\nl1293\nl1294\nl1295\nl1296\nl1297\nl1298\nl1299\nl1300\nl1301\nl1302\nl1303\nl1304\nl1305\nl1306\nl1307\nl1308\nl1309\nl1310\nl1311\nl1312\nl1313\nl1314\nl1315\nl1316\nl1317\nl1318\nl1319\nl1320\nl1321\nl1322\nl1323\nl1324\nl1325\nl1326\nl1327\nl1328\nl1329\nl1330\nl1331\nl1332\nl1333\nl1334\nl1335\nl1336\nl1337\nl1338\nl1339\nl1340\nl1341\nl1342\nl1343\nl1344\nl1345\nl1346\nl1347\nl1348\nl1349\nl1350\nl1351\nl1352\nl1353\nl1354\nl1355\nl1356\nl1357\nl1358\nl1359\nl1360\nl1361\nl1362\nl1363\nl1364\nl1365\nl1366\nl1367\nl1368\nl1369\nl1370\nl1371\nl1372\nl1373\nl1374\nl1375\nl1376\nl1377\nl1378\nl1379\nl1380\nl1381\nl1382\nl1383\nl1384\nl1385\nl1386\nl1387\nl1388\nl1389\nl1390\nl1391\nl1392\nl1393\nl1394\nl1395\nl1396\nl1397\nl1398\nl1399\nl1400\nl1401\nl1402\nl1403\nl1404\nl1405\nl1406\nl1407\nl1408\nl1409\nl1410\nl1411\nl1412\nl1413\nl1414\nl1415\nl1416\nl1417\nl1418\nl1419\nl1420\nl1421\nl1422\nl1423\nl1424\nl1425\nl1426\nl1427\nl1428\nl1429\nl1430\nl1431\nl1432\nl1433\nl1434\nl1435\nl1436\nl1437\nl1438\nl1439\nl1440\nl1441\nl1442\nl1443\nl1444\nl1445\nl1446\nl1447\nl1448\nl1449\nl1450\nl1451\nl1452\nl1453\nl1454\nl1455\nl1456\nl1457\nl1458\nl1459\nl1460\nl1461\nl1462\nl1463\nl1464\nl1465\nl1466\nl1467\nl1468\nl1469\nl1470\nl1471\nl1472\nl1473\nl1474\nl1475\nl1476\nl1477\nl1478\nl1479\nl1480\nl1481\nl1482\nl1483\nl1484\nl1485\nl1486\nl1487\nl1488\nl1489\nl1490\nl1491\nl1492\nl1493\nl1494\nl1495\nl1496\nl1497\nl1498\nl1499\nl1500\nl1501\nl1502\nl1503\nl1504\nl1505\nl1506\nl1507\nl1508\nl1509\nl1510\nl1511\nl1512\nl1513\nl1514\nl1515\nl1516\nl1517\nl1518\nl1519\nl1520\nl1521\nl1522\nl1523\nl1524\nl1525\nl1526\nl1527\nl1528\nl1529\nl1530\nl1531\nl1532\nl1533\nl1534\nl1535\nl1536\nl1537\nl1538\nl1539\nl1540\nl1541\nl1542\nl1543\nl1544\nl1545\nl1546\nl1547\nl1548\nl1549\nl1550\nl1551\nl1552\nl1553\nl1554\nl1555\nl1556\nl1557\nl1558\nl1559\nl1560\nl1561\nl1562\nl1563\nl1564\nl1565\nl1566\nl1567\nl1568\nl1569\nl1570\nl1571\nl1572\nl1573\nl1574\nl1575\nl1576\nl1577\nl1578\nl1579\nl1580\nl1581\nl1582\nl1583\nl1584\nl1585\nl1586\nl1587\nl1588\nl1589\nl1590\nl1591\nl1592\nl1593\nl1594\nl1595\nl1596\nl1597\nl1598\nl1599\nl1600\nl1601\nl1602\nl1603\nl1604\nl1605\nl1606\nl1607\nl1608\nl1609\nl1610\nl1611\nl1612\nl1613\nl1614\nl1615\nl1616\nl1617\nl1618\nl1619\nl1620\nl1621\nl1622\nl1623\nl1624\nl1625\nl1626\nl1627\nl1628\nl1629\nl1630\nl1631\nl1632\nl1633\nl1634\nl1635\nl1636\nl1637\nl1638\nl1639\nl1640\nl1641\nl1642\nl1643\nl1644\nl1645\nl1646\nl1647\nl1648\nl1649\nl1650\nl1651\nl1652\nl1653\nl1654\nl1655\nl1656\nl1657\nl1658\nl1659\nl1660\nl1661\nl1662\nl1663\nl1664\nl1665\nl1666\nl1667\nl1668\nl1669\nl1670\nl1671\nl1672\nl1673\nl1674\nl1675\nl1676\nl1677\nl1678\nl1679\nl1680\nl1681\nl1682\nl1683\nl1684\nl1685\nl1686\nl1687\nl1688\nl1689\nl1690\nl1691\nl1692\nl1693\nl1694\nl1695\nl1696\nl1697\nl1698\nl1699\nl1700\nl1701\nl1702\nl1703\nl1704\nl1705\nl1706\nl1707\nl1708\nl1709\nl1710\nl1711\nl1712\nl1713\nl1714\nl1715\nl1716\nl1717\nl1718\nl1719\nl1720\nl1721\nl1722\nl1723\nl1724\nl1725\nl1726\nl1727\nl1728\nl1729\nl1730\nl1731\nl1732\nl1733\nl1734\nl1735\nl1736\nl1737\nl1738\nl1739\nl1740\nl1741\nl1742\nl1743\nl1744\nl1745\nl1746\nl1747\nl1748\nl1749\nl1750\nl1751\nl1752\nl1753\nl1754\nl1755\nl1756\nl1757\nl1758\nl1759\nl1760\nl1761\nl1762\nl1763\nl1764\nl1765\nl1766\nl1767\nl1768\nl1769\nl1770\nl1771\nl1772\nl1773\nl1774\nl1775\nl1776\nl1777\nl1778\nl1779\nl1780\nl1781\nl1782\nl1783\nl1784\nl1785\nl1786\nl1787\nl1788\nl1789\nl1790\nl1791\nl1792\nl1793\nl1794\nl1795\nl1796\nl1797\nl1798\nl1799\nl1800\nl1801\nl1802\nl1803\nl1804\nl1805\nl1806\nl1807\nl1808\nl1809\nl1810\nl1811\nl1812\nl1813\nl1814\nl1815\nl1816\nl1817\nl1818\nl1819\nl1820\nl1821\nl1822\nl1823\nl1824\nl1825\nl1826\nl1827\nl1828\nl1829\nl1830\nl1831\nl1832\nl1833\nl1834\nl1835\nl1836\nl1837\nl1838\nl1839\nl1840\nl1841\nl1842\nl1843\nl1844\nl1845\nl1846\nl1847\nl1848\nl1849\nl1850\nl1851\nl1852\nl1853\nl1854\nl1855\nl1856\nl1857\nl1858\nl1859\nl1860\nl1861\nl1862\nl1863\nl1864\nl1865\nl1866\nl1867\nl1868\nl1869\nl1870\nl1871\nl1872\nl1873\nl1874\nl1875\nl1876\nl1877\nl1878\nl1879\nl1880\nl1881\nl1882\nl1883\nl1884\nl1885\nl1886\nl1887\nl1888\nl1889\nl1890\nl1891\nl1892\nl1893\nl1894\nl1895\nl1896\nl1897\nl1898\nl1899\nl1900\nl1901\nl1902\nl1903\nl1904\nl1905\nl1906\nl1907\nl1908\nl1909\nl1910\nl1911\nl1912\nl1913\nl1914\nl1915\nl1916\nl1917\nl1918\nl1919\nl1920\nl1921\nl1922\nl1923\nl1924\nl1925\nl1926\nl1927\nl1928\nl1929\nl1930\nl1931\nl1932\nl1933\nl1934\nl1935\nl1936\nl1937\nl1938\nl1939\nl1940\nl1941\nl1942\nl1943\nl1944\nl1945\nl1946\nl1947\nl1948\nl1949\nl1950\nl1951\nl1952\nl1953\nl1954\nl1955\nl1956\nl1957\nl1958\nl1959\nl1960\nl1961\nl1962\nl1963\nl1964\nl1965\nl1966\nl1967\nl1968\nl1969\nl1970\nl1971\nl1972\nl1973\nl1974\nl1975\nl1976\nl1977\nl1978\nl1979\nl1980\nl1981\nl1982\nl1983\nl1984\nl1985\nl1986\nl1987\nl1988\nl1989\nl1990\nl1991\nl1992\nl1993\nl1994\nl1995\nl1996\nl1997\nl1998\nl1999\nl2000\n\n[Showing lines 1-2000 of 2501. Use offset=2001 to continue.]"
+  },
+  {
+   "name": "byte_limit",
+   "ok": true,
+   "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  }
+ ],
+ "write_cases": [
+  {
+   "name": "verbatim_trailing_ws",
+   "ok": true,
+   "value": {
+    "message": "Successfully wrote to out1.txt",
+    "written_base64": "bm8gdHJhaWxpbmcgbmV3bGluZSAgCnNlY29uZAkK",
+    "content_base64": "bm8gdHJhaWxpbmcgbmV3bGluZSAgCnNlY29uZAkK"
+   }
+  },
+  {
+   "name": "nested_dirs",
+   "ok": true,
+   "value": {
+    "message": "Successfully wrote to deep/nested/dir/out.txt",
+    "exists": true
+   }
+  }
+ ],
+ "edit_cases": [
+  {
+   "name": "exact",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 1 block(s) in e-exact.txt.",
+    "details": {
+     "diff": " 1 alpha\n-2 beta\n+2 BETA\n 3 gamma",
+     "patch": "--- e-exact.txt\n+++ e-exact.txt\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
+     "firstChangedLine": 2
+    },
+    "written_base64": "YWxwaGEKQkVUQQpnYW1tYQo="
+   }
+  },
+  {
+   "name": "exact_trailing_ws",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 1 block(s) in e-exact_trailing_ws.txt.",
+    "details": {
+     "diff": "-1 alpha  \n-2 beta\t\n+1 alpha",
+     "patch": "--- e-exact_trailing_ws.txt\n+++ e-exact_trailing_ws.txt\n@@ -1,2 +1,1 @@\n-alpha  \n-beta\t\n+alpha\n",
+     "firstChangedLine": 1
+    },
+    "written_base64": "YWxwaGEK"
+   }
+  },
+  {
+   "name": "fuzzy_trailing_ws",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 1 block(s) in e-fuzzy_trailing_ws.txt.",
+    "details": {
+     "diff": "-1 alpha  \n+1 ALPHA\n 2 beta\t\n 3 gamma ",
+     "patch": "--- e-fuzzy_trailing_ws.txt\n+++ e-fuzzy_trailing_ws.txt\n@@ -1,3 +1,3 @@\n-alpha  \n+ALPHA\n beta\t\n gamma \n",
+     "firstChangedLine": 1
+    },
+    "written_base64": "QUxQSEEKYmV0YQkKZ2FtbWEgCg=="
+   }
+  },
+  {
+   "name": "replacement_trailing_ws",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 1 block(s) in e-replacement_trailing_ws.txt.",
+    "details": {
+     "diff": " 1 alpha\n-2 beta\n+2 beta  ",
+     "patch": "--- e-replacement_trailing_ws.txt\n+++ e-replacement_trailing_ws.txt\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+beta  \n",
+     "firstChangedLine": 2
+    },
+    "written_base64": "YWxwaGEKYmV0YSAgCg=="
+   }
+  },
+  {
+   "name": "smart_quotes",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 1 block(s) in e-smart_quotes.txt.",
+    "details": {
+     "diff": "-1 don’t stop…\n+1 done",
+     "patch": "--- e-smart_quotes.txt\n+++ e-smart_quotes.txt\n@@ -1,1 +1,1 @@\n-don’t stop…\n+done\n",
+     "firstChangedLine": 1
+    },
+    "written_base64": "ZG9uZQo="
+   }
+  },
+  {
+   "name": "dashes",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 1 block(s) in e-dashes.txt.",
+    "details": {
+     "diff": "-1 a–b—c\n+1 abc",
+     "patch": "--- e-dashes.txt\n+++ e-dashes.txt\n@@ -1,1 +1,1 @@\n-a–b—c\n+abc\n",
+     "firstChangedLine": 1
+    },
+    "written_base64": "YWJjCg=="
+   }
+  },
+  {
+   "name": "crlf",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 1 block(s) in e-crlf.txt.",
+    "details": {
+     "diff": " 1 a\n-2 b\n+2 B\n 3 c",
+     "patch": "--- e-crlf.txt\n+++ e-crlf.txt\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n",
+     "firstChangedLine": 2
+    },
+    "written_base64": "YQ0KQg0KYw0K"
+   }
+  },
+  {
+   "name": "bom",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 1 block(s) in e-bom.txt.",
+    "details": {
+     "diff": "-1 a\n+1 A\n 2 b",
+     "patch": "--- e-bom.txt\n+++ e-bom.txt\n@@ -1,2 +1,2 @@\n-a\n+A\n b\n",
+     "firstChangedLine": 1
+    },
+    "written_base64": "77u/QQpiCg=="
+   }
+  },
+  {
+   "name": "multi",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 2 block(s) in e-multi.txt.",
+    "details": {
+     "diff": "-1 one\n+1 ONE\n 2 two\n 3 three\n-4 four\n+4 FOUR",
+     "patch": "--- e-multi.txt\n+++ e-multi.txt\n@@ -1,4 +1,4 @@\n-one\n+ONE\n two\n three\n-four\n+FOUR\n",
+     "firstChangedLine": 1
+    },
+    "written_base64": "T05FCnR3bwp0aHJlZQpGT1VSCg=="
+   }
+  },
+  {
+   "name": "multi_fuzzy",
+   "ok": true,
+   "value": {
+    "message": "Successfully replaced 2 block(s) in e-multi_fuzzy.txt.",
+    "details": {
+     "diff": "-1 x  \n+1 X\n 2 y\n-3 z\t\n+3 Z",
+     "patch": "--- e-multi_fuzzy.txt\n+++ e-multi_fuzzy.txt\n@@ -1,3 +1,3 @@\n-x  \n+X\n y\n-z\t\n+Z\n",
+     "firstChangedLine": 1
+    },
+    "written_base64": "WAp5CloK"
+   }
+  },
+  {
+   "name": "not_found",
+   "ok": false,
+   "error": "Could not find the exact text in e-not_found.txt. The old text must match exactly including all whitespace and newlines."
+  },
+  {
+   "name": "duplicate",
+   "ok": false,
+   "error": "Found 2 occurrences of the text in e-duplicate.txt. The text must be unique. Please provide more context to make it unique."
+  },
+  {
+   "name": "no_change",
+   "ok": false,
+   "error": "No changes made to e-no_change.txt. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+  },
+  {
+   "name": "empty_old_text",
+   "ok": false,
+   "error": "oldText must not be empty in e-empty_old_text.txt."
+  },
+  {
+   "name": "overlap",
+   "ok": false,
+   "error": "edits[0] and edits[1] overlap in e-overlap.txt. Merge them into one edit or target disjoint regions."
+  },
+  {
+   "name": "legacy_top_level_args",
+   "ok": false,
+   "error": "Edit tool input is invalid. edits must contain at least one replacement."
+  },
+  {
+   "name": "legacy_args",
+   "ok": true,
+   "value": {
+    "error": "Edit tool input is invalid. edits must contain at least one replacement."
+   }
+  }
+ ],
+ "edit_unit_cases": [
+  {
+   "name": "normalize_smart_quotes",
+   "ok": true,
+   "value": "'x' \"y\""
+  },
+  {
+   "name": "normalize_spaces",
+   "ok": true,
+   "value": "a b c d"
+  },
+  {
+   "name": "normalize_dashes",
+   "ok": true,
+   "value": "a-b-c-d-e"
+  },
+  {
+   "name": "normalize_trailing_ws",
+   "ok": true,
+   "value": "a\nb\nc"
+  },
+  {
+   "name": "normalize_not_internal_runs",
+   "ok": true,
+   "value": "a  b"
+  },
+  {
+   "name": "fuzzy_find_exact",
+   "ok": true,
+   "value": {
+    "found": true,
+    "index": 0,
+    "matchLength": 3,
+    "usedFuzzyMatch": false,
+    "contentForReplacement": "abc\n"
+   }
+  },
+  {
+   "name": "fuzzy_find_fuzzy",
+   "ok": true,
+   "value": {
+    "found": true,
+    "index": 0,
+    "matchLength": 3,
+    "usedFuzzyMatch": false,
+    "contentForReplacement": "abc  \n"
+   }
+  },
+  {
+   "name": "fuzzy_find_miss",
+   "ok": true,
+   "value": {
+    "found": false,
+    "index": -1,
+    "matchLength": 0,
+    "usedFuzzyMatch": false,
+    "contentForReplacement": "abc\n"
+   }
+  },
+  {
+   "name": "detect_line_ending_crlf",
+   "ok": true,
+   "value": "\r\n"
+  },
+  {
+   "name": "detect_line_ending_lf",
+   "ok": true,
+   "value": "\n"
+  },
+  {
+   "name": "detect_line_ending_none",
+   "ok": true,
+   "value": "\n"
+  },
+  {
+   "name": "split_bom",
+   "ok": true,
+   "value": "{\"bom\":\"﻿\",\"text\":\"ab\"}"
+  }
+ ],
+ "truncate_cases": [
+  {
+   "name": "head_no_truncation",
+   "ok": true,
+   "value": "{\"content\":\"a\\nb\\nc\",\"truncated\":false,\"truncatedBy\":null,\"totalLines\":3,\"totalBytes\":5,\"outputLines\":3,\"outputBytes\":5,\"lastLinePartial\":false,\"firstLineExceedsLimit\":false,\"maxLines\":2000,\"maxBytes\":51200}"
+  },
+  {
+   "name": "head_line_limit",
+   "ok": true,
+   "value": "{\"content\":\"l0\\nl1\\nl2\\nl3\\nl4\\nl5\\nl6\\nl7\\nl8\\nl9\",\"truncated\":true,\"truncatedBy\":\"lines\",\"totalLines\":30,\"totalBytes\":109,\"outputLines\":10,\"outputBytes\":29,\"lastLinePartial\":false,\"firstLineExceedsLimit\":false,\"maxLines\":10,\"maxBytes\":51200}"
+  },
+  {
+   "name": "head_byte_limit",
+   "ok": true,
+   "value": "{\"content\":\"yyyyyyyyyy\\nyyyyyyyyyy\",\"truncated\":true,\"truncatedBy\":\"bytes\",\"totalLines\":10,\"totalBytes\":109,\"outputLines\":2,\"outputBytes\":21,\"lastLinePartial\":false,\"firstLineExceedsLimit\":false,\"maxLines\":2000,\"maxBytes\":25}"
+  },
+  {
+   "name": "head_first_line_exceeds",
+   "ok": true,
+   "value": "{\"content\":\"\",\"truncated\":true,\"truncatedBy\":\"bytes\",\"totalLines\":2,\"totalBytes\":107,\"outputLines\":0,\"outputBytes\":0,\"lastLinePartial\":false,\"firstLineExceedsLimit\":true,\"maxLines\":2000,\"maxBytes\":50}"
+  },
+  {
+   "name": "head_trailing_ws_lines",
+   "ok": true,
+   "value": "{\"content\":\"a  \\nb\\t\",\"truncated\":true,\"truncatedBy\":\"lines\",\"totalLines\":3,\"totalBytes\":11,\"outputLines\":2,\"outputBytes\":6,\"lastLinePartial\":false,\"firstLineExceedsLimit\":false,\"maxLines\":2,\"maxBytes\":51200}"
+  },
+  {
+   "name": "tail_no_truncation",
+   "ok": true,
+   "value": "{\"content\":\"a\\nb\\nc\",\"truncated\":false,\"truncatedBy\":null,\"totalLines\":3,\"totalBytes\":5,\"outputLines\":3,\"outputBytes\":5,\"lastLinePartial\":false,\"firstLineExceedsLimit\":false,\"maxLines\":2000,\"maxBytes\":51200}"
+  },
+  {
+   "name": "tail_line_limit",
+   "ok": true,
+   "value": "{\"content\":\"l20\\nl21\\nl22\\nl23\\nl24\\nl25\\nl26\\nl27\\nl28\\nl29\",\"truncated\":true,\"truncatedBy\":\"lines\",\"totalLines\":30,\"totalBytes\":109,\"outputLines\":10,\"outputBytes\":39,\"lastLinePartial\":false,\"firstLineExceedsLimit\":false,\"maxLines\":10,\"maxBytes\":51200}"
+  },
+  {
+   "name": "tail_byte_limit",
+   "ok": true,
+   "value": "{\"content\":\"yyyyyyyyyy\\nyyyyyyyyyy\",\"truncated\":true,\"truncatedBy\":\"bytes\",\"totalLines\":10,\"totalBytes\":109,\"outputLines\":2,\"outputBytes\":21,\"lastLinePartial\":false,\"firstLineExceedsLimit\":false,\"maxLines\":2000,\"maxBytes\":25}"
+  },
+  {
+   "name": "tail_single_huge_line_partial",
+   "ok": true,
+   "value": "{\"content\":\"tail\",\"truncated\":true,\"truncatedBy\":\"bytes\",\"totalLines\":2,\"totalBytes\":106,\"outputLines\":1,\"outputBytes\":4,\"lastLinePartial\":false,\"firstLineExceedsLimit\":false,\"maxLines\":2000,\"maxBytes\":30}"
+  },
+  {
+   "name": "format_size",
+   "ok": true,
+   "value": "\"500B,4.9KB,4.8MB\""
+  },
+  {
+   "name": "truncate_line",
+   "ok": true,
+   "value": "\"{\\\"text\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa... [truncated]\\\",\\\"wasTruncated\\\":true}\""
+  },
+  {
+   "name": "truncate_middle",
+   "ok": true,
+   "value": "\"mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm…900 chars truncated…mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm\""
+  }
+ ]
+}
