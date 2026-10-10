@@ -23,6 +23,9 @@ module Tart
 
     def user_dir = File.join(@root, "skills")
     def project_dir = File.join(@cwd, ".tart", "skills")
+    # The sandboxed ~/.claude/skills fixture root (the owner ruling
+    # 2026-10-10's second user source) — never the real ~/.claude.
+    def claude_dir = File.join(@root, "claude-skills")
 
     def write_skill(dir, name, frontmatter, body = "Do the thing.", file: "SKILL.md")
       dir = File.join(dir, name) unless name.nil?
@@ -32,7 +35,7 @@ module Tart
     end
 
     def skill(name) = load_skills[:skills].find { |s| s.name == name }
-    def load_skills = Skills.load(cwd: @cwd, root: @root)
+    def load_skills = Skills.load(cwd: @cwd, root: @root, claude_dir: claude_dir)
 
     # --- discovery ---
 
@@ -170,7 +173,47 @@ module Tart
     end
 
     def test_missing_directories_load_nothing
-      assert_empty Skills.load(cwd: @cwd, root: @root).skills
+      assert_empty Skills.load(cwd: @cwd, root: @root, claude_dir: claude_dir).skills
+    end
+
+    # --- the ~/.claude/skills user source (owner ruling 2026-10-10) ---
+
+    def test_claude_skills_dir_loads_as_a_user_source
+      write_skill(claude_dir, "architect", "description: Runs the loop")
+
+      loaded = load_skills
+      assert_equal %w[architect], loaded.skills.map(&:name)
+      assert_empty loaded.diagnostics
+    end
+
+    def test_user_root_precedes_claude_skills_and_project
+      write_skill(user_dir, "dupe", "description: Root wins")
+      write_skill(claude_dir, "dupe", "description: Claude loses")
+      write_skill(project_dir, "dupe", "description: Project loses too")
+      loaded = load_skills
+
+      assert_equal 1, loaded.skills.size, "first-loaded wins across all three sources"
+      assert_equal "Root wins", loaded.skills.first.description
+      collision = loaded.diagnostics.find { |d| d.type == "collision" }
+      assert_equal File.join(claude_dir, "dupe", "SKILL.md"), collision.collision[:loser_path]
+    end
+
+    def test_claude_skills_precede_project
+      write_skill(claude_dir, "dupe", "description: Claude wins")
+      write_skill(project_dir, "dupe", "description: Project loses")
+      loaded = load_skills
+
+      assert_equal "Claude wins", loaded.skills.first.description
+    end
+
+    def test_realpath_dedup_spans_claude_and_user_sources
+      write_skill(user_dir, "real", "description: The real one")
+      FileUtils.mkpath(claude_dir)
+      File.symlink(File.join(user_dir, "real", "SKILL.md"), File.join(claude_dir, "SKILL.md"))
+
+      loaded = load_skills
+      assert_equal 1, loaded.skills.size
+      assert_empty loaded.diagnostics
     end
 
     # --- prompt formatting (byte-identical, pi skills.ts:358-394) ---
@@ -178,7 +221,7 @@ module Tart
     def test_format_matches_pis_block_byte_for_byte
       FileUtils.mkpath(File.join(user_dir, "sc"))
       File.write(File.join(user_dir, "sc", "SKILL.md"), "---\nname: sc\ndescription: Say \"hi\" & <bye>\n---\nbody")
-      loaded = Skills.load(cwd: @cwd, root: @root)
+      loaded = Skills.load(cwd: @cwd, root: @root, claude_dir: claude_dir)
 
       expected = <<~BLOCK.chomp
         The following skills provide specialized instructions for specific tasks.
