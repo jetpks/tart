@@ -4,6 +4,18 @@ require_relative "test_helper"
 
 module Tart
   class LoopTest < Test
+    def test_first_frame_draws_at_boot_with_zero_events
+      session = ScriptedSession.new
+      event_loop = Core::Loop.new(session:, renderer: -> { "boot frame" })
+
+      # No input event is ever pushed: the run ends as soon as the boot
+      # render appears (pi renders on start; tui.ts start() requestRender).
+      event_loop.run { wait_until { !session.drawn.empty? } }
+
+      assert_operator event_loop.stats[:draws], :>=, 1,
+        "the first frame must render at boot, before any input event"
+    end
+
     def test_native_events_round_trip_through_poller_and_queue
       session = ScriptedSession.new
       received = Queue.new
