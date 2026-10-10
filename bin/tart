@@ -20,10 +20,9 @@ require_relative "../lib/tart"
 
 module Tart
   module Executable
-    DEFAULT_MODEL = "accounts/fireworks/models/glm-5p3-flash"
-    DEFAULT_PROVIDER = "openai"
-    DEFAULT_API_BASE = "https://api.fireworks.ai/inference/v1"
-    SELECTED_TOOLS = %w[read write edit bash find grep ls].freeze
+    # The built-in defaults are Settings::DEFAULTS (the settings module's
+    # resolution bottoms out there); the loadout is its tool base.
+    SELECTED_TOOLS = Settings::DEFAULT_TOOLS
 
     module_function
 
@@ -47,16 +46,40 @@ module Tart
           Interactive runs are recorded by default — one JSONL session file
           per run under ~/.tart/sessions; --resume continues one.
 
+        Settings:
+          JSON settings load from ~/.tart/settings.json (user) and
+          <workdir>/.tart/settings.json (project, merged over user).
+          Keys (camelCase): defaultModel, defaultProvider, apiBase, apiKey,
+          contextWindow, compaction {enabled, reserveTokens,
+          keepRecentTokens}, defaultTools (plain names replace the default
+          loadout; +name adds, -name removes). Environment overrides
+          settings for model/provider/apiBase/apiKey (TART_* above).
+
+        Skills:
+          Skills load from ~/.tart/skills (user) and <workdir>/.tart/skills
+          (project): a SKILL.md (or top-level .md) with YAML frontmatter
+          (name, description, optional disable-model-invocation). Invoke a
+          skill with /skill:<name> [args] — its file's body joins your
+          message; loaded skills are listed with /skills.
+
+        Commands:
+          /new /compact /skills /settings /help /quit — /new starts a fresh
+          session, /compact compacts the context now, /quit exits (when
+          idle). Slash text matching no command goes to the model.
+
         MCP servers:
           MCP stdio servers are loaded from ~/.tart/mcp.json (shape:
           {"mcpServers": {name: {command, args?, env?}}}); their tools join
           the loadout as mcp__<server>__<tool>.
 
         Environment:
-          TART_MODEL         model id (default: #{DEFAULT_MODEL})
-          TART_PROVIDER      LLM provider (default: #{DEFAULT_PROVIDER}, chat-completions protocol)
+          TART_MODEL         model id (default: #{Settings::DEFAULTS["defaultModel"]})
+          TART_PROVIDER      LLM provider (default: #{Settings::DEFAULTS["defaultProvider"]}, chat-completions protocol)
           TART_API_KEY       provider API key (required; no default)
-          TART_API_BASE      OpenAI-compatible endpoint (default: #{DEFAULT_API_BASE})
+          TART_API_BASE      OpenAI-compatible endpoint (default: #{Settings::DEFAULTS["apiBase"]})
+          TART_CONTEXT_WINDOW  context-window override in tokens (default: the model's
+                             context window; the default fireworks model resolves to
+                             #{Settings::MODEL_CONTEXT_WINDOWS[Settings::DEFAULTS["defaultModel"]]})
           TART_MCP_CONFIG    MCP config path (default: ~/.tart/mcp.json)
 
         Keys: type + Enter to send (steers a running agent); y/n at approval
@@ -92,69 +115,109 @@ module Tart
     end
 
     def print_mode(options, workdir)
-      require_api_key
+      settings = Settings.load(cwd: workdir)
+      report_diagnostics(settings.diagnostics)
+      require_api_key(settings)
+      skills = Skills.load(cwd: workdir)
       abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
 
       exit Print.run(
         prompt: options[:print],
-        chat: build_chat,
-        tools: build_tools(workdir),
-        system_prompt: system_prompt(workdir)
+        chat: build_chat(settings),
+        tools: build_tools(workdir, settings),
+        system_prompt: system_prompt(workdir, skills.skills)
       )
     end
 
     def interactive(options, workdir)
-      require_api_key
-      resume_path = options[:resume_given] && resolve_resume(options[:resume], workdir)
-      recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
-      seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
-      chat = build_chat
-      tools = build_tools(workdir)
+      settings = Settings.load(cwd: workdir)
+      skills = Skills.load(cwd: workdir)
+      require_api_key(settings)
 
       TUI.run(viewport: :inline, height: 8, bracketed_paste: true) do |session|
         kernel = Core::Loop.new(session:)
         surface = Render::Chat.new(session:, kernel:)
-        surface.agent = Agent::Loop.new(
-          chat:,
-          tools:,
-          system_prompt: system_prompt(workdir),
-          on_event: ->(event) { surface.on_agent_event(event) },
-          approval: ->(tool_call) { surface.approval(tool_call) },
-          recorder:,
-          seed_messages:
+        tools = build_tools(workdir, settings)
+        prompt = system_prompt(workdir, skills.skills)
+
+        # /new's reset seam: a fresh session is a new recorder (new session
+        # file, no parent) plus a fresh Agent::Loop on the same settings,
+        # system prompt, skills, and tools — the surface swaps its agent.
+        start_session = lambda do |resume_path|
+          recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
+          seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
+          chat = build_chat(settings)
+          surface.agent = Agent::Loop.new(
+            chat:,
+            tools:,
+            system_prompt: prompt,
+            on_event: ->(event) { surface.on_agent_event(event) },
+            approval: ->(tool_call) { surface.approval(tool_call) },
+            recorder:,
+            seed_messages:,
+            context_window: Settings.resolve_context_window(settings:, model: chat.model),
+            compaction: Settings.compaction_kwargs(settings)
+          )
+        end
+
+        surface.commands = Commands::Handler.new(
+          skills: skills.skills,
+          settings: settings.settings,
+          output: ->(text) { surface.command_line(text) },
+          spawn: ->(&block) { kernel.async(&block) },
+          agent: -> { surface.agent },
+          reset: lambda { start_session.call(nil); surface.command_line("✓ New session started") },
+          quit: -> { kernel.stop! }
         )
+        start_session.call(options[:resume_given] && resolve_resume(options[:resume], workdir))
+        report_diagnostics(settings.diagnostics, surface:)
+        skills.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
+
         kernel.renderer = surface.renderer
         kernel.on_event = ->(event, source) { surface.on_event(event, source) }
         kernel.run
       end
     end
 
-    def require_api_key
-      abort "TART_API_KEY is not set (see --help)." unless ENV["TART_API_KEY"]
+    def require_api_key(settings)
+      abort "TART_API_KEY is not set (see --help)." if Settings.resolve_setting("apiKey", settings).nil?
     end
 
-    def system_prompt(workdir)
-      "You are a coding assistant working in #{workdir}. " \
+    def report_diagnostics(diagnostics, surface: nil)
+      diagnostics.each do |diagnostic|
+        line = "#{diagnostic.path}: #{diagnostic.message}"
+        surface ? surface.command_line(line) : warn(line)
+      end
+    end
+
+    # The port's custom preamble plus the skills block (pi emits the
+    # <skills> section when a reader tool is available, system-prompt.ts:
+    # 175-182 — read/bash are always in the launcher's loadout).
+    def system_prompt(workdir, skills = [])
+      base = "You are a coding assistant working in #{workdir}. " \
         "Inspect files with read/grep/find before editing; keep answers brief."
+      return base if skills.empty?
+
+      "#{base}\n\n#{Skills.format_skills_for_prompt(skills, Skills.skill_file_read_tool(SELECTED_TOOLS)).strip}"
     end
 
-    def build_chat
+    def build_chat(settings)
       context = RubyLLM.context do |config|
-        config.openai_api_key = ENV.fetch("TART_API_KEY")
-        config.openai_api_base = ENV.fetch("TART_API_BASE", DEFAULT_API_BASE)
+        config.openai_api_key = Settings.resolve_setting("apiKey", settings)
+        config.openai_api_base = Settings.resolve_setting("apiBase", settings)
         config.request_timeout = 120
         config.max_retries = 1
       end
       context.chat(
-        model: ENV.fetch("TART_MODEL", DEFAULT_MODEL),
-        provider: ENV.fetch("TART_PROVIDER", DEFAULT_PROVIDER),
+        model: Settings.resolve_setting("defaultModel", settings),
+        provider: Settings.resolve_setting("defaultProvider", settings),
         protocol: :chat_completions, assume_model_exists: true
       )
     end
 
-    def build_tools(workdir)
+    def build_tools(workdir, settings)
       mcp_servers = Mcp::Config.load(mcp_config_path)
-      Tools::Registry.build(selected: SELECTED_TOOLS, cwd: workdir, mcp_servers:)
+      Tools::Registry.build(selected: Settings.selected_tools(settings), cwd: workdir, mcp_servers:)
     rescue Mcp::Config::ConfigError => e
       abort "tart: #{e.message}"
     end

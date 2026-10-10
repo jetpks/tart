@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "../skills"
+
 module Tart
   module Agent
     # System prompt construction (port of pi's system-prompt.ts).
@@ -10,8 +12,10 @@ module Tart
     # name. Dynamic segments (recorded for the report): the selected-tools
     # snippet list, the rule bullets (conditional on the bash/grep/find/ls
     # loadout plus per-tool guideline bullets), the pi docs paths, and the
-    # cwd. Skills are out of scope this iteration (recorded deviation: pi's
-    # `<skills>` section is never emitted).
+    # cwd. The `<skills>` section (pi system-prompt.ts:175-182) exists only
+    # when skills are loaded AND a reader tool (read/bash) is available:
+    # with no skills the composed prompt is byte-identical to the pre-skills
+    # port (the goldens depend on it).
     module SystemPrompt
       DEFAULT_SELECTED_TOOLS = %w[read bash edit write].freeze
 
@@ -47,11 +51,12 @@ module Tart
 
       module_function
 
-      # Ordered section hash (pi's buildSystemPromptSections, minus skills).
+      # Ordered section hash (pi's buildSystemPromptSections); +skills+ is
+      # additive — empty (the default) emits no `<skills>` section.
       # +docs_paths+ replaces pi's getReadmePath/getDocsPath/getExamplesPath
       # dynamic segment.
       def sections(selected_tools: DEFAULT_SELECTED_TOOLS, append_system_prompt: "", cwd:,
-                   context_files: [], docs_paths: nil)
+                   context_files: [], docs_paths: nil, skills: [])
         declared = selected_tools
 
         result = {}
@@ -84,6 +89,13 @@ module Tart
             "Project-specific instructions and guidelines:",
             *context_files.map { |file| "<project_instructions path=\"#{file[:path]}\">\n#{file[:content]}\n</project_instructions>" }
           ].join("\n\n")
+        end
+        # pi system-prompt.ts:178-182: reader-gated; an all-invisible
+        # listing (every skill disable-model-invocation) emits nothing.
+        reader = Skills.skill_file_read_tool(declared)
+        if reader && !skills.empty?
+          skills_prompt = Skills.format_skills_for_prompt(skills, reader).strip
+          result[:skills] = skills_prompt unless skills_prompt.empty?
         end
         result[:cwd] = cwd.tr("\\", "/")
 
@@ -124,8 +136,8 @@ module Tart
       # by a blank line, empty parts dropped. Sections wraps each
       # non-preamble section in its tag exactly once.
       def build(selected_tools: DEFAULT_SELECTED_TOOLS, append_system_prompt: "", cwd:, context_files: [],
-                docs_paths: nil)
-        ordered = sections(selected_tools:, append_system_prompt:, cwd:, context_files:, docs_paths:)
+                docs_paths: nil, skills: [])
+        ordered = sections(selected_tools:, append_system_prompt:, cwd:, context_files:, docs_paths:, skills:)
         ordered.values.reject { |content| content.nil? || content.empty? }.join("\n\n")
       end
     end

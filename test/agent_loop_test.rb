@@ -198,17 +198,15 @@ module Tart
       refute kernel.poller&.thread&.alive?, "no orphan poller after interrupt"
     end
 
-    private
-
     def agent_on_kernel(session: ScriptedSession.new, tools: empty_tools, approval: nil,
-                        on_event: nil, script_enabled: true)
+                        on_event: nil, script_enabled: true, **loop_kwargs)
       events = []
       events_mutex = Mutex.new
       sink = lambda do |event|
         events_mutex.synchronize { events << event }
       end
       chat = TestChat.build(@server, tools: tools.values, system_prompt: "test prompt")
-      [Agent::Loop.new(chat:, tools:, on_event: on_event || sink, approval:), events]
+      [Agent::Loop.new(chat:, tools:, on_event: on_event || sink, approval:, **loop_kwargs), events]
     end
 
     def empty_tools
@@ -233,10 +231,14 @@ module Tart
     # request carries [summary message, kept tail, queued message] and none
     # of the summarized-away messages.
     def test_threshold_compaction_replaces_history_after_a_completed_turn
+      # The mock's usage is fixed (10+5 every response), so the estimate
+      # stays over this small threshold after every turn — pi re-checks per
+      # turn (agent-session.ts:1884), hence the second summary.
       @server.script([
         {type: :stream, content: "first answer"},
         {type: :message, content: "a summary of the first turn"},
         {type: :stream, content: "second answer"},
+        {type: :message, content: "a summary of the second turn"},
       ])
       agent, events = agent_on_kernel(
         compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14
@@ -245,13 +247,13 @@ module Tart
       run_agent(agent, "first question")
 
       requests = @server.captured_requests
-      assert_equal 3, requests.size
+      assert_equal 4, requests.size
 
       # The summarization one-shot: system prompt + one user message with
       # the serialized conversation; only the summarized turn is in it.
       summary_request = requests[1]
       assert_equal "You are a context summarization assistant",
-        summary_request["messages"].first["content"][0, 43]
+        summary_request["messages"].first["content"][0, 41]
       conversation = summary_request["messages"].last["content"]
       assert_includes conversation, "[User]: first question"
       refute_includes conversation, "second question"
@@ -339,6 +341,7 @@ module Tart
         {type: :stream, content: "recovered again"},
       ])
       agent, _events = agent_on_kernel_with_seeds
+      agent.push_message("second question") # drives the second overflow cycle
       run_agent(agent, "new question")
 
       requests = @server.captured_requests

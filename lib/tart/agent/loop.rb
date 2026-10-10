@@ -73,6 +73,7 @@ module Tart
         @context_window = context_window
         @compaction_settings = Compaction::Settings.resolve(compaction)
         @overflow_recovery_attempted = false
+        @pre_compaction_messages = {}.compare_by_identity
         @entry_ids = {}.compare_by_identity
         @new_messages = []
         @sink = nil
@@ -144,6 +145,17 @@ module Tart
         @new_messages.dup
       end
 
+      # Manual compaction (pi session.compact, agent-session.ts:2764 — the
+      # /compact command's seam): runs the I08 machinery now, on demand.
+      # Like #run, it must be called on the kernel reactor fiber (the
+      # summarization call bridges to a worker). @return [Boolean] whether
+      # a compaction happened — false when there is nothing to compact
+      # (pi raises "Nothing to compact (session too small)"); pi aborts a
+      # running turn first — the port dispatches /compact only when idle.
+      def compact
+        run_compaction(reason: :manual)
+      end
+
       private
 
       # Session recording (pi SessionManager.appendMessage): the recorder
@@ -195,10 +207,13 @@ module Tart
           if message.role == :tool
             next # tool batch executed; the model responds on the next step
           elsif @chat.complete?
+            # pi _handlePostAgentRun checks compaction after EVERY
+            # completed turn, queued steering or not (agent-session.ts:
+            # 1861-1885); the run then continues with the queued messages.
+            run_threshold_compaction
             pending = steering_messages
             if pending.empty?
               emit(type: :turn_end, message:)
-              run_threshold_compaction
               break
             end
 
@@ -242,6 +257,13 @@ module Tart
         return false unless window.is_a?(Integer) && window.positive?
 
         estimate = Compaction.estimate_context_tokens(@chat.messages)
+        # pi's stale pre-compaction usage guard (agent-session.ts:3063-3075):
+        # kept pre-compaction messages carry usage reflecting the old
+        # (larger) context and would falsely re-trigger right after a
+        # compaction — only a post-compaction usage message may fire it.
+        usage_message = estimate[:last_usage_index] && @chat.messages[estimate[:last_usage_index]]
+        return false if usage_message && @pre_compaction_messages.key?(usage_message)
+
         Compaction.should_compact?(estimate[:tokens], window, @compaction_settings)
       end
 
@@ -288,6 +310,7 @@ module Tart
           # pi CompactionDetails (compaction.ts:37-40).
           details: {"readFiles" => lists[:read_files], "modifiedFiles" => lists[:modified_files]},
         )
+        @pre_compaction_messages = @chat.messages.each_with_object({}.compare_by_identity) { |message, set| set[message] = true }
         emit(type: :compaction, reason:, tokens_before: preparation.tokens_before, summary:)
         true
       end
@@ -314,7 +337,7 @@ module Tart
         bridge.on_cancel { summary_chat&.cancel }
         terminal = bridge.run(lambda { |_sink|
           summary_chat = build_summary_chat
-          result = summary_chat.generate(prompt)
+          result = summary_chat.ask(prompt)
         }) { |_item| }
         return nil if terminal.is_a?(Hash) && terminal[:type] == :error
 
@@ -322,7 +345,12 @@ module Tart
       end
 
       def build_summary_chat
+        # The protocol must ride along: the gem has no public reader for it
+        # (chat.rb stores @protocol, no attr_reader), and a summary chat
+        # built without it speaks the default protocol — never matching
+        # the endpoint the main chat was built for.
         chat = @chat.context.chat(model: @chat.model&.id, provider: @chat.provider&.slug,
+                                  protocol: @chat.instance_variable_get(:@protocol),
                                   assume_model_exists: true)
         chat.with_instructions(Compaction::SUMMARIZATION_SYSTEM_PROMPT)
         chat.with_max_output_tokens(summarization_max_tokens)

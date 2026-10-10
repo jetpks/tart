@@ -296,6 +296,113 @@ module Tart
         "the interrupted turn renders coherently"
     end
 
+    # --- the submit seam: slash commands (AC3) ---
+
+    # A real Commands::Handler with stub callables; skills load from the
+    # tmp project dir.
+    def with_commands_handler(chat)
+      FileUtils.mkpath(File.join(@dir, ".tart", "skills", "greet"))
+      File.write(File.join(@dir, ".tart", "skills", "greet", "SKILL.md"),
+        "---\nname: greet\ndescription: Says hello\n---\nHello body.")
+      skills = Skills.load(cwd: @dir, root: @dir).skills
+      outputs = []
+      handler = Commands::Handler.new(
+        skills:, settings: {}, output: ->(text) { outputs << text },
+        spawn: ->(&block) { block.call }, agent: -> { chat.agent },
+        reset: -> {}, quit: -> {}
+      )
+      chat.commands = handler
+      outputs
+    end
+
+    def kernel_runs(chat)
+      chat.instance_variable_get(:@kernel).submitted
+    end
+
+    # Runs (and drains) the agent-run blocks the idle submit branch queued.
+    def drain_runs(chat)
+      kernel_runs(chat).slice!(0..).each(&:call)
+    end
+
+    # Records agent.run calls (the idle branch wraps the run in a kernel
+    # task — IdleKernel captures the block; the test runs it).
+    def with_recording_agent(chat)
+      runs = []
+      agent = Object.new.tap do |a|
+        a.define_singleton_method(:run) { |text| runs << text }
+        a.define_singleton_method(:push_message) { |text| runs << [:steer, text] }
+      end
+      chat.agent = agent
+      runs
+    end
+
+    def test_slash_builtin_is_consumed_before_any_agent_call
+      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new)
+        outputs = with_commands_handler(chat)
+        runs = with_recording_agent(chat)
+        send_message(chat, "/help")
+
+        assert_empty kernel_runs(chat), "a dispatched builtin never starts an agent run"
+        assert outputs.last.is_a?(String) && outputs.last.include?("/help"),
+          "command output renders through the chat-line surface"
+        assert_empty runs
+      end
+    end
+
+    def test_skill_invocation_sends_the_expanded_block_to_the_agent
+      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new)
+        with_commands_handler(chat)
+        runs = with_recording_agent(chat)
+        send_message(chat, "/skill:greet")
+        drain_runs(chat)
+
+        assert_equal 1, runs.size
+        assert_includes runs.first, "<skill name=\"greet\""
+        assert_includes runs.first, "Hello body.", "the model receives the expanded block"
+      end
+    end
+
+    def test_unknown_skill_and_unknown_command_pass_through_as_plain_text
+      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new)
+        with_commands_handler(chat)
+        runs = with_recording_agent(chat)
+        send_message(chat, "/skill:missing")
+        drain_runs(chat)
+        send_message(chat, "/nope")
+        drain_runs(chat)
+
+        assert_equal ["/skill:missing", "/nope"], runs,
+          "pi: unknown skill passes through (:2155); an unmatched /command is just a message"
+      end
+    end
+
+    def test_slash_text_while_running_steers_like_any_message
+      @server = MockLLMServer.new.start
+      @server.script([
+        {type: :slow_stream, content: "first answer"},
+        {type: :message, content: "second answer"},
+      ])
+      kernel, chat, session = chat_with_server
+      with_commands_handler(chat)
+
+      scenario = Thread.new do
+        type(session, "first")
+        wait_until { chat.busy? }
+        type(session, "/compact")
+        wait_until { captured.size >= 2 }
+        kernel.stop!
+      end
+      kernel.run
+      scenario.join
+
+      request = captured.last
+      assert_equal "/compact", request["messages"].select { |m| m["role"] == "user" }.last["content"],
+        "the reduced deviation: slash text mid-turn steers instead of dispatching"
+    end
+
     # --- markdown seam (AC5): assistant completions render through the
     # converter into scrollback — styled cells proven by readback; the live
     # region stays verbatim streaming text. ---

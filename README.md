@@ -25,7 +25,65 @@ Configuration is environment-driven with documented defaults (see
 | `TART_PROVIDER` | `openai` (chat-completions protocol) |
 | `TART_API_KEY` | — (required) |
 | `TART_API_BASE` | `https://api.fireworks.ai/inference/v1` |
+| `TART_CONTEXT_WINDOW` | the model's context window (tokens) |
 | `TART_MCP_CONFIG` | `~/.tart/mcp.json` |
+
+For model, provider, API base, and API key the resolution is environment →
+settings → built-in default.
+
+### Settings
+
+JSON settings load from `~/.tart/settings.json` (user) and
+`<workdir>/.tart/settings.json` (project, deep-merged over user). Missing
+keys fall back to the built-in defaults; unknown keys warn and run continues;
+a file that fails to parse counts as absent (defaults hold) with a warning.
+
+| Key | Default |
+|---|---|
+| `defaultModel` | `accounts/fireworks/models/glm-5p3-flash` |
+| `defaultProvider` | `openai` |
+| `apiBase` | `https://api.fireworks.ai/inference/v1` |
+| `apiKey` | — |
+| `contextWindow` | the model's context window |
+| `compaction.enabled` | `true` |
+| `compaction.reserveTokens` | `16384` |
+| `compaction.keepRecentTokens` | `20000` |
+| `defaultTools` | all built-in tools (`read write edit bash find grep ls`) |
+
+`defaultTools` takes plain names (replacing the default loadout), `+name`
+(adds), and `-name` (removes), in list order; a project list of only
+modifiers composes onto the user's selection, a project list with a plain
+name replaces it.
+
+### Skills
+
+Skills load from `~/.tart/skills` (user) and `<workdir>/.tart/skills`
+(project): each skill is a `SKILL.md` with YAML frontmatter — `name`
+(defaults to the directory name), `description` (required), and optional
+`disable-model-invocation` (still user-invocable, never offered to the
+model). A directory holding a `SKILL.md` is a skill root and is not searched
+below it; subdirectories recurse; bare `.md` files at the skills-dir root
+load too. First-loaded wins on a name collision (user before project), with
+a collision diagnostic; malformed frontmatter is a warning, not a crash.
+
+Invoke a skill with `/skill:<name> [args]` — the skill file's body joins
+your message as an expanded `<skill>` block (the model sees the expansion;
+the session records it). `/skills` lists what loaded.
+
+### Slash commands
+
+| Command | Action |
+|---|---|
+| `/new` | start a fresh session (new session file, empty history, same settings/skills) |
+| `/compact` | compact the session context now |
+| `/skills` | list loaded skills |
+| `/settings` | show the resolved settings |
+| `/help` | show the builtin commands |
+| `/quit` | quit (when idle) |
+
+Slash text matching no command — including an unknown `/skill:x` — goes to
+the model as a plain message. While a turn is running, slash text steers
+like any message.
 
 Keys: type + Enter to send (steers a running agent); y/n at approval prompts;
 Ctrl+C interrupts a running turn / quits when idle.
@@ -59,9 +117,12 @@ come back.
 Settings (defaults: enabled, `reserve_tokens` 16384, `keep_recent_tokens`
 20000) are injectable on `Agent::Loop` via the `compaction:` kwarg;
 `enabled: false` disables the threshold trigger. The context window resolves
-from `TART_CONTEXT_WINDOW` (tokens), then the model registry's
-`context_window`; unset/0 disables the threshold trigger only — the overflow
-recovery always fires.
+from `TART_CONTEXT_WINDOW` (tokens), then the settings' `contextWindow`,
+then the model registry's `context_window`, then the port's registry-default
+table (the pinned ruby_llm registry misses the default fireworks model; its
+catalog window is 1048573 — so the default chat compacts out of the box);
+unset/0 disables the threshold trigger only — the overflow recovery always
+fires.
 
 ### MCP servers
 
