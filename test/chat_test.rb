@@ -2,6 +2,7 @@
 
 require_relative "test_helper"
 require_relative "support/mock_llm_server"
+require "stringio"
 require "tmpdir"
 require "fileutils"
 
@@ -1280,6 +1281,173 @@ module Tart
         assert_equal "│", session.cell_symbol(19, 3)
         assert_equal "│", session.cell_symbol(19, 0)
       end
+    end
+
+    # --- mouse: wheel scroll + transcript selection (I14 items 6/10,
+    # driven through the synthetic-seam event shapes) ---
+
+    def test_wheel_scrolls_one_line_per_event_and_alt_wheel_five
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        max = chat.scroll_offset # following: pinned at the end
+        assert_operator max, :>, 0, "the transcript overflows"
+
+        chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0))
+        draw(chat, session)
+        assert_equal max - 1, chat.scroll_offset, "one wheel notch = one line (pi lines-per-event default 1)"
+
+        chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0, modifiers: ["alt"]))
+        draw(chat, session)
+        assert_equal max - 6, chat.scroll_offset, "alt+wheel moves 5x (tui-alt-screen.ts:79)"
+      end
+    end
+
+    def test_wheeling_back_down_to_the_end_re_arms_follow
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        3.times { chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0)) }
+        draw(chat, session)
+
+        3.times { chat.on_event(TUI.mouse_event(kind: "scroll_down", x: 0, y: 0)) }
+        draw(chat, session)
+        finish_message(chat, "late")
+        draw(chat, session)
+        assert_equal "late", transcript_view(session, chat).last,
+          "landing at the end re-arms follow-end (scroll-view.ts:127-135)"
+      end
+    end
+
+    def test_mouse_drag_selects_with_inverse_highlight_and_copies_on_release
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        finish_message(chat, "hello world")
+        draw(chat, session)
+        y = buffer_row(chat, "hello world")
+
+        chat.on_event(TUI.mouse_event(kind: "down", x: 6, y:, button: "left"))
+        chat.on_event(TUI.mouse_event(kind: "drag", x: 10, y:, button: "left"))
+        draw(chat, session)
+        (6..10).each do |x|
+          assert_equal [:reversed], session.cell_modifiers(x, y), "cell #{x} is inverse-highlighted"
+        end
+        assert_empty session.cell_modifiers(5, y), "the cell before the anchor is unhighlighted"
+        assert_empty session.cell_modifiers(11, y), "the cell after the focus is unhighlighted"
+
+        copied = capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "up", x: 10, y:, button: "left"))
+        end
+        assert_equal "world", copied_text(copied), "copy-on-select copies the drag range (OSC 52)"
+      end
+    end
+
+    def test_double_click_selects_the_word_with_path_and_kebab_boundaries
+      with_chat(width: 30, screen_height: 12) do |chat, session|
+        finish_message(chat, "see docs/foo/bar-baz now")
+        draw(chat, session)
+        y = buffer_row(chat, "docs/foo/bar-baz")
+        word_start = chat.transcript_lines[y].index("docs")
+
+        2.times do
+          chat.on_event(TUI.mouse_event(kind: "down", x: word_start + 10, y:, button: "left"))
+        end
+        draw(chat, session)
+        (word_start...(word_start + "docs/foo/bar-baz".length)).each do |x|
+          assert_equal [:reversed], session.cell_modifiers(x, y), "word cell #{x} is highlighted"
+        end
+        assert_empty session.cell_modifiers(word_start - 1, y), "the boundary before the word is clear"
+        assert_empty session.cell_modifiers(word_start + "docs/foo/bar-baz".length, y),
+          "the boundary after the word is clear"
+
+        copied = capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "up", x: word_start + 10, y:, button: "left"))
+        end
+        assert_equal "docs/foo/bar-baz", copied_text(copied),
+          "the word selection keeps paths and kebab-case whole (tui-alt-screen.ts:85)"
+      end
+    end
+
+    def test_triple_click_selects_the_whole_line
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        finish_message(chat, "all of it")
+        draw(chat, session)
+        y = buffer_row(chat, "all of it")
+        line_width = "all of it".length
+
+        3.times do
+          chat.on_event(TUI.mouse_event(kind: "down", x: 4, y:, button: "left"))
+        end
+        draw(chat, session)
+        (0...line_width).each do |x|
+          assert_equal [:reversed], session.cell_modifiers(x, y), "line cell #{x} is highlighted"
+        end
+        assert_empty session.cell_modifiers(line_width, y), "nothing beyond the line"
+      end
+    end
+
+    def test_a_plain_click_drops_the_selection
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        finish_message(chat, "hello world")
+        draw(chat, session)
+        y = buffer_row(chat, "hello world")
+        capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "down", x: 6, y:, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "drag", x: 10, y:, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "up", x: 10, y:, button: "left"))
+        end
+
+        copied = capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "down", x: 0, y:, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "up", x: 0, y:, button: "left"))
+        end
+        assert_empty copied, "a plain click copies nothing"
+        draw(chat, session)
+        assert_empty session.cell_modifiers(6, y), "a click without a drag collapses the selection"
+      end
+    end
+
+    def test_selection_survives_wheel_scrolling
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        offset = chat.scroll_offset
+        y = (0...transcript_height(session, chat)).find do |r|
+          chat.transcript_lines[offset + r].to_s.include?("line")
+        end
+        capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "down", x: 0, y:, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "drag", x: 6, y:, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "up", x: 6, y:, button: "left"))
+        end
+
+        offset = chat.scroll_offset
+        chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0))
+        draw(chat, session)
+        assert_equal [:reversed], session.cell_modifiers(0, y + offset - chat.scroll_offset),
+          "the selection is anchored to buffer rows (pi getScrollSelectionPoint :1133-1155)"
+      end
+    end
+
+    # The buffer row currently displaying the transcript line containing
+    # +text+ (the tests keep the view following, so the mapping is direct).
+    def buffer_row(chat, text)
+      chat.transcript_lines.index { |line| line.include?(text) } or
+        raise "transcript line not found: #{text.inspect}"
+    end
+
+    def capture_stdout
+      previous = $stdout
+      $stdout = StringIO.new
+      yield
+      $stdout.string
+    ensure
+      $stdout = previous
+    end
+
+    # The OSC 52 payload's text (pi tui-alt-screen.ts:1483 — base64 under
+    # a bell terminator, buffer "c").
+    def copied_text(stdout)
+      stdout[/\e\]52;c;(.*?)\a/, 1].unpack1("m")
     end
 
     # --- compaction-start border status (AC3, I12): the frozen event

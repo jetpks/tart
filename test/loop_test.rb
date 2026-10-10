@@ -50,6 +50,64 @@ module Tart
       assert_equal :synthetic, source
     end
 
+    # The gem's mouse event duck-shape (the surface's wheel/selection
+    # events; ScriptedSession's native queue takes any event double).
+    MouseEvent = Struct.new(:kind) do
+      def mouse? = true
+
+      def moved? = kind == "moved"
+
+      def key? = false
+    end
+
+    # Mouse events dispatch to the surface like any other event (I14 item
+    # 6: the kernel routes the gem's mouse events; shape verified live on
+    # the synthetic seam).
+    def test_mouse_events_route_to_the_surface
+      session = ScriptedSession.new
+      received = Queue.new
+      event_loop = Core::Loop.new(session:, on_event: ->(event, source) { received << [event, source] })
+      session.push_event(MouseEvent.new("scroll_up"))
+
+      event_loop.run { wait_until { !received.empty? } }
+
+      event, source = received.pop(timeout: 0)
+      assert event.mouse?
+      assert_equal "scroll_up", event.kind
+      assert_equal :synthetic, source
+    end
+
+    # A bare pointer move carries no state change (pi renders on
+    # press/click/drag/wheel, not motion — tui-alt-screen.ts
+    # applyMouseDispatchResult); with all-motion mouse capture on, moves
+    # stream per pointer step and must not trigger redraws.
+    def test_bare_pointer_motion_does_not_redraw
+      session = ScriptedSession.new
+      received = Queue.new
+      event_loop = Core::Loop.new(session:, renderer: -> { "frame" }, on_event: ->(event, _s) { received << event })
+
+      event_loop.run do
+        wait_until { !session.drawn.empty? } # the boot frame
+        session.push_event(MouseEvent.new("moved"))
+        wait_until { !received.empty? }
+      end
+
+      assert_equal 1, event_loop.stats[:draws], "the boot frame is the only draw; motion must not redraw"
+    end
+
+    def test_state_carrying_mouse_events_redraw
+      session = ScriptedSession.new
+      event_loop = Core::Loop.new(session:, renderer: -> { "frame" })
+
+      event_loop.run do
+        wait_until { !session.drawn.empty? } # the boot frame
+        session.push_event(MouseEvent.new("drag"))
+        wait_until { event_loop.stats[:draws] > 1 }
+      end
+
+      assert_operator event_loop.stats[:draws], :>, 1, "press/drag/wheel events redraw"
+    end
+
     def test_ctrl_c_interrupt_cancels_in_flight_task_subtree
       session = ScriptedSession.new
       session.push_native(KeyEvent.new("c", ["ctrl"]))

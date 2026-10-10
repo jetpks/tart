@@ -287,7 +287,13 @@ module Tart
             interrupt!
           else
             @on_event&.call(event, source)
-            @dirty = true
+            # Mouse events dispatch to the surface (wheel scroll, selection);
+            # a bare pointer move carries no state change (the surface
+            # ignores it — pi tui-alt-screen.ts applyMouseDispatchResult
+            # renders on press/click/drag/wheel, not motion), and with
+            # all-motion capture on (gem init.rs:67) moves stream on every
+            # pointer step: redrawing per move would burn the idle CPU.
+            @dirty = true unless event.respond_to?(:moved?) && event.moved?
           end
         end
       end

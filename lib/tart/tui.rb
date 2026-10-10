@@ -289,6 +289,29 @@ module Tart
       RatatuiRuby::Event::Paste.new(content:)
     end
 
+    # @return [RatatuiRuby::Event::Mouse] a mouse event with the given kind
+    #   ("down"/"up"/"drag"/"moved"/"scroll_up"/"scroll_down"), cell
+    #   position, button and modifiers — the shape the real terminal's
+    #   crossterm parse produces (gem ext events.rs:552-612; mouse capture
+    #   is enabled on every real init — init.rs:67). The chat surface's
+    #   wheel-scroll and selection tests drive events through the
+    #   synthetic seam in exactly this shape.
+    def mouse_event(kind:, x:, y:, button: "none", modifiers: [])
+      RatatuiRuby::Event::Mouse.new(kind:, x:, y:, button:, modifiers:)
+    end
+
+    # Copies +text+ to the system clipboard with an OSC 52 write — pi
+    # tui-alt-screen.ts copyTextToClipboard's fallback path (:1476-1487):
+    # the base64 payload under bell-terminated OSC 52, buffer "c". The
+    # host-injected native-clipboard write pi prefers (tui-renderer.ts:39-45)
+    # is cut (no platform tooling seam — itemized deviation). Invisible to
+    # the rendered buffer: straight to stdout, flushed so it cannot land
+    # after the gem's terminal restore.
+    def osc52_copy(text)
+      $stdout.write("\e]52;c;#{[text].pack("m0")}\a")
+      $stdout.flush
+    end
+
     # @return [Boolean] whether +event+ is the Ctrl+C key event (byte 0x03 in
     #   raw mode arrives as an in-band Key event, never as SIGINT).
     def ctrl_c?(event)
