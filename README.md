@@ -25,9 +25,49 @@ Configuration is environment-driven with documented defaults (see
 | `RASPBERRY_PI_PROVIDER` | `openai` (chat-completions protocol) |
 | `RASPBERRY_PI_API_KEY` | — (required) |
 | `RASPBERRY_PI_API_BASE` | `https://api.fireworks.ai/inference/v1` |
+| `RASPBERRY_PI_MCP_CONFIG` | `~/.raspberry-pi/mcp.json` |
 
 Keys: type + Enter to send (steers a running agent); y/n at approval prompts;
 Ctrl+C interrupts a running turn / quits when idle.
+
+### Sessions
+
+Interactive runs are recorded by default — one JSONL session file per run
+under `~/.raspberry-pi/sessions`, holding the header and every user and
+assistant message in order. Resume a previous session with `--resume`: with
+no argument it continues the most recent session for the working directory;
+with a session id or session-file path it continues that one (the resumed
+run records into a new session file linked to the old one):
+
+```sh
+bundle exec ruby bin/raspberry-pi --resume
+bundle exec ruby bin/raspberry-pi --resume <session-id>
+```
+
+### MCP servers
+
+MCP stdio servers are loaded from `~/.raspberry-pi/mcp.json` (override the
+path with `RASPBERRY_PI_MCP_CONFIG`; a missing file means no servers):
+
+```json
+{"mcpServers": {"echo": {"command": "/path/to/echo-server", "args": [], "env": {}}}}
+```
+
+A configured server's tools join the loadout as `mcp__<server>__<tool>` and
+are declared to the model like the built-in tools; a server that fails to
+connect is skipped with a warning.
+
+### Print mode
+
+Single-shot headless runs — send one prompt, write the final response to
+stdout, exit 0 (1 on error); no TUI anywhere on the path:
+
+```sh
+bundle exec ruby bin/raspberry-pi -p "list the ruby files in this repo"
+```
+
+Print runs are not recorded (the session store is wired into the interactive
+path only).
 
 ### Input-line editing
 
@@ -65,6 +105,7 @@ bundle install            # runtime deps: async, ratatui_ruby (pinned 1.5.0)
 bundle exec rake          # minitest suite (headless, no tty required)
 timeout 90 bundle exec ruby bench/seam_bench.rb   # seam bench, prints JSON + SEAM_BENCH_OK/FAIL
 bundle exec ruby bin/raspberry-pi --help          # launcher usage (non-tty-safe)
+bundle exec ruby bin/raspberry-pi -p "prompt"     # headless single-shot run
 ```
 
 The bench runs itself inside a fresh 80x24 pty, self-asserts (hard internal
