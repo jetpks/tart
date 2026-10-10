@@ -31,7 +31,18 @@ module RaspberryPi
       session = ScriptedSession.new
       event_loop = Core::Loop.new(session:)
 
-      error = assert_raises(RuntimeError) { event_loop.run { raise "work boom" } }
+      # Yield to the reactor before raising: async 2.46 logs "Task may have
+      # ended with unhandled exception" unless someone is waiting on the task
+      # (task.rb:224-226 `unless @promise.waiting?`), and a synchronous raise
+      # beats the kernel's supervisor to the wait. The yield lets the
+      # supervisor register, so the failure stays observed as handled — the
+      # kernel still reraises it after teardown, which is what we assert.
+      error = assert_raises(RuntimeError) do
+        event_loop.run do
+          sleep 0.001
+          raise "work boom"
+        end
+      end
       assert_equal "work boom", error.message
       refute event_loop.poller&.thread&.alive?, "no orphan poller after a work raise"
     end

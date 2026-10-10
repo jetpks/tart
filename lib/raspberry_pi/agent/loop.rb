@@ -298,10 +298,14 @@ module RaspberryPi
       # `reasoning` and `reasoning_content`), which strict OpenAI-compatible
       # endpoints reject with a schema 400 (fireworks: "Extra inputs are not
       # permitted, field: 'messages[n].reasoning'") — killing every follow-up
-      # turn after a thinking reply. pi does not build replay from reasoning
-      # deltas either way (packages/ai/src/api/openai-completions.ts
-      # convertMessages); the port suppresses it outright (deviation itemized
-      # in the iteration record). Mirrors the gem's own without_native_content
+      # turn after a thinking reply. pi, by contrast, replays the reasoning
+      # field the deltas carried: chat-completions endpoints map deltas to
+      # thinking blocks keyed by signature ∈ {reasoning, reasoning_content,
+      # reasoning_text} (packages/ai/src/api/openai-completions.ts:611-627),
+      # then send the joined thinking back as assistantMsg[signature] — unless
+      # encrypted reasoning_details are preserved (:1340-1351). The port
+      # suppresses it outright (deviation itemized in the iteration record).
+      # Mirrors the gem's own without_native_content
       # idiom (message.rb:140-146: instance_variable_set on a live message);
       # narrower than calling without_native_content, which would also strip
       # tool-call thought signatures (message.rb:316-321).
