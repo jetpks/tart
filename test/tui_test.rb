@@ -55,6 +55,42 @@ module Tart
       end
     end
 
+    # The transcript scrollbar's glyph run (I12 AC2): pi layout.ts:285-330
+    # geometry — full-height "│" track, the "┃" thumb sized
+    # max(min(2, track), min(track, round(track²/content))) and placed
+    # round(scrollTop/maxScrollTop · maxThumbTop), themed per glyph.
+    def test_scrollbar_lines_ports_pi_s_geometry
+      lines = TUI.scrollbar_lines(content_length: 22, position: 15, viewport: 7, track_fg: :dark_gray, thumb_fg: :gray)
+      assert_equal 7, lines.size, "one line per viewport row — a full-height track"
+      assert_equal ["│", "│", "│", "│", "│", "┃", "┃"], lines.map { |line| line.spans.map(&:content).join }
+      assert_equal :dark_gray, lines.first.spans.first.style.fg, "the track routes its theme color"
+      assert_equal :gray, lines[5].spans.first.style.fg, "the thumb routes its theme color"
+
+      # The thumb slides up with the offset (round(8/15 · 5) = 3 → rows 3-4).
+      slid = TUI.scrollbar_lines(content_length: 22, position: 8, viewport: 7, track_fg: nil, thumb_fg: nil)
+      assert_equal ["│", "│", "│", "┃", "┃", "│", "│"], slid.map { |line| line.spans.map(&:content).join }
+
+      # A barely-overflowing view grows a near-full-height thumb (6 of 7 —
+      # round(track²/content)); the caller hides the bar when the view
+      # fits, so the helper never sees content ≤ viewport.
+      tiny = TUI.scrollbar_lines(content_length: 8, position: 1, viewport: 7, track_fg: nil, thumb_fg: nil)
+      assert_equal %w[│ ┃ ┃ ┃ ┃ ┃ ┃], tiny.map { |line| line.spans.map(&:content).join }
+    end
+
+    def test_scrollbar_lines_render_in_a_layout_gutter
+      TUI.run(headless: true, width: 10, screen_height: 6) do |session|
+        bar = TUI.scrollbar_lines(content_length: 12, position: 6, viewport: 6, track_fg: :dark_gray, thumb_fg: :gray)
+        session.draw(TUI.layout(
+          direction: :horizontal,
+          children: [TUI.paragraph(text: "abcdef", wrap: false), TUI.paragraph(text: bar, wrap: false)],
+          constraints: [TUI.constraint_min(1), TUI.constraint_length(1)]
+        ))
+        assert_equal "┃", session.cell_symbol(9, 3), "the thumb renders in the carved right-gutter column"
+        assert_equal :gray, session.cell_fg(9, 3)
+        assert_equal "│", session.cell_symbol(9, 0)
+      end
+    end
+
     # --- fullscreen seam surface (AC1): layout splits, bordered blocks,
     # widget-tree readback, resize — all on the headless test terminal. ---
 
