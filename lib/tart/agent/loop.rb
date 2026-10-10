@@ -16,7 +16,8 @@ module Tart
     #   arrive after the agent would stop;
     # - inner loop: model turn, then tool-call batches (ruby_llm's
     #   pending-tool-call execution on #step), until the model answers
-    #   without tool calls;
+    #   without tool calls; tools execute unconditionally (pi's
+    #   agent-loop.ts:832 — no permissions system);
     # - an aborted turn emits turn_end/agent_end and stops.
     #
     # Kernel mapping: the loop runs as the work block (task subtree) on
@@ -41,14 +42,10 @@ module Tart
     class Loop
       # @param chat [RubyLLM::Chat] configured for the endpoint (model,
       #   provider, protocol).
-      # @param tools [Hash{String => RubyLLM::Tool}] the gated loadout
+      # @param tools [Hash{String => RubyLLM::Tool}] the selected loadout
       #   ({Tools::Registry.build}); disabled tools are never registered.
       # @param system_prompt [String, nil] set as the chat's instructions.
       # @param on_event [Proc, nil] called with each event Hash.
-      # @param approval [Proc, nil] the injectable approval callback: called
-      #   on the kernel fiber (interruptible) with each
-      #   +RubyLLM::ToolCall+ that requires approval; +true+ approves,
-      #   +false+ denies. Only consulted for tools that gate.
       # @param recorder [Session::Recorder, nil] the optional session
       #   recorder (pi's SessionManager, message subset): every message this
       #   run adds is appended to the session file in order; +nil+ = off.
@@ -63,12 +60,11 @@ module Tart
       # @param compaction [Hash, Compaction::Settings, nil] compaction
       #   settings ({enabled:, reserve_tokens:, keep_recent_tokens:});
       #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
-      def initialize(chat:, tools:, system_prompt: nil, on_event: nil, approval: nil,
+      def initialize(chat:, tools:, system_prompt: nil, on_event: nil,
         recorder: nil, seed_messages: [], context_window: nil, compaction: nil)
         @chat = chat
         @tools = tools
         @on_event = on_event
-        @approval = approval
         @recorder = recorder
         @context_window = context_window
         @compaction_settings = Compaction::Settings.resolve(compaction)
@@ -195,7 +191,6 @@ module Tart
       def inner_loop
         loop do
           message = step_via_bridge
-          next if handle_pause
           next if recover_overflow?
 
           # The error check precedes the nil-message break: a step the worker
@@ -372,7 +367,7 @@ module Tart
 
       # One ruby_llm #step on the worker thread. Returns the step's message
       # (assistant message or tool result), or nil when the step produced no
-      # message (approval pause, chat pause).
+      # message (chat pause).
       def step_via_bridge
         bridge = Bridge.new
         bridge.on_cancel { @chat.cancel }
@@ -392,18 +387,6 @@ module Tart
           end
           sink.call({type: :step, message:}) if message
         }
-      end
-
-      # @return [Boolean] whether the loop must pause for an approval
-      #   decision (recorded here, on the kernel fiber).
-      def handle_pause
-        return false unless @chat.waiting? && @chat.awaiting_approval?
-
-        @chat.pending_approvals.each do |tool_call|
-          decision = @approval ? @approval.call(tool_call) : false
-          decision ? @chat.approve(tool_call) : @chat.deny(tool_call)
-        end
-        true
       end
 
       def record_terminal_error(terminal)

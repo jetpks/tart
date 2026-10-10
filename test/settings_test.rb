@@ -130,6 +130,27 @@ module Tart
         Settings.resolve_context_window(settings: load_settings.settings, model: chat.model)
     end
 
+    # --- thinking level (pi's vocabulary + default; the footer's right side) ---
+
+    def test_thinking_level_resolves_settings_over_pi_s_default
+      # Out of the box: pi's DEFAULT_THINKING_LEVEL (defaults.ts:3), and the
+      # key is known (no unknown-key warning).
+      result = load_settings
+      assert_equal "medium", Settings.resolve_thinking_level(result.settings)
+      assert_empty result.diagnostics
+
+      # Any vocabulary value passes through (user over project).
+      write_settings(@user_path, '{"thinkingLevel": "low"}')
+      write_settings(@project_path, '{"thinkingLevel": "high"}')
+      assert_equal "high", Settings.resolve_thinking_level(load_settings.settings)
+
+      # Off-vocabulary or null values fall back to the default.
+      write_settings(@project_path, '{"thinkingLevel": "loud"}')
+      assert_equal "medium", Settings.resolve_thinking_level(load_settings.settings)
+      write_settings(@project_path, '{"thinkingLevel": null}')
+      assert_equal "medium", Settings.resolve_thinking_level(load_settings.settings)
+    end
+
     # --- defaultTools ---
 
     def test_default_tools_plain_names_replace_the_base

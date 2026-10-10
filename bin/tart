@@ -9,8 +9,8 @@
 #   tart -p "prompt"        # headless single-shot
 #   tart --resume           # continue the most recent session
 #
-# Keys: type + Enter to send (steers a running agent); y/n at approval
-# prompts; Ctrl+C interrupts a running turn / quits when idle.
+# Keys: type + Enter to send (steers a running agent); Ctrl+C interrupts
+# a running turn / quits when idle.
 #
 # Run from a REAL terminal (raw mode / alt-screen need a tty).
 
@@ -65,7 +65,8 @@ module Tart
           JSON settings load from ~/.tart/settings.json (user) and
           <workdir>/.tart/settings.json (project, merged over user).
           Keys (camelCase): defaultModel, defaultProvider, apiBase, apiKey,
-          contextWindow, compaction {enabled, reserveTokens,
+          contextWindow, thinkingLevel (off/minimal/low/medium/high/xhigh/
+          max, default medium), compaction {enabled, reserveTokens,
           keepRecentTokens}, defaultTools (plain names replace the default
           loadout; +name adds, -name removes). Environment overrides
           settings for model/provider/apiBase/apiKey (TART_* above).
@@ -100,8 +101,8 @@ module Tart
                              #{Settings::MODEL_CONTEXT_WINDOWS[Settings::DEFAULTS["defaultModel"]]})
           TART_MCP_CONFIG    MCP config path (default: ~/.tart/mcp.json)
 
-        Keys: type + Enter to send (steers a running agent); y/n at approval
-        prompts; Ctrl+C interrupts a running turn / quits when idle.
+        Keys: type + Enter to send (steers a running agent); Ctrl+C
+        interrupts a running turn / quits when idle.
 
         Surface: fullscreen three-area layout — transcript, bordered editor
         (its top border carries the working/tool status), footer (cwd, git
@@ -180,20 +181,12 @@ module Tart
           recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
           seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
           chat = build_chat(settings)
-          # Footer facts (AC4): the I10 resolved window is the context-usage
-          # denominator; the model id is the settings-resolved one.
-          surface.footer_data = {
-            cwd: workdir,
-            model: Settings.resolve_setting("defaultModel", settings),
-            context_window: Settings.resolve_context_window(settings:, model: chat.model),
-            auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true)
-          }
+          surface.footer_data = footer_data(workdir, settings, chat:)
           surface.agent = Agent::Loop.new(
             chat:,
             tools:,
             system_prompt: prompt,
             on_event: ->(event) { surface.on_agent_event(event) },
-            approval: ->(tool_call) { surface.approval(tool_call) },
             recorder:,
             seed_messages:,
             context_window: Settings.resolve_context_window(settings:, model: chat.model),
@@ -222,6 +215,19 @@ module Tart
 
     def require_api_key(settings)
       abort "TART_API_KEY is not set (see --help)." if Settings.resolve_setting("apiKey", settings).nil?
+    end
+
+    # Footer facts (AC4): the I10 resolved window is the context-usage
+    # denominator; the model id is the settings-resolved one; the thinking
+    # level rides the settings-resolved value (pi footer.ts:236-239).
+    def footer_data(workdir, settings, chat:)
+      {
+        cwd: workdir,
+        model: Settings.resolve_setting("defaultModel", settings),
+        context_window: Settings.resolve_context_window(settings:, model: chat.model),
+        auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
+        thinking_level: Settings.resolve_thinking_level(settings)
+      }
     end
 
     def report_diagnostics(diagnostics, surface: nil)
