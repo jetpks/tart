@@ -2,7 +2,7 @@
 
 require_relative "test_helper"
 
-module RaspberryPi
+module Tart
   class LoopTest < Test
     def test_native_events_round_trip_through_poller_and_queue
       session = ScriptedSession.new

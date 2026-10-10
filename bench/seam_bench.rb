@@ -120,7 +120,7 @@ end
 
 def run_workload
   require "bundler/setup"
-  require_relative "../lib/raspberry_pi"
+  require_relative "../lib/tart"
 
   state = {
     mutex: Mutex.new,
@@ -140,7 +140,7 @@ def run_workload
   }
   t_start = mono_now
 
-  RaspberryPi::TUI.run do |session|
+  Tart::TUI.run do |session|
     renderer = lambda do
       snapshot = state[:mutex].synchronize do
         "chunks=#{state[:sse_ts].size} lines=#{state[:lines]} ticks=#{state[:ticks]} events=#{state[:dispatched]}"
@@ -160,7 +160,7 @@ def run_workload
       end
     end
 
-    kernel = RaspberryPi::Core::Loop.new(session:, renderer:, on_event:)
+    kernel = Tart::Core::Loop.new(session:, renderer:, on_event:)
 
     # Internal hard deadline: kill and fail the run (self-asserting).
     Thread.new do
@@ -334,7 +334,7 @@ def spawn_injector(kernel, state, session)
     t0 = mono_now
     SYNTHETIC_EVENTS.times do |i|
       state[:inject_ts] << mono_now
-      session.push_event(RaspberryPi::TUI.sync_event)
+      session.push_event(Tart::TUI.sync_event)
       d = t0 + (i + 1) * SYNTHETIC_INTERVAL - mono_now
       sleep d if d > 0
     end

@@ -1,0 +1,201 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# The committed launcher (BRIEF §7.1) — the live-proven demo shape
+# (tmp/demo_chat.rb, I04's first real-world run) as a gem executable.
+#
+#   cd <a directory you want the agent to work in>
+#   tart [workdir]
+#   tart -p "prompt"        # headless single-shot
+#   tart --resume           # continue the most recent session
+#
+# Keys: type + Enter to send (steers a running agent); y/n at approval
+# prompts; Ctrl+C interrupts a running turn / quits when idle.
+#
+# Run from a REAL terminal (the inline viewport's init DSR query needs a tty
+# reply).
+
+require "optparse"
+require_relative "../lib/tart"
+
+module Tart
+  module Executable
+    DEFAULT_MODEL = "accounts/fireworks/models/glm-5p3-flash"
+    DEFAULT_PROVIDER = "openai"
+    DEFAULT_API_BASE = "https://api.fireworks.ai/inference/v1"
+    SELECTED_TOOLS = %w[read write edit bash find grep ls].freeze
+
+    module_function
+
+    # --help is non-tty-safe and runs before any environment or terminal
+    # interaction (the gate runs it headless).
+    def usage
+      <<~USAGE
+        Usage: tart [WORKDIR] [options]
+
+        Interactive coding-agent chat on an inline-viewport TUI, scoped to
+        WORKDIR (default: the current directory).
+
+        Options:
+          -p, --print PROMPT  single-shot: send PROMPT headless, write the
+                              final response to stdout, exit 0 (1 on error)
+          -r, --resume [ID]   resume a session in WORKDIR: ID is a session id
+                              or session-file path; default: the most recent
+          -h, --help          show this help
+
+        Sessions:
+          Interactive runs are recorded by default — one JSONL session file
+          per run under ~/.tart/sessions; --resume continues one.
+
+        MCP servers:
+          MCP stdio servers are loaded from ~/.tart/mcp.json (shape:
+          {"mcpServers": {name: {command, args?, env?}}}); their tools join
+          the loadout as mcp__<server>__<tool>.
+
+        Environment:
+          TART_MODEL         model id (default: #{DEFAULT_MODEL})
+          TART_PROVIDER      LLM provider (default: #{DEFAULT_PROVIDER}, chat-completions protocol)
+          TART_API_KEY       provider API key (required; no default)
+          TART_API_BASE      OpenAI-compatible endpoint (default: #{DEFAULT_API_BASE})
+          TART_MCP_CONFIG    MCP config path (default: ~/.tart/mcp.json)
+
+        Keys: type + Enter to send (steers a running agent); y/n at approval
+        prompts; Ctrl+C interrupts a running turn / quits when idle.
+      USAGE
+    end
+
+    def parse(argv)
+      options = {resume_given: false}
+      OptionParser.new do |parser|
+        parser.on("-p", "--print PROMPT",
+          "single-shot: send PROMPT headless, write the final response to stdout, exit 0 (1 on error)") do |prompt|
+          options[:print] = prompt
+        end
+        parser.on("-r", "--resume [ID]",
+          "resume a session in WORKDIR: ID is a session id or session-file path; default: the most recent") do |id|
+          options[:resume] = id
+          options[:resume_given] = true
+        end
+        parser.on("-h", "--help", "show this help") { $stdout.write(usage); exit 0 }
+      end.parse!(argv)
+      options
+    end
+
+    def run(argv)
+      options = parse(argv)
+      workdir = argv.shift || Dir.pwd
+      return print_mode(options, workdir) if options[:print]
+
+      interactive(options, workdir)
+    rescue OptionParser::ParseError => e
+      abort "tart: #{e.message} (see --help)."
+    end
+
+    def print_mode(options, workdir)
+      require_api_key
+      abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
+
+      exit Print.run(
+        prompt: options[:print],
+        chat: build_chat,
+        tools: build_tools(workdir),
+        system_prompt: system_prompt(workdir)
+      )
+    end
+
+    def interactive(options, workdir)
+      require_api_key
+      resume_path = options[:resume_given] && resolve_resume(options[:resume], workdir)
+      recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
+      seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
+      chat = build_chat
+      tools = build_tools(workdir)
+
+      TUI.run(viewport: :inline, height: 8, bracketed_paste: true) do |session|
+        kernel = Core::Loop.new(session:)
+        surface = Render::Chat.new(session:, kernel:)
+        surface.agent = Agent::Loop.new(
+          chat:,
+          tools:,
+          system_prompt: system_prompt(workdir),
+          on_event: ->(event) { surface.on_agent_event(event) },
+          approval: ->(tool_call) { surface.approval(tool_call) },
+          recorder:,
+          seed_messages:
+        )
+        kernel.renderer = surface.renderer
+        kernel.on_event = ->(event, source) { surface.on_event(event, source) }
+        kernel.run
+      end
+    end
+
+    def require_api_key
+      abort "TART_API_KEY is not set (see --help)." unless ENV["TART_API_KEY"]
+    end
+
+    def system_prompt(workdir)
+      "You are a coding assistant working in #{workdir}. " \
+        "Inspect files with read/grep/find before editing; keep answers brief."
+    end
+
+    def build_chat
+      context = RubyLLM.context do |config|
+        config.openai_api_key = ENV.fetch("TART_API_KEY")
+        config.openai_api_base = ENV.fetch("TART_API_BASE", DEFAULT_API_BASE)
+        config.request_timeout = 120
+        config.max_retries = 1
+      end
+      context.chat(
+        model: ENV.fetch("TART_MODEL", DEFAULT_MODEL),
+        provider: ENV.fetch("TART_PROVIDER", DEFAULT_PROVIDER),
+        protocol: :chat_completions, assume_model_exists: true
+      )
+    end
+
+    def build_tools(workdir)
+      mcp_servers = Mcp::Config.load(mcp_config_path)
+      Tools::Registry.build(selected: SELECTED_TOOLS, cwd: workdir, mcp_servers:)
+    rescue Mcp::Config::ConfigError => e
+      abort "tart: #{e.message}"
+    end
+
+    def mcp_config_path
+      ENV.fetch("TART_MCP_CONFIG", Mcp::Config::DEFAULT_PATH)
+    end
+
+    # --resume [ID]: no ID = the most recent session for the workdir (the
+    # port has no session-picker UI); an ID is a session-file path or a
+    # session id (the file name's trailing _<id> or the header id) in the
+    # workdir's session dir.
+    def resolve_resume(id, workdir)
+      return require_session(Agent::Session.find_most_recent(session_dir(workdir), cwd: workdir),
+        "for #{File.expand_path(workdir)}") if id.nil?
+      return id if File.file?(id)
+
+      require_session(find_session_by_id(session_dir(workdir), id), "matching #{id}")
+    end
+
+    def session_dir(workdir)
+      Agent::Session.dir_path(workdir)
+    end
+
+    def find_session_by_id(dir, id)
+      return nil unless File.directory?(dir)
+
+      files = Dir.children(dir).select { |file| file.end_with?(".jsonl") }
+        .map { |file| File.join(dir, file) }
+        .sort_by { |path| File.mtime(path) }
+        .reverse
+      files.find do |path|
+        File.basename(path, ".jsonl").end_with?("_#{id}") ||
+          Agent::Session.read_header(path)&.fetch("id", nil) == id
+      end
+    end
+
+    def require_session(path, description)
+      path || abort("tart: no session found #{description}")
+    end
+  end
+end
+
+Tart::Executable.run(ARGV)

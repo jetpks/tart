@@ -5,7 +5,7 @@ require_relative "support/mock_llm_server"
 require "tmpdir"
 require "fileutils"
 
-module RaspberryPi
+module Tart
   # The agent loop on the I02 kernel (AC1/AC3): multi-turn tool round-trip
   # against the real ruby_llm client over a local mock OpenAI-compatible
   # endpoint, kernel-interrupt cancellation, schema gating, approval gating.
@@ -15,7 +15,7 @@ module RaspberryPi
 
     def setup
       @server = MockLLMServer.new.start
-      @dir = Dir.mktmpdir("raspberry-pi-agent-")
+      @dir = Dir.mktmpdir("tart-agent-")
     end
 
     def teardown

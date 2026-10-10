@@ -2,7 +2,7 @@
 
 require_relative "test_helper"
 
-module RaspberryPi
+module Tart
   # The ported system prompt (pi's system-prompt.ts): sections wrapped once
   # in their tags, preamble untagged, dynamic segments interpolated.
   class SystemPromptTest < Test

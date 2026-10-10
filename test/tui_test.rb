@@ -2,7 +2,7 @@
 
 require_relative "test_helper"
 
-module RaspberryPi
+module Tart
   class TUITest < Test
     def test_status_panel_draws_paragraph_in_block_headless
       TUI.run(headless: true) do |session|

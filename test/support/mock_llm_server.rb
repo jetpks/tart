@@ -3,7 +3,7 @@
 require "socket"
 require "json"
 
-module RaspberryPi
+module Tart
   class Test < Minitest::Test
     # A hermetic mock OpenAI-compatible endpoint over TCP (127.0.0.1, ephemeral
     # port): the real ruby_llm client (Faraday/net_http, custom-endpoint
@@ -204,7 +204,7 @@ module RaspberryPi
             config.request_timeout = request_timeout
             config.max_retries = 0
           end
-          chat = context.chat(model: "raspberry-test-model", provider: "openai",
+          chat = context.chat(model: "tart-test-model", provider: "openai",
                               protocol: :chat_completions, assume_model_exists: true)
           chat.with_tools(*tools) unless tools.empty?
           chat.with_instructions(system_prompt) if system_prompt

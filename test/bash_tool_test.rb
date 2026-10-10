@@ -4,13 +4,13 @@ require_relative "test_helper"
 require "tmpdir"
 require "fileutils"
 
-module RaspberryPi
+module Tart
   # The bash tool's safety properties (AC4), hermetic and bounded: the
   # process-group child, timeout kill by negative-pid -TERM escalating to
   # -KILL, every pid reaped, no zombie, no leaked pipes.
   class BashToolTest < Test
     def setup
-      @dir = Dir.mktmpdir("raspberry-pi-bash-")
+      @dir = Dir.mktmpdir("tart-bash-")
     end
 
     def teardown
@@ -30,7 +30,7 @@ module RaspberryPi
     end
 
     def test_timeout_kills_process_group_with_term_and_reaps
-      marker = "raspberry-pi-probe-#{Process.pid}-#{rand(1_000_000)}"
+      marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
       command = "echo #{marker}; sleep 30"
 
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -44,7 +44,7 @@ module RaspberryPi
     end
 
     def test_term_ignored_escalates_to_kill
-      marker = "raspberry-pi-probe-#{Process.pid}-#{rand(1_000_000)}"
+      marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
       command = "trap '' TERM; echo #{marker}; sleep 30"
 
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -60,7 +60,7 @@ module RaspberryPi
 
     def test_child_in_its_own_group_dies_with_the_parent_command
       # A backgrounded grandchild in the group must not survive the kill.
-      marker = "raspberry-pi-probe-#{Process.pid}-#{rand(1_000_000)}"
+      marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
       result = tool.execute(command: "#{marker}-grandchild & sleep 30", timeout: 1)
 
       assert result.key?(:error)

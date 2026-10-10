@@ -5,7 +5,7 @@ require_relative "support/mock_llm_server"
 require "tmpdir"
 require "fileutils"
 
-module RaspberryPi
+module Tart
   # The JSONL session store (AC1/AC2): recording an agent turn to a session
   # file, parsing it back, resume seeding (the model sees prior turns on the
   # wire), and most-recent-session-for-cwd selection — against the real
@@ -13,7 +13,7 @@ module RaspberryPi
   class SessionTest < Test
     def setup
       @server = MockLLMServer.new.start
-      @dir = Dir.mktmpdir("raspberry-pi-session-")
+      @dir = Dir.mktmpdir("tart-session-")
       @root = File.join(@dir, "root")
     end
 

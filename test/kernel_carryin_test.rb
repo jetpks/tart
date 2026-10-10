@@ -2,7 +2,7 @@
 
 require_relative "test_helper"
 
-module RaspberryPi
+module Tart
   # I02 carry-ins (defect ledger / I02 Verdict): exception-safe kernel
   # teardown, SIGINT trap restoration, surfaced poller joins, and the
   # documented event-only mode.
