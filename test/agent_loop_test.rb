@@ -228,6 +228,142 @@ module RaspberryPi
       agent.new_messages.last.role == :assistant
     end
 
+    # AC2: threshold compaction after a completed turn — usage (the mock
+    # reports 10+5 tokens) over context_window - reserve compacts; the next
+    # request carries [summary message, kept tail, queued message] and none
+    # of the summarized-away messages.
+    def test_threshold_compaction_replaces_history_after_a_completed_turn
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+        {type: :stream, content: "second answer"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14
+      )
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      requests = @server.captured_requests
+      assert_equal 3, requests.size
+
+      # The summarization one-shot: system prompt + one user message with
+      # the serialized conversation; only the summarized turn is in it.
+      summary_request = requests[1]
+      assert_equal "You are a context summarization assistant",
+        summary_request["messages"].first["content"][0, 43]
+      conversation = summary_request["messages"].last["content"]
+      assert_includes conversation, "[User]: first question"
+      refute_includes conversation, "second question"
+
+      # The next request: [summary message, kept tail, queued message].
+      payload = requests[2]["messages"].reject { |m| %w[system developer].include?(m["role"]) }
+      assert_equal %w[user assistant user], payload.map { |m| m["role"] }
+      assert_includes payload[0]["content"], "a summary of the first turn"
+      assert_equal "first answer", payload[1]["content"]
+      assert_equal "second question", payload[2]["content"]
+
+      assert_includes events.map { |e| e[:type] }, :compaction
+      compaction = events.find { |e| e[:type] == :compaction }
+      assert_equal :threshold, compaction[:reason]
+    end
+
+    def test_compaction_disabled_performs_no_compaction
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :stream, content: "second answer"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {enabled: false, reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14
+      )
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      assert_equal 2, @server.captured_requests.size, "no summarization call"
+      assert_empty events.select { |e| e[:type] == :compaction }
+    end
+
+    # AC3: a context-overflow step failure compacts and retries the turn
+    # once; the overflowing attempt is not in the summarized or kept
+    # history (the gem never appends the failed response).
+    def test_overflow_compacts_and_retries_the_turn_once
+      @server.script([
+        {type: :error, status: 400, message: "This model's maximum context length is 8 tokens"},
+        {type: :message, content: "a summary of the prior turns"},
+        {type: :stream, content: "recovered"},
+      ])
+      agent, _events = agent_on_kernel_with_seeds
+      result = run_agent(agent, "new question")
+
+      assert_equal "recovered", result.last.content
+      refute agent.last_error
+
+      requests = @server.captured_requests
+      assert_equal 3, requests.size
+      summary_conversation = requests[1]["messages"].last["content"]
+      assert_includes summary_conversation, "[User]: old question"
+      refute_includes summary_conversation, "new question"
+      retry_payload = requests[2]["messages"].reject { |m| %w[system developer].include?(m["role"]) }
+      assert_equal %w[user user], retry_payload.map { |m| m["role"] }
+      assert_includes retry_payload[0]["content"], "a summary of the prior turns"
+      assert_equal "new question", retry_payload[1]["content"]
+    end
+
+    # AC3: the overflow-recovery latch — a second consecutive overflow
+    # after compaction does not retry again; the error surfaces.
+    def test_second_consecutive_overflow_after_compaction_does_not_retry_again
+      @server.script([
+        {type: :error, status: 400, message: "This model's maximum context length is 8 tokens"},
+        {type: :message, content: "a summary of the prior turns"},
+        {type: :error, status: 400, message: "This model's maximum context length is 8 tokens"},
+      ])
+      agent, events = agent_on_kernel_with_seeds
+      run_agent(agent, "new question")
+
+      assert_equal 3, @server.captured_requests.size, "no third LLM call for the same turn"
+      assert_kind_of RubyLLM::ContextLengthExceededError, agent.last_error
+      error_end = events.find { |e| e[:type] == :agent_end }
+      assert error_end[:error], "the second overflow must surface on agent_end"
+    end
+
+    # A clean assistant response after an overflow recovery resets the
+    # latch (pi agent-session.ts:1168-1171): a later turn's overflow gets
+    # its own compact-and-retry.
+    def test_overflow_recovery_latch_resets_on_a_clean_response
+      @server.script([
+        {type: :error, status: 400, message: "This model's maximum context length is 8 tokens"},
+        {type: :message, content: "a summary of the prior turns"},
+        {type: :stream, content: "recovered"},
+        {type: :error, status: 400, message: "This model's maximum context length is 8 tokens"},
+        {type: :message, content: "another summary"},
+        {type: :stream, content: "recovered again"},
+      ])
+      agent, _events = agent_on_kernel_with_seeds
+      run_agent(agent, "new question")
+
+      requests = @server.captured_requests
+      assert_equal 6, requests.size
+      assert_equal "recovered again", agent.new_messages.last.content
+    end
+
+    private
+
+    # Overflow scripts need more than one summary-able message in the
+    # history: the seed turns stand in for prior context (the overflowing
+    # attempt itself is never appended by the gem).
+    def agent_on_kernel_with_seeds(compaction: {keep_recent_tokens: 1})
+      events = []
+      events_mutex = Mutex.new
+      sink = ->(event) { events_mutex.synchronize { events << event } }
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      agent = Agent::Loop.new(chat:, tools: {}, on_event: sink, compaction:,
+                              seed_messages: [
+                                RubyLLM::Message.new(role: :user, content: "old question"),
+                                RubyLLM::Message.new(role: :assistant, content: "old answer"),
+                              ])
+      [agent, events]
+    end
+
     # Runs the agent on the kernel in a side thread with the house 5 s
     # deadline: an unbounded run (the pre-fix error-path hang) fails the
     # test instead of wedging the suite.

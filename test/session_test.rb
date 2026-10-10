@@ -143,6 +143,78 @@ module RaspberryPi
       assert_equal "and then?", entries[1]["message"]["content"]
     end
 
+    # AC4: the compaction entry shape (pi CompactionEntry session-manager.ts
+    # :91-104, the port's field subset) and the null first-kept fallback
+    # (appendCompaction's `firstKeptEntryId ?? id`).
+    def test_recorder_appends_compaction_entries
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_message(RubyLLM::Message.new(role: :user, content: "hi"))
+      id = recorder.append_compaction(summary: "the summary", first_kept_entry_id: nil,
+        tokens_before: 42, details: {"readFiles" => ["a.rb"], "modifiedFiles" => []})
+
+      entries = Agent::Session.load_entries(recorder.path)
+      compaction = entries.last
+      assert_equal "compaction", compaction["type"]
+      assert_equal id, compaction["id"]
+      assert_equal entries[1]["id"], compaction["parentId"]
+      assert_equal id, compaction["firstKeptEntryId"], "null first-kept falls back to the entry id"
+      assert_equal "the summary", compaction["summary"]
+      assert_equal 42, compaction["tokensBefore"]
+      assert_equal({"readFiles" => ["a.rb"], "modifiedFiles" => []}, compaction["details"])
+    end
+
+    # AC4: compaction-aware context replay (pi buildContextEntries
+    # :475-513): the summary, the kept entries from firstKeptEntryId
+    # (system messages skipped), everything after — none of the
+    # summarized-away messages; files without compaction entries unchanged.
+    def test_compaction_aware_context_messages_replay
+      path = File.join(@dir, "compacted.jsonl")
+      File.write(path, [
+        '{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/tmp"}',
+        '{"type":"message","id":"e1","parentId":null,"timestamp":"t","message":{"role":"user","content":"old question"}}',
+        '{"type":"message","id":"e2","parentId":"e1","timestamp":"t","message":{"role":"assistant","content":"old answer"}}',
+        '{"type":"message","id":"e2b","parentId":"e2","timestamp":"t","message":{"role":"system","content":"prompt state"}}',
+        '{"type":"compaction","id":"e3","parentId":"e2b","timestamp":"t","summary":"the summary","firstKeptEntryId":"e2","tokensBefore":42,"details":{"readFiles":[],"modifiedFiles":[]}}',
+        '{"type":"message","id":"e4","parentId":"e3","timestamp":"t","message":{"role":"user","content":"after compaction"}}',
+      ].join("\n"))
+
+      messages = Agent::Session.context_messages(path)
+      assert_equal %i[user assistant user], messages.map { |m| m[:role] }
+      assert_includes messages[0][:content],
+        "The conversation history before this point was compacted into the following summary:"
+      assert_includes messages[0][:content], "the summary"
+      assert_includes messages[0][:content], "</summary>"
+      assert_equal "old answer", messages[1][:content]
+      assert_equal "after compaction", messages[2][:content]
+    end
+
+    # AC4 end-to-end: the seeded next-request payload on a compacted
+    # session file shows exactly summary + kept + after, and none of the
+    # pre-compaction summarized messages.
+    def test_resume_after_compaction_seeds_the_compacted_context
+      @server.script([{type: :message, content: "continuing"}])
+      path = File.join(@dir, "compacted.jsonl")
+      File.write(path, [
+        '{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/tmp"}',
+        '{"type":"message","id":"e1","parentId":null,"timestamp":"t","message":{"role":"user","content":"old question"}}',
+        '{"type":"message","id":"e2","parentId":"e1","timestamp":"t","message":{"role":"assistant","content":"old answer"}}',
+        '{"type":"compaction","id":"e3","parentId":"e2","timestamp":"t","summary":"the summary","firstKeptEntryId":"e2","tokensBefore":42,"details":{"readFiles":[],"modifiedFiles":[]}}',
+        '{"type":"message","id":"e4","parentId":"e3","timestamp":"t","message":{"role":"user","content":"after compaction"}}',
+      ].join("\n"))
+
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root, parent_session: path)
+      run_agent(agent_on_kernel(recorder:, seed_messages: Agent::Session.context_messages(path)), "and now?")
+
+      payload = @server.captured_requests.last["messages"]
+        .reject { |m| %w[system developer].include?(m["role"]) }
+      assert_equal %w[user assistant user user], payload.map { |m| m["role"] }
+      assert_includes payload[0]["content"], "the summary"
+      refute_includes payload[0]["content"], "old question", "the summarized-away turn is gone"
+      assert_equal "old answer", payload[1]["content"]
+      assert_equal "after compaction", payload[2]["content"]
+      assert_equal "and now?", payload[3]["content"]
+    end
+
     def test_most_recent_session_for_cwd_selection
       dir = Agent::Session.ensure_dir(@dir, root: @root)
       other_cwd = File.join(@dir, "elsewhere")
