@@ -23,6 +23,22 @@ module Tart
     # resolution bottoms out there); the loadout is its tool base.
     SELECTED_TOOLS = Settings::DEFAULT_TOOLS
 
+    # async 2.46's reactor wrapper instantiates an IO::Buffer on the first
+    # in-reactor IO (once per process) and ruby 4.0.7 blames the outermost
+    # user frame with an experimental warning — on a quiet first turn it
+    # lands mid-UI at the session's first persist. Not any tart frame's
+    # fault; filter exactly that one message and let every other warning
+    # through (unit-proven in test/launcher_smoke_test.rb).
+    module QuietIOBufferWarning
+      IO_BUFFER_EXPERIMENTAL =
+        "IO::Buffer is experimental and both the Ruby and C interface may change in the future!"
+
+      def warn(message, **)
+        return if message.include?(IO_BUFFER_EXPERIMENTAL)
+        super
+      end
+    end
+
     module_function
 
     # --help is non-tty-safe and runs before any environment or terminal
@@ -111,6 +127,10 @@ module Tart
     end
 
     def run(argv)
+      # Once per process, before any reactor runs (print mode runs a reactor
+      # too): the first in-reactor IO draws async's IO::Buffer experimental
+      # warning onto the terminal.
+      Warning.extend(QuietIOBufferWarning)
       options = parse(argv)
       workdir = argv.shift || Dir.pwd
       return print_mode(options, workdir) if options[:print]

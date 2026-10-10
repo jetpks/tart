@@ -34,6 +34,43 @@ module Tart
       FileUtils.rm_rf(home)
     end
 
+    # The async-reactor IO::Buffer experimental warning never fires in print
+    # mode (no in-reactor IO — the LLM work bridges to a worker thread and
+    # print mode records no session), so its filter is unit-proven here:
+    # exactly the IO::Buffer message dies, every other warning passes
+    # through.
+    def test_io_buffer_experimental_warning_is_filtered_others_pass_through
+      sink = Class.new do
+        attr_reader :seen
+
+        def initialize = @seen = []
+
+        def warn(message, **)
+          @seen << message
+        end
+      end.new.extend(launcher_filter)
+
+      # The realistic shape: ruby decorates the message with a file:line:
+      # prefix and category :experimental (probed live on 4.0.7).
+      sink.warn("somewhere.rb:10: warning: IO::Buffer is experimental and both " \
+        "the Ruby and C interface may change in the future!\n", category: :experimental)
+      sink.warn("some unrelated warning\n", category: nil)
+
+      assert_equal ["some unrelated warning\n"], sink.seen
+    end
+
+    # bin/tart launches the agent on load, so it cannot be required — eval
+    # its source minus the final run line to reach the filter module (the
+    # launcher boot itself is covered by the child-process smoke above).
+    def launcher_filter
+      src = File.read(File.join(REPO_ROOT, "bin", "tart"))
+        .sub(/^Tart::Executable\.run\(ARGV\)\n\z/, "")
+      # Anchor the filename so bin/tart's require_relative resolves (it is
+      # already loaded in-process and no-ops).
+      eval(src, TOPLEVEL_BINDING, File.join(REPO_ROOT, "bin", "tart")) # rubocop:disable Security/Eval
+      Executable::QuietIOBufferWarning
+    end
+
     def smoke_env(home, server)
       {
         "PATH" => ENV.fetch("PATH", nil),

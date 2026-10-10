@@ -63,7 +63,10 @@ module Tart
         @work_task = nil
         @tasks = []
         @animation_deadline = nil
-        @dirty = false
+        # Boot render: the first frame is dirty by definition (pi renders on
+        # start — tui.ts start() requestRender); after it, draw_frame's gate
+        # keeps static frames off the CPU (I01).
+        @dirty = true
         @draws = 0
         @wakes = 0
 
