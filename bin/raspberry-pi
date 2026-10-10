@@ -1,0 +1,93 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# The committed launcher (BRIEF §7.1) — the live-proven demo shape
+# (tmp/demo_chat.rb, I04's first real-world run) as a gem executable.
+#
+#   cd <a directory you want the agent to work in>
+#   raspberry-pi [workdir]
+#
+# Keys: type + Enter to send (steers a running agent); y/n at approval
+# prompts; Ctrl+C interrupts a running turn / quits when idle.
+#
+# Run from a REAL terminal (the inline viewport's init DSR query needs a tty
+# reply).
+
+require "optparse"
+require_relative "../lib/raspberry_pi"
+
+module RaspberryPi
+  module Executable
+    DEFAULT_MODEL = "accounts/fireworks/models/glm-5p3-flash"
+    DEFAULT_PROVIDER = "openai"
+    DEFAULT_API_BASE = "https://api.fireworks.ai/inference/v1"
+
+    module_function
+
+    # --help is non-tty-safe and runs before any environment or terminal
+    # interaction (the gate runs it headless).
+    def usage
+      <<~USAGE
+        Usage: raspberry-pi [WORKDIR]
+
+        Interactive coding-agent chat on an inline-viewport TUI, scoped to
+        WORKDIR (default: the current directory).
+
+        Environment:
+          RASPBERRY_PI_MODEL      model id (default: #{DEFAULT_MODEL})
+          RASPBERRY_PI_PROVIDER   LLM provider (default: #{DEFAULT_PROVIDER}, chat-completions protocol)
+          RASPBERRY_PI_API_KEY    provider API key (required; no default)
+          RASPBERRY_PI_API_BASE   OpenAI-compatible endpoint (default: #{DEFAULT_API_BASE})
+
+        Keys: type + Enter to send (steers a running agent); y/n at approval
+        prompts; Ctrl+C interrupts a running turn / quits when idle.
+      USAGE
+    end
+
+    def run(argv)
+      OptionParser.new do |parser|
+        parser.on("-h", "--help", "show this help") { $stdout.write(usage); exit 0 }
+      end.parse(argv)
+
+      workdir = argv.shift || Dir.pwd
+      abort "RASPBERRY_PI_API_KEY is not set (see --help)." unless ENV["RASPBERRY_PI_API_KEY"]
+
+      api_key = ENV.fetch("RASPBERRY_PI_API_KEY")
+      model = ENV.fetch("RASPBERRY_PI_MODEL", DEFAULT_MODEL)
+      provider = ENV.fetch("RASPBERRY_PI_PROVIDER", DEFAULT_PROVIDER)
+      api_base = ENV.fetch("RASPBERRY_PI_API_BASE", DEFAULT_API_BASE)
+
+      context = RubyLLM.context do |config|
+        config.openai_api_key = api_key
+        config.openai_api_base = api_base
+        config.request_timeout = 120
+        config.max_retries = 1
+      end
+      chat = context.chat(model:, provider:,
+                          protocol: :chat_completions, assume_model_exists: true)
+
+      tools = Tools::Registry.build(
+        selected: %w[read write edit bash find grep ls],
+        cwd: workdir
+      )
+
+      TUI.run(viewport: :inline, height: 8, bracketed_paste: true) do |session|
+        kernel = Core::Loop.new(session:)
+        surface = Render::Chat.new(session:, kernel:)
+        surface.agent = Agent::Loop.new(
+          chat:,
+          tools:,
+          system_prompt: "You are a coding assistant working in #{workdir}. " \
+                         "Inspect files with read/grep/find before editing; keep answers brief.",
+          on_event: ->(event) { surface.on_agent_event(event) },
+          approval: ->(tool_call) { surface.approval(tool_call) }
+        )
+        kernel.renderer = surface.renderer
+        kernel.on_event = ->(event, source) { surface.on_event(event, source) }
+        kernel.run
+      end
+    end
+  end
+end
+
+RaspberryPi::Executable.run(ARGV)

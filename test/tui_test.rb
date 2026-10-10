@@ -12,6 +12,15 @@ module RaspberryPi
       end
     end
 
+    def test_style_and_line_vocabulary_render_styled_cells
+      TUI.run(headless: true, width: 20, screen_height: 4) do |session|
+        session.draw(TUI.paragraph(text: [TUI.line("user", fg: :light_blue), TUI.line("plain")]))
+        assert_equal :light_blue, session.cell_fg(0, 0), "styled span's fg reads back"
+        assert_nil session.cell_fg(0, 1), "unstyled span carries the terminal default"
+        assert_equal :light_blue, TUI.style(fg: :light_blue).fg
+      end
+    end
+
     def test_terminal_restored_after_normal_run
       TUI.run(headless: true) { |session| session.draw(TUI.status_panel("x")) }
       refute TUI::Session.active?

@@ -61,8 +61,64 @@ module RaspberryPi
         draw(chat, session)
         assert_includes live_region(session), "❯", "input line visible after tool end"
         # inserted_lines strips per-row whitespace (buffer rows are padded).
-        assert_equal ["⎿ bash: done"], inserted_lines(session),
-          "the tool result lifecycle renders into scrollback"
+        assert_equal ["⎿ bash: done", "more"], inserted_lines(session),
+          "the tool result lifecycle renders into scrollback as a multi-line excerpt"
+      end
+    end
+
+    def test_tool_result_preview_is_bounded_multiline
+      with_inline_chat(width: 40) do |chat, session|
+        tool_start(chat, "bash")
+        tool_end(chat, "bash", "one\ntwo\nthree\nfour\nfive")
+        draw(chat, session)
+        assert_equal ["⎿ bash: one", "two", "three", "…"], inserted_lines(session),
+          "the preview shows a bounded multi-line excerpt, then an ellipsis"
+      end
+    end
+
+    # The style vocabulary (AC4): line kinds are distinguished by fg color,
+    # proven by cell readback on the headless terminal (not presence-greps).
+    def test_user_assistant_tool_and_status_lines_read_back_distinct_fg_colors
+      with_inline_chat(width: 40, height: 10) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        stream(chat, "streaming")
+        draw(chat, session)
+        assert lead_cells(session).any? { |symbol, fg| Render::Chat::SPINNER.include?(symbol) && fg == Render::Chat::FG[:status] },
+          "the status line is dim (#{Render::Chat::FG[:status].inspect})"
+
+        finish_message(chat, "assistant answer") # scrollback: assistant, terminal default
+        tool_end(chat, "bash", "tool output")    # scrollback: tool, muted
+        chat.on_agent_event({type: :agent_end})
+        "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))    # scrollback: user echo
+        draw(chat, session)
+
+        leads = lead_cells(session)
+        assert_includes leads, ["a", nil],
+          "assistant text carries the terminal default fg (pi: userMessageText/text)"
+        assert_includes leads, ["⎿", Render::Chat::FG[:tool]],
+          "tool output is muted (pi: toolOutput)"
+        assert_includes leads, ["❯", Render::Chat::FG[:user]],
+          "the user echo carries the blue distinction (pi: userMessageBg)"
+        assert_includes leads, ["❯", nil],
+          "the input line keeps the terminal default — visually apart from the colored echo"
+      end
+    end
+
+    def test_pending_approval_stays_fully_visible_over_a_full_live_region
+      with_inline_chat(width: 40, height: 10) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        stream(chat, "word " * 40, start: false)
+        decision = Thread.new { chat.approval(ToolCallDouble.new("bash")) }
+        wait_until { chat.pending_approval }
+        draw(chat, session)
+
+        region = live_region(session)
+        assert_includes region, "approve bash?"
+        assert_includes region, "y = yes, n = no", "the full approval prompt stays in the viewport"
+
+        chat.on_event(TUI.key_event("y"))
+        assert decision.value == true, "the prompt remains answerable"
       end
     end
 
@@ -277,8 +333,8 @@ module RaspberryPi
     # Render-only tests: the real headless inline test terminal (buffer
     # readback) without the kernel. Width 9 makes wrapping observable
     # ("aaaa bbbb" is exactly 9 cells).
-    def with_inline_chat(width: 9, &)
-      TUI.run(headless: true, viewport: :inline, height: 4, width:, screen_height: 24) do |session|
+    def with_inline_chat(width: 9, height: 4, &)
+      TUI.run(headless: true, viewport: :inline, height:, width:, screen_height: 24) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new)
         yield chat, session
       end
@@ -344,13 +400,34 @@ module RaspberryPi
       session.buffer_content[0, area.y].map(&:strip).reject(&:empty?)
     end
 
+    # [symbol, fg] of the first non-blank cell of every non-blank screen row
+    # — the style readback for line-kind assertions (lead glyphs ❯ / ⎿ /
+    # spinner make the row kind identifiable).
+    def lead_cells(session)
+      area = session.viewport_area
+      (0...session.buffer_content.size).filter_map do |row|
+        col = (0...area.width).find { |x| session.cell_symbol(x, row) != " " }
+        next unless col
+
+        [session.cell_symbol(col, row), session.cell_fg(col, row)]
+      end
+    end
+
     def drawn_text(session)
-      session.drawn.last&.text.to_s
+      widget = session.drawn.last
+      widget ? widget_lines(widget).join("\n") : ""
     end
 
     # Widget texts recorded by ScriptedSession#insert_before, in order.
     def scrollback_lines(session)
-      session.scrollback.flat_map { |(_height, widget)| widget.text.lines(chomp: true) }
+      session.scrollback.flat_map { |(_height, widget)| widget_lines(widget) }
+    end
+
+    # A Paragraph's text is a String or an array of styled Lines (the chat
+    # surface's style vocabulary); both normalize to display strings.
+    def widget_lines(widget)
+      text = widget.text
+      text.is_a?(String) ? text.lines(chomp: true) : text.map { |line| line.spans.map(&:content).join }
     end
 
     # Accumulating view of the mock server's captured request bodies.
