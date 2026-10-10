@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "../compaction"
+
 require "json"
 require "securerandom"
 require "fileutils"
@@ -32,6 +34,16 @@ module RaspberryPi
     # user/assistant/toolResult content to [] (sessionEntryToContextMessages
     # :439-474), which ruby_llm rejects (Message#normalize_content only takes
     # String or nil), so the port maps it to "".
+    #
+    # Compaction (I08): compaction entries (pi CompactionEntry
+    # session-manager.ts:91-104, appendCompaction :1260-1285) are appended
+    # by the recorder on an auto-compaction, and context replay is
+    # compaction-aware (pi buildContextEntries :475-513): the latest
+    # compaction's summary projects to a user message wrapped in
+    # Compaction::COMPACTION_SUMMARY_PREFIX/SUFFIX (pi's compactionSummary
+    # projection, messages.ts:176-184), followed by the kept entries from
+    # firstKeptEntryId up to the compaction (system messages skipped) and
+    # everything after the compaction entry.
     module Session
       CURRENT_VERSION = 3
 
@@ -111,12 +123,27 @@ module RaspberryPi
         {type: "message", id:, parentId: parent_id, timestamp:, message:}
       end
 
+      # Compaction entry factory (pi CompactionEntry :91-104 /
+      # appendCompaction :1260-1285), the port's entry subset (no usage,
+      # fromHook, or systemMessage field). A null first-kept entry falls
+      # back to the compaction entry's own id (pi's
+      # `firstKeptEntryId ?? id`).
+      def compaction_entry(summary:, first_kept_entry_id:, tokens_before:, details:,
+                           id:, parent_id:, timestamp:)
+        {
+          type: "compaction", id:, parentId: parent_id, timestamp:,
+          summary:, firstKeptEntryId: first_kept_entry_id || id, tokensBefore: tokens_before, details:
+        }
+      end
+
       # pi sessionEntryToContextMessages :439 for the message subset: message
       # entries project to their message, made chat-ready (symbol keys,
       # symbol role); null/missing content is tolerated ("" on the port —
-      # module doc for the [] deviation). Other entry types project to
+      # module doc for the [] deviation). Compaction entries project to the
+      # wrapped summary (see module doc). Other entry types project to
       # nothing; malformed entries are tolerated, never fatal.
       def entry_to_context_message(entry)
+        return compaction_summary_message(entry) if entry.is_a?(Hash) && entry["type"] == "compaction"
         return nil unless entry.is_a?(Hash) && entry["type"] == "message"
 
         message = entry["message"]
@@ -128,11 +155,48 @@ module RaspberryPi
         message
       end
 
-      # The message entries of +path+ projected to chat-ready attribute
+      # pi's compactionSummary projection (messages.ts:109-121 + :176-184):
+      # the summary rides a user message wrapped in the prefix/suffix —
+      # ruby_llm supports no compactionSummary role.
+      def compaction_summary_message(entry)
+        summary = entry["summary"]
+        return nil unless summary.is_a?(String)
+
+        {role: :user,
+         content: "#{Compaction::COMPACTION_SUMMARY_PREFIX}#{summary}#{Compaction::COMPACTION_SUMMARY_SUFFIX}"}
+      end
+
+      # The context entries of +path+ projected to chat-ready attribute
       # hashes (pi buildSessionContext's message subset): what gets seeded
-      # into a chat on resume.
+      # into a chat on resume. Compaction-aware (pi buildContextEntries
+      # :475-513): with a compaction entry in the path, the replay is the
+      # latest compaction's summary, the kept entries from firstKeptEntryId
+      # up to the compaction (system messages skipped — prompt state), and
+      # everything after the compaction entry; the pre-compaction summarized
+      # messages are gone. Files without compaction entries replay exactly
+      # as before.
       def context_messages(path)
-        load_entries(path).filter_map { |entry| entry_to_context_message(entry) }
+        entries = load_entries(path)
+        compaction_index = entries.rindex { |entry| entry.is_a?(Hash) && entry["type"] == "compaction" }
+        return entries.filter_map { |entry| entry_to_context_message(entry) } unless compaction_index
+
+        compaction = entries[compaction_index]
+        context_entries = [compaction]
+        found_first_kept = false
+        entries[0...compaction_index].each do |entry|
+          found_first_kept ||= entry.is_a?(Hash) && entry["id"] == compaction["firstKeptEntryId"]
+          next unless found_first_kept
+          next if message_entry_with_role?(entry, "system")
+
+          context_entries << entry
+        end
+        context_entries.concat(entries[(compaction_index + 1)..] || [])
+        context_entries.filter_map { |entry| entry_to_context_message(entry) }
+      end
+
+      def message_entry_with_role?(entry, role)
+        entry.is_a?(Hash) && entry["type"] == "message" &&
+          entry["message"].is_a?(Hash) && entry["message"]["role"] == role
       end
 
       # pi findMostRecentSession :749: *.jsonl by mtime descending; the first
@@ -220,15 +284,37 @@ module RaspberryPi
           entry[:id]
         end
 
+        # Appends a compaction entry as a child of the current leaf and
+        # advances the leaf (pi SessionManager.appendCompaction :1260-1285,
+        # the port's field subset). Returns the entry id.
+        def append_compaction(summary:, first_kept_entry_id:, tokens_before:, details:)
+          entry = Session.compaction_entry(
+            summary:,
+            first_kept_entry_id:,
+            tokens_before:,
+            details:,
+            id: Session.generate_id(@ids),
+            parent_id: @leaf_id,
+            timestamp: Session.now_iso,
+          )
+          @ids << entry[:id]
+          @leaf_id = entry[:id]
+          @entries << entry
+          persist
+          entry[:id]
+        end
+
         private
 
         # pi _persist :1173: the file is created only once the session holds
         # a user or assistant message — setup-only sessions leave no file;
-        # afterwards, every further entry appends one JSON line.
-        def persist(message)
+        # afterwards, every further entry appends one JSON line. A compaction
+        # entry (+message+ nil) flushes too: a compaction always follows a
+        # recorded turn, and the entry would otherwise dangle in memory.
+        def persist(message = nil)
           if @flushed
             File.write(@path, entry_line(@entries.last), mode: "a")
-          elsif %i[user assistant].include?(message.role)
+          elsif message.nil? || %i[user assistant].include?(message.role)
             File.open(@path, "wx") do |file|
               @entries.each { |entry| file.write(entry_line(entry)) }
             end

@@ -44,6 +44,25 @@ bundle exec ruby bin/raspberry-pi --resume
 bundle exec ruby bin/raspberry-pi --resume <session-id>
 ```
 
+#### Compaction
+
+Long sessions compact instead of overflowing: after a completed turn whose
+provider-reported context usage exceeds the model's context window minus a
+reserve, the agent summarizes the older turns with a standalone LLM call and
+replaces the history with `[summary message, kept recent tail]`; a request
+that fails with a context-length error omits the attempt, compacts, and
+retries the turn once (a second consecutive overflow surfaces as the error).
+A compaction is recorded as a `compaction` session entry, and `--resume`
+replays it: the summary plus the kept tail — pre-compaction messages do not
+come back.
+
+Settings (defaults: enabled, `reserve_tokens` 16384, `keep_recent_tokens`
+20000) are injectable on `Agent::Loop` via the `compaction:` kwarg;
+`enabled: false` disables the threshold trigger. The context window resolves
+from `RASPBERRY_PI_CONTEXT_WINDOW` (tokens), then the model registry's
+`context_window`; unset/0 disables the threshold trigger only — the overflow
+recovery always fires.
+
 ### MCP servers
 
 MCP stdio servers are loaded from `~/.raspberry-pi/mcp.json` (override the

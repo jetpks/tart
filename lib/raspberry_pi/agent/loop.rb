@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative "../compaction"
 require_relative "bridge"
 require_relative "session"
 require_relative "status"
@@ -24,10 +25,19 @@ module RaspberryPi
     # cancelled (tools kill their subprocess groups at the next checkpoint),
     # and the cancel propagates.
     #
-    # Events (minimal surface, pi's AgentEvent vocabulary): :agent_start,
-    # :turn_start, :message_start, :message_update (streamed chunks),
-    # :message_end, :tool_execution_start, :tool_execution_end, :turn_end,
-    # :agent_end.
+    # Events (minimal surface, pi's AgentEvent vocabulary plus a compaction
+    # event): :agent_start, :turn_start, :message_start, :message_update
+    # (streamed chunks), :message_end, :tool_execution_start,
+    # :tool_execution_end, :turn_end, :compaction, :agent_end.
+    #
+    # Compaction (pi's auto-compaction, agent-session.ts:3007-3219): after
+    # a completed turn, provider-reported context usage over the model's
+    # context window minus the reserve compacts ("threshold"); a step that
+    # fails with RubyLLM::ContextLengthExceededError omits the attempt (the
+    # gem never appends the failed response), compacts and retries the turn
+    # once ("overflow", latched — a second consecutive overflow surfaces as
+    # the error). The compaction entry goes to the session recorder; the
+    # chat history is replaced in place with [summary message, kept tail].
     class Loop
       # @param chat [RubyLLM::Chat] configured for the endpoint (model,
       #   provider, protocol).
@@ -46,13 +56,24 @@ module RaspberryPi
       #   messages to seed the chat with before the run (resume:
       #   Agent::Session.context_messages) — the model sees them on the
       #   wire, they are never re-recorded as new messages.
+      # @param context_window [Integer, nil] the model's context window,
+      #   overriding the resolution order RASPBERRY_PI_CONTEXT_WINDOW →
+      #   chat.model.context_window → nil (nil/<= 0 disables the threshold
+      #   trigger only; the overflow trigger always fires).
+      # @param compaction [Hash, Compaction::Settings, nil] compaction
+      #   settings ({enabled:, reserve_tokens:, keep_recent_tokens:});
+      #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
       def initialize(chat:, tools:, system_prompt: nil, on_event: nil, approval: nil,
-        recorder: nil, seed_messages: [])
+        recorder: nil, seed_messages: [], context_window: nil, compaction: nil)
         @chat = chat
         @tools = tools
         @on_event = on_event
         @approval = approval
         @recorder = recorder
+        @context_window = context_window
+        @compaction_settings = Compaction::Settings.resolve(compaction)
+        @overflow_recovery_attempted = false
+        @entry_ids = {}.compare_by_identity
         @new_messages = []
         @sink = nil
         @stream_started = false
@@ -127,8 +148,12 @@ module RaspberryPi
 
       # Session recording (pi SessionManager.appendMessage): the recorder
       # appends each new message as a message entry, in conversation order.
+      # The entry id is kept for the message so a later compaction can name
+      # its first-kept entry (pi's firstKeptEntryId).
       def record(message)
-        @recorder&.append_message(message)
+        entry_id = @recorder&.append_message(message)
+        @entry_ids[message] = entry_id if entry_id
+        entry_id
       end
 
       def run_loop(prompt)
@@ -159,6 +184,7 @@ module RaspberryPi
         loop do
           message = step_via_bridge
           next if handle_pause
+          next if recover_overflow?
 
           # The error check precedes the nil-message break: a step the worker
           # failed before producing a message (e.g. the request itself 400s)
@@ -172,6 +198,7 @@ module RaspberryPi
             pending = steering_messages
             if pending.empty?
               emit(type: :turn_end, message:)
+              run_threshold_compaction
               break
             end
 
@@ -180,6 +207,133 @@ module RaspberryPi
           # Assistant message with tool calls: the batch executes on the
           # next step.
         end
+      end
+
+      # pi _checkCompaction's overflow branch (agent-session.ts:3007-3047):
+      # a context-overflow step failure compacts and retries the turn once;
+      # the second consecutive overflow surfaces as the error
+      # (_overflowRecoveryAttempted, :3040). The latch resets on a clean
+      # assistant response (:1168-1171). The gem never appends a failed
+      # response to chat.messages (chat.rb: provider_completion raises
+      # before record_generated_message), so the overflowing attempt is
+      # already omitted. False here lets stopped_on_error? surface it.
+      def recover_overflow?
+        return false unless @last_error.is_a?(RubyLLM::ContextLengthExceededError)
+        return false if @overflow_recovery_attempted
+
+        @overflow_recovery_attempted = true
+        return false unless run_compaction(reason: :overflow)
+
+        @last_error = nil
+        true
+      end
+
+      # pi _checkCompaction Case 3 (agent-session.ts:3079-3083): after a
+      # completed turn, provider-reported usage vs the model's context
+      # window and the reserve.
+      def run_threshold_compaction
+        return unless threshold_exceeded?
+
+        run_compaction(reason: :threshold)
+      end
+
+      def threshold_exceeded?
+        window = resolved_context_window
+        return false unless window.is_a?(Integer) && window.positive?
+
+        estimate = Compaction.estimate_context_tokens(@chat.messages)
+        Compaction.should_compact?(estimate[:tokens], window, @compaction_settings)
+      end
+
+      # Explicit kwarg → RASPBERRY_PI_CONTEXT_WINDOW → chat.model.context_
+      # window → nil. The gem's assume_model_exists resolution lands on
+      # Model.default, which carries no context_window (models.rb:210,
+      # model.rb:65-75) — nil disables the threshold trigger only.
+      def resolved_context_window
+        return @context_window if @context_window
+
+        env = ENV["RASPBERRY_PI_CONTEXT_WINDOW"]
+        return Integer(env, 10) if env&.match(/\A\d+\z/)
+
+        @chat.model&.context_window
+      end
+
+      # pi _runAutoCompaction (agent-session.ts:3097-3219) on the flat chat
+      # history: prepare → summarize (the standalone one-shot call) →
+      # replace the history with [summary message, kept tail] → record the
+      # compaction entry → emit the compaction event. Returns whether a
+      # compaction happened.
+      def run_compaction(reason:)
+        preparation = Compaction.prepare(@chat.messages, @compaction_settings)
+        return false unless preparation
+
+        summary = summarize(preparation)
+        return false unless summary
+
+        lists = Compaction.compute_file_lists(
+          Compaction.extract_file_ops(preparation.messages_to_summarize)
+        )
+        summary += Compaction.format_file_operations(lists[:read_files], lists[:modified_files])
+
+        keep_from = preparation.first_kept_index
+        system_messages = @chat.messages.select { |message| message.role == :system }
+        kept = @chat.messages[keep_from..] || []
+        summary_message = @chat.add_message(role: :user, content: compaction_summary_content(summary))
+        @chat.messages = [*system_messages, summary_message, *kept]
+
+        @recorder&.append_compaction(
+          summary:,
+          first_kept_entry_id: @entry_ids[kept.first],
+          tokens_before: preparation.tokens_before,
+          # pi CompactionDetails (compaction.ts:37-40).
+          details: {"readFiles" => lists[:read_files], "modifiedFiles" => lists[:modified_files]},
+        )
+        emit(type: :compaction, reason:, tokens_before: preparation.tokens_before, summary:)
+        true
+      end
+
+      def compaction_summary_content(summary)
+        "#{Compaction::COMPACTION_SUMMARY_PREFIX}#{summary}#{Compaction::COMPACTION_SUMMARY_SUFFIX}"
+      end
+
+      # The standalone summarization call (pi generateSummaryWithUsage on
+      # buildSummarizationContext, compaction.ts:637-647 + :671-741): a
+      # fresh one-shot chat on the same context/endpoint — system =
+      # SUMMARIZATION_SYSTEM_PROMPT, one user message carrying the serialized
+      # conversation; not the chat history, no tools. max_tokens =
+      # min(floor(0.8 * reserve_tokens), model max) (:683-686); the gem's
+      # model.max_output_tokens is the model max (model.rb:36). Run through
+      # the Bridge like every blocking LLM call so a kernel interrupt
+      # cancels it. nil (compaction aborted) when the call fails.
+      def summarize(preparation)
+        prompt = Compaction.summarization_prompt(preparation.messages_to_summarize,
+          previous_summary: preparation.previous_summary)
+        result = nil
+        summary_chat = nil
+        bridge = Bridge.new
+        bridge.on_cancel { summary_chat&.cancel }
+        terminal = bridge.run(lambda { |_sink|
+          summary_chat = build_summary_chat
+          result = summary_chat.generate(prompt)
+        }) { |_item| }
+        return nil if terminal.is_a?(Hash) && terminal[:type] == :error
+
+        result.content
+      end
+
+      def build_summary_chat
+        chat = @chat.context.chat(model: @chat.model&.id, provider: @chat.provider&.slug,
+                                  assume_model_exists: true)
+        chat.with_instructions(Compaction::SUMMARIZATION_SYSTEM_PROMPT)
+        chat.with_max_output_tokens(summarization_max_tokens)
+        chat
+      end
+
+      def summarization_max_tokens
+        reserve = @compaction_settings.reserve_tokens
+        model_max = @chat.model&.max_output_tokens
+        cap = model_max.is_a?(Integer) && model_max.positive? ? model_max : Float::INFINITY
+        [(reserve * 0.8).floor, cap].min
       end
 
       # One ruby_llm #step on the worker thread. Returns the step's message
@@ -289,6 +443,9 @@ module RaspberryPi
           @stream_started = false
           message = item[:message]
           @last_message = message
+          # A clean assistant response resets the overflow-recovery latch
+          # (pi agent-session.ts:1168-1171).
+          @overflow_recovery_attempted = false if message.role == :assistant
           # Tool results are recorded by the :tool_message item (ruby_llm's
           # after_message); the step's own return would double-count them.
           unless message.role == :tool
