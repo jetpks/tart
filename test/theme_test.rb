@@ -30,6 +30,9 @@ module Tart
       md_quote_border: :gray,         # dark.json:49 muted
       md_hr: :gray,                   # dark.json:50 muted
       md_list_bullet: :light_magenta, # dark.json:51 violet
+      thinkingText: :light_blue,  # dark.json:26 okhsl(226 7% 65%) — light member of the blue pair
+      scrollbarTrack: :blue,      # dark.json:28 okhsl(237 7% 33%) — dark member of the blue pair
+      scrollbarThumb: :light_blue, # dark.json:29 okhsl(232 7% 65%) — light member of the blue pair
     }.freeze
 
     def test_token_table_carries_the_pi_transcription
@@ -63,6 +66,16 @@ module Tart
       assert_equal Theme[:dim], :dark_gray
       assert_equal Theme[:warning], :yellow
       assert_equal Theme[:error], :red
+    end
+
+    # The I13 promotions (dark.json:26-29, blue-tinted family — NOT the
+    # interim dim/muted the scrollbar rode on).
+    def test_scrollbar_and_reasoning_tokens_carry_pis_blue_tinted_values
+      assert_equal :light_blue, Theme[:thinkingText]
+      assert_equal :blue, Theme[:scrollbarTrack]
+      assert_equal :light_blue, Theme[:scrollbarThumb]
+      refute_equal Theme[:dim], Theme[:scrollbarTrack]
+      refute_equal Theme[:muted], Theme[:scrollbarThumb]
     end
   end
 end

@@ -127,6 +127,12 @@ module Tart
         # The running compaction's reason (the border-status label's key).
         @compaction_reason = nil
         @live = +""
+        # The in-flight message's reasoning (pi's live thinking block): the
+        # joined chunk.thinking deltas, rendered dim while it grows and
+        # flushed as the completed thinking block at :message_end (the loop
+        # strips Message#thinking before the surface sees the event —
+        # loop.rb strip_thinking_replay).
+        @reasoning = +""
         @busy = false
         @tool = nil
         @pending = nil
@@ -246,13 +252,22 @@ module Tart
             @branch_fetched = false
           when :message_start
             @live = +""
+            @reasoning = +""
           when :message_update
             chunk = event[:chunk]
             @live << chunk.content if chunk.content.is_a?(String) && !chunk.content.empty?
+            reasoning = chunk.thinking&.text
+            @reasoning << reasoning if reasoning.is_a?(String) && !reasoning.empty?
           when :message_end
             message = event[:message]
             if message.role == :assistant
               accumulate_usage(message)
+              # The joined thinking renders as a dim block BEFORE the content
+              # (pi assistant-message.ts:99-175 render order). The live
+              # reasoning buffer is the text source, not Message#thinking —
+              # the loop strips the latter before this event (itemized
+              # deviation from the spec's message.thinking.text letter).
+              flush_reasoning
               handled = complete(message.content)
               # Assistant completions render as markdown (AC5) — at
               # completion only: the live region streamed the raw source.
@@ -317,6 +332,15 @@ module Tart
           @decisions.pop until @decisions.empty?
         end
         decision
+      end
+
+      # Slash-command output (pi's chat-line status UX): a muted line in
+      # the transcript buffer. Thread-safe — the kernel task calls this
+      # off-frame. Public placement is load-bearing: bin/tart wires the
+      # Commands::Handler with +output: ->(text) { surface.command_line(text) }+
+      # (the I13 /skills NoMethodError).
+      def command_line(text)
+        @mutex.synchronize { enqueue_scrollback(text, fg: Theme[:muted]) }
       end
 
       class << self
@@ -690,7 +714,19 @@ module Tart
         when "e" then ctrl ? move_end : insert_printable(event)
         when "b" then alt ? move_word_backward : (ctrl ? move_left : insert_printable(event))
         when "f" then alt ? move_word_forward : (ctrl ? move_right : insert_printable(event))
-        when "d" then alt ? delete_word_forward : (ctrl ? delete_forward : insert_printable(event))
+        when "d"
+          # app.exit (pi custom-editor.ts:118-125, keybindings.ts:28 —
+          # default ctrl+d): on an empty editor the run exits (the /quit
+          # path); non-empty falls through to delete-char-forward.
+          if ctrl && @input.empty?
+            @kernel.stop!
+          elsif alt
+            delete_word_forward
+          elsif ctrl
+            delete_forward
+          else
+            insert_printable(event)
+          end
         when "w" then ctrl ? delete_word_backward : insert_printable(event)
         else insert_printable(event)
         end
@@ -733,11 +769,22 @@ module Tart
         end
       end
 
-      # Slash-command output (pi's chat-line status UX): a muted line in
-      # the transcript buffer. Thread-safe — the kernel task calls this
-      # off-frame.
-      def command_line(text)
-        @mutex.synchronize { enqueue_scrollback(text, fg: Theme[:muted]) }
+      # The completed thinking block (pi assistant-message.ts:99-175 order —
+      # thinking before the content): the live reasoning buffer flushed as
+      # dim italic transcript rows, then cleared.
+      def flush_reasoning
+        text = @reasoning
+        @reasoning = +""
+        return if text.empty?
+
+        @scrollback << reasoning_lines(text, viewport_width)
+      end
+
+      # Reasoning text as dim italic display lines (pi assistant-message.ts
+      # :140-150: thinkingText fg, italic; markdown-of-reasoning is cut,
+      # plain dim text — itemized reduction).
+      def reasoning_lines(text, width)
+        self.class.wrap(text, width).map { |line| TUI.line([TUI.span(line, fg: Theme[:thinkingText], modifiers: [:italic])]) }
       end
 
       # pi's editor history (components/editor.ts addToHistory): trimmed,
@@ -930,13 +977,12 @@ module Tart
       end
 
       # The right-gutter scrollbar (pi layout.ts:307-330 paintScrollbar:
-      # track "│" / thumb "┃"). Theme routing: the port's token table has
-      # no scrollbarTrack/scrollbarThumb (RAISED in PHASE 0 — theme.rb
-      # read-only this iteration); the nearest analogs carry it (track →
-      # dim, thumb → muted) until the tokens are promoted.
+      # track "│" / thumb "┃"). pi's actual scrollbarTrack/scrollbarThumb
+      # tokens (dark.json:28-29, blue-tinted) — promoted in the theme table
+      # (I12 ruling 2 carry-in; the interim dim/muted routing retired).
       def scrollbar_glyphs(total, rows)
         TUI.scrollbar_lines(content_length: total, position: @scroll_offset, viewport: rows,
-          track_fg: Theme[:dim], thumb_fg: Theme[:muted])
+          track_fg: Theme[:scrollbarTrack], thumb_fg: Theme[:scrollbarThumb])
       end
 
       # The bordered editor area (pi CustomEditor): the input line inside
@@ -1203,11 +1249,13 @@ module Tart
 
       # The streaming text, wrapped to the transcript width — the
       # transcript area's tail clip bounds it (deltas append; the window
-      # slides).
+      # slides). Streaming reasoning renders dim above the content while it
+      # grows (pi renders the thinking block first — assistant-message.ts
+      # :99-175).
       def live_lines(width)
-        return [] if @live.empty?
+        return [] if @live.empty? && @reasoning.empty?
 
-        self.class.wrap(@live, width).map { |line| TUI.line(line) }
+        reasoning_lines(@reasoning, width) + self.class.wrap(@live, width).map { |line| TUI.line(line) }
       end
 
       def approval_lines(width)

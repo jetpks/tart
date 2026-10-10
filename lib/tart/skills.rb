@@ -9,8 +9,11 @@ module Tart
     # utils/frontmatter.ts, reduced to the port's discovery surface).
     #
     # Discovery (pi loadSkillsFromDir :177-281): user skills from
-    # <root>/skills (pi: agentDir/skills), project skills from
-    # <cwd>/.tart/skills (pi: cwd/.pi/skills) — user first, project second.
+    # <root>/skills (pi: agentDir/skills), then ~/.claude/skills (owner
+    # ruling 2026-10-10: the owner's pi surfaces its skills from there —
+    # a second user source, first-loaded-wins against <root>/skills),
+    # project skills from <cwd>/.tart/skills (pi: cwd/.pi/skills) — user
+    # first, project second.
     # Per directory: a SKILL.md makes it a skill root (loaded, no recursion
     # below it); otherwise subdirectories recurse (dotfiles and
     # node_modules skipped) and bare .md children of the top directory
@@ -49,9 +52,12 @@ module Tart
 
     module_function
 
-    def load(cwd:, root: Agent::Session.default_root)
+    def load(cwd:, root: Agent::Session.default_root, claude_dir: File.join(Dir.home, ".claude", "skills"))
       merged = merge(
-        load_from_dir(File.join(root, "skills"), "user"),
+        merge(
+          load_from_dir(File.join(root, "skills"), "user"),
+          load_from_dir(claude_dir, "user")
+        ),
         load_from_dir(File.join(cwd, ".tart", "skills"), "project")
       )
       Result.new(skills: merged[:skills], diagnostics: merged[:diagnostics])

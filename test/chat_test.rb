@@ -53,6 +53,68 @@ module Tart
       end
     end
 
+    # Streaming reasoning (I13, pi assistant-message.ts:99-175): reasoning
+    # deltas render dim (thinkingText, italic) above the live content while
+    # it grows.
+    def test_streaming_reasoning_renders_dim_above_the_live_content
+      with_chat do |chat, session|
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
+        draw(chat, session)
+        y = session.buffer_content.index { |row| row.include?("pondering") }
+        x = session.buffer_content[y].index("p")
+        assert_equal Theme[:thinkingText], session.cell_fg(x, y), "reasoning renders in the thinkingText token"
+        assert_includes session.cell_modifiers(x, y), :italic
+
+        chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("answer")})
+        draw(chat, session)
+        live = live_region(session, chat)
+        assert live.index("pondering") < live.index("answer"), "reasoning renders before the live content"
+      end
+    end
+
+    # At completion the joined thinking renders as a dim block BEFORE the
+    # content in the transcript (pi assistant-message.ts render order;
+    # no toggle/collapse — itemized cut). Text source: the live reasoning
+    # buffer — the loop strips Message#thinking before :message_end.
+    def test_completed_reasoning_lands_dim_before_the_content
+      with_chat do |chat, session|
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
+        chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("hi")})
+        chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "hi")})
+        draw(chat, session)
+
+        lines = transcript_lines(session, chat)
+        assert_equal ["pondering", "hi"], lines,
+          "the thinking block lands in the transcript before the content, cleared from the live region"
+        y = session.buffer_content.index { |row| row.include?("pondering") }
+        x = session.buffer_content[y].index("p")
+        assert_equal Theme[:thinkingText], session.cell_fg(x, y)
+        assert_includes session.cell_modifiers(x, y), :italic
+      end
+    end
+
+    # End-to-end through the real gem chunk shape (mock server reasoning
+    #_content deltas — the gem parses them into chunk.thinking.text).
+    def test_reasoning_streams_dim_through_the_real_gem_chunks
+      @server = MockLLMServer.new.start
+      @server.script([{type: :stream, reasoning_content: "pondering deeply", content: "done"}])
+      kernel, chat, session = chat_with_server
+
+      scenario = Thread.new do
+        type(session, "hi")
+        wait_until { chat.transcript_lines.join.include?("done") }
+        kernel.stop!
+      end
+      kernel.run
+      scenario.join
+
+      lines = chat.transcript_lines
+      assert lines.index { |line| line.include?("pondering deeply") } < lines.index { |line| line.include?("done") },
+        "the joined thinking renders before the content (pi assistant-message.ts order)"
+    end
+
     def test_tool_call_lifecycle_is_rendered
       with_chat(width: 40) do |chat, session|
         chat.on_agent_event({type: :agent_start})
@@ -357,7 +419,7 @@ module Tart
       FileUtils.mkpath(File.join(@dir, ".tart", "skills", "greet"))
       File.write(File.join(@dir, ".tart", "skills", "greet", "SKILL.md"),
         "---\nname: greet\ndescription: Says hello\n---\nHello body.")
-      skills = Skills.load(cwd: @dir, root: @dir).skills
+      skills = Skills.load(cwd: @dir, root: @dir, claude_dir: File.join(@dir, "claude-skills")).skills
       outputs = []
       handler = Commands::Handler.new(
         skills:, settings: {}, output: ->(text) { outputs << text },
@@ -400,6 +462,37 @@ module Tart
           "command output renders through the chat-line surface"
         assert_empty runs
       end
+    end
+
+    # AC3 regression (the I13 live-run NoMethodError): /skills submitted
+    # through the exact bin/tart:185-191 handler wiring — output routed
+    # through the surface's command_line — renders the listing.
+    def test_skills_command_renders_the_listing_through_the_bin_wiring
+      @server = MockLLMServer.new.start
+      kernel, chat, session = chat_with_server
+      FileUtils.mkpath(File.join(@dir, ".tart", "skills", "greet"))
+      File.write(File.join(@dir, ".tart", "skills", "greet", "SKILL.md"),
+        "---\nname: greet\ndescription: Says hello\n---\nHello body.")
+      skills = Skills.load(cwd: @dir, root: @dir, claude_dir: File.join(@dir, "claude-skills")).skills
+      chat.commands = Commands::Handler.new(
+        skills:, settings: {},
+        output: ->(text) { chat.command_line(text) },
+        spawn: ->(&block) { kernel.async(&block) },
+        agent: -> { chat.agent },
+        reset: -> { chat.command_line("✓ New session started") },
+        quit: -> { kernel.stop! }
+      )
+
+      scenario = Thread.new do
+        type(session, "/skills")
+        wait_until { chat.transcript_lines.join.include?("greet") }
+        kernel.stop!
+      end
+      kernel.run
+      scenario.join
+
+      assert_includes chat.transcript_lines.join, "1 skills:", "the /skills listing renders"
+      assert_includes chat.transcript_lines.join, "greet: Says hello"
     end
 
     def test_skill_invocation_sends_the_expanded_block_to_the_agent
@@ -789,6 +882,27 @@ module Tart
       assert_equal 2, Render::Chat.find_word_forward("hi", 3), "at end-of-line the cursor stays put"
     end
 
+    # app.exit (pi custom-editor.ts:118-125, keybindings.ts:28 — the gem
+    # delivers ctrl+d as code "d" + ctrl): empty editor exits, non-empty
+    # deletes forward.
+    def test_ctrl_d_on_empty_input_exits_the_run
+      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
+        kernel = IdleKernel.new
+        chat = Render::Chat.new(session:, kernel:)
+        chat.on_event(TUI.key_event("d", modifiers: ["ctrl"]))
+        assert kernel.stopped?, "ctrl+d on an empty editor exits via the kernel's stop! (the /quit path)"
+      end
+    end
+
+    def test_ctrl_d_with_content_deletes_forward
+      with_headless_chat do |chat|
+        "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("left")) # the char after the cursor is what dies
+        chat.on_event(TUI.key_event("d", modifiers: ["ctrl"]))
+        assert_equal "h", chat.input, "ctrl+d with content falls through to delete-char-forward (pi custom-editor.ts:123-125)"
+      end
+    end
+
     def test_ctrl_w_deletes_word_backward_through_the_key_surface
       with_headless_chat do |chat|
         "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
@@ -920,6 +1034,29 @@ module Tart
       end
     end
 
+    # The live tab path (I13): /ar + tab through the kernel's synthetic
+    # dispatch completes to the port's skill routing shape (commands.rb
+    # /skill:<name>); the catalog is the real SlashSource over a skill.
+    def test_tab_completes_a_skill_through_the_kernel_dispatch
+      @server = MockLLMServer.new.start
+      skill = Skills::Skill.new(name: "architect", description: "Runs the loop",
+        file_path: "/fixtures/architect/SKILL.md", base_dir: "/fixtures/architect",
+        disable_model_invocation: false)
+      kernel, chat, session = chat_with_server(
+        autocomplete: Render::Chat::SlashSource.new(commands: Commands::BUILTINS, skills: [skill]))
+
+      scenario = Thread.new do
+        "/ar".each_char { |char| session.push_event(TUI.key_event(char)) }
+        session.push_event(TUI.key_event("tab"))
+        wait_until { chat.input == "/skill:architect " }
+        kernel.stop!
+      end
+      kernel.run
+      scenario.join
+
+      assert_equal "/skill:architect ", chat.input
+    end
+
     def test_escape_cancels_the_list_without_interrupting_the_run
       with_headless_chat(autocomplete: slash_source("architect")) do |chat|
         chat.on_agent_event({type: :agent_start})
@@ -1031,9 +1168,9 @@ module Tart
         20.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session)
         assert_equal "┃", session.cell_symbol(19, 5), "the thumb pins to the track bottom while following"
-        assert_equal :gray, session.cell_fg(19, 5), "the thumb routes through the theme (muted analog)"
+        assert_equal Theme[:scrollbarThumb], session.cell_fg(19, 5), "the thumb routes through the theme (pi's blue-tinted token)"
         assert_equal "│", session.cell_symbol(19, 0), "the track fills above the thumb"
-        assert_equal :dark_gray, session.cell_fg(19, 0)
+        assert_equal Theme[:scrollbarTrack], session.cell_fg(19, 0)
 
         chat.on_event(TUI.key_event("page_up"))
         draw(chat, session)
@@ -1165,6 +1302,13 @@ module Tart
     def send_message(chat, text)
       text.chars.each { |char| chat.on_event(TUI.key_event(char)) }
       chat.on_event(TUI.key_event("enter"))
+    end
+
+    # A streaming reasoning delta double carrying the gem's real Thinking
+    # value object (ruby_llm 2.1.0 protocols/chat_completions/streaming.rb
+    # :28-29 — the shape the surface reads).
+    def thinking_chunk(content, text = "pondering")
+      ChunkDouble.new(content, RubyLLM::Thinking.new(text:))
     end
 
     # Types +text+ into the input line and presses Enter (synthetic events —
@@ -1313,7 +1457,7 @@ module Tart
       @captured.concat(@server.captured_requests)
     end
 
-    ChunkDouble = Struct.new(:content)
+    ChunkDouble = Struct.new(:content, :thinking)
     MessageDouble = Struct.new(:role, :content, :tokens)
     ToolCallDouble = Struct.new(:name) do
       def arguments = {}
@@ -1330,6 +1474,14 @@ module Tart
       end
 
       def animate(duration:) = nil
+
+      # The /quit path (bin/tart wires quit: -> { kernel.stop! }) — ctrl+d's
+      # exit route (pi app.exit).
+      def stop!
+        @stopped = true
+      end
+
+      def stopped? = !!@stopped
 
       # Records the submitted agent-run block (a real kernel spawns it as a
       # reactor task).

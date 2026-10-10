@@ -36,6 +36,9 @@ module Tart
       md_quote_border: :gray,   # dark.json:49 muted
       md_hr: :gray,             # dark.json:50 muted
       md_list_bullet: :light_magenta, # dark.json:51 violet
+      thinkingText: :light_blue,  # dark.json:26 "thinkingText" okhsl(226 7% 65%) — 65%-lightness blue-tint: the light member of the ANSI blue pair (streaming/completed reasoning, Chat::reasoning_lines)
+      scrollbarTrack: :blue,      # dark.json:28 "scrollbarTrack" okhsl(237 7% 33%) — the dark member of the blue pair (transcript gutter track, Chat::scrollbar_glyphs)
+      scrollbarThumb: :light_blue, # dark.json:29 "scrollbarThumb" okhsl(232 7% 65%) — the light member of the blue pair (transcript gutter thumb, Chat::scrollbar_glyphs)
     }.freeze
 
     # The markdown converter (Render::Markdown::FG, read-only) emits raw
