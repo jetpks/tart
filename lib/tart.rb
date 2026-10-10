@@ -14,4 +14,6 @@ require_relative "tart/render/markdown"
 require_relative "tart/print"
 
 module Tart
+  # The version the MOTD renders — defined in version.rb (Tart::VERSION);
+  # this file adds no second definition.
 end

@@ -18,7 +18,14 @@ module Tart
     # nil = the terminal default (pi's "text" renders as the empty color).
     TOKENS = {
       text: nil,                # dark.json "text" → default prose
-      dim: :dark_gray,          # "dim" okhsl(229 8% 56%) — status/footer (Chat::FG[:status], I05)
+      # "dim" okhsl(229 8% 56%) (dark.json:24, I14 item 9) — a blue-tinted
+      # mid gray. Closest ANSI analog: :gray, the same mid-gray the table
+      # already renders for the 53% (borderMuted) and 67% (muted) band —
+      # 56% sits between them. The blue tint is unrepresentable in the
+      # gem's 16-color vocabulary: :blue (the 33% family member) and
+      # :light_blue (65%, thinkingText) are farther in lightness and would
+      # either darken the footer or collapse it into the reasoning color.
+      dim: :gray,
       muted: :gray,             # "muted" okhsl(229 6% 67%) — tool output (Chat::FG[:tool], I05)
       border: :gray,            # "borderMuted" okhsl(229 8% 53%) — the port's one border style
       warning: :yellow,         # "warning" yellow — interrupts, context >70% (Chat::FG[:interrupted])
