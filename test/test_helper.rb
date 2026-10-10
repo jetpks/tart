@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
-require_relative "../lib/raspberry_pi"
+require_relative "../lib/tart"
 
-module RaspberryPi
+module Tart
   # Shared base class for the minitest suite.
   class Test < Minitest::Test
     # Runs until the block is satisfied, then returns. Fails after 5 s

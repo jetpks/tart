@@ -5,7 +5,7 @@ require_relative "support/mock_llm_server"
 require "tmpdir"
 require "fileutils"
 
-module RaspberryPi
+module Tart
   # The interactive chat surface (AC1/AC2): streaming render on the inline
   # viewport, scrollback insertion on completion, input line, key-driven
   # approval gates — hermetic via the headless inline test terminal (render,
@@ -14,7 +14,7 @@ module RaspberryPi
   # without a tty — I01 finding).
   class ChatTest < Test
     def setup
-      @dir = Dir.mktmpdir("raspberry-pi-chat-")
+      @dir = Dir.mktmpdir("tart-chat-")
     end
 
     def teardown

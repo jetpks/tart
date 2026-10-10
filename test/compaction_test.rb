@@ -2,7 +2,7 @@
 
 require_relative "test_helper"
 
-module RaspberryPi
+module Tart
   # The compaction pure functions (AC1): token estimation, provider-usage
   # accounting, the threshold predicate, cut-point selection that never
   # orphans a tool result from its tool call, file-op extraction/formatting,

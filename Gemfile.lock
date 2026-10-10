@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    raspberry-pi (0.1.0)
+    tart (0.1.0)
       async (~> 2.46)
       diff-lcs (~> 1.6)
       ratatui_ruby (= 1.5.0)
@@ -107,7 +107,7 @@ DEPENDENCIES
   irb
   minitest (~> 5.20)
   rake (~> 13.0)
-  raspberry-pi!
+  tart!
 
 CHECKSUMS
   async (2.46.0) sha256=34f984733dbf63a997376346451ec995e858cacc3105e86ccfeaf8877b4f490b
@@ -137,7 +137,6 @@ CHECKSUMS
   prism (1.9.0) sha256=7b530c6a9f92c24300014919c9dcbc055bf4cdf51ec30aed099b06cd6674ef85
   rake (13.4.2) sha256=cb825b2bd5f1f8e91ca37bddb4b9aaf345551b4731da62949be002fa89283701
   rake-compiler-dock (1.12.0) sha256=f13205c2738f3d2053afcd03491a9e4541b22a59a0bfc53fc8bc883bd8188023
-  raspberry-pi (0.1.0)
   ratatui_ruby (1.5.0) sha256=85b164c432968d883557cd19333fb318953671052af990df71cd594cd8e59ece
   ratatui_ruby (1.5.0-arm64-darwin-24) sha256=35a8c4aa01ff3fe177aaba80ba620c9185ee02ef0adc53960516d8be2523aed2
   ratatui_ruby (1.5.0-x86_64-linux) sha256=8a0f48d1eaf5e686aa9d0de20622bbf5b8e1901860de1676ee1e6cc93aafb10b
@@ -148,6 +147,7 @@ CHECKSUMS
   rexml (3.4.4) sha256=19e0a2c3425dfbf2d4fc1189747bdb2f849b6c5e74180401b15734bc97b5d142
   ruby_llm (2.1.0) sha256=041e73588758172e37b2883584b3bbca6fbddec2f273cdbdfa5f2b4f2f9a053e
   schematist (1.1.0) sha256=905d8f0286830926e77e0d631bee325ee741c4b99640bc99735593b40ba73e7b
+  tart (0.1.0)
   timeout (0.6.1) sha256=78f57368a7e7bbadec56971f78a3f5ecbcfb59b7fcbb0a3ed6ddc08a5094accb
   tsort (0.2.0) sha256=9650a793f6859a43b6641671278f79cfead60ac714148aabe4e3f0060480089f
   uri (1.1.2) sha256=89292e98eabbef6248b0a0ed5e7e398e152f83f17560023a6d94a7f492b169fb

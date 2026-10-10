@@ -1,4 +1,4 @@
-# raspberry-pi
+# tart
 
 A Ruby port of the [pi](https://github.com/earendil-works/pi) coding-agent harness — the parts we use — on the socketry async stack.
 
@@ -12,20 +12,20 @@ Interactive chat on an inline-viewport TUI, scoped to the working directory
 (from a real terminal — the inline viewport's init query needs a tty reply):
 
 ```sh
-export RASPBERRY_PI_API_KEY=...   # provider API key (required)
-bundle exec ruby bin/raspberry-pi [workdir]   # default: the current directory
+export TART_API_KEY=...   # provider API key (required)
+bundle exec ruby bin/tart [workdir]   # default: the current directory
 ```
 
 Configuration is environment-driven with documented defaults (see
-`bin/raspberry-pi --help`):
+`bin/tart --help`):
 
 | Variable | Default |
 |---|---|
-| `RASPBERRY_PI_MODEL` | `accounts/fireworks/models/glm-5p3-flash` |
-| `RASPBERRY_PI_PROVIDER` | `openai` (chat-completions protocol) |
-| `RASPBERRY_PI_API_KEY` | — (required) |
-| `RASPBERRY_PI_API_BASE` | `https://api.fireworks.ai/inference/v1` |
-| `RASPBERRY_PI_MCP_CONFIG` | `~/.raspberry-pi/mcp.json` |
+| `TART_MODEL` | `accounts/fireworks/models/glm-5p3-flash` |
+| `TART_PROVIDER` | `openai` (chat-completions protocol) |
+| `TART_API_KEY` | — (required) |
+| `TART_API_BASE` | `https://api.fireworks.ai/inference/v1` |
+| `TART_MCP_CONFIG` | `~/.tart/mcp.json` |
 
 Keys: type + Enter to send (steers a running agent); y/n at approval prompts;
 Ctrl+C interrupts a running turn / quits when idle.
@@ -33,15 +33,15 @@ Ctrl+C interrupts a running turn / quits when idle.
 ### Sessions
 
 Interactive runs are recorded by default — one JSONL session file per run
-under `~/.raspberry-pi/sessions`, holding the header and every user and
+under `~/.tart/sessions`, holding the header and every user and
 assistant message in order. Resume a previous session with `--resume`: with
 no argument it continues the most recent session for the working directory;
 with a session id or session-file path it continues that one (the resumed
 run records into a new session file linked to the old one):
 
 ```sh
-bundle exec ruby bin/raspberry-pi --resume
-bundle exec ruby bin/raspberry-pi --resume <session-id>
+bundle exec ruby bin/tart --resume
+bundle exec ruby bin/tart --resume <session-id>
 ```
 
 #### Compaction
@@ -59,14 +59,14 @@ come back.
 Settings (defaults: enabled, `reserve_tokens` 16384, `keep_recent_tokens`
 20000) are injectable on `Agent::Loop` via the `compaction:` kwarg;
 `enabled: false` disables the threshold trigger. The context window resolves
-from `RASPBERRY_PI_CONTEXT_WINDOW` (tokens), then the model registry's
+from `TART_CONTEXT_WINDOW` (tokens), then the model registry's
 `context_window`; unset/0 disables the threshold trigger only — the overflow
 recovery always fires.
 
 ### MCP servers
 
-MCP stdio servers are loaded from `~/.raspberry-pi/mcp.json` (override the
-path with `RASPBERRY_PI_MCP_CONFIG`; a missing file means no servers):
+MCP stdio servers are loaded from `~/.tart/mcp.json` (override the
+path with `TART_MCP_CONFIG`; a missing file means no servers):
 
 ```json
 {"mcpServers": {"echo": {"command": "/path/to/echo-server", "args": [], "env": {}}}}
@@ -82,7 +82,7 @@ Single-shot headless runs — send one prompt, write the final response to
 stdout, exit 0 (1 on error); no TUI anywhere on the path:
 
 ```sh
-bundle exec ruby bin/raspberry-pi -p "list the ruby files in this repo"
+bundle exec ruby bin/tart -p "list the ruby files in this repo"
 ```
 
 Print runs are not recorded (the session store is wired into the interactive
@@ -123,8 +123,8 @@ and keeps the separator space).
 bundle install            # runtime deps: async, ratatui_ruby (pinned 1.5.0)
 bundle exec rake          # minitest suite (headless, no tty required)
 timeout 90 bundle exec ruby bench/seam_bench.rb   # seam bench, prints JSON + SEAM_BENCH_OK/FAIL
-bundle exec ruby bin/raspberry-pi --help          # launcher usage (non-tty-safe)
-bundle exec ruby bin/raspberry-pi -p "prompt"     # headless single-shot run
+bundle exec ruby bin/tart --help          # launcher usage (non-tty-safe)
+bundle exec ruby bin/tart -p "prompt"     # headless single-shot run
 ```
 
 The bench runs itself inside a fresh 80x24 pty, self-asserts (hard internal

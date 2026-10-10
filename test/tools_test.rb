@@ -4,12 +4,12 @@ require_relative "test_helper"
 require "tmpdir"
 require "fileutils"
 
-module RaspberryPi
+module Tart
   # Basic behavior of the find/grep/ls tools (pi semantics: sorting, '/ '
   # suffixes, limits, notices, pi's output text).
   class ToolsTest < Test
     def setup
-      @dir = Dir.mktmpdir("raspberry-pi-tools-")
+      @dir = Dir.mktmpdir("tart-tools-")
       Dir.mkdir(File.join(@dir, "sub"))
       File.write(File.join(@dir, "apple.txt"), "one\n")
       File.write(File.join(@dir, "banana.md"), "hello world\n")

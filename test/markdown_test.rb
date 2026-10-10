@@ -2,7 +2,7 @@
 
 require_relative "test_helper"
 
-module RaspberryPi
+module Tart
   # The markdown converter (AC4): every subset construct's observable
   # distinction, cited to the pi oracle
   # (repos/pi/packages/tui/src/components/markdown.ts).
@@ -151,7 +151,7 @@ module RaspberryPi
     end
 
     def test_converter_source_is_gem_neutral
-      source = File.read(File.expand_path("../lib/raspberry_pi/render/markdown.rb", __dir__))
+      source = File.read(File.expand_path("../lib/tart/render/markdown.rb", __dir__))
       refute_includes source, "RatatuiRuby", "the tui-seam gate scans all of lib"
     end
   end

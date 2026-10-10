@@ -6,7 +6,7 @@ require "stringio"
 require "tmpdir"
 require "fileutils"
 
-module RaspberryPi
+module Tart
   # The MCP lane (AC3/AC4): the hand-rolled stdio client against the pure-Ruby
   # fixture echo server over real pipes; mcp.json-shaped config validation
   # with pi's exact error strings; Registry integration; the agent-level
@@ -17,7 +17,7 @@ module RaspberryPi
     RUBY = RbConfig.ruby
 
     def setup
-      @dir = Dir.mktmpdir("raspberry-pi-mcp-")
+      @dir = Dir.mktmpdir("tart-mcp-")
       @mcp_tools = []
       @errors = []
     end

@@ -6,14 +6,14 @@ require "stringio"
 require "tmpdir"
 require "fileutils"
 
-module RaspberryPi
+module Tart
   # Print mode (AC5): headless single-shot — final response only on raw
   # stdout, pi's exit-code semantics, pi's approval disposition (execute,
   # no gate) — no terminal session anywhere on the path.
   class PrintTest < Test
     def setup
       @server = MockLLMServer.new.start
-      @dir = Dir.mktmpdir("raspberry-pi-print-")
+      @dir = Dir.mktmpdir("tart-print-")
       @stdout = StringIO.new
       @stderr = StringIO.new
     end
