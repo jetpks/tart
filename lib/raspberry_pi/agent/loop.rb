@@ -143,8 +143,11 @@ module RaspberryPi
           message = step_via_bridge
           next if handle_pause
 
-          break if message.nil?
+          # The error check precedes the nil-message break: a step the worker
+          # failed before producing a message (e.g. the request itself 400s)
+          # must surface through the error path, not stop silently.
           return if stopped_on_error?
+          break if message.nil?
 
           if message.role == :tool
             next # tool batch executed; the model responds on the next step
@@ -271,6 +274,7 @@ module RaspberryPi
           # Tool results are recorded by the :tool_message item (ruby_llm's
           # after_message); the step's own return would double-count them.
           unless message.role == :tool
+            strip_thinking_replay(message)
             @new_messages << message
             emit(type: :message_end, message:) if message.role == :assistant
           end
@@ -287,6 +291,25 @@ module RaspberryPi
 
       def emit(event)
         @on_event&.call(event)
+      end
+
+      # ruby_llm 2.1 replays an assistant reply's thinking on every later
+      # request (protocols/chat_completions/chat.rb format_thinking: both
+      # `reasoning` and `reasoning_content`), which strict OpenAI-compatible
+      # endpoints reject with a schema 400 (fireworks: "Extra inputs are not
+      # permitted, field: 'messages[n].reasoning'") — killing every follow-up
+      # turn after a thinking reply. pi does not build replay from reasoning
+      # deltas either way (packages/ai/src/api/openai-completions.ts
+      # convertMessages); the port suppresses it outright (deviation itemized
+      # in the iteration record). Mirrors the gem's own without_native_content
+      # idiom (message.rb:140-146: instance_variable_set on a live message);
+      # narrower than calling without_native_content, which would also strip
+      # tool-call thought signatures (message.rb:316-321).
+      def strip_thinking_replay(message)
+        return unless message.role == :assistant
+
+        message.instance_variable_set(:@thinking, nil)
+        message.instance_variable_set(:@raw_reasoning, nil)
       end
     end
   end

@@ -112,6 +112,59 @@ module RaspberryPi
       assert_includes tool_message["content"], "approved-output"
     end
 
+    # I05 defect 1 (live repro tmp/repro_tool_hang.rb): a worker exception
+    # (the mock's scripted 400 — the live shape was fireworks 400ing the
+    # replayed reasoning field) must terminate the run through the existing
+    # error path. The pre-fix bridge left the reactor blocked on queue.pop
+    # forever after the dead worker pushed {type: :error} — this test's
+    # bounded wait times out there (5 s) instead of hanging the suite.
+    def test_worker_error_terminates_the_run_bounded
+      @server.script([{type: :error, status: 400,
+                       message: "Extra inputs are not permitted ('messages[1].reasoning')"}])
+      agent, events = agent_on_kernel
+      run_agent_bounded(agent, "hi")
+
+      error_event = events.find { |e| e[:type] == :agent_end }
+      assert error_event, "the run must reach agent_end"
+      assert error_event[:error], "the worker's error must surface on agent_end"
+      assert_kind_of RubyLLM::BadRequestError, agent.last_error
+      assert_includes agent.last_error.message, "Extra inputs"
+      assert_equal %i[user], agent.new_messages.map(&:role)
+    end
+
+    # I05 defect 2 (live repro: GLM-5.3-flash thinking reply): ruby_llm
+    # stores reasoning_content deltas as Message#thinking and replays it as
+    # `reasoning` + `reasoning_content` on every later request (chat.rb
+    # format_thinking), which fireworks rejects with a schema 400. The port
+    # strips it at the step boundary: the captured follow-up payload must
+    # carry no reasoning field on any assistant message, and the
+    # tool-result continuation must stream to completion.
+    def test_thinking_replay_is_suppressed_on_followup_requests
+      @server.script([
+        {type: :stream, content: "listing", reasoning_content: "I should list the files",
+         tool_calls: [{id: "call_1", name: "ls", arguments: {path: "."}}]},
+        {type: :message, content: "done"},
+      ])
+      File.write(File.join(@dir, "fixture.txt"), "x")
+      tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
+      agent, events = agent_on_kernel(tools:)
+      result = run_agent(agent, "list the files")
+
+      requests = @server.captured_requests
+      assert_equal 2, requests.size
+      assistants = requests.last["messages"].select { |m| m["role"] == "assistant" }
+      assert assistants.any?
+      assistants.each do |message|
+        refute message.key?("reasoning"), "replayed `reasoning` must be stripped"
+        refute message.key?("reasoning_content"), "replayed `reasoning_content` must be stripped"
+      end
+      assert_equal "done", result.last.content
+      types = events.map { |e| e[:type] }
+      assert_includes types, :turn_end
+      error_ends = events.select { |e| e[:type] == :agent_end && e[:error] }
+      assert_empty error_ends, "the continuation must complete without an error"
+    end
+
     def test_queued_message_continues_the_outer_loop
       @server.script([
         {type: :message, content: "first answer"},
@@ -173,6 +226,18 @@ module RaspberryPi
 
     def agent_newly_complete?(agent)
       agent.new_messages.last.role == :assistant
+    end
+
+    # Runs the agent on the kernel in a side thread with the house 5 s
+    # deadline: an unbounded run (the pre-fix error-path hang) fails the
+    # test instead of wedging the suite.
+    def run_agent_bounded(agent, prompt)
+      thread = Thread.new do
+        Thread.current.report_on_exception = false
+        Core::Loop.new(session: ScriptedSession.new).run { agent.run(prompt) }
+      end
+      wait_until { !thread.alive? }
+      thread.join
     end
   end
 end
