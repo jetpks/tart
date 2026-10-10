@@ -37,6 +37,24 @@ module RaspberryPi
       end
     end
 
+    # The markdown seam's conversion (AC5): markdown-vocabulary rows
+    # (duck-typed spans: text/fg/modifiers) → styled Lines; an empty row is
+    # a blank line.
+    def test_markdown_line_converts_vocabulary_rows_and_read_back
+      TUI.run(headless: true, width: 20, screen_height: 4) do |session|
+        span = Render::Markdown::Span
+        session.draw(TUI.paragraph(text: [
+          TUI.markdown_line([span.new(text: "ab", fg: :yellow, modifiers: [:bold])]),
+          TUI.markdown_line([]),
+          TUI.markdown_line([span.new(text: "cd")]),
+        ]))
+        assert_equal :yellow, session.cell_fg(0, 0), "fg converts to the span's Style"
+        assert_equal [:bold], session.cell_modifiers(0, 0), "modifiers convert to the span's Style"
+        assert_equal " ", session.cell_symbol(0, 1), "an empty row renders a blank line"
+        assert_nil session.cell_fg(0, 2), "an unstyled span carries the terminal default"
+      end
+    end
+
     def test_terminal_restored_after_normal_run
       TUI.run(headless: true) { |session| session.draw(TUI.status_panel("x")) }
       refute TUI::Session.active?
