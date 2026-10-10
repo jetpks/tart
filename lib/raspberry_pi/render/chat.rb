@@ -35,6 +35,29 @@ module RaspberryPi
       # event-driven when idle — the I02 static-loop property).
       BUSY_FRAME_SECONDS = 0.25
 
+      # Rows the pending-approval block occupies in the live region.
+      APPROVAL_ROWS = 3
+
+      # Bounded multi-line tool-result preview: at most this many content
+      # lines, then an ellipsis row (pi truncates tool output previews).
+      TOOL_PREVIEW_LINES = 3
+
+      # The style vocabulary — fg colors behind the TUI seam, porting pi's
+      # observable distinctions (dark theme): the user echo carries the blue
+      # distinction (pi: userMessageBg blue background; fg is the closest
+      # analog on a plain span), assistant text stays the terminal default
+      # (pi: userMessageText/text), tool output is muted (pi: toolOutput),
+      # status is dim (pi: spinner/thinking), interrupts yellow and errors
+      # red (pi: warning/error).
+      FG = {
+        user: :light_blue,
+        assistant: nil,
+        tool: :gray,
+        status: :dark_gray,
+        interrupted: :yellow,
+        error: :red,
+      }.freeze
+
       # @param session the TUI session (inline viewport).
       # @param kernel [Core::Loop] the kernel; used to open animation windows
       #   and to submit agent runs as kernel tasks.
@@ -110,6 +133,7 @@ module RaspberryPi
       # Agent event sink (I03 event surface). Runs on the agent fiber.
       def on_agent_event(event)
         handled = nil
+        fg = nil
         @mutex.synchronize do
           case event[:type]
           when :agent_start
@@ -121,18 +145,24 @@ module RaspberryPi
             @live << chunk.content if chunk.content.is_a?(String) && !chunk.content.empty?
           when :message_end
             message = event[:message]
-            handled = complete(message.content) if message.role == :assistant
+            if message.role == :assistant
+              handled = complete(message.content)
+              fg = FG[:assistant]
+            end
           when :tool_execution_start
             @tool = event[:tool_call].name
           when :tool_execution_end
             @tool = nil
             handled = tool_line(event[:tool_call].name, event[:result])
+            fg = FG[:tool]
           when :agent_end
             @busy = false
-            handled = if event[:interrupted] == true
-              "interrupted"
+            if event[:interrupted] == true
+              handled = "interrupted"
+              fg = FG[:interrupted]
             elsif event[:error]
-              "error: #{event[:error].message}"
+              handled = "error: #{event[:error].message}"
+              fg = FG[:error]
             end
             # A message submitted in the wind-down window (after the agent's
             # final steering check, before agent_end) sits queued with no run
@@ -143,7 +173,7 @@ module RaspberryPi
             end
           end
         end
-        enqueue_scrollback(handled) if handled
+        enqueue_scrollback(handled, fg:) if handled
         @kernel.animate(duration: BUSY_FRAME_SECONDS)
       end
 
@@ -214,6 +244,7 @@ module RaspberryPi
       # Completed content: queued for insertion above the live region,
       # wrapped to the viewport width. Mutex context (called from
       # on_agent_event); returns the final text (nil when nothing to show).
+      # (fg set by the caller.)
       def complete(text)
         @live = +""
         return nil if !text.is_a?(String) || text.empty?
@@ -221,16 +252,23 @@ module RaspberryPi
         text
       end
 
-      def enqueue_scrollback(line)
-        return if line.nil? || line.empty?
+      def enqueue_scrollback(text, fg:)
+        return if text.nil? || text.empty?
 
-        @scrollback << Chat.wrap(line, viewport_width)
+        @scrollback << [Chat.wrap(text, viewport_width), fg]
       end
 
+      # Bounded multi-line preview (pi truncates tool output): the first
+      # TOOL_PREVIEW_LINES non-empty lines, then an ellipsis row.
       def tool_line(name, result)
         text = result.is_a?(Hash) ? (result[:error] || result[:content] || "").to_s : result.to_s
-        preview = text.lines(chomp: true).first.to_s
-        "  ⎿ #{name}: #{preview}"
+        lines = text.lines(chomp: true).map(&:rstrip).reject(&:empty?)
+        return "  ⎿ #{name}" if lines.empty?
+
+        preview = lines.first(TOOL_PREVIEW_LINES)
+        preview << "…" if lines.size > TOOL_PREVIEW_LINES
+        rest = preview[1..].map { |line| "    #{line}" }
+        (["  ⎿ #{name}: #{preview.first}"] + rest).join("\n")
       end
 
       def viewport_width
@@ -275,7 +313,7 @@ module RaspberryPi
         return if text.strip.empty?
 
         @input.clear
-        enqueue_scrollback("❯ #{text}")
+        enqueue_scrollback("❯ #{text}", fg: FG[:user])
         if busy?
           @agent.push_message(text) # steering: consumed at the next turn boundary
         else
@@ -290,15 +328,15 @@ module RaspberryPi
       # editor in the editor container) and its keys are consumed.
       def build_widget
         lines = []
-        lines << status_line if @busy
-        lines.concat(live_lines)
+        lines << TUI.line(status_line, fg: FG[:status]) if @busy
+        lines.concat(live_lines.map { |line| TUI.line(line) }) # assistant: terminal default
         if @pending
-          lines.concat(approval_lines)
+          lines.concat(approval_lines.map { |line| TUI.line(line, fg: FG[:interrupted]) })
         else
-          lines << "❯ #{@input}"
+          lines << TUI.line("❯ #{@input}")
         end
         lines = lines.last(viewport_height) if viewport_height
-        TUI.paragraph(text: lines.join("\n"), wrap: false)
+        TUI.paragraph(text: lines, wrap: false)
       end
 
       def status_line
@@ -307,13 +345,17 @@ module RaspberryPi
       end
 
       # The streaming text, wrapped to the viewport width, as many tail
-      # lines as fit above the status/input rows (deltas append; the
-      # window slides).
+      # lines as fit above the other live-region rows (deltas append; the
+      # window slides): the status line while busy, then the approval block
+      # (APPROVAL_ROWS rows) or the input line. (The final clip in
+      # build_widget stays authoritative; this estimate is what keeps a
+      # full live tail from pushing those rows out from under it.)
       def live_lines
         return [] if @live.empty?
 
         wrapped = self.class.wrap(@live, viewport_width)
-        budget = viewport_height ? viewport_height - 1 - (@busy ? 1 : 0) - (@pending ? 0 : 1) : wrapped.size
+        fixed = (@busy ? 1 : 0) + (@pending ? APPROVAL_ROWS : 1)
+        budget = viewport_height ? viewport_height - fixed : wrapped.size
         wrapped.last([budget, 0].max)
       end
 
@@ -336,8 +378,8 @@ module RaspberryPi
       # renderer before drawing, and insert_before itself raises during draw.
       def flush_scrollback
         until @scrollback.empty?
-          lines = @scrollback.pop
-          @session.insert_before(lines.size, TUI.paragraph(text: lines.join("\n")))
+          lines, fg = @scrollback.pop
+          @session.insert_before(lines.size, TUI.paragraph(text: lines.map { |line| TUI.line(line, fg:) }))
         end
       end
     end

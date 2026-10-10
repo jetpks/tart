@@ -74,6 +74,14 @@ module RaspberryPi
         RatatuiRuby.get_cell_at(x, y).symbol
       end
 
+      # Foreground color of the cell at (+x+, +y+) — style assertions on the
+      # headless test terminal. Named colors read back as symbols (+:red+,
+      # +:light_blue+, +:dark_gray+), indexed as integers, RGB as
+      # +"#rrggbb"+; nil when the cell carries the terminal default.
+      def cell_fg(x, y)
+        RatatuiRuby.get_cell_at(x, y).fg
+      end
+
       # Inserts content above an inline viewport into scrollback (the chat
       # surface's completed-content path). Requires an inline viewport;
       # +height+ is the number of lines the widget renders. Follow with a
@@ -142,9 +150,22 @@ module RaspberryPi
     end
 
     # @return a Paragraph widget (the chat surface's live region / scrollback
-    #   line builder). +text+ is a String (newlines are rows).
+    #   line builder). +text+ is a String (newlines are rows) or an array of
+    #   Lines (one styled row each) built by {line}.
     def paragraph(text:, wrap: false)
       RatatuiRuby::Widgets::Paragraph.new(text:, wrap:)
+    end
+
+    # @return [RatatuiRuby::Style::Style] a style value (fg color + modifiers).
+    def style(fg: nil, modifiers: [])
+      RatatuiRuby::Style::Style.new(fg:, modifiers:)
+    end
+
+    # @return [RatatuiRuby::Text::Line] one display line as a single span,
+    #   optionally fg-colored (nil = the terminal default).
+    def line(text, fg: nil)
+      span = RatatuiRuby::Text::Span.new(content: text, style: fg && style(fg: fg))
+      RatatuiRuby::Text::Line.new(spans: [span])
     end
 
     # @return [Integer] the display width of +string+ in terminal cells

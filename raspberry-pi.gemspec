@@ -19,9 +19,12 @@ Gem::Specification.new do |spec|
   spec.metadata["homepage_uri"] = spec.homepage
 
   spec.files = Dir.chdir(__dir__) do
-    Dir["lib/**/*.rb", "README.md"]
+    Dir["lib/**/*.rb", "bin/*", "README.md"]
   end
   spec.require_paths = ["lib"]
+
+  spec.bindir = "bin"
+  spec.executables = ["raspberry-pi"]
 
   spec.add_dependency "async", "~> 2.46"
   # Line diffs for the edit tool's details (pi uses the jsdiff package).
