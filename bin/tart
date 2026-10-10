@@ -176,7 +176,8 @@ module Tart
 
         # /new's reset seam: a fresh session is a new recorder (new session
         # file, no parent) plus a fresh Agent::Loop on the same settings,
-        # system prompt, skills, and tools — the surface swaps its agent.
+        # system prompt, skills, and tools. The surface then clears itself
+        # and re-renders the MOTD + accent line (Chat#new_session).
         start_session = lambda do |resume_path|
           recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
           seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
@@ -200,7 +201,7 @@ module Tart
           output: ->(text) { surface.command_line(text) },
           spawn: ->(&block) { kernel.async(&block) },
           agent: -> { surface.agent },
-          reset: lambda { start_session.call(nil); surface.command_line("✓ New session started") },
+          reset: lambda { start_session.call(nil); surface.new_session },
           quit: -> { kernel.stop! }
         )
         start_session.call(options[:resume_given] && resolve_resume(options[:resume], workdir))

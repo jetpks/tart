@@ -474,7 +474,9 @@ module Tart
         draw(chat, session)
         lines = chat.transcript_lines
 
-        assert_includes lines.join, "▛", "the logo placeholder renders (swappable)"
+        art = Dir[File.join(Render::Chat::LOGOS_DIR, "*.txt")].map { |f| File.readlines(f, chomp: true) }
+        assert art.any? { |piece| (piece - lines).empty? },
+          "a random logo piece from the owner's collection renders in full"
         assert_includes lines, "tart v#{Tart::VERSION}", "the version line renders Tart::VERSION"
         assert_includes lines.join, "/ commands", "the hints line carries the port's real keys"
         refute_includes lines.join, "! ", "no `!` bash hint — the port has no bash mode"

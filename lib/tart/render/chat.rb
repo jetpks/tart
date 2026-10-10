@@ -62,15 +62,17 @@ module Tart
         overflow: "Context overflow detected, Auto-compacting..."
       }.freeze
 
-      # The MOTD logo placeholder (identity deviation, itemized): the
-      # owner's own art lands here. pi's half-block mark
-      # (components/pi-logo.ts) is a shape reference only — two-ish lines of
-      # fixed brand art beside the header — never copied.
-      LOGO_LINES = [
-        "▛▀▀▀▀▀▀▀▀▜",
-        "▌ tart ▐",
-        "▙▄▄▄▄▄▄▄▄▟"
-      ].freeze
+      # The MOTD logo (identity deviation, itemized): the owner's
+      # ascii-art collection — one random piece per MOTD render (boot and
+      # /new). pi's half-block mark (components/pi-logo.ts) is a shape
+      # reference only — never copied.
+      LOGOS_DIR = File.expand_path("logos", __dir__)
+
+      # One random art piece's lines (empty collection → no logo lines).
+      def motd_logo_lines
+        file = Dir[File.join(LOGOS_DIR, "*.txt")].sample
+        file ? File.readlines(file, chomp: true) : []
+      end
 
       # The MOTD hints line — the PORT's real keys only (pi's `!` bash
       # mode, escape-to-clear, ctrl+c-twice and the thinking/model cycles
@@ -632,7 +634,7 @@ module Tart
       # onboarding line are cut — the port loads none of them, itemized).
       def enqueue_motd
         width = viewport_width
-        lines = LOGO_LINES.map { |line| TUI.line(line) }
+        lines = motd_logo_lines.map { |line| TUI.line(line) }
         lines << TUI.line([TUI.span("tart"), TUI.span(" v#{Tart::VERSION}", fg: Theme[:dim])])
         lines << TUI.line(Chat.wrap(HINTS_LINE, width).map { |row| TUI.span(row, fg: Theme[:dim]) })
         motd_sections(width).each do |header, rows|

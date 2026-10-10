@@ -19,7 +19,7 @@ Gem::Specification.new do |spec|
   spec.metadata["homepage_uri"] = spec.homepage
 
   spec.files = Dir.chdir(__dir__) do
-    Dir["lib/**/*.rb", "bin/*", "README.md"]
+    Dir["lib/**/*.rb", "lib/tart/render/logos/*.txt", "bin/*", "README.md"]
   end
   spec.require_paths = ["lib"]
 
