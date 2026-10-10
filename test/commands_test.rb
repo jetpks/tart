@@ -39,7 +39,9 @@ module Tart
     def load_skills
       FileUtils.mkpath(File.dirname(skill_file))
       File.write(skill_file, "---\nname: greet\ndescription: Says hello\n---\nHello body line.")
-      Skills.load(cwd: @dir, root: @root).skills
+      # claude_dir: a nonexistent fixture path — the default (~/.claude/skills,
+      # owner ruling 2026-10-10) would leak the real home into the test.
+      Skills.load(cwd: @dir, root: @root, claude_dir: File.join(@root, "claude-skills")).skills
     end
 
     # Minimal loop double: dispatch_compact calls #compact and the surface
