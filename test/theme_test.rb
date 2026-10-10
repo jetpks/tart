@@ -12,7 +12,7 @@ module Tart
     # mappings — rendered output stays identical where tests pin it).
     EXPECTED = {
       text: nil,                      # dark.json "text" — the terminal default
-      dim: :dark_gray,                # "dim" okhsl(229 8% 56%)
+      dim: :gray,                     # "dim" okhsl(229 8% 56%) (dark.json:24) — the mid-gray analog, I14 item 9
       muted: :gray,                   # "muted" okhsl(229 6% 67%)
       border: :gray,                  # "borderMuted" okhsl(229 8% 53%)
       warning: :yellow,               # "warning" yellow
@@ -63,7 +63,7 @@ module Tart
     def test_surface_roles_resolve_through_the_theme
       assert_equal Theme[:user_message_text], :light_blue
       assert_equal Theme[:tool_output], Theme[:muted]
-      assert_equal Theme[:dim], :dark_gray
+      assert_equal Theme[:dim], :gray, "the footer-dim analog (I14 item 9: pi's whole footer is dim, okhsl 56%)"
       assert_equal Theme[:warning], :yellow
       assert_equal Theme[:error], :red
     end

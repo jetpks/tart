@@ -23,13 +23,9 @@ module Tart
     # proc); agent events mutate state under a mutex from the agent fiber;
     # key events arrive through the kernel's on_event. The agent runs as a
     # kernel task (+kernel.async { agent.run }+, event-only run mode) so a
-    # kernel interrupt (Ctrl+C) cancels the in-flight turn.
-    #
-    # Approval: the approval callback runs on the kernel fiber and waits on
-    # an +Async::Queue#pop+ — interruptible at the suspension point by
-    # Task#stop. The decision is pushed cross-thread (the I03 lost-wakeup
-    # cure: a fiber-to-fiber +Async::Queue+ push on the same thread can fail
-    # to wake a blocked pop; a cross-thread push is the proven path).
+    # kernel interrupt (Ctrl+C) cancels the in-flight turn. (I14: the
+    # approval UI is deleted — pi has no permissions system; the plumbing
+    # side lives in the agent lane.)
     class Chat
       SPINNER = %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏].freeze
 
@@ -37,9 +33,6 @@ module Tart
       # (frame pacing: deadline-paced at the frame rate while busy, purely
       # event-driven when idle — the I02 static-loop property).
       BUSY_FRAME_SECONDS = 0.25
-
-      # Rows the pending-approval block occupies in the editor area.
-      APPROVAL_ROWS = 3
 
       # Rows the footer always occupies (pi renders a pwd line + a stats
       # line — footer.ts:169-171).
@@ -69,6 +62,21 @@ module Tart
         overflow: "Context overflow detected, Auto-compacting..."
       }.freeze
 
+      # The MOTD logo placeholder (identity deviation, itemized): the
+      # owner's own art lands here. pi's half-block mark
+      # (components/pi-logo.ts) is a shape reference only — two-ish lines of
+      # fixed brand art beside the header — never copied.
+      LOGO_LINES = [
+        "▛▀▀▀▀▀▀▀▀▜",
+        "▌ tart ▐",
+        "▙▄▄▄▄▄▄▄▄▟"
+      ].freeze
+
+      # The MOTD hints line — the PORT's real keys only (pi's `!` bash
+      # mode, escape-to-clear, ctrl+c-twice and the thinking/model cycles
+      # have no port binding; cut, itemized).
+      HINTS_LINE = "ctrl+c interrupt/quit · ctrl+d exit (empty) · / commands · pgup/pgdn scroll".freeze
+
       # The boundary classes of pi's word navigation (word-navigation.ts with
       # utils.ts:1006 PUNCTUATION_REGEX and :1011 isWhitespaceChar). The
       # Intl.Segmenter word-like segment is approximated by word-character
@@ -94,15 +102,24 @@ module Tart
       # @param footer_data [Hash, nil] launcher-wired footer facts (AC4):
       #   +:cwd+ (the working directory), +:model+ (the resolved model id),
       #   +:context_window+ (the I10 resolved window — the usage
-      #   denominator), +:auto_compact+ (the compaction-enabled indicator).
-      #   nil renders the footer from what the surface knows alone.
+      #   denominator), +:auto_compact+ (the compaction-enabled indicator),
+      #   +:thinking_level+ (the settings-resolved level; the footer
+      #   renders +model • <level>+, nil → the model alone). nil renders
+      #   the footer from what the surface knows alone.
       # @param branch_reader [Proc] +call(cwd)+ → branch name or nil.
       # @param autocomplete [Object, nil] the completion-source seam (AC1):
       #   answers +items+ with the full {value:, label:, description:}
       #   catalog the surface fuzzy-filters. nil (the default) offers no
       #   suggestions — headless tests stay deterministic; bin/tart wires
       #   the real command/skill sources (see {SlashSource}).
-      def initialize(session:, kernel:, footer_data: nil, branch_reader: DEFAULT_BRANCH_READER, autocomplete: nil)
+      # @param motd [Boolean] render the startup MOTD block on the first
+      #   frame (and on {new_session}); tests that pin plain transcript
+      #   content opt out, the launcher's default renders it.
+      # @param settings_root [String] the user config dir the MOTD's
+      #   [Context] section reports (injectable so tests never touch
+      #   ~/.tart).
+      def initialize(session:, kernel:, footer_data: nil, branch_reader: DEFAULT_BRANCH_READER, autocomplete: nil,
+        motd: true, settings_root: Agent::Session.default_root)
         @session = session
         @kernel = kernel
         @footer_data = footer_data
@@ -135,9 +152,7 @@ module Tart
         @reasoning = +""
         @busy = false
         @tool = nil
-        @pending = nil
         @frames = 0
-        @decisions = Async::Queue.new
         # Completed lines awaiting the transcript buffer on the next frame
         # (thread-safe: agent fiber produces, frame loop consumes).
         @scrollback = Queue.new
@@ -153,6 +168,8 @@ module Tart
         @usage_stale = false
         @branch = nil
         @branch_fetched = false
+        @settings_root = settings_root
+        @motd_pending = motd # rendered on the first frame, once wired
       end
 
       # The agent loop this surface drives (wired after construction: the
@@ -167,18 +184,12 @@ module Tart
       # The launcher-wired footer facts (see #initialize).
       attr_writer :footer_data
 
-      # @return [Object, nil] the tool call awaiting an approval decision.
-      def pending_approval
-        @mutex.synchronize { @pending }
-      end
-
       # @return [Boolean] whether an agent run is in flight.
       def busy?
         @mutex.synchronize { @busy }
       end
 
-      # @return [String] the input line buffer (input is not rendered while
-      #   an approval prompt is pending; keys are consumed by the prompt).
+      # @return [String] the input line buffer.
       attr_reader :input
 
       # @return [Array<String>] the transcript buffer's display lines (test
@@ -215,6 +226,8 @@ module Tart
       def render_frame
         widget = nil
         @mutex.synchronize do
+          enqueue_motd if @motd_pending
+          @motd_pending = false
           flush_scrollback
           @frames += 1
           widget = build_widget
@@ -232,13 +245,7 @@ module Tart
       def on_event(event, _source = nil)
         return unless event.key? || event.paste?
 
-        decided = nil
-        @mutex.synchronize { decided = @pending }
-        if decided
-          decide(event)
-        else
-          edit_input(event)
-        end
+        edit_input(event)
       end
 
       # Agent event sink (I03 event surface). Runs on the agent fiber.
@@ -262,16 +269,8 @@ module Tart
             message = event[:message]
             if message.role == :assistant
               accumulate_usage(message)
-              # The joined thinking renders as a dim block BEFORE the content
-              # (pi assistant-message.ts:99-175 render order). The live
-              # reasoning buffer is the text source, not Message#thinking —
-              # the loop strips the latter before this event (itemized
-              # deviation from the spec's message.thinking.text letter).
-              flush_reasoning
               handled = complete(message.content)
-              # Assistant completions render as markdown (AC5) — at
-              # completion only: the live region streamed the raw source.
-              enqueue_markdown(handled) if handled
+              enqueue_message(handled)
             end
           when :tool_execution_start
             @tool = event[:tool_call].name
@@ -317,21 +316,30 @@ module Tart
         @kernel.animate(duration: BUSY_FRAME_SECONDS)
       end
 
-      # The agent loop's approval callback (runs on the kernel fiber).
-      # Waits interruptibly for the key-driven decision; +false+ (deny) is
-      # the default outcome, pi's permission-dialog semantics.
-      def approval(tool_call)
-        @mutex.synchronize { @pending = tool_call }
-        decision = false
-        begin
-          @kernel.animate(duration: BUSY_FRAME_SECONDS)
-          decision = @decisions.pop # interruptible: Task#stop raises here
-        ensure
-          @mutex.synchronize { @pending = nil }
-          # A raced decision must not pre-approve a later call.
-          @decisions.pop until @decisions.empty?
+      # The /new surface (bin/tart's reset seam): pi handleClearCommand →
+      # newSession → renderCurrentSessionState — the chat container clears,
+      # initial state re-renders, then the accent "✓ New session started"
+      # line (interactive-mode.ts:6926-6936, 2209-2216). The port's flat
+      # transcript analog: drop the buffer and stream state, re-render the
+      # MOTD block, then the accent line (deviation, itemized: pi's header
+      # lives in a separate container and never re-renders). Cross-lane
+      # contract: bin/tart's reset lambda calls this after swapping in the
+      # fresh agent (start_session + surface.new_session).
+      def new_session
+        @mutex.synchronize do
+          @transcript = []
+          @scrollback.clear
+          @scroll_offset = 0
+          @follow = true
+          @live = +""
+          @reasoning = +""
+          # pi's footer stats re-derive from the fresh (empty) session.
+          @usage_totals = {input: 0, output: 0, cache_read: 0, cache_write: 0}
+          @last_usage = nil
+          @usage_stale = false
+          enqueue_motd
+          enqueue_scrollback("✓ New session started", fg: Theme[:accent])
         end
-        decision
       end
 
       # Slash-command output (pi's chat-line status UX): a muted line in
@@ -492,17 +500,21 @@ module Tart
 
         # pi fuzzyFilter (fuzzy.ts:75-106): whitespace/slash-separated query
         # tokens must ALL match the search text; matches sort best-first.
+        # pi's Array#sort is stable (ties keep the pre-sort catalog order —
+        # item 4); Ruby's sort_by is not, so the pre-sort index is the
+        # tie-break (item 4 fix: /ar's architect-family ties land where
+        # pi's do).
         def fuzzy_filter(items, query)
           return items if query.strip.empty?
 
           tokens = query.strip.split(/[\s\/]+/).reject(&:empty?)
           return items if tokens.empty?
 
-          items.filter_map do |item|
+          items.each_with_index.filter_map do |item, i|
             text = yield(item)
             scores = tokens.map { |token| fuzzy_match(token, text) }
-            scores.all? ? [item, scores.sum] : nil
-          end.sort_by { |_, score| score }.map(&:first)
+            scores.all? ? [item, scores.sum, i] : nil
+          end.sort_by { |_, score, i| [score, i] }.map(&:first)
         end
 
         # Longest prefix of +line+ fitting +width+, preferring a word break.
@@ -583,6 +595,104 @@ module Tart
         text
       end
 
+      # A completed assistant message as transcript rows (pi
+      # assistant-message.ts updateContent): the leading blank every
+      # message with visible content opens with (:103-105 — the
+      # between-item rule), the joined reasoning block, the blank after a
+      # thinking run when content follows (:172-174), then the content.
+      # A reasoning-only message gets no trailing blank.
+      def enqueue_message(content)
+        has_reasoning = !@reasoning.empty?
+        has_content = !content.nil?
+        return unless has_reasoning || has_content
+
+        @scrollback << [blank_line]
+        # The joined thinking renders as a dim block BEFORE the content
+        # (pi assistant-message.ts:99-175 render order). The live
+        # reasoning buffer is the text source, not Message#thinking —
+        # the loop strips the latter before this event (itemized
+        # deviation from the spec's message.thinking.text letter).
+        flush_reasoning
+        if has_content
+          # Assistant completions render as markdown (AC5).
+          @scrollback << [blank_line] if has_reasoning
+          enqueue_markdown(content)
+        end
+      end
+
+      def blank_line
+        TUI.line("")
+      end
+
+      # The startup MOTD block (I14 item 12): the logo placeholder, the
+      # version line, the hints line, then the [Context] and [Skills]
+      # resource sections (pi's header interactive-mode.ts:1040-1080 +
+      # showLoadedResources :1778-1860; the [Prompts]/[Extensions]/[Themes]
+      # sections, package-update notices, the expand machinery and the
+      # onboarding line are cut — the port loads none of them, itemized).
+      def enqueue_motd
+        width = viewport_width
+        lines = LOGO_LINES.map { |line| TUI.line(line) }
+        lines << TUI.line([TUI.span("tart"), TUI.span(" v#{Tart::VERSION}", fg: Theme[:dim])])
+        lines << TUI.line(Chat.wrap(HINTS_LINE, width).map { |row| TUI.span(row, fg: Theme[:dim]) })
+        motd_sections(width).each do |header, rows|
+          lines << blank_line << TUI.line(header, fg: Theme[:md_heading])
+          lines.concat(rows)
+        end
+        @scrollback << lines
+      end
+
+      # The loaded-resource sections (pi showLoadedResources): [Context] —
+      # the config sources the port actually loads, existing files only,
+      # registration order (pi's contextCompactList, sort: false);
+      # [Skills] — the loaded skill names, sorted, dim, one wrapped
+      # compact list (pi formatCompactList :1791-1797). Sections with no
+      # entries are omitted, as in pi.
+      def motd_sections(width)
+        sections = []
+        context = context_sources.select { |path| File.file?(path) }
+        unless context.empty?
+          sections << ["[Context]", dim_compact_list(context, width)]
+        end
+        skills = motd_skill_names # sorted (pi formatCompactList's localeCompare)
+        unless skills.empty?
+          sections << ["[Skills]", dim_compact_list(skills, width)]
+        end
+        sections
+      end
+
+      # The config files the port loads for +cwd+ (Settings.load's user +
+      # project pair and the MCP config; settings.rb:12-14,
+      # mcp/config.rb:16). Paths injectable through +settings_root+ so
+      # tests never touch ~/.tart.
+      def context_sources
+        mcp = ENV["TART_MCP_CONFIG"] || File.join(@settings_root, "mcp.json")
+        cwd = @footer_data&.fetch(:cwd, nil) || Dir.pwd
+        [
+          File.join(@settings_root, Settings::ROOT_KEY),
+          File.join(cwd, Settings::CONFIG_DIR, Settings::ROOT_KEY),
+          mcp
+        ]
+      end
+
+      # The MOTD's [Skills] names: the wired completion source's skill
+      # entries (SlashSource carries exactly the launcher's loaded skills).
+      def motd_skill_names
+        return [] unless @autocomplete
+
+        @autocomplete.items.filter_map { |item|
+          item[:value].delete_prefix("skill:") if item[:value].start_with?("skill:")
+        }.sort
+      end
+
+      # pi formatCompactList (:1791-1797): trimmed entries joined ", ",
+      # two-space indent, dim — word-wrapped to the viewport width. (The
+      # sort, when wanted, happens at the call site: pi's [Context] list
+      # passes sort: false — registration order.)
+      def dim_compact_list(entries, width)
+        Chat.wrap("  #{entries.join(", ")}", width).map { |row| TUI.line(row, fg: Theme[:dim]) }
+      end
+
       # Verbatim completed text (user echo, tool output, status): wrapped to
       # the transcript width, one line-level fg.
       def enqueue_scrollback(text, fg:)
@@ -594,15 +704,21 @@ module Tart
       # Assistant completions render through the markdown converter (AC5):
       # styled rows wrapped to the transcript width, every span's fg routed
       # through the theme (AC3), then converted row → Line at the TUI seam.
-      # The live region streamed the raw source verbatim — markdown renders
-      # at completion only (the recorded deviation from pi's streaming
-      # markdown rendering).
       def enqueue_markdown(text)
         return if text.nil? || text.empty?
 
-        width = viewport_width
+        @scrollback << markdown_lines(text, viewport_width)
+      end
+
+      # Markdown text as themed display lines (the Render::Markdown
+      # converter is read-only — theme colors apply at the span level via
+      # {Theme.md_fg}; rows re-wrapped to the width). Shared by the
+      # completion path and the live region (item 3: pi re-renders the
+      # whole streaming message as markdown on every update —
+      # interactive-mode.ts:3519-3535, assistant-message.ts:107-109).
+      def markdown_lines(text, width)
         rows = Render::Markdown.rows(text, width:).flat_map { |row| Chat.wrap_row(row, width) }
-        @scrollback << rows.map do |row|
+        rows.map do |row|
           themed = row.map { |span| Render::Markdown::Span.new(text: span.text, fg: Theme.md_fg(span.fg), modifiers: span.modifiers) }
           TUI.markdown_line(themed)
         end
@@ -639,24 +755,6 @@ module Tart
       def viewport_width
         area = @session.viewport_area
         area ? area.width : 80
-      end
-
-      # Pending-approval keys: y/Y approve, n/N deny, everything else is
-      # consumed by the prompt (never reaches the chat input line).
-      def decide(event)
-        return unless event.key?
-
-        case event.code
-        when "y", "Y" then resolve(true)
-        when "n", "N" then resolve(false)
-        end
-      end
-
-      # Cross-thread push (the I03 lost-wakeup cure): the waiting fiber is on
-      # the reactor thread; a fiber-to-fiber Async::Queue push can fail to
-      # wake it, a cross-thread push is the proven path.
-      def resolve(value)
-        Thread.new { @decisions << value }.join
       end
 
       # The input-line editor (pi's Input, components/input.ts): a cursor
@@ -893,7 +991,7 @@ module Tart
       end
 
       def editor_area_rows(height)
-        [MIN_EDITOR_ROWS + (@pending ? APPROVAL_ROWS - 1 : 0) + autocomplete_rows, height - 1].min
+        [MIN_EDITOR_ROWS + autocomplete_rows, height - 1].min
       end
 
       # pi's navigateHistory (editor.ts:454-484): -1 is the live draft; up
@@ -985,24 +1083,23 @@ module Tart
           track_fg: Theme[:scrollbarTrack], thumb_fg: Theme[:scrollbarThumb])
       end
 
-      # The bordered editor area (pi CustomEditor): the input line inside
-      # the borders; while an approval prompt holds the editor, its prompt
-      # displaces the input row (pi: the dialog replaces the editor in the
-      # editor container). The top border's title is the status line (pi
-      # renderTopBorder via custom-editor.ts:18-22) — absent when idle (pi
-      # IdleStatus renders empty).
+      # The edit box (pi CustomEditor, item 5): full-width from column 0,
+      # horizontal borders ONLY (the top border carries the status line —
+      # custom-editor.ts renderTopBorder :36-77; renderBottomBorder
+      # editor.ts:516), no east/west borders, no prompt char (pi's editor
+      # renders the bare text; the "❯" prompt was an I11 invention),
+      # paddingX 0 (pi's editorPaddingX default, settings-defaults.ts:46)
+      # with pi's one reserved cursor column (editor.ts:518-521: without
+      # padding the layout width is width − 1). The suggestion list renders
+      # below the input row, inside the editor area (pi editor.ts:618-634
+      # — the area height grows by the list height; the port's standing
+      # I12 placement).
       def editor_widget
-        inner = [viewport_width - 2, 1].max
-        content = if @pending
-          approval_lines(inner).map { |text| TUI.line(text, fg: Theme[:warning]) }
-        else
-          # The suggestion list renders below the input row, inside the
-          # editor area (pi editor.ts:618-634 — the area height grows by
-          # the list height).
-          [TUI.line(clip_spans(input_spans, inner))] + autocomplete_lines(inner)
-        end
+        inner = [viewport_width - 1, 1].max
+        content = [TUI.line(clip_spans(input_spans, inner))] + autocomplete_lines(inner)
         TUI.block(
           title: status_title,
+          borders: [:top, :bottom],
           border_style: TUI.style(fg: Theme[:border]),
           title_style: TUI.style(fg: Theme[:dim]),
           children: [TUI.paragraph(text: content, wrap: false)]
@@ -1027,9 +1124,11 @@ module Tart
       end
 
       # The footer (AC4, pi footer.ts): line 1 the ~-contracted cwd with the
-      # git branch; line 2 the token stats left and the model id
-      # right-aligned, all dim except the context segment (warning >70%,
-      # error >90% — footer.ts:132-139).
+      # git branch; line 2 the token stats left and the model (plus the
+      # thinking level — footer.ts:226-244) right-aligned. pi's whole
+      # footer renders dim (:280-288 — the parts dimmed independently so
+      # the colored context segment survives): every span is dim except
+      # the context segment when it crosses the warning/error thresholds.
       def footer_widget
         data = @footer_data || {}
         width = viewport_width
@@ -1056,8 +1155,11 @@ module Tart
 
       # The stats line as spans (footer.ts:113-153): ↑input ↓output
       # R(ead) W(rite) CH% when present, the context segment, then the
-      # model id right-aligned (min 2 spaces padding, stats truncated with
-      # "..." when they would crowd it out).
+      # model right-aligned (min 2 spaces padding, stats truncated with
+      # "..." when they would crowd it out). The thinking level rides the
+      # right side as +model • <level>+ (footer.ts:226-244; nil → the
+      # model alone — the frozen cross-lane contract; pi's "thinking off"
+      # state is unreachable through the contract key, itemized).
       def footer_stats(data, width)
         totals = @usage_totals
         parts = []
@@ -1068,31 +1170,36 @@ module Tart
         parts << "CH#{format("%.1f%%", cache_hit_rate)}" if cache_hit_rate
 
         model = data[:model] || "no-model"
-        left = parts.map { |part| TUI.span("#{part} ") }
+        right = data[:thinking_level] ? "#{model} • #{data[:thinking_level]}" : model
+        left = parts.map { |part| TUI.span("#{part} ", fg: Theme[:dim]) }
         left << TUI.span(context_segment(data), fg: context_fg)
-        pad = width - left.sum { |span| TUI.text_width(span.content) } - TUI.text_width(model)
+        pad = width - left.sum { |span| TUI.text_width(span.content) } - TUI.text_width(right)
         spans = if pad >= 2
-          left + [TUI.span(" " * pad + model)]
+          left + [TUI.span(" " * pad + right, fg: Theme[:dim])]
         else
           # Too wide: the stats clip (with their colors) and the model keeps
           # a two-cell margin (pi truncates statsLeft with "...").
-          clip_spans(left, [width - TUI.text_width(model) - 2, 0].max) + [TUI.span("… #{model}")]
+          clip_spans(left, [width - TUI.text_width(right) - 2, 0].max) + [TUI.span("… #{right}", fg: Theme[:dim])]
         end
         TUI.line(spans)
       end
 
-      # The context numerator: provider-reported context tokens of the
-      # latest assistant usage — nil before the first usage and after a
-      # compaction (pi's post-compaction "?").
+      # The context numerator (pi getContextUsage, agent-session.ts
+      # :4237-4271): provider-reported context tokens of the latest
+      # assistant usage — 0 at boot (pi's estimate 0 → the 0.0% boot
+      # state), nil after a compaction until the next LLM response (pi's
+      # post-compaction "?").
       def context_used
-        return nil if @usage_stale || @last_usage.nil?
+        return nil if @usage_stale
+        return 0 if @last_usage.nil?
 
         Compaction.calculate_context_tokens(@last_usage)
       end
 
-      # The context segment (footer.ts:134-143): "?/window (auto)" until
-      # usage arrives (and after compaction, pi's post-compaction "?"),
-      # then "pct%/window (auto)". Nil window renders "?" alone.
+      # The context segment (footer.ts:134-143): "0.0%/window (auto)" at
+      # boot, "pct%/window (auto)" after usage, "?/window (auto)" after a
+      # compaction (pi's post-compaction "?"). Nil window renders "?"
+      # alone.
       def context_segment(data)
         window = data[:context_window]
         auto = data[:auto_compact] ? " (auto)" : ""
@@ -1110,7 +1217,7 @@ module Tart
         return Theme[:dim] if used.nil? || !window.is_a?(Integer) || !window.positive?
 
         percent = used * 100.0 / window
-        if percent > 90 then Theme[:error]
+        if percent > 90 then Theme[:error] # footer.ts:194-213
         elsif percent > 70 then Theme[:warning]
         else Theme[:dim]
         end
@@ -1220,7 +1327,7 @@ module Tart
       # the editor's inner width (pre-existing; pi scrolls horizontally).
       def input_spans
         at = @input[@cursor]
-        spans = [TUI.span("❯ "), TUI.span(@input[0, @cursor] || "")]
+        spans = [TUI.span(@input[0, @cursor] || "")]
         return spans << TUI.span(" ", modifiers: [:reversed]) unless at
 
         spans << TUI.span(at, modifiers: [:reversed]) << TUI.span(@input[(@cursor + 1)..])
@@ -1247,32 +1354,24 @@ module Tart
         out
       end
 
-      # The streaming text, wrapped to the transcript width — the
-      # transcript area's tail clip bounds it (deltas append; the window
-      # slides). Streaming reasoning renders dim above the content while it
-      # grows (pi renders the thinking block first — assistant-message.ts
-      # :99-175).
+      # The streaming region (item 3, pi interactive-mode.ts:3519-3535 +
+      # assistant-message.ts:107-109): the reasoning block stays plain dim
+      # italic (the I13 standing ruling — markdown-of-reasoning is cut,
+      # itemized) and the CONTENT re-renders as markdown on every delta —
+      # pi re-renders the whole streaming message each update, no
+      # incremental cleverness. The transcript area's tail clip bounds it
+      # (deltas append; the window slides).
       def live_lines(width)
         return [] if @live.empty? && @reasoning.empty?
 
-        reasoning_lines(@reasoning, width) + self.class.wrap(@live, width).map { |line| TUI.line(line) }
-      end
-
-      def approval_lines(width)
-        args = JSON.generate(@pending.arguments) rescue @pending.arguments.to_s
-        [
-          "approve #{@pending.name}?",
-          args.length > width ? args[0, width] : args,
-          "y = yes, n = no"
-        ]
+        reasoning_lines(@reasoning, width) + (@live.empty? ? [] : markdown_lines(@live, width))
       end
 
       # The editor area's extra rows while the suggestion list is active:
       # the visible window plus the (i/N) scroll-info line (select-list.ts
-      # render). An approval prompt consumes the keys — no list alongside
-      # it.
+      # render).
       def autocomplete_rows
-        return 0 unless @suggestions && !@pending
+        return 0 unless @suggestions
 
         [@suggestions.size, AUTOCOMPLETE_MAX + (@suggestions.size > AUTOCOMPLETE_MAX ? 1 : 0)].min
       end
@@ -1287,7 +1386,7 @@ module Tart
       # select-list.ts:189); the command column clamps to 12-32
       # (SLASH_COMMAND_SELECT_LIST_LAYOUT, editor.ts:248-251, gap 2).
       def autocomplete_lines(width)
-        return [] unless @suggestions && !@pending
+        return [] unless @suggestions
 
         items = @suggestions
         start = [[@selected - AUTOCOMPLETE_MAX / 2, items.size - AUTOCOMPLETE_MAX].min, 0].max
