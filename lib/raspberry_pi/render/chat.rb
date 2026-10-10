@@ -42,6 +42,18 @@ module RaspberryPi
       # lines, then an ellipsis row (pi truncates tool output previews).
       TOOL_PREVIEW_LINES = 3
 
+      # History depth (pi: editor.ts addToHistory caps at 100 entries).
+      HISTORY_LIMIT = 100
+
+      # The boundary classes of pi's word navigation (word-navigation.ts with
+      # utils.ts:1006 PUNCTUATION_REGEX and :1011 isWhitespaceChar). The
+      # Intl.Segmenter word-like segment is approximated by word-character
+      # runs (recorded simplification); ASCII punctuation stays a boundary
+      # either way — pi's PUNCTUATION_REGEX sub-rule.
+      PUNCTUATION = /[(){}\[\]<>.,;:'"!?+\-=*\/\\|&%^$#@~`]/.freeze
+      WORD_CHAR = /[[:alnum:]_]/.freeze
+      WHITESPACE = /\s/.freeze
+
       # The style vocabulary — fg colors behind the TUI seam, porting pi's
       # observable distinctions (dark theme): the user echo carries the blue
       # distinction (pi: userMessageBg blue background; fg is the closest
@@ -67,6 +79,10 @@ module RaspberryPi
         @agent = nil
         @mutex = Mutex.new
         @input = +""
+        @cursor = 0
+        @history = []
+        @history_index = -1 # -1 = not browsing (pi: editor.ts historyIndex)
+        @history_draft = nil
         @live = +""
         @busy = false
         @tool = nil
@@ -215,6 +231,49 @@ module RaspberryPi
           out
         end
 
+        # pi's findWordBackward (word-navigation.ts:17-70): from the cursor,
+        # skip trailing whitespace, then stop at the next word/punctuation
+        # boundary — one word run (ASCII punctuation inside it stays a
+        # boundary) or one punctuation run. On "hello world" this lands at 6
+        # (the separator space is kept); on "hello " it lands at 0 (the
+        # whitespace is trailing). Pure function.
+        def find_word_backward(text, cursor)
+          return 0 if cursor <= 0
+
+          i = cursor
+          i -= 1 while i.positive? && WHITESPACE.match?(text[i - 1])
+          return i if i.zero?
+
+          if WORD_CHAR.match?(text[i - 1])
+            i -= 1 while i.positive? && WORD_CHAR.match?(text[i - 1])
+          elsif PUNCTUATION.match?(text[i - 1])
+            i -= 1 while i.positive? && PUNCTUATION.match?(text[i - 1])
+          else
+            i -= 1 # non-word, non-punct (e.g. an emoji): one char
+          end
+          i
+        end
+
+        # pi's findWordForward (word-navigation.ts:73-124): the mirror of
+        # {find_word_backward} — skip leading whitespace, then stop at the
+        # next word/punctuation boundary. Pure function.
+        def find_word_forward(text, cursor)
+          return text.length if cursor >= text.length
+
+          i = cursor
+          i += 1 while i < text.length && WHITESPACE.match?(text[i])
+          return i if i == text.length
+
+          if WORD_CHAR.match?(text[i])
+            i += 1 while i < text.length && WORD_CHAR.match?(text[i])
+          elsif PUNCTUATION.match?(text[i])
+            i += 1 while i < text.length && PUNCTUATION.match?(text[i])
+          else
+            i += 1
+          end
+          i
+        end
+
         # Longest prefix of +line+ fitting +width+, preferring a word break.
         # Returns [head, chars_consumed].
         def fit(line, width)
@@ -294,17 +353,39 @@ module RaspberryPi
         Thread.new { @decisions << value }.join
       end
 
+      # The input-line editor (pi's Input, components/input.ts): a cursor
+      # into the buffer, mid-line editing, in-memory history, and word-wise
+      # operations (word-navigation.ts boundary semantics). The key surface
+      # is exactly the events the kernel forwards (code + ctrl/alt/shift
+      # modifiers), bound per pi's keybindings.ts defaults. Editing and
+      # movement keys leave history browsing (pi: exitHistoryBrowsing);
+      # edit units are chars where pi uses graphemes (single-line input,
+      # recorded simplification).
       def edit_input(event)
         if event.paste?
-          @input << event.content
-        else
-          case event.code
-          when "enter" then submit
-          when "backspace" then @input.chop!
-          else
-            printable = event.text? && !(event.modifiers & %w[ctrl alt]).any?
-            @input << event.code if printable
-          end
+          insert(event.content)
+          return
+        end
+
+        ctrl = event.modifiers.include?("ctrl")
+        alt = event.modifiers.include?("alt")
+        case event.code
+        when "enter" then submit
+        when "backspace" then alt ? delete_word_backward : delete_backward
+        when "delete" then alt ? delete_word_forward : delete_forward
+        when "left" then (alt || ctrl) ? move_word_backward : move_left
+        when "right" then (alt || ctrl) ? move_word_forward : move_right
+        when "up" then history_previous
+        when "down" then history_next
+        when "home" then move_start
+        when "end" then move_end
+        when "a" then ctrl ? move_start : insert_printable(event)
+        when "e" then ctrl ? move_end : insert_printable(event)
+        when "b" then alt ? move_word_backward : (ctrl ? move_left : insert_printable(event))
+        when "f" then alt ? move_word_forward : (ctrl ? move_right : insert_printable(event))
+        when "d" then alt ? delete_word_forward : (ctrl ? delete_forward : insert_printable(event))
+        when "w" then ctrl ? delete_word_backward : insert_printable(event)
+        else insert_printable(event)
         end
       end
 
@@ -312,12 +393,52 @@ module RaspberryPi
         text = @input.dup
         return if text.strip.empty?
 
+        add_to_history(text)
         @input.clear
+        @cursor = 0
+        exit_history_browsing
         enqueue_scrollback("❯ #{text}", fg: FG[:user])
         if busy?
           @agent.push_message(text) # steering: consumed at the next turn boundary
         else
           @kernel.async { @agent.run(text) }
+        end
+      end
+
+      # pi's editor history (components/editor.ts addToHistory): trimmed,
+      # no consecutive duplicates, capped, most recent first.
+      def add_to_history(text)
+        trimmed = text.strip
+        return if trimmed.empty? || @history.first == trimmed
+
+        @history.unshift(trimmed)
+        @history.pop if @history.size > HISTORY_LIMIT
+      end
+
+      # pi's navigateHistory (editor.ts:454-484): -1 is the live draft; up
+      # walks toward older entries (index 0 = most recent), down back toward
+      # the draft. The draft is captured when browsing starts and restored
+      # at -1. Up places the cursor at line start, down at line end
+      # (cursorPlacement "start"/"end"). The port is single-line, so up/down
+      # always navigate (pi: only from the first/last visual line).
+      def history_previous = navigate_history(-1)
+
+      def history_next = navigate_history(1)
+
+      def navigate_history(direction)
+        return if @history.empty?
+
+        new_index = @history_index - direction
+        return if new_index < -1 || new_index >= @history.size
+
+        @history_draft = [@input.dup, @cursor] if @history_index == -1 && new_index >= 0
+        @history_index = new_index
+        if @history_index == -1
+          @input, @cursor = @history_draft || ["", 0]
+          @history_draft = nil
+        else
+          @input = @history[@history_index].dup
+          @cursor = direction == -1 ? 0 : @input.length
         end
       end
 
@@ -333,7 +454,7 @@ module RaspberryPi
         if @pending
           lines.concat(approval_lines.map { |line| TUI.line(line, fg: FG[:interrupted]) })
         else
-          lines << TUI.line("❯ #{@input}")
+          lines << TUI.line(input_spans)
         end
         lines = lines.last(viewport_height) if viewport_height
         TUI.paragraph(text: lines, wrap: false)
@@ -342,6 +463,107 @@ module RaspberryPi
       def status_line
         detail = @tool ? "tool: #{@tool}" : (@live.empty? ? "thinking" : "…")
         "#{SPINNER[@frames % SPINNER.size]} #{detail}"
+      end
+
+      # --- input-line editing primitives (each leaves history browsing) ---
+
+      def insert(text)
+        exit_history_browsing
+        @input.insert(@cursor, text)
+        @cursor += text.length
+      end
+
+      def delete_backward
+        exit_history_browsing
+        return if @cursor.zero?
+
+        @input = @input[0, @cursor - 1] + @input[@cursor..]
+        @cursor -= 1
+      end
+
+      def delete_forward
+        exit_history_browsing
+        return if @cursor >= @input.length
+
+        @input = @input[0, @cursor] + @input[(@cursor + 1)..]
+      end
+
+      def move_left
+        exit_history_browsing
+        @cursor -= 1 if @cursor.positive?
+      end
+
+      def move_right
+        exit_history_browsing
+        @cursor += 1 if @cursor < @input.length
+      end
+
+      def move_start
+        exit_history_browsing
+        @cursor = 0
+      end
+
+      def move_end
+        exit_history_browsing
+        @cursor = @input.length
+      end
+
+      def move_word_backward
+        exit_history_browsing
+        @cursor = self.class.find_word_backward(@input, @cursor)
+      end
+
+      def move_word_forward
+        exit_history_browsing
+        @cursor = self.class.find_word_forward(@input, @cursor)
+      end
+
+      # pi's deleteWordBackwards (input.ts:309): move one word backward,
+      # delete what the move crossed.
+      def delete_word_backward
+        return if @cursor.zero?
+
+        exit_history_browsing
+        target = self.class.find_word_backward(@input, @cursor)
+        @input = @input[0, target] + @input[@cursor..]
+        @cursor = target
+      end
+
+      def delete_word_forward
+        return if @cursor >= @input.length
+
+        exit_history_browsing
+        target = self.class.find_word_forward(@input, @cursor)
+        @input = @input[0, @cursor] + @input[target..]
+      end
+
+      def exit_history_browsing
+        @history_index = -1
+        @history_draft = nil
+      end
+
+      # Printable characters insert at the cursor (pi input.ts:268-277);
+      # ctrl/alt-modified keys are never text (the real gem's text? ignores
+      # modifiers, so the guard is load-bearing for alt+b/f).
+      def insert_printable(event)
+        return unless event.text? && !(event.modifiers & %w[ctrl alt]).any?
+
+        insert(event.code)
+      end
+
+      # The input row as spans with pi's fake cursor (tui.ts:205
+      # renderFakeCursor via editor.ts:583-597): the grapheme at the
+      # insertion point renders inverse-video; at end-of-input a highlighted
+      # trailing space. The port's readback-provable analog carries the
+      # reversed modifier (the hardware cursor is unreachable through the
+      # tree-draw seam and not cell-readable). Input beyond one row clips at
+      # the viewport edge (pre-existing; pi scrolls horizontally).
+      def input_spans
+        at = @input[@cursor]
+        spans = [TUI.span("❯ "), TUI.span(@input[0, @cursor] || "")]
+        return spans << TUI.span(" ", modifiers: [:reversed]) unless at
+
+        spans << TUI.span(at, modifiers: [:reversed]) << TUI.span(@input[(@cursor + 1)..])
       end
 
       # The streaming text, wrapped to the viewport width, as many tail

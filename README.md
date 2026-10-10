@@ -29,6 +29,35 @@ Configuration is environment-driven with documented defaults (see
 Keys: type + Enter to send (steers a running agent); y/n at approval prompts;
 Ctrl+C interrupts a running turn / quits when idle.
 
+### Input-line editing
+
+The input line is a single-line editor with a visible cursor (the grapheme at
+the insertion point renders inverse-video; at end-of-input a highlighted
+trailing space), mid-line editing, in-memory history, and word-wise
+operations — the pi `editor.ts`/`input.ts`/`word-navigation.ts` subset
+(single-line; no multi-line editing, undo/kill-ring, or autocomplete):
+
+| Key | Action |
+|---|---|
+| printable characters | insert at the cursor |
+| Left / Right | move the cursor one character (Ctrl+B / Ctrl+F too) |
+| Backspace | delete before the cursor |
+| Delete / Ctrl+D | delete after the cursor |
+| Home / End (Ctrl+A / Ctrl+E) | jump to line start / end |
+| Alt+Left or Alt+B (Ctrl+Left) | jump one word backward |
+| Alt+Right or Alt+F (Ctrl+Right) | jump one word forward |
+| Ctrl+W or Alt+Backspace | delete one word backward |
+| Alt+D or Alt+Delete | delete one word forward |
+| Up / Down | recall previous / next sent message |
+| Enter | send (steers a running agent) |
+
+History is in-memory for the session (most recent first, capped at 100,
+no consecutive duplicates): Up walks older entries, Down returns toward the
+draft you were typing, and a recalled entry is editable and sends as edited.
+Word operations stop at whitespace, punctuation, and word boundaries (pi's
+`word-navigation.ts` semantics — on `hello world|`, Ctrl+W deletes `world`
+and keeps the separator space).
+
 ## Development
 
 ```sh
