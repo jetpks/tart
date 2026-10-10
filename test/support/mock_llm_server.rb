@@ -21,9 +21,14 @@ module RaspberryPi
     #
     # Scripting: pass a list of response specs, each either
     #   {type: :stream, content: "text", tool_calls: [{id:, name:, arguments: hash_or_string}]}
+    #   {type: :stream, reasoning_content: "thinking"}  (a `reasoning_content` delta
+    #     before the content deltas — thinking-model wire shape, ruby_llm
+    #     protocols/chat_completions/streaming.rb build_chunk)
     #   {type: :stream, chunks: [delta_hashes...]}   (raw deltas, full control)
     #   {type: :message, content: "text"}            (non-streaming JSON)
     #   {type: :slow_stream, content:, chunk_every:} (streams slowly, for interrupts)
+    #   {type: :error, status: 400, message: "..."}  (HTTP error the client raises
+    #     on — transport/error_middleware.rb maps 400 to BadRequestError)
     # Every captured request body is pushed to +requests+ (a Queue) for
     # assertions (e.g. schema gating against the actual payload).
     class MockLLMServer
@@ -86,7 +91,9 @@ module RaspberryPi
         _ = request_line
 
         spec = @script.shift || {type: :message, content: ""}
-        if headers["accept"].to_s.include?("text/event-stream") || body.to_s.include?('"stream":true')
+        if spec[:type] == :error
+          respond_error(io, spec)
+        elsif headers["accept"].to_s.include?("text/event-stream") || body.to_s.include?('"stream":true')
           respond_stream(io, spec)
         else
           respond_message(io, spec)
@@ -107,6 +114,16 @@ module RaspberryPi
         }
         out = JSON.generate(payload)
         io.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: #{out.bytesize}\r\n\r\n#{out}")
+      end
+
+      # The body openai-compatible endpoints return on a schema rejection;
+      # ruby_llm's error middleware raises on the status before any stream
+      # is read.
+      def respond_error(io, spec)
+        payload = {error: {message: spec[:message], type: "invalid_request_error"}}
+        out = JSON.generate(payload)
+        status = spec[:status] || 400
+        io.write("HTTP/1.1 #{status} Bad Request\r\nContent-Type: application/json\r\nContent-Length: #{out.bytesize}\r\n\r\n#{out}")
       end
 
       def respond_stream(io, spec)
@@ -134,7 +151,8 @@ module RaspberryPi
       def deltas_for(spec)
         return spec[:chunks] if spec[:chunks]
 
-        deltas = [{choices: [{delta: {role: "assistant", content: spec[:content] || ""}}]}]
+        reasoning = [{choices: [{delta: {reasoning_content: spec[:reasoning_content]}}]}] if spec[:reasoning_content]
+        deltas = [*reasoning, {choices: [{delta: {role: "assistant", content: spec[:content] || ""}}]}]
         Array(spec[:tool_calls]).each_with_index do |call, i|
           deltas << {choices: [{delta: {tool_calls: [{index: i, id: call[:id], type: "function",
                                                       function: {name: call[:name], arguments: ""}}]}}]}

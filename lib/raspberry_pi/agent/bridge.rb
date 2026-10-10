@@ -22,11 +22,17 @@ module RaspberryPi
       # The terminal item types the worker sends.
       DONE = :done
       CANCELLED = :cancelled
+      ERROR = :error
 
       # Runs +work+ (a callable taking the +sink+ proc) on a worker thread.
       # Yields every item the worker sinks, in order, to this method's block.
       # The worker signals completion by calling +sink.({type: :done})+ (or
       # +{type: :cancelled}+).
+      #
+      # A worker exception is terminal too: the worker pushes {type: :error,
+      # error:} and dies, so the wait must end with the worker instead of
+      # blocking on the queue forever. The error item is returned (not
+      # yielded) — the caller's error path owns it.
       #
       # On interrupt (Async::Cancel at the queue wait), calls the on_cancel
       # callback, joins the worker bounded, and re-raises.
@@ -45,7 +51,7 @@ module RaspberryPi
         begin
           loop do
             item = queue.pop # interruptible: Task#stop raises here
-            return item if item[:type] == DONE || item[:type] == CANCELLED
+            return item if [DONE, CANCELLED, ERROR].include?(item[:type])
 
             yield item
           end
