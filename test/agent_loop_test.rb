@@ -270,6 +270,70 @@ module Tart
       assert_equal :threshold, compaction[:reason]
     end
 
+    # AC3 (I12): compaction_start fires once per started compaction, with
+    # the reason, BEFORE the completed-compaction event (pi
+    # agent-session.ts:3119 — after prepare, before the summary call).
+    def test_compaction_start_precedes_compaction_on_threshold
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+        {type: :stream, content: "second answer"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14
+      )
+      run_agent(agent, "first question")
+
+      starts = events.each_index.select { |i| events[i][:type] == :compaction_start }
+      dones = events.each_index.select { |i| events[i][:type] == :compaction }
+      assert_equal 1, starts.size
+      assert_equal 1, dones.size
+      assert_operator starts.first, :<, dones.first, "compaction_start before compaction"
+      assert_equal :threshold, events[starts.first][:reason]
+      assert_equal :threshold, events[dones.first][:reason]
+    end
+
+    # The start event marks the ATTEMPT: a failed summarization call never
+    # emits the completed-compaction event — pinning the emission point
+    # before the summarize call (pi: the status indicator is cleared by
+    # compaction_end/error, agent-session.ts:3119's placement).
+    def test_compaction_start_without_completion_when_the_summary_call_fails
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :error, status: 500, message: "summary endpoint down"},
+        {type: :stream, content: "second answer"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14
+      )
+      run_agent(agent, "first question")
+
+      starts = events.select { |e| e[:type] == :compaction_start }
+      assert_equal 1, starts.size
+      assert_equal :threshold, starts.first[:reason]
+      assert_empty events.select { |e| e[:type] == :compaction }
+      refute agent.last_error, "a failed compaction never stops the run"
+    end
+
+    # Nothing to compact (prepare returns nil — the keep-recent tail is the
+    # whole history): no start event, no compaction (pi: no compaction_start
+    # when prepareCompaction returns falsy, agent-session.ts:3113-3116).
+    def test_no_compaction_start_when_nothing_to_compact
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :stream, content: "second answer"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 10_000}, context_window: 14
+      )
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      assert_equal 2, @server.captured_requests.size, "no summarization call"
+      assert_empty events.select { |e| e[:type] == :compaction_start }
+      assert_empty events.select { |e| e[:type] == :compaction }
+    end
+
     def test_compaction_disabled_performs_no_compaction
       @server.script([
         {type: :stream, content: "first answer"},
@@ -283,6 +347,7 @@ module Tart
 
       assert_equal 2, @server.captured_requests.size, "no summarization call"
       assert_empty events.select { |e| e[:type] == :compaction }
+      assert_empty events.select { |e| e[:type] == :compaction_start }
     end
 
     # AC3: a context-overflow step failure compacts and retries the turn
@@ -294,11 +359,18 @@ module Tart
         {type: :message, content: "a summary of the prior turns"},
         {type: :stream, content: "recovered"},
       ])
-      agent, _events = agent_on_kernel_with_seeds
+      agent, events = agent_on_kernel_with_seeds
       result = run_agent(agent, "new question")
 
       assert_equal "recovered", result.last.content
       refute agent.last_error
+
+      starts = events.each_index.select { |i| events[i][:type] == :compaction_start }
+      dones = events.each_index.select { |i| events[i][:type] == :compaction }
+      assert_equal 1, starts.size
+      assert_equal 1, dones.size
+      assert_operator starts.first, :<, dones.first
+      assert_equal :overflow, events[starts.first][:reason]
 
       requests = @server.captured_requests
       assert_equal 3, requests.size

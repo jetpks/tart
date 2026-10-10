@@ -289,6 +289,12 @@ module Tart
         preparation = Compaction.prepare(@chat.messages, @compaction_settings)
         return false unless preparation
 
+        # pi emits compaction_start once per started compaction, after
+        # prepare returns truthy and before the summarization call
+        # (agent-session.ts:3119, the auto path's placement, unified across
+        # reasons) — the surface's "Compacting context..." border status
+        # keys off it; the completed-compaction event below clears it.
+        emit(type: :compaction_start, reason:)
         summary = summarize(preparation)
         return false unless summary
 
