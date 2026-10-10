@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "bridge"
+require_relative "session"
 require_relative "status"
 require_relative "system_prompt"
 
@@ -38,11 +39,20 @@ module RaspberryPi
       #   on the kernel fiber (interruptible) with each
       #   +RubyLLM::ToolCall+ that requires approval; +true+ approves,
       #   +false+ denies. Only consulted for tools that gate.
-      def initialize(chat:, tools:, system_prompt: nil, on_event: nil, approval: nil)
+      # @param recorder [Session::Recorder, nil] the optional session
+      #   recorder (pi's SessionManager, message subset): every message this
+      #   run adds is appended to the session file in order; +nil+ = off.
+      # @param seed_messages [Array<Hash, RubyLLM::Message>] prior context
+      #   messages to seed the chat with before the run (resume:
+      #   Agent::Session.context_messages) — the model sees them on the
+      #   wire, they are never re-recorded as new messages.
+      def initialize(chat:, tools:, system_prompt: nil, on_event: nil, approval: nil,
+        recorder: nil, seed_messages: [])
         @chat = chat
         @tools = tools
         @on_event = on_event
         @approval = approval
+        @recorder = recorder
         @new_messages = []
         @sink = nil
         @stream_started = false
@@ -52,6 +62,7 @@ module RaspberryPi
 
         @chat.with_tools(*tools.values) unless tools.empty?
         @chat.with_instructions(system_prompt) if system_prompt
+        seed_messages.each { |message| @chat.add_message(message) }
         install_chat_callbacks
       end
 
@@ -113,6 +124,12 @@ module RaspberryPi
       end
 
       private
+
+      # Session recording (pi SessionManager.appendMessage): the recorder
+      # appends each new message as a message entry, in conversation order.
+      def record(message)
+        @recorder&.append_message(message)
+      end
 
       def run_loop(prompt)
         # Outer loop (pi): keep going while queued messages keep arriving.
@@ -235,6 +252,7 @@ module RaspberryPi
         @new_messages << message
         emit(type: :message_start, message:)
         emit(type: :message_end, message:)
+        record(message)
         message
       end
 
@@ -277,11 +295,13 @@ module RaspberryPi
             strip_thinking_replay(message)
             @new_messages << message
             emit(type: :message_end, message:) if message.role == :assistant
+            record(message)
           end
         when :tool_message
           @new_messages << item[:message]
           emit(type: :message_start, message: item[:message])
           emit(type: :message_end, message: item[:message])
+          record(item[:message])
         when :tool_execution_start
           emit(type: :tool_execution_start, tool_call: item[:tool_call])
         when :tool_execution_end
