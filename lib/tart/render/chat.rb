@@ -1,32 +1,32 @@
 # frozen_string_literal: true
 
+require "open3"
+
 module Tart
   module Render
-    # The interactive chat surface (BRIEF §7.1) — the I04 consumer of the I03
-    # agent event surface on the I02 kernel.
+    # The interactive chat surface (BRIEF §7.1) — the I11 fullscreen
+    # three-area composition of the I03 agent event surface on the I02
+    # kernel.
     #
-    # Render model (ported from pi's tui-main-screen.ts): completed content
-    # lands as scrollback *above* the live region, the live region at the
-    # bottom carries status/spinner, the pending-approval prompt, and the
-    # input line. Mechanism is §5.1-sanctioned foundation mechanics: pi
-    # diff-redraws the main screen itself; here the ratatui_ruby inline
-    # viewport is the live region and {TUI} scrollback insertion
-    # (+insert_before+) is how completed content lands above it. Observable
-    # contract is parity: completed messages readable above a live bottom
-    # region, streaming visible while it happens, terminal restored on
-    # exit/interrupt. Assistant completions render through the markdown
-    # converter at completion; the live region streams the raw source
-    # verbatim (pi renders markdown while streaming — the recorded
-    # deviation).
+    # Render model (ported from pi's fullscreen chat viewport,
+    # chat-viewport.ts createChatViewport): the surface owns a scrollback
+    # buffer and every frame composes a vertical Layout — a transcript area
+    # (the buffer's visible tail, with the streaming message's raw source at
+    # its end), a bordered editor area whose top border carries the status
+    # line (pi custom-editor.ts renderTopBorder), and a two-line footer (pi
+    # footer.ts). The ratatui_ruby inline viewport + insert_before path is
+    # retired from the interactive surface (it stays in the TUI seam for any
+    # other caller); the buffer is redrawn wholesale each frame, which is
+    # what makes resize redrawing clobber-proof.
     #
-    # Threading: all draws and scrollback insertions happen on the kernel's
-    # frame loop (the renderer proc); agent events mutate state under a mutex
-    # from the agent fiber; key events arrive through the kernel's on_event.
-    # The agent runs as a kernel task (+kernel.async { agent.run }+, event-only
-    # run mode) so a kernel interrupt (Ctrl+C) cancels the in-flight turn.
+    # Threading: all draws happen on the kernel's frame loop (the renderer
+    # proc); agent events mutate state under a mutex from the agent fiber;
+    # key events arrive through the kernel's on_event. The agent runs as a
+    # kernel task (+kernel.async { agent.run }+, event-only run mode) so a
+    # kernel interrupt (Ctrl+C) cancels the in-flight turn.
     #
-    # Approval: the approval callback runs on the kernel fiber and waits on an
-    # +Async::Queue#pop+ — interruptible at the suspension point by
+    # Approval: the approval callback runs on the kernel fiber and waits on
+    # an +Async::Queue#pop+ — interruptible at the suspension point by
     # Task#stop. The decision is pushed cross-thread (the I03 lost-wakeup
     # cure: a fiber-to-fiber +Async::Queue+ push on the same thread can fail
     # to wake a blocked pop; a cross-thread push is the proven path).
@@ -38,8 +38,16 @@ module Tart
       # event-driven when idle — the I02 static-loop property).
       BUSY_FRAME_SECONDS = 0.25
 
-      # Rows the pending-approval block occupies in the live region.
+      # Rows the pending-approval block occupies in the editor area.
       APPROVAL_ROWS = 3
+
+      # Rows the footer always occupies (pi renders a pwd line + a stats
+      # line — footer.ts:169-171).
+      FOOTER_ROWS = 2
+
+      # Smallest editor area: top border, one input row, bottom border (pi
+      # chat-viewport.ts:33 editor minSize 3).
+      MIN_EDITOR_ROWS = 3
 
       # Bounded multi-line tool-result preview: at most this many content
       # lines, then an ellipsis row (pi truncates tool output previews).
@@ -57,28 +65,30 @@ module Tart
       WORD_CHAR = /[[:alnum:]_]/.freeze
       WHITESPACE = /\s/.freeze
 
-      # The style vocabulary — fg colors behind the TUI seam, porting pi's
-      # observable distinctions (dark theme): the user echo carries the blue
-      # distinction (pi: userMessageBg blue background; fg is the closest
-      # analog on a plain span), assistant completions carry their styles
-      # per-span through the markdown converter (plain prose stays the
-      # terminal default, pi: userMessageText/text), tool output is muted
-      # (pi: toolOutput), status is dim (pi: spinner/thinking), interrupts
-      # yellow and errors red (pi: warning/error).
-      FG = {
-        user: :light_blue,
-        tool: :gray,
-        status: :dark_gray,
-        interrupted: :yellow,
-        error: :red,
-      }.freeze
+      # The git branch reader (pi footer-data-provider.ts:52-70, reduced):
+      # one +git symbolic-ref+ per turn, nil when not on a branch (detached
+      # HEAD or no repo — pi labels detached "detached"; the port omits the
+      # segment, recorded). Injected so tests never shell out.
+      DEFAULT_BRANCH_READER = lambda do |cwd|
+        out, _err, status = Open3.capture3("git", "--no-optional-locks", "symbolic-ref",
+          "--quiet", "--short", "HEAD", chdir: cwd)
+        status.success? && !out.empty? ? out.strip : nil
+      end
 
-      # @param session the TUI session (inline viewport).
+      # @param session the TUI session (fullscreen viewport).
       # @param kernel [Core::Loop] the kernel; used to open animation windows
       #   and to submit agent runs as kernel tasks.
-      def initialize(session:, kernel:)
+      # @param footer_data [Hash, nil] launcher-wired footer facts (AC4):
+      #   +:cwd+ (the working directory), +:model+ (the resolved model id),
+      #   +:context_window+ (the I10 resolved window — the usage
+      #   denominator), +:auto_compact+ (the compaction-enabled indicator).
+      #   nil renders the footer from what the surface knows alone.
+      # @param branch_reader [Proc] +call(cwd)+ → branch name or nil.
+      def initialize(session:, kernel:, footer_data: nil, branch_reader: DEFAULT_BRANCH_READER)
         @session = session
         @kernel = kernel
+        @footer_data = footer_data
+        @branch_reader = branch_reader
         @agent = nil
         @mutex = Mutex.new
         @input = +""
@@ -92,9 +102,21 @@ module Tart
         @pending = nil
         @frames = 0
         @decisions = Async::Queue.new
-        # Completed lines awaiting scrollback insertion on the next frame
+        # Completed lines awaiting the transcript buffer on the next frame
         # (thread-safe: agent fiber produces, frame loop consumes).
         @scrollback = Queue.new
+        # The surface-owned scrollback buffer (final display Lines) — the
+        # transcript area draws its visible tail every frame.
+        @transcript = []
+        # Footer usage state: session-cumulative token totals accumulated at
+        # each assistant completion, the latest assistant usage (the context
+        # numerator), and the staleness flag pi's post-compaction "?" comes
+        # from (footer.ts getSessionStats / contextUsage).
+        @usage_totals = {input: 0, output: 0, cache_read: 0, cache_write: 0}
+        @last_usage = nil
+        @usage_stale = false
+        @branch = nil
+        @branch_fetched = false
       end
 
       # The agent loop this surface drives (wired after construction: the
@@ -105,6 +127,9 @@ module Tart
       # "/" submit text routes through it before any agent call. nil (the
       # default; e.g. tests) sends every text to the agent — pre-I10 shape.
       attr_accessor :commands
+
+      # The launcher-wired footer facts (see #initialize).
+      attr_writer :footer_data
 
       # @return [Object, nil] the tool call awaiting an approval decision.
       def pending_approval
@@ -120,17 +145,24 @@ module Tart
       #   an approval prompt is pending; keys are consumed by the prompt).
       attr_reader :input
 
-      # The kernel renderer proc: drains queued scrollback above the viewport,
-      # then builds the live-region widget. A String result would be wrapped
-      # in TUI.status_panel by the kernel; this returns the widget itself.
+      # @return [Array<String>] the transcript buffer's display lines (test
+      #   readback for kernel-driven tests, where the drawn widget tree is
+      #   the only observable).
+      def transcript_lines
+        @mutex.synchronize { @transcript.map { |line| line.spans.map(&:content).join } }
+      end
+
+      # The kernel renderer proc: builds the fullscreen three-area widget.
+      # A String result would be wrapped in TUI.status_panel by the kernel;
+      # this returns the widget itself.
       def renderer
         @renderer_proc ||= -> { render_frame }
       end
 
       def render_frame
-        flush_scrollback
         widget = nil
         @mutex.synchronize do
+          flush_scrollback
           @frames += 1
           widget = build_widget
         end
@@ -141,7 +173,9 @@ module Tart
       end
 
       # Kernel event sink (every dispatched event, native or synthetic).
-      # Ctrl+C never reaches here — the kernel owns it (interrupt).
+      # Ctrl+C never reaches here — the kernel owns it (interrupt). Resize
+      # events are ignored here; the kernel marks the frame dirty either way
+      # and the next frame recomposes from the session's fresh viewport.
       def on_event(event, _source = nil)
         return unless event.key? || event.paste?
 
@@ -161,6 +195,8 @@ module Tart
           case event[:type]
           when :agent_start
             @busy = true
+            @branch = nil # per-turn branch invalidation (pi's provider cache, reduced)
+            @branch_fetched = false
           when :message_start
             @live = +""
           when :message_update
@@ -169,6 +205,7 @@ module Tart
           when :message_end
             message = event[:message]
             if message.role == :assistant
+              accumulate_usage(message)
               handled = complete(message.content)
               # Assistant completions render as markdown (AC5) — at
               # completion only: the live region streamed the raw source.
@@ -179,15 +216,24 @@ module Tart
           when :tool_execution_end
             @tool = nil
             handled = tool_line(event[:tool_call].name, event[:result])
-            enqueue_scrollback(handled, fg: FG[:tool])
+            enqueue_scrollback(handled, fg: Theme[:tool_output])
+          when :compaction
+            # pi: after compaction, context tokens are unknown until the
+            # next LLM response (footer "?"); the event itself renders a
+            # post-hoc compaction line (the port has no compaction-start
+            # seam — recorded).
+            @usage_stale = true
+            enqueue_scrollback(
+              "✻ compacted (#{event[:reason]}, #{event[:tokens_before]} tokens)", fg: Theme[:dim]
+            )
           when :agent_end
             @busy = false
             if event[:interrupted] == true
               handled = "interrupted"
-              enqueue_scrollback(handled, fg: FG[:interrupted])
+              enqueue_scrollback(handled, fg: Theme[:warning])
             elsif event[:error]
               handled = "error: #{event[:error].message}"
-              enqueue_scrollback(handled, fg: FG[:error])
+              enqueue_scrollback(handled, fg: Theme[:error])
             end
             # A message submitted in the wind-down window (after the agent's
             # final steering check, before agent_end) sits queued with no run
@@ -330,11 +376,33 @@ module Tart
             [line.chars.first, 1] # over-wide first grapheme; force progress
           end
         end
+
+        # pi formatTokens (footer.ts:23-30): compact token counts.
+        def format_tokens(count)
+          if count < 1000 then count.to_s
+          elsif count < 10_000 then format("%.1fk", count / 1000.0)
+          elsif count < 1_000_000 then "#{(count / 1000.0).round}k"
+          elsif count < 10_000_000 then format("%.1fM", count / 1_000_000.0)
+          else "#{(count / 1_000_000.0).round}M"
+          end
+        end
+
+        # pi formatCwdForFooter (footer.ts:33-43): the cwd with the home
+        # prefix contracted to "~"; paths outside home render absolute.
+        def format_cwd(cwd, home = Dir.home)
+          return cwd if home.nil? || home.empty?
+
+          resolved = File.expand_path(cwd)
+          resolved_home = File.expand_path(home)
+          return resolved unless resolved == resolved_home || resolved.start_with?(resolved_home + File::SEPARATOR)
+
+          resolved == resolved_home ? "~" : "~#{File::SEPARATOR}#{resolved[(resolved_home.length + 1)..]}"
+        end
       end
 
       private
 
-      # Completed content: queued for insertion above the live region.
+      # Completed content: queued for the transcript buffer.
       # Mutex context (called from on_agent_event); returns the final text
       # (nil when nothing to show).
       def complete(text)
@@ -345,7 +413,7 @@ module Tart
       end
 
       # Verbatim completed text (user echo, tool output, status): wrapped to
-      # the viewport width, one line-level fg.
+      # the transcript width, one line-level fg.
       def enqueue_scrollback(text, fg:)
         return if text.nil? || text.empty?
 
@@ -353,16 +421,35 @@ module Tart
       end
 
       # Assistant completions render through the markdown converter (AC5):
-      # styled rows wrapped to the viewport width, span styling intact, then
-      # converted row → Line at the TUI seam. The live region streamed the
-      # raw source verbatim — markdown renders at completion only (the
-      # recorded deviation from pi's streaming markdown rendering).
+      # styled rows wrapped to the transcript width, every span's fg routed
+      # through the theme (AC3), then converted row → Line at the TUI seam.
+      # The live region streamed the raw source verbatim — markdown renders
+      # at completion only (the recorded deviation from pi's streaming
+      # markdown rendering).
       def enqueue_markdown(text)
         return if text.nil? || text.empty?
 
         width = viewport_width
         rows = Render::Markdown.rows(text, width:).flat_map { |row| Chat.wrap_row(row, width) }
-        @scrollback << rows.map { |row| TUI.markdown_line(row) }
+        @scrollback << rows.map do |row|
+          themed = row.map { |span| Render::Markdown::Span.new(text: span.text, fg: Theme.md_fg(span.fg), modifiers: span.modifiers) }
+          TUI.markdown_line(themed)
+        end
+      end
+
+      # Session-cumulative usage totals + the latest assistant usage (the
+      # context numerator; pi's getSessionStats over session entries,
+      # reduced to what the event surface carries: assistant messages).
+      def accumulate_usage(message)
+        tokens = message.tokens if message.respond_to?(:tokens)
+        return if tokens.nil?
+
+        @usage_totals[:input] += tokens.input if tokens.input
+        @usage_totals[:output] += tokens.output if tokens.output
+        @usage_totals[:cache_read] += tokens.cache_read if tokens.cache_read
+        @usage_totals[:cache_write] += tokens.cache_write if tokens.cache_write
+        @last_usage = tokens
+        @usage_stale = false
       end
 
       # Bounded multi-line preview (pi truncates tool output): the first
@@ -453,7 +540,9 @@ module Tart
         @input.clear
         @cursor = 0
         exit_history_browsing
-        enqueue_scrollback("❯ #{text}", fg: FG[:user])
+        @branch = nil # per-turn branch invalidation
+        @branch_fetched = false
+        enqueue_scrollback("❯ #{text}", fg: Theme[:user_message_text])
         if @commands && text.start_with?("/")
           text = @commands.expand_skill(text)
           return if !busy? && @commands.dispatch(text)
@@ -466,9 +555,10 @@ module Tart
       end
 
       # Slash-command output (pi's chat-line status UX): a muted line in
-      # scrollback. Thread-safe — the kernel task calls this off-frame.
+      # the transcript buffer. Thread-safe — the kernel task calls this
+      # off-frame.
       def command_line(text)
-        @mutex.synchronize { enqueue_scrollback(text, fg: FG[:tool]) }
+        @mutex.synchronize { enqueue_scrollback(text, fg: Theme[:muted]) }
       end
 
       # pi's editor history (components/editor.ts addToHistory): trimmed,
@@ -508,27 +598,168 @@ module Tart
         end
       end
 
-      # pi's live region: the bottom viewport shows status, the streaming
-      # message tail, and the input line — as many rows as the viewport
-      # affords, everything beyond clipped at the top. During an approval
-      # prompt the input line is displaced (pi: the dialog replaces the
-      # editor in the editor container) and its keys are consumed.
+      # The fullscreen three-area composition (AC1, pi chat-viewport.ts):
+      # a transcript area on top (Min 1 — takes the rest), the bordered
+      # editor area and the footer docked at the bottom (Length — pi's
+      # shrink:1 fixed-height dock). All heights derive from the session's
+      # viewport every frame, so a resize recomposes cleanly.
       def build_widget
-        lines = []
-        lines << TUI.line(status_line, fg: FG[:status]) if @busy
-        lines.concat(live_lines.map { |line| TUI.line(line) }) # assistant: terminal default
-        if @pending
-          lines.concat(approval_lines.map { |line| TUI.line(line, fg: FG[:interrupted]) })
+        area = @session.viewport_area
+        height = area ? area.height : 24
+        editor_rows = [MIN_EDITOR_ROWS + (@pending ? APPROVAL_ROWS - 1 : 0), height - 1].min
+        transcript_rows = [height - editor_rows - FOOTER_ROWS, 1].max
+        TUI.layout(
+          children: [
+            transcript_widget(transcript_rows),
+            editor_widget,
+            footer_widget,
+          ],
+          constraints: [
+            TUI.constraint_min(transcript_rows),
+            TUI.constraint_length(editor_rows),
+            TUI.constraint_length(FOOTER_ROWS),
+          ]
+        )
+      end
+
+      # The transcript area: the scrollback buffer's visible tail with the
+      # streaming message's raw source at its end (the buffer is final
+      # content; the live tail is transient, recomputed per frame).
+      def transcript_widget(rows)
+        width = viewport_width
+        lines = @transcript + live_lines(width)
+        TUI.paragraph(text: lines.last(rows), wrap: false)
+      end
+
+      # The bordered editor area (pi CustomEditor): the input line inside
+      # the borders; while an approval prompt holds the editor, its prompt
+      # displaces the input row (pi: the dialog replaces the editor in the
+      # editor container). The top border's title is the status line (pi
+      # renderTopBorder via custom-editor.ts:18-22) — absent when idle (pi
+      # IdleStatus renders empty).
+      def editor_widget
+        inner = [viewport_width - 2, 1].max
+        content = if @pending
+          approval_lines(inner).map { |text| TUI.line(text, fg: Theme[:warning]) }
         else
-          lines << TUI.line(input_spans)
+          [TUI.line(clip_spans(input_spans, inner))]
         end
-        lines = lines.last(viewport_height) if viewport_height
-        TUI.paragraph(text: lines, wrap: false)
+        TUI.block(
+          title: status_title,
+          border_style: TUI.style(fg: Theme[:border]),
+          title_style: TUI.style(fg: Theme[:dim]),
+          children: [TUI.paragraph(text: content, wrap: false)]
+        )
+      end
+
+      def status_title
+        return nil unless @busy
+
+        " #{status_line} "
       end
 
       def status_line
         detail = @tool ? "tool: #{@tool}" : (@live.empty? ? "thinking" : "…")
         "#{SPINNER[@frames % SPINNER.size]} #{detail}"
+      end
+
+      # The footer (AC4, pi footer.ts): line 1 the ~-contracted cwd with the
+      # git branch; line 2 the token stats left and the model id
+      # right-aligned, all dim except the context segment (warning >70%,
+      # error >90% — footer.ts:132-139).
+      def footer_widget
+        data = @footer_data || {}
+        width = viewport_width
+        pwd = Chat.format_cwd(data[:cwd] || Dir.pwd)
+        pwd = "#{pwd} (#{read_branch(data[:cwd])})" if read_branch(data[:cwd])
+        TUI.paragraph(text: [
+          TUI.line(clip_spans([TUI.span(pwd)], width), fg: Theme[:dim]),
+          footer_stats(data, width),
+        ], wrap: false)
+      end
+
+      # The branch, cached until the next turn invalidates it (pi's provider
+      # cache, reduced to per-turn invalidation — recorded). The fetched
+      # flag makes a nil result (no repo / detached HEAD) cached too.
+      def read_branch(cwd)
+        return nil if @branch_reader.nil? || cwd.nil?
+
+        unless @branch_fetched
+          @branch = @branch_reader.call(cwd)
+          @branch_fetched = true
+        end
+        @branch
+      end
+
+      # The stats line as spans (footer.ts:113-153): ↑input ↓output
+      # R(ead) W(rite) CH% when present, the context segment, then the
+      # model id right-aligned (min 2 spaces padding, stats truncated with
+      # "..." when they would crowd it out).
+      def footer_stats(data, width)
+        totals = @usage_totals
+        parts = []
+        parts << "↑#{Chat.format_tokens(totals[:input])}" if totals[:input].positive?
+        parts << "↓#{Chat.format_tokens(totals[:output])}" if totals[:output].positive?
+        parts << "R#{Chat.format_tokens(totals[:cache_read])}" if totals[:cache_read].positive?
+        parts << "W#{Chat.format_tokens(totals[:cache_write])}" if totals[:cache_write].positive?
+        parts << "CH#{format("%.1f%%", cache_hit_rate)}" if cache_hit_rate
+
+        model = data[:model] || "no-model"
+        left = parts.map { |part| TUI.span("#{part} ") }
+        left << TUI.span(context_segment(data), fg: context_fg)
+        pad = width - left.sum { |span| TUI.text_width(span.content) } - TUI.text_width(model)
+        spans = if pad >= 2
+          left + [TUI.span(" " * pad + model)]
+        else
+          # Too wide: the stats clip (with their colors) and the model keeps
+          # a two-cell margin (pi truncates statsLeft with "...").
+          clip_spans(left, [width - TUI.text_width(model) - 2, 0].max) + [TUI.span("… #{model}")]
+        end
+        TUI.line(spans)
+      end
+
+      # The context numerator: provider-reported context tokens of the
+      # latest assistant usage — nil before the first usage and after a
+      # compaction (pi's post-compaction "?").
+      def context_used
+        return nil if @usage_stale || @last_usage.nil?
+
+        Compaction.calculate_context_tokens(@last_usage)
+      end
+
+      # The context segment (footer.ts:134-143): "?/window (auto)" until
+      # usage arrives (and after compaction, pi's post-compaction "?"),
+      # then "pct%/window (auto)". Nil window renders "?" alone.
+      def context_segment(data)
+        window = data[:context_window]
+        auto = data[:auto_compact] ? " (auto)" : ""
+        return "?" if window.nil?
+
+        used = context_used
+        return "?/#{Chat.format_tokens(window)}#{auto}" if used.nil?
+
+        "#{(used * 100.0 / window).round(1)}%/#{Chat.format_tokens(window)}#{auto}"
+      end
+
+      def context_fg
+        used = context_used
+        window = @footer_data&.fetch(:context_window, nil)
+        return Theme[:dim] if used.nil? || !window.is_a?(Integer) || !window.positive?
+
+        percent = used * 100.0 / window
+        if percent > 90 then Theme[:error]
+        elsif percent > 70 then Theme[:warning]
+        else Theme[:dim]
+        end
+      end
+
+      # pi's latestCacheHitRate (footer.ts:98-103): the latest assistant
+      # usage's cacheRead share of the prompt tokens.
+      def cache_hit_rate
+        return nil if @last_usage.nil? || @usage_totals[:cache_read].zero? && @usage_totals[:cache_write].zero?
+
+        prompt = [@last_usage.input, @last_usage.cache_read, @last_usage.cache_write].compact.sum
+        prompt.positive? ? @last_usage.cache_read * 100.0 / prompt : nil
       end
 
       # --- input-line editing primitives (each leaves history browsing) ---
@@ -623,7 +854,7 @@ module Tart
       # trailing space. The port's readback-provable analog carries the
       # reversed modifier (the hardware cursor is unreachable through the
       # tree-draw seam and not cell-readable). Input beyond one row clips at
-      # the viewport edge (pre-existing; pi scrolls horizontally).
+      # the editor's inner width (pre-existing; pi scrolls horizontally).
       def input_spans
         at = @input[@cursor]
         spans = [TUI.span("❯ "), TUI.span(@input[0, @cursor] || "")]
@@ -632,44 +863,52 @@ module Tart
         spans << TUI.span(at, modifiers: [:reversed]) << TUI.span(@input[(@cursor + 1)..])
       end
 
-      # The streaming text, wrapped to the viewport width, as many tail
-      # lines as fit above the other live-region rows (deltas append; the
-      # window slides): the status line while busy, then the approval block
-      # (APPROVAL_ROWS rows) or the input line. (The final clip in
-      # build_widget stays authoritative; this estimate is what keeps a
-      # full live tail from pushing those rows out from under it.)
-      def live_lines
+      # Clips styled spans to +width+ visible columns (the editor's inner
+      # width); the trailing partial span is trimmed cell-wise.
+      def clip_spans(spans, width)
+        out = []
+        budget = width
+        spans.each do |span|
+          break if budget <= 0
+
+          text = span.content
+          if TUI.text_width(text) <= budget
+            out << span
+            budget -= TUI.text_width(text)
+          else
+            head, = self.class.fit(text, budget)
+            out << TUI.span(head, fg: span.style&.fg, modifiers: span.style&.modifiers.to_a)
+            budget -= TUI.text_width(head)
+          end
+        end
+        out
+      end
+
+      # The streaming text, wrapped to the transcript width — the
+      # transcript area's tail clip bounds it (deltas append; the window
+      # slides).
+      def live_lines(width)
         return [] if @live.empty?
 
-        wrapped = self.class.wrap(@live, viewport_width)
-        fixed = (@busy ? 1 : 0) + (@pending ? APPROVAL_ROWS : 1)
-        budget = viewport_height ? viewport_height - fixed : wrapped.size
-        wrapped.last([budget, 0].max)
+        self.class.wrap(@live, width).map { |line| TUI.line(line) }
       end
 
-      def viewport_height
-        area = @session.viewport_area
-        area ? area.height : nil
-      end
-
-      def approval_lines
+      def approval_lines(width)
         args = JSON.generate(@pending.arguments) rescue @pending.arguments.to_s
         [
           "approve #{@pending.name}?",
-          args.length > viewport_width ? args[0, viewport_width] : args,
+          args.length > width ? args[0, width] : args,
           "y = yes, n = no"
         ]
       end
 
-      # Insert queued lines above the live viewport (pi: completed content
-      # into scrollback). Entries are final display lines (plain text at a
-      # line-level fg, or markdown-vocabulary rows converted at the seam).
-      # Must never run inside a draw — the kernel calls the renderer before
-      # drawing, and insert_before itself raises during draw.
+      # Completed lines move into the transcript buffer (pi: completed
+      # content into scrollback). Entries are final display Lines. The
+      # inline insert_before path is retired from the interactive surface —
+      # the buffer is drawn wholesale every frame.
       def flush_scrollback
         until @scrollback.empty?
-          lines = @scrollback.pop
-          @session.insert_before(lines.size, TUI.paragraph(text: lines))
+          @transcript.concat(@scrollback.pop)
         end
       end
     end

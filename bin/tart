@@ -12,8 +12,7 @@
 # Keys: type + Enter to send (steers a running agent); y/n at approval
 # prompts; Ctrl+C interrupts a running turn / quits when idle.
 #
-# Run from a REAL terminal (the inline viewport's init DSR query needs a tty
-# reply).
+# Run from a REAL terminal (raw mode / alt-screen need a tty).
 
 require "optparse"
 require_relative "../lib/tart"
@@ -32,8 +31,8 @@ module Tart
       <<~USAGE
         Usage: tart [WORKDIR] [options]
 
-        Interactive coding-agent chat on an inline-viewport TUI, scoped to
-        WORKDIR (default: the current directory).
+        Interactive coding-agent chat on a fullscreen TUI (transcript,
+        editor, footer), scoped to WORKDIR (default: the current directory).
 
         Options:
           -p, --print PROMPT  single-shot: send PROMPT headless, write the
@@ -84,6 +83,10 @@ module Tart
 
         Keys: type + Enter to send (steers a running agent); y/n at approval
         prompts; Ctrl+C interrupts a running turn / quits when idle.
+
+        Surface: fullscreen three-area layout — transcript, bordered editor
+        (its top border carries the working/tool status), footer (cwd, git
+        branch, token usage, context vs the context window, model).
       USAGE
     end
 
@@ -136,7 +139,7 @@ module Tart
       skills = Skills.load(cwd: workdir)
       require_api_key(settings)
 
-      TUI.run(viewport: :inline, height: 8, bracketed_paste: true) do |session|
+      TUI.run(viewport: :fullscreen, bracketed_paste: true) do |session|
         kernel = Core::Loop.new(session:)
         surface = Render::Chat.new(session:, kernel:)
         tools = build_tools(workdir, settings)
@@ -149,6 +152,14 @@ module Tart
           recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
           seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
           chat = build_chat(settings)
+          # Footer facts (AC4): the I10 resolved window is the context-usage
+          # denominator; the model id is the settings-resolved one.
+          surface.footer_data = {
+            cwd: workdir,
+            model: Settings.resolve_setting("defaultModel", settings),
+            context_window: Settings.resolve_context_window(settings:, model: chat.model),
+            auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true)
+          }
           surface.agent = Agent::Loop.new(
             chat:,
             tools:,

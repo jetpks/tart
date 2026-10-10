@@ -55,6 +55,62 @@ module Tart
       end
     end
 
+    # --- fullscreen seam surface (AC1): layout splits, bordered blocks,
+    # widget-tree readback, resize — all on the headless test terminal. ---
+
+    def test_layout_splits_children_into_constraint_rects
+      TUI.run(headless: true, width: 20, screen_height: 6) do |session|
+        session.draw(TUI.layout(
+          children: [TUI.paragraph(text: "top"), TUI.paragraph(text: "bottom")],
+          constraints: [TUI.constraint_min(1), TUI.constraint_length(2)]
+        ))
+        assert_equal "t", session.cell_symbol(0, 0), "the Min child takes the top"
+        assert_equal "b", session.cell_symbol(0, 4), "the Length child docks at the bottom"
+      end
+    end
+
+    def test_block_renders_title_and_borders_with_styles
+      TUI.run(headless: true, width: 20, screen_height: 5) do |session|
+        session.draw(TUI.block(
+          title: " status ",
+          border_style: TUI.style(fg: :dark_gray),
+          title_style: TUI.style(fg: :dark_gray),
+          children: [TUI.paragraph(text: "input")]
+        ))
+        assert_equal "┌", session.cell_symbol(0, 0)
+        assert_equal "s", session.cell_symbol(2, 0), "the title renders on the top border"
+        assert_equal :dark_gray, session.cell_fg(2, 0), "the title carries its style"
+        assert_equal "i", session.cell_symbol(1, 1), "children render inside the borders"
+      end
+    end
+
+    def test_widget_lines_reads_back_a_composed_tree
+      TUI.run(headless: true, width: 20, screen_height: 6) do |session|
+        widget = TUI.layout(
+          children: [
+            TUI.paragraph(text: [TUI.line("echo"), TUI.line("rows")]),
+            TUI.block(children: [TUI.paragraph(text: "input")]),
+          ],
+          constraints: [TUI.constraint_min(1), TUI.constraint_length(3)]
+        )
+        assert_equal ["echo", "rows", "input"], TUI.widget_lines(widget),
+          "layout children read back in order; a block's title row is not display content"
+        session.draw(widget)
+      end
+    end
+
+    def test_resize_reshapes_the_test_terminal_and_the_next_frame_recomposes
+      TUI.run(headless: true, width: 20, screen_height: 6) do |session|
+        session.draw(TUI.paragraph(text: "x"))
+        session.resize(30, 8)
+        area = session.viewport_area
+        assert_equal [30, 8], [area.width, area.height], "the viewport reports the new geometry"
+        session.draw(TUI.paragraph(text: [TUI.line("y" * 25)]))
+        assert_equal 8, session.buffer_content.size, "the buffer reshaped"
+        assert_equal 30, session.buffer_content.first.length
+      end
+    end
+
     def test_terminal_restored_after_normal_run
       TUI.run(headless: true) { |session| session.draw(TUI.status_panel("x")) }
       refute TUI::Session.active?

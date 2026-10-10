@@ -3,13 +3,13 @@
 A Ruby port of the [pi](https://github.com/earendil-works/pi) coding-agent harness — the parts we use — on the socketry async stack.
 
 - **LLM layer:** [ruby_llm](https://rubyllm.com/) (harness-driven tool loop, model registry, MCP client)
-- **TUI layer:** [ratatui_ruby](https://www.ratatui-ruby.dev/) (inline viewport chat, native Rust rendering)
+- **TUI layer:** [ratatui_ruby](https://www.ratatui-ruby.dev/) (fullscreen chat surface, native Rust rendering)
 - **Concurrency:** the [async](https://github.com/socketry/async) gem — one fiber-scheduler reactor for TTY input, LLM SSE streaming, and subprocess execution
 
 ## Usage
 
-Interactive chat on an inline-viewport TUI, scoped to the working directory
-(from a real terminal — the inline viewport's init query needs a tty reply):
+Interactive chat on a fullscreen TUI, scoped to the working directory
+(from a real terminal — raw mode / the alt screen need a tty):
 
 ```sh
 export TART_API_KEY=...   # provider API key (required)
@@ -87,6 +87,26 @@ like any message.
 
 Keys: type + Enter to send (steers a running agent); y/n at approval prompts;
 Ctrl+C interrupts a running turn / quits when idle.
+
+### The surface
+
+The fullscreen layout composes three areas (pi's chat viewport): the
+transcript on top (completed turns render into a scrollback buffer;
+assistant messages render as styled markdown at completion; the streaming
+message shows its raw source at the buffer's tail), a bordered editor area
+whose top border carries the status line (spinner + working/tool while a
+turn runs), and a two-line footer: the ~-contracted working directory with
+the git branch, then token counters (↑input ↓output R cache-read
+W cache-write CH cache-hit), context usage against the resolved context
+window (warning above 70%, error above 90%, `(auto)` when compaction is
+enabled), and the model id.
+
+Colors come from a theme token table (`Tart::Theme`) — pi's dark theme
+tokens mapped onto the terminal's ANSI palette. All surface rendering —
+chat roles, markdown styles, borders, the footer — resolves through it.
+
+Editor keys: Ctrl+B/F step, Alt+B/F jump words, Ctrl+W deletes a word
+backward, Ctrl+A/E home/end, ↑/↓ recall history.
 
 ### Sessions
 
