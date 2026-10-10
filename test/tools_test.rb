@@ -107,5 +107,75 @@ module RaspberryPi
     def test_registry_rejects_unknown_tools
       assert_raises(ArgumentError) { Tools::Registry.build(selected: %w[rm_rf], cwd: @dir) }
     end
+
+    # ---- §5 toggle seam: write-boundary trailing-whitespace strip ----
+
+    def test_registry_plumbs_strip_toggle_to_edit_and_write
+      tools = Tools::Registry.build(selected: Tools::ALL, cwd: @dir, strip_trailing_whitespace: true)
+      assert tools.fetch("write").instance_variable_get(:@strip_trailing_whitespace)
+      assert tools.fetch("edit").instance_variable_get(:@strip_trailing_whitespace)
+
+      default = Tools::Registry.build(selected: Tools::ALL, cwd: @dir)
+      refute default.fetch("write").instance_variable_get(:@strip_trailing_whitespace)
+      refute default.fetch("edit").instance_variable_get(:@strip_trailing_whitespace)
+    end
+
+    def test_write_default_stays_byte_verbatim
+      content = "trailing spaces  \ntab\t\nlast line no newline"
+      Tools::Write.new(cwd: @dir).execute(path: "off.txt", content:)
+      assert_equal content, File.binread(File.join(@dir, "off.txt"))
+    end
+
+    def test_write_on_strips_trailing_spaces_and_tabs_per_line
+      content = "spaces  \ttabs\t  \n\t  \nnone\r\nno trailing newline  "
+      result = Tools::Write.new(cwd: @dir, strip_trailing_whitespace: true).execute(path: "on.txt", content:)
+
+      assert_equal "Successfully wrote to on.txt", result
+      # Internal runs preserved; whitespace-only line strips to empty; the
+      # space before \r stays (lines split on "\n" — spec-literal).
+      assert_equal "spaces  \ttabs\n\nnone\r\nno trailing newline",
+        File.binread(File.join(@dir, "on.txt"))
+    end
+
+    def test_write_on_preserves_line_count_and_final_newline_presence
+      # Final newline present.
+      Tools::Write.new(cwd: @dir, strip_trailing_whitespace: true).execute(path: "nl.txt", content: "a  \nb\t\n")
+      assert_equal "a\nb\n", File.binread(File.join(@dir, "nl.txt"))
+
+      # Final newline absent.
+      Tools::Write.new(cwd: @dir, strip_trailing_whitespace: true).execute(path: "no-nl.txt", content: "a  \nb\t")
+      assert_equal "a\nb", File.binread(File.join(@dir, "no-nl.txt"))
+    end
+
+    def test_edit_default_stays_byte_verbatim
+      path = File.join(@dir, "off.txt")
+      File.binwrite(path, "alpha\nbeta  \n")
+      result = Tools::Edit.new(cwd: @dir).execute(path: "off.txt", edits: [{old_text: "alpha", new_text: "ALPHA  "}])
+
+      assert_equal "Successfully replaced 1 block(s) in off.txt.", result
+      assert_equal "ALPHA  \nbeta  \n", File.binread(path)
+    end
+
+    def test_edit_on_strips_trailing_whitespace_from_committed_bytes
+      path = File.join(@dir, "on.txt")
+      File.binwrite(path, "alpha\nbeta  \n")
+      result = Tools::Edit.new(cwd: @dir, strip_trailing_whitespace: true)
+        .execute(path: "on.txt", edits: [{old_text: "alpha", new_text: "ALPHA  "}])
+
+      assert_equal "Successfully replaced 1 block(s) in on.txt.", result
+      assert_equal "ALPHA\nbeta\n", File.binread(path)
+    end
+
+    def test_edit_on_preserves_line_count_and_final_newline_presence
+      path = File.join(@dir, "crlf.txt")
+      File.binwrite(path, "a\r\nb  \r\n")
+      result = Tools::Edit.new(cwd: @dir, strip_trailing_whitespace: true)
+        .execute(path: "crlf.txt", edits: [{old_text: "a", new_text: "A  "}])
+
+      assert_equal "Successfully replaced 1 block(s) in crlf.txt.", result
+      # Line count (2), CRLF endings, and every non-trailing byte identical;
+      # the space before \r is untouched (lines split on "\n" — spec-literal).
+      assert_equal "A  \r\nb  \r\n", File.binread(path)
+    end
   end
 end

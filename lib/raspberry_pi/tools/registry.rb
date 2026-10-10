@@ -28,26 +28,42 @@ module RaspberryPi
         "ls" => "RaspberryPi::Tools::Ls"
       }.freeze
 
+      # Classes whose write boundary accepts the §5 toggle (registry.rb doc).
+      WRITE_BOUNDARY_CLASSES = %w[
+        RaspberryPi::Tools::Edit
+        RaspberryPi::Tools::Write
+      ].freeze
+
       module_function
 
       # @param selected [Array<String>] enabled tool names (schema gating).
       # @param cwd [String] working directory for all tools.
+      # @param strip_trailing_whitespace [Boolean] §5 toggle (default off):
+      #   edit/write strip trailing spaces/tabs from each committed line.
       # @return [Hash{String => RubyLLM::Tool}] instances for the selected
       #   tools only, keyed by wire name. Destructive tools are extended with
       #   requires_approval (ruby_llm native approval gating, verified in gem
       #   source: Chat#run_tools consults tool.requires_approval? before
       #   executing; undecided calls stay pending and Chat#awaiting_approval?
       #   reports them).
-      def build(selected:, cwd:)
+      def build(selected:, cwd:, strip_trailing_whitespace: false)
         selected.each do |name|
           raise ArgumentError, "Unknown tool: #{name}" unless TOOL_CLASSES.key?(name)
         end
 
         TOOL_CLASSES.slice(*selected).transform_values do |class_name|
-          instance = Object.const_get(class_name).new(cwd:)
+          instance = build_tool(class_name, cwd:, strip_trailing_whitespace:)
           instance.extend(approval_module) if approval_required?(instance.name)
           instance
         end
+      end
+
+      # Only the write-boundary tools accept the §5 toggle; the others take
+      # cwd only.
+      def build_tool(class_name, cwd:, strip_trailing_whitespace:)
+        kwargs = {cwd:}
+        kwargs[:strip_trailing_whitespace] = strip_trailing_whitespace if WRITE_BOUNDARY_CLASSES.include?(class_name)
+        Object.const_get(class_name).new(**kwargs)
       end
 
       APPROVAL_MODULE = Module.new do
