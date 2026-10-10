@@ -296,6 +296,66 @@ module RaspberryPi
         "the interrupted turn renders coherently"
     end
 
+    # --- markdown seam (AC5): assistant completions render through the
+    # converter into scrollback — styled cells proven by readback; the live
+    # region stays verbatim streaming text. ---
+
+    def test_assistant_completion_renders_markdown_styled_in_scrollback
+      with_inline_chat(width: 40, height: 6) do |chat, session|
+        finish_message(chat, "# Heading\n\nplain **bold** text")
+        draw(chat, session)
+
+        cells = scrollback_cells(session) # [x, y, symbol, fg, modifiers]
+        heading = cells.find { |cell| cell[2] == "H" }
+        assert_equal :yellow, heading[3], "the markdown heading renders yellow (mdHeading)"
+        assert_equal %i[bold underlined], heading[4], "h1 is bold+underlined (markdown.ts:481-483)"
+        bold = cells.find { |cell| cell[2] == "b" }
+        assert_equal [:bold], bold[4], "strong renders the bold modifier (markdown.ts:683-687)"
+        plain = cells.find { |cell| cell[2] == "p" }
+        assert_equal [nil, []], plain[3, 2], "plain prose keeps the terminal default"
+        assert_equal 3, session.viewport_area.y,
+          "the heading, its spacing row, and the paragraph occupy three scrollback rows"
+      end
+    end
+
+    def test_live_region_streams_markdown_source_verbatim
+      with_inline_chat do |chat, session|
+        stream(chat, "**bo")
+        draw(chat, session)
+        assert_includes live_region(session), "**bo",
+          "the live region carries the raw markdown source while streaming"
+      end
+    end
+
+    def test_assistant_markdown_renders_through_the_kernel_loop
+      @server = MockLLMServer.new.start
+      @server.script([{type: :message, content: "# Title\n\nplain body"}])
+      kernel, chat, session = chat_with_server
+
+      scenario = Thread.new do
+        type(session, "hi")
+        wait_until { scrollback_lines(session).join.include?("Title") }
+        kernel.stop!
+      end
+      kernel.run
+      scenario.join
+
+      assert_equal ["❯ hi", "Title", "", "plain body"], scrollback_lines(session),
+        "the assistant reply renders as markdown rows in scrollback (with the spacing row between blocks)"
+    end
+
+    def test_wrap_row_wraps_styled_rows_preserving_spans
+      bold = Render::Markdown::Span.new(text: "bold", modifiers: [:bold])
+      row = [Render::Markdown::Span.new(text: "plain "), bold]
+      rows = Render::Chat.wrap_row(row, 9) # "plain bold" is 10 cells
+
+      assert_equal ["plain", "bold"], rows.map { |r| r.map(&:text).join },
+        "the break consumes the separator space, as {wrap} does"
+      assert_equal [:bold], rows[1].first.modifiers, "styling survives the wrap"
+      assert_equal [row], Render::Chat.wrap_row(row, 10), "a fitting row passes through unchanged"
+      assert_equal [[]], Render::Chat.wrap_row([], 10), "a blank row stays blank"
+    end
+
     # --- wrapping ---
 
     def test_wrap_breaks_words_and_hard_splits_long_words
@@ -615,6 +675,20 @@ module RaspberryPi
     def inserted_lines(session)
       area = session.viewport_area
       session.buffer_content[0, area.y].map(&:strip).reject(&:empty?)
+    end
+
+    # [x, y, symbol, fg, modifiers] of every non-blank cell in the rows the
+    # chat inserted above the viewport — the markdown-seam style readback.
+    def scrollback_cells(session)
+      area = session.viewport_area
+      (0...area.y).flat_map do |y|
+        (0...area.width).filter_map do |x|
+          symbol = session.cell_symbol(x, y)
+          next if symbol == " "
+
+          [x, y, symbol, session.cell_fg(x, y), session.cell_modifiers(x, y)]
+        end
+      end
     end
 
     # [symbol, fg] of the first non-blank cell of every non-blank screen row

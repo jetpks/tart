@@ -14,7 +14,10 @@ module RaspberryPi
     # (+insert_before+) is how completed content lands above it. Observable
     # contract is parity: completed messages readable above a live bottom
     # region, streaming visible while it happens, terminal restored on
-    # exit/interrupt.
+    # exit/interrupt. Assistant completions render through the markdown
+    # converter at completion; the live region streams the raw source
+    # verbatim (pi renders markdown while streaming — the recorded
+    # deviation).
     #
     # Threading: all draws and scrollback insertions happen on the kernel's
     # frame loop (the renderer proc); agent events mutate state under a mutex
@@ -57,13 +60,13 @@ module RaspberryPi
       # The style vocabulary — fg colors behind the TUI seam, porting pi's
       # observable distinctions (dark theme): the user echo carries the blue
       # distinction (pi: userMessageBg blue background; fg is the closest
-      # analog on a plain span), assistant text stays the terminal default
-      # (pi: userMessageText/text), tool output is muted (pi: toolOutput),
-      # status is dim (pi: spinner/thinking), interrupts yellow and errors
-      # red (pi: warning/error).
+      # analog on a plain span), assistant completions carry their styles
+      # per-span through the markdown converter (plain prose stays the
+      # terminal default, pi: userMessageText/text), tool output is muted
+      # (pi: toolOutput), status is dim (pi: spinner/thinking), interrupts
+      # yellow and errors red (pi: warning/error).
       FG = {
         user: :light_blue,
-        assistant: nil,
         tool: :gray,
         status: :dark_gray,
         interrupted: :yellow,
@@ -149,7 +152,6 @@ module RaspberryPi
       # Agent event sink (I03 event surface). Runs on the agent fiber.
       def on_agent_event(event)
         handled = nil
-        fg = nil
         @mutex.synchronize do
           case event[:type]
           when :agent_start
@@ -163,22 +165,24 @@ module RaspberryPi
             message = event[:message]
             if message.role == :assistant
               handled = complete(message.content)
-              fg = FG[:assistant]
+              # Assistant completions render as markdown (AC5) — at
+              # completion only: the live region streamed the raw source.
+              enqueue_markdown(handled) if handled
             end
           when :tool_execution_start
             @tool = event[:tool_call].name
           when :tool_execution_end
             @tool = nil
             handled = tool_line(event[:tool_call].name, event[:result])
-            fg = FG[:tool]
+            enqueue_scrollback(handled, fg: FG[:tool])
           when :agent_end
             @busy = false
             if event[:interrupted] == true
               handled = "interrupted"
-              fg = FG[:interrupted]
+              enqueue_scrollback(handled, fg: FG[:interrupted])
             elsif event[:error]
               handled = "error: #{event[:error].message}"
-              fg = FG[:error]
+              enqueue_scrollback(handled, fg: FG[:error])
             end
             # A message submitted in the wind-down window (after the agent's
             # final steering check, before agent_end) sits queued with no run
@@ -189,7 +193,6 @@ module RaspberryPi
             end
           end
         end
-        enqueue_scrollback(handled, fg:) if handled
         @kernel.animate(duration: BUSY_FRAME_SECONDS)
       end
 
@@ -229,6 +232,32 @@ module RaspberryPi
           end
           out << line
           out
+        end
+
+        # Word-wrap one styled markdown row to +width+ visible columns: the
+        # {fit} word-wrap over the row's visible text, spans re-grouped per
+        # wrapped line (pi wraps rendered markdown to the terminal width).
+        # Rows that fit — and blank rows — pass through unchanged.
+        def wrap_row(row, width)
+          return [row] if row.empty? || TUI.text_width(row.map(&:text).join) <= width
+
+          cells = row.flat_map { |span| span.text.chars.product([span]) }
+          out = []
+          until cells.empty?
+            head, consumed = fit(cells.map(&:first).join, width)
+            out << styled_row(cells[0, head.length])
+            cells = cells[consumed..] || []
+          end
+          out
+        end
+
+        # Wrapped cells re-grouped into spans (consecutive chars of one
+        # source span coalesce back into a single run).
+        def styled_row(cells)
+          cells.chunk_while { |(_, a), (_, b)| a.equal?(b) }.map do |group|
+            span = group.first[1]
+            Render::Markdown::Span.new(text: group.map(&:first).join, fg: span.fg, modifiers: span.modifiers)
+          end
         end
 
         # pi's findWordBackward (word-navigation.ts:17-70): from the cursor,
@@ -300,10 +329,9 @@ module RaspberryPi
 
       private
 
-      # Completed content: queued for insertion above the live region,
-      # wrapped to the viewport width. Mutex context (called from
-      # on_agent_event); returns the final text (nil when nothing to show).
-      # (fg set by the caller.)
+      # Completed content: queued for insertion above the live region.
+      # Mutex context (called from on_agent_event); returns the final text
+      # (nil when nothing to show).
       def complete(text)
         @live = +""
         return nil if !text.is_a?(String) || text.empty?
@@ -311,10 +339,25 @@ module RaspberryPi
         text
       end
 
+      # Verbatim completed text (user echo, tool output, status): wrapped to
+      # the viewport width, one line-level fg.
       def enqueue_scrollback(text, fg:)
         return if text.nil? || text.empty?
 
-        @scrollback << [Chat.wrap(text, viewport_width), fg]
+        @scrollback << Chat.wrap(text, viewport_width).map { |line| TUI.line(line, fg:) }
+      end
+
+      # Assistant completions render through the markdown converter (AC5):
+      # styled rows wrapped to the viewport width, span styling intact, then
+      # converted row → Line at the TUI seam. The live region streamed the
+      # raw source verbatim — markdown renders at completion only (the
+      # recorded deviation from pi's streaming markdown rendering).
+      def enqueue_markdown(text)
+        return if text.nil? || text.empty?
+
+        width = viewport_width
+        rows = Render::Markdown.rows(text, width:).flat_map { |row| Chat.wrap_row(row, width) }
+        @scrollback << rows.map { |row| TUI.markdown_line(row) }
       end
 
       # Bounded multi-line preview (pi truncates tool output): the first
@@ -596,12 +639,14 @@ module RaspberryPi
       end
 
       # Insert queued lines above the live viewport (pi: completed content
-      # into scrollback). Must never run inside a draw — the kernel calls the
-      # renderer before drawing, and insert_before itself raises during draw.
+      # into scrollback). Entries are final display lines (plain text at a
+      # line-level fg, or markdown-vocabulary rows converted at the seam).
+      # Must never run inside a draw — the kernel calls the renderer before
+      # drawing, and insert_before itself raises during draw.
       def flush_scrollback
         until @scrollback.empty?
-          lines, fg = @scrollback.pop
-          @session.insert_before(lines.size, TUI.paragraph(text: lines.map { |line| TUI.line(line, fg:) }))
+          lines = @scrollback.pop
+          @session.insert_before(lines.size, TUI.paragraph(text: lines))
         end
       end
     end

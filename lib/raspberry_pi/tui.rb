@@ -185,6 +185,15 @@ module RaspberryPi
       RatatuiRuby::Text::Line.new(spans:)
     end
 
+    # @return [RatatuiRuby::Text::Line] one display line built from a
+    #   markdown-vocabulary row: an Array of duck-typed spans answering
+    #   +text/+fg/+modifiers+ (Render::Markdown::Span's contract — +fg+ a
+    #   color symbol or nil, +modifiers+ modifier symbols). An empty row is
+    #   a blank line.
+    def markdown_line(row)
+      line(row.map { |s| span(s.text, fg: s.fg, modifiers: s.modifiers) })
+    end
+
     # @return [Integer] the display width of +string+ in terminal cells
     #   (wrapping measurements; native, no terminal session required).
     def text_width(string)
