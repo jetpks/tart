@@ -40,8 +40,14 @@ module Tart
       "apiBase" => "https://api.fireworks.ai/inference/v1",
       "apiKey" => nil,
       "contextWindow" => nil,
+      "thinkingLevel" => "medium",
       "compaction" => {"enabled" => true, "reserveTokens" => 16_384, "keepRecentTokens" => 20_000}
     }.freeze
+
+    # pi's ThinkingLevel vocabulary (model-schema.ts:2-3, agent types.ts:349).
+    # The setting diverges from pi's schema key (defaultThinkingLevel,
+    # settings-schema.ts:212) — recorded divergence.
+    THINKING_LEVELS = %w[off minimal low medium high xhigh max].freeze
 
     # The port's built-in tool base (bin/tart's loadout; pi's
     # DEFAULT_TOOL_NAMES is its four core tools — recorded divergence).
@@ -105,6 +111,16 @@ module Tart
       return window if window.is_a?(Integer) && window.positive?
 
       MODEL_CONTEXT_WINDOWS[model&.id]
+    end
+
+    # The thinking level for the footer's "model • <level>" (pi footer.ts:
+    # 236-239): a settings value in pi's vocabulary passes through; anything
+    # else (missing, null, mistyped) falls back to pi's runtime default
+    # DEFAULT_THINKING_LEVEL "medium" (defaults.ts:3, model-resolver.ts:646).
+    # No env override — pi has none for it either.
+    def resolve_thinking_level(settings)
+      level = settings["thinkingLevel"]
+      THINKING_LEVELS.include?(level) ? level : DEFAULTS.fetch("thinkingLevel")
     end
 
     # The compaction settings as Agent::Loop kwargs (camelCase JSON keys →

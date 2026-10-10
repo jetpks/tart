@@ -92,16 +92,11 @@ module Tart
     def test_registry_schema_gating
       tools = Tools::Registry.build(selected: %w[read ls], cwd: @dir)
       assert_equal %w[ls read], tools.keys.sort
-      refute Tools::Registry.approval_required?("read")
 
-      destructive = Tools::Registry.build(selected: Tools::ALL, cwd: @dir)
-      Tools::DESTRUCTIVE.each do |name|
-        assert destructive.fetch(name).requires_approval?,
-          "#{name} must gate behind approval"
-      end
-      %w[read find grep ls].each do |name|
-        refute destructive.fetch(name).requires_approval?
-      end
+      # Tools execute unconditionally (pi agent-loop.ts:832): the full
+      # loadout instantiates bare, nothing extended, nothing gated.
+      all = Tools::Registry.build(selected: Tools::ALL, cwd: @dir)
+      assert_equal Tools::ALL.sort, all.keys.sort
     end
 
     def test_registry_rejects_unknown_tools

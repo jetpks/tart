@@ -5,20 +5,13 @@ require_relative "../mcp"
 module Tart
   module Tools
     # The tool registry: builds the built-in tool instances and gates the
-    # loadout (BRIEF §4 safety gating).
+    # loadout (BRIEF §4 schema gating).
     #
     # Schema gating: a tool not in the selected set is never instantiated and
     # never registered on the chat, so it never appears in the tool
     # declarations sent to the model (asserted in tests against the captured
-    # wire payload).
-    #
-    # Approval gating: destructive tools ({DESTRUCTIVE}) declare
-    # `requires_approval` (ruby_llm native mechanics, verified in gem source:
-    # Chat#run_tools partitions pending calls through the tool's approval
-    # resolver; undecided approval-required calls stay pending and
-    # Chat#waiting?/awaiting_approval? report it). The agent loop calls the
-    # injectable approval callback on the kernel fiber for exactly those
-    # pending calls.
+    # wire payload). Tools execute unconditionally — pi ships no permissions
+    # system (agent-loop.ts:832).
     module Registry
       TOOL_CLASSES = {
         "read" => "Tart::Tools::Read",
@@ -47,20 +40,14 @@ module Tart
       #   MCP tools and no connections. Configured servers' tools register
       #   behind the schema gate as mcp__<server>__<tool>, declared direct.
       # @return [Hash{String => RubyLLM::Tool}] instances for the selected
-      #   tools only, keyed by wire name. Destructive tools are extended with
-      #   requires_approval (ruby_llm native approval gating, verified in gem
-      #   source: Chat#run_tools consults tool.requires_approval? before
-      #   executing; undecided calls stay pending and Chat#awaiting_approval?
-      #   reports them).
+      #   tools only, keyed by wire name.
       def build(selected:, cwd:, strip_trailing_whitespace: false, mcp_servers: nil)
         selected.each do |name|
           raise ArgumentError, "Unknown tool: #{name}" unless TOOL_CLASSES.key?(name)
         end
 
         builtins = TOOL_CLASSES.slice(*selected).transform_values do |class_name|
-          instance = build_tool(class_name, cwd:, strip_trailing_whitespace:)
-          instance.extend(approval_module) if approval_required?(instance.name)
-          instance
+          build_tool(class_name, cwd:, strip_trailing_whitespace:)
         end
         return builtins unless mcp_servers
 
@@ -75,20 +62,6 @@ module Tart
         Object.const_get(class_name).new(**kwargs)
       end
 
-      APPROVAL_MODULE = Module.new do
-        def requires_approval?
-          true
-        end
-      end
-
-      def approval_module
-        APPROVAL_MODULE
-      end
-
-      # @return [Boolean] whether the named tool gates behind approval.
-      def approval_required?(name)
-        Tools::DESTRUCTIVE.include?(name)
-      end
     end
   end
 end

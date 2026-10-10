@@ -59,6 +59,32 @@ module Tart
       assert_equal ["some unrelated warning\n"], sink.seen
     end
 
+    # The launcher's wired footer hash (the frozen cross-lane contract): the
+    # surface lane renders footer_data[:thinking_level] as "model • <level>"
+    # (nil → model alone); the data side sources it from the thinkingLevel
+    # setting. bin/tart cannot be required (it launches on load) — the same
+    # eval-minus-run-line seam as launcher_filter reaches the module.
+    def test_footer_data_carries_the_settings_resolved_thinking_level
+      launcher_filter
+      home = Dir.mktmpdir("tart-footer-home-")
+      settings = Settings.load(cwd: home, root: home).settings
+      chat = RubyLLM.context do |config|
+        config.openai_api_key = "k"
+        config.openai_api_base = "http://localhost:1/v1"
+      end.chat(model: "accounts/fireworks/models/glm-5p3-flash", provider: "openai",
+               protocol: :chat_completions, assume_model_exists: true)
+
+      data = Executable.footer_data("/somewhere", settings, chat: chat)
+      assert_equal "/somewhere", data[:cwd]
+      assert_equal "medium", data[:thinking_level]
+      assert data.key?(:model) && data.key?(:context_window) && data.key?(:auto_compact)
+
+      data = Executable.footer_data("/somewhere", settings.merge("thinkingLevel" => "off"), chat: chat)
+      assert_equal "off", data[:thinking_level]
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
     # bin/tart launches the agent on load, so it cannot be required — eval
     # its source minus the final run line to reach the filter module (the
     # launcher boot itself is covered by the child-process smoke above).

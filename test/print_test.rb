@@ -8,8 +8,8 @@ require "fileutils"
 
 module Tart
   # Print mode (AC5): headless single-shot — final response only on raw
-  # stdout, pi's exit-code semantics, pi's approval disposition (execute,
-  # no gate) — no terminal session anywhere on the path.
+  # stdout, pi's exit-code semantics, unconditional tool execution — no
+  # terminal session anywhere on the path.
   class PrintTest < Test
     def setup
       @server = MockLLMServer.new.start
@@ -49,11 +49,11 @@ module Tart
       assert_includes tool_message["content"], "fixture.txt"
     end
 
-    # pi's disposition: no approval mechanism exists (agent-loop.ts:832
-    # executes unconditionally), so a gated tool in print mode executes.
-    def test_print_executes_approval_gated_tools
+    # pi -p executes bash with no decision point (agent-loop.ts:832
+    # executes unconditionally); print mode mirrors that exactly.
+    def test_print_executes_bash_headlessly_with_no_gate
       @server.script([
-        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo print-gated"}}]},
+        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo print-bash"}}]},
         {type: :message, content: "ran it"},
       ])
       tools = Tools::Registry.build(selected: %w[bash], cwd: @dir)
@@ -63,9 +63,7 @@ module Tart
       assert_equal Print::EXIT_OK, code
       assert_equal "ran it\n", @stdout.string
       tool_message = @server.captured_requests.last["messages"].find { |m| m["role"] == "tool" }
-      assert_includes tool_message["content"], "print-gated",
-        "pi -p executes gated tools with no approval; print mode must mirror that"
-      refute_includes tool_message["content"], "denied"
+      assert_includes tool_message["content"], "print-bash"
     end
 
     def test_print_exit_code_1_on_agent_error

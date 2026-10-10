@@ -8,7 +8,8 @@ require "fileutils"
 module Tart
   # The agent loop on the I02 kernel (AC1/AC3): multi-turn tool round-trip
   # against the real ruby_llm client over a local mock OpenAI-compatible
-  # endpoint, kernel-interrupt cancellation, schema gating, approval gating.
+  # endpoint, kernel-interrupt cancellation, schema gating, unconditional
+  # tool execution (pi's agent-loop.ts:832 — no permissions system).
   class AgentLoopTest < Test
     EVENTS = %i[agent_start turn_start message_start message_update message_end
                 tool_execution_start tool_execution_end turn_end agent_end].freeze
@@ -71,45 +72,23 @@ module Tart
       assert request["tools"].all? { |t| t["function"]["parameters"].is_a?(Hash) }
     end
 
-    def test_denied_approval_produces_error_tool_result_and_model_continues
+    # The former destructive-tool gate is gone (owner ruling 2026-10-10,
+    # reversing I03): bash runs through the loop with no decision point —
+    # pi's shape, agent-loop.ts:832.
+    def test_bash_runs_through_the_loop_with_no_decision_point
       @server.script([
-        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo destructive"}}]},
-        {type: :message, content: "understood"},
-      ])
-      approval_fibers = Queue.new
-      agent, events = agent_on_kernel(
-        tools: Tools::Registry.build(selected: %w[bash], cwd: @dir),
-        approval: ->(tool_call) { approval_fibers << Fiber.current; false }
-      )
-      result = run_agent(agent, "run it")
-
-      assert_equal "understood", result.last.content
-      requests = @server.captured_requests
-      tool_message = requests.last["messages"].find { |m| m["role"] == "tool" }
-      assert_includes tool_message["content"], "The user denied the bash tool call."
-
-      # The approval callback ran on the kernel reactor fiber (interruptible).
-      decided_on = approval_fibers.pop
-      refute_equal Fiber.current, decided_on
-
-      types = events.map { |e| e[:type] }
-      refute_includes types, :tool_execution_start, "a denied call must never execute"
-    end
-
-    def test_approved_tool_executes
-      @server.script([
-        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo approved-output"}}]},
+        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo straight-through"}}]},
         {type: :message, content: "done"},
       ])
-      agent, events = agent_on_kernel(
-        tools: Tools::Registry.build(selected: %w[bash], cwd: @dir),
-        approval: ->(_tool_call) { true }
-      )
+      agent, events = agent_on_kernel(tools: Tools::Registry.build(selected: %w[bash], cwd: @dir))
       run_agent(agent, "run it")
 
       requests = @server.captured_requests
       tool_message = requests.last["messages"].find { |m| m["role"] == "tool" }
-      assert_includes tool_message["content"], "approved-output"
+      assert_includes tool_message["content"], "straight-through"
+      types = events.map { |e| e[:type] }
+      assert types.index(:tool_execution_start) < types.index(:tool_execution_end),
+        "the call executes — no pause, no decision"
     end
 
     # I05 defect 1 (live repro tmp/repro_tool_hang.rb): a worker exception
@@ -198,7 +177,7 @@ module Tart
       refute kernel.poller&.thread&.alive?, "no orphan poller after interrupt"
     end
 
-    def agent_on_kernel(session: ScriptedSession.new, tools: empty_tools, approval: nil,
+    def agent_on_kernel(session: ScriptedSession.new, tools: empty_tools,
                         on_event: nil, script_enabled: true, **loop_kwargs)
       events = []
       events_mutex = Mutex.new
@@ -206,7 +185,7 @@ module Tart
         events_mutex.synchronize { events << event }
       end
       chat = TestChat.build(@server, tools: tools.values, system_prompt: "test prompt")
-      [Agent::Loop.new(chat:, tools:, on_event: on_event || sink, approval:, **loop_kwargs), events]
+      [Agent::Loop.new(chat:, tools:, on_event: on_event || sink, **loop_kwargs), events]
     end
 
     def empty_tools
