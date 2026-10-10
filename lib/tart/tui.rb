@@ -175,6 +175,30 @@ module Tart
       RatatuiRuby::Layout::Constraint.min(n)
     end
 
+    # @return [Array<RatatuiRuby::Text::Line>] the transcript scrollbar's
+    #   glyph run — one line per viewport row (pi layout.ts:285-330
+    #   getScrollbarGeometry + paintScrollbar, ported exactly): a full-height
+    #   track of "│" (+track_fg+) with the thumb "┃" (+thumb_fg+) sized
+    #   max(min(2, track), min(track, round(track²/content))) and placed
+    #   round(scrollTop/maxScrollTop · maxThumbTop). Verified against the
+    #   gem's Widgets::Scrollbar (1.5.0, live) and rejected: it burns the
+    #   first/last track rows on begin/end glyphs and computes a different
+    #   thumb size — pi is the oracle.
+    def scrollbar_lines(content_length:, position:, viewport:, track_fg:, thumb_fg:)
+      content_length = [content_length, 1].max
+      thumb = [[2, viewport].min, [viewport, (viewport * viewport.to_f / content_length).round].min].max
+      max_scroll_top = [content_length - viewport, 0].max
+      max_thumb_top = viewport - thumb
+      thumb_top = max_scroll_top.zero? ? 0 : (position * max_thumb_top.to_f / max_scroll_top).round
+      (0...viewport).map do |row|
+        if row >= thumb_top && row < thumb_top + thumb
+          line("┃", fg: thumb_fg)
+        else
+          line("│", fg: track_fg)
+        end
+      end
+    end
+
     # @return [RatatuiRuby::Widgets::Block] a bordered container: +title+ on
     #   the top border (the editor area's status line, pi custom-editor.ts
     #   renderTopBorder), +border_style+/+title_style+ the border/title

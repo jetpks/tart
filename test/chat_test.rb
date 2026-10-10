@@ -814,14 +814,301 @@ module Tart
       end
     end
 
+    # --- autocomplete (AC1, I12): the /-triggered fuzzy suggestion list,
+    # with pi's key precedence (the list owns up/down/escape/enter while
+    # active — history and interrupt yield). ---
+
+    def test_fuzzy_match_scores_like_pi
+      assert_equal 0, Render::Chat.fuzzy_match("", "new"), "an empty query matches everything"
+      assert Render::Chat.fuzzy_match("ar", "architect"), "a subsequence matches"
+      assert_nil Render::Chat.fuzzy_match("zx", "architect"), "no subsequence = no match"
+      assert Render::Chat.fuzzy_match("new", "new") <= -100, "an exact match scores best (pi's -100 bonus)"
+      assert Render::Chat.fuzzy_match("ab12", "12abc"), "the swapped alnum query retries (+5)"
+    end
+
+    def test_fuzzy_filter_ranks_word_boundary_matches_first
+      items = %w[skills compact].map { |value| {value:} }
+      ranked = Render::Chat.fuzzy_filter(items, "c") { |item| item[:value] }
+      assert_equal "compact", ranked.first[:value], "a word-boundary match outranks a mid-word one"
+    end
+
+    def test_slash_source_lists_builtin_commands_and_skills
+      skill = Skills::Skill.new(name: "greet", description: "Says hi", file_path: "/tmp/x",
+        base_dir: "/tmp", disable_model_invocation: false)
+      source = Render::Chat::SlashSource.new(commands: {"new" => {description: "Start a new session"}}, skills: [skill])
+      assert_equal [
+        {value: "new", label: "new", description: "Start a new session"},
+        {value: "skill:greet", label: "skill:greet", description: "Says hi"}
+      ], source.items
+    end
+
+    def test_typing_slash_opens_the_fuzzy_list_below_the_input
+      with_headless_chat(autocomplete: slash_source("new", "compact", "architect"), width: 50) do |chat, session|
+        chat.on_event(TUI.key_event("/"))
+        draw(chat, session)
+        input_y, rows = editor_rows(session)
+        assert_includes session.buffer_content[input_y - 1], "┌", "the list renders inside the bordered editor area"
+        assert_equal 3, chat.suggestions.size
+        assert_match(/\A→ new\s+new description\z/, rows[0], "the selection marker on the first item")
+        assert_match(/\A  compact\s+compact description\z/, rows[1], "descriptions render beside the labels")
+        assert_equal :light_magenta, session.cell_fg(1, input_y + 1), "the selected row is accent (pi theme.ts:1063-1064)"
+        assert_equal :gray, session.cell_fg(15, input_y + 2), "the description column is muted (pi theme.ts:1065)"
+      end
+    end
+
+    def test_autocomplete_default_offers_nothing
+      with_headless_chat do |chat|
+        "/ar".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        assert_equal "/ar", chat.input
+        assert_nil chat.suggestions, "no provider = no list (headless tests stay deterministic)"
+      end
+    end
+
+    def test_further_typing_refilters_and_dismisses_the_list
+      with_headless_chat(autocomplete: slash_source("new", "compact", "architect")) do |chat|
+        "/co".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        assert_equal ["compact"], chat.suggestions.map { |item| item[:value] }, "the prefix filters fuzzily"
+        chat.on_event(TUI.key_event("m"))
+        chat.on_event(TUI.key_event("p"))
+        assert_equal ["compact"], chat.suggestions.map { |item| item[:value] }, "typing re-filters"
+        chat.on_event(TUI.key_event("z"))
+        assert_nil chat.suggestions, "a token matching nothing dismisses the list"
+        chat.on_event(TUI.key_event("backspace"))
+        assert_equal ["compact"], chat.suggestions.map { |item| item[:value] }, "backspace re-triggers in context (pi editor.ts:1449-1463)"
+      end
+    end
+
+    def test_up_down_navigate_the_list_instead_of_history
+      with_headless_chat(autocomplete: slash_source("new", "help", "quit")) do |chat|
+        "older message".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter")) # lands in history
+        "/".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("down"))
+        assert_equal "/", chat.input, "down does NOT browse history while the list is active"
+        assert_equal 1, chat.suggestions_index, "down moves the selection"
+        chat.on_event(TUI.key_event("up"))
+        assert_equal 0, chat.suggestions_index
+        chat.on_event(TUI.key_event("up"))
+        assert_equal 2, chat.suggestions_index, "up wraps to the last item (pi select-list.ts:146-155)"
+      end
+    end
+
+    def test_tab_applies_the_selection_without_submitting
+      with_headless_chat(autocomplete: slash_source("architect"), width: 50) do |chat, session|
+        "/ar".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("tab"))
+        assert_equal "/architect ", chat.input, "pi applyCompletion: /<value> with a trailing space"
+        assert_nil chat.suggestions, "the list closes on apply"
+        draw(chat, session)
+        input_y, = editor_rows(session)
+        # The fake cursor (reversed) sits on input position 11 — the
+        # applied value's trailing space.
+        assert_equal [:reversed], session.cell_modifiers(14, input_y), "the cursor lands after the applied value"
+        assert_empty transcript_lines(session, chat).grep(/description/),
+          "the transcript holds no submission echo — tab never submits"
+      end
+    end
+
+    def test_enter_applies_and_submits_the_selection
+      with_headless_chat(autocomplete: slash_source("architect")) do |chat, session|
+        "/ar".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal "", chat.input
+        draw(chat, session)
+        assert_equal ["❯ /architect"], transcript_lines(session, chat),
+          "enter applies AND submits (pi editor.ts:790-816 — a /-prefix completion falls through to submit, trimmed)"
+      end
+    end
+
+    def test_escape_cancels_the_list_without_interrupting_the_run
+      with_headless_chat(autocomplete: slash_source("architect")) do |chat|
+        chat.on_agent_event({type: :agent_start})
+        "/ar".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("escape"))
+        assert_nil chat.suggestions, "escape cancels the list"
+        assert_equal "/ar", chat.input, "the input is untouched"
+        assert chat.busy?, "the run is NOT interrupted (pi custom-editor.ts:103-111)"
+      end
+    end
+
+    def test_escape_with_no_list_leaves_the_run_alone_and_is_a_noop
+      with_headless_chat do |chat|
+        chat.on_event(TUI.key_event("escape"))
+        assert_equal "", chat.input, "the port binds no escape action outside the list"
+      end
+    end
+
+    def test_typing_a_space_dismisses_the_list
+      with_headless_chat(autocomplete: slash_source("new")) do |chat|
+        "/new".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        assert chat.suggestions
+        chat.on_event(TUI.key_event(" "))
+        assert_nil chat.suggestions, "a space means argument completion — none exist (pi autocomplete.ts:340-341)"
+        assert_equal "/new ", chat.input
+      end
+    end
+
+    def test_list_windows_at_five_items_with_a_scroll_info_line
+      names = %w[one two three four five six seven]
+      with_headless_chat(autocomplete: slash_source(*names), width: 50) do |chat, session|
+        chat.on_event(TUI.key_event("/"))
+        draw(chat, session)
+        _, rows = editor_rows(session)
+        assert_equal 7, chat.suggestions.size, "the full filtered list is held"
+        assert_match(/\A→ one\s+one description\z/, rows[0], "the window opens at the top...")
+        assert_match(/\A  five/, rows[4], "...five items deep (maxVisible 5, fixed)")
+        assert_match(/\(1\/7\)/, rows[5], "the (i/N) scroll-info line renders (select-list.ts:107-110)")
+        5.times { chat.on_event(TUI.key_event("down")) }
+        draw(chat, session)
+        _, rows = editor_rows(session)
+        assert_match(/\A  five/, rows[2], "the window slides with the selection (centered, pi getVisibleRange)")
+        assert_match(/\A→ six/, rows[3])
+        assert_match(/\A  seven/, rows[4])
+        assert_match(/\(6\/7\)/, rows[5])
+      end
+    end
+
+    # --- transcript scrolling (AC2, I12): pi ScrollView follow-end + the
+    # auto scrollbar (pageUp/pageDown per keybindings.ts:114-115 — the gem
+    # spells the codes page_up/page_down). ---
+
+    def test_page_up_pans_the_transcript_and_the_tail_refollows
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        assert_equal "line19", transcript_view(session, chat).last, "following: the tail is visible"
+
+        chat.on_event(TUI.key_event("page_up"))
+        draw(chat, session)
+        visible = transcript_view(session, chat)
+        refute_includes visible, "line19", "a page up detaches from the end"
+        assert_equal "line12", visible.last, "one page = the transcript viewport rows (7 here)"
+
+        chat.on_event(TUI.key_event("page_down"))
+        draw(chat, session)
+        assert_equal "line19", transcript_view(session, chat).last,
+          "a page down from the page-up position lands at the end and re-follows"
+      end
+    end
+
+    def test_a_scrolled_up_view_stays_put_as_new_output_arrives
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        chat.on_event(TUI.key_event("page_up"))
+        draw(chat, session)
+
+        finish_message(chat, "late")
+        draw(chat, session)
+        assert_equal "line12", transcript_view(session, chat).last,
+          "the detached view stays put while output streams"
+
+        chat.on_event(TUI.key_event("page_down"))
+        draw(chat, session)
+        refute_includes transcript_view(session, chat), "late", "a paged view pans one page, not to the end"
+        chat.on_event(TUI.key_event("page_down"))
+        draw(chat, session)
+        assert_equal "late", transcript_view(session, chat).last,
+          "landing at the end re-follows the new output"
+      end
+    end
+
+    def test_page_scrolling_is_the_lists_prisoner_and_needs_no_overflow
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        "ar".each_char { |char| chat.on_event(TUI.key_event(char)) } # no slash: no list, page keys free
+        chat.on_event(TUI.key_event("page_up"))
+        assert_equal 0, chat.scroll_offset, "paging with nothing to scroll is a no-op"
+      end
+    end
+
+    def test_scrollbar_renders_only_when_content_overflows
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        2.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        assert_equal " ", session.cell_symbol(19, 0), "no gutter glyphs when the view fits (pi 'auto')"
+
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        assert_equal "┃", session.cell_symbol(19, 5), "the thumb pins to the track bottom while following"
+        assert_equal :gray, session.cell_fg(19, 5), "the thumb routes through the theme (muted analog)"
+        assert_equal "│", session.cell_symbol(19, 0), "the track fills above the thumb"
+        assert_equal :dark_gray, session.cell_fg(19, 0)
+
+        chat.on_event(TUI.key_event("page_up"))
+        draw(chat, session)
+        assert_equal "┃", session.cell_symbol(19, 3), "the thumb moves with the scroll offset"
+        assert_equal "│", session.cell_symbol(19, 5)
+      end
+    end
+
+    # --- compaction-start border status (AC3, I12): the frozen event
+    # contract consumed synthetically (the house on_agent_event pattern). ---
+
+    def test_compaction_start_shows_pi_s_label_per_reason
+      with_chat(width: 60) do |chat, session|
+        chat.on_agent_event({type: :compaction_start, reason: :manual})
+        draw(chat, session)
+        assert_includes editor_area(session, chat), "Compacting context..."
+
+        chat.on_agent_event({type: :compaction_start, reason: :threshold})
+        draw(chat, session)
+        assert_includes editor_area(session, chat), "Auto-compacting..."
+
+        chat.on_agent_event({type: :compaction_start, reason: :overflow})
+        draw(chat, session)
+        assert_includes editor_area(session, chat), "Context overflow detected, Auto-compacting..."
+        refute_includes editor_area(session, chat), "cancel",
+          "the cancel hint is cut — ctrl+c aborts the whole run in the port (BRIEF §5.1)"
+      end
+    end
+
+    def test_compaction_status_clears_on_compaction_and_agent_end
+      with_chat(width: 60) do |chat, session|
+        chat.on_agent_event({type: :compaction_start, reason: :manual})
+        chat.on_agent_event({type: :compaction, reason: :manual, tokens_before: 100, summary: "s"})
+        draw(chat, session)
+        refute_includes editor_area(session, chat), "Compacting context...", "cleared by the result event"
+        assert_includes transcript_lines(session, chat), "✻ compacted (manual, 100 tokens)",
+          "the post-hoc compaction line renders unchanged"
+
+        chat.on_agent_event({type: :compaction_start, reason: :threshold})
+        chat.on_agent_event({type: :agent_end})
+        draw(chat, session)
+        refute_includes editor_area(session, chat), "Auto-compacting...", "cleared by the run end"
+      end
+    end
+
+    def test_escape_while_running_cancels_only_the_list_kernel_driven
+      @server = MockLLMServer.new.start
+      @server.script([{type: :slow_stream, content: "answer"}])
+      kernel, chat, session = chat_with_server(autocomplete: slash_source("new", "compact"))
+
+      scenario = Thread.new do
+        type(session, "hi")
+        wait_until { chat.busy? }
+        session.push_event(TUI.key_event("/")) # a bare slash: opens the list (no submit)
+        wait_until { chat.suggestions }
+        session.push_event(TUI.key_event("escape"))
+        wait_until { chat.suggestions.nil? }
+        wait_until { chat.transcript_lines.join.include?("answer") }
+        kernel.stop!
+      end
+      kernel.run
+      scenario.join
+
+      assert_includes chat.transcript_lines.join, "answer",
+        "the turn completed — escape with an active list never interrupts the run"
+    end
+
     private
 
     # A chat surface on the headless fullscreen test terminal for key-surface
     # tests (draw/readback assertions use with_chat; these only need the
     # editor's key path, which never draws).
-    def with_headless_chat
-      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
-        yield Render::Chat.new(session:, kernel: IdleKernel.new)
+    def with_headless_chat(autocomplete: nil, width: 40)
+      TUI.run(headless: true, viewport: :fullscreen, width:, screen_height: 12) do |session|
+        yield Render::Chat.new(session:, kernel: IdleKernel.new, autocomplete:), session
       end
     end
 
@@ -837,10 +1124,10 @@ module Tart
     end
 
     # Kernel-driven tests: ScriptedSession feeds the real poller/frame loop.
-    def chat_with_server(tools: {})
+    def chat_with_server(tools: {}, autocomplete: nil)
       session = ScriptedSession.new(width: 80, height: 24)
       kernel = Core::Loop.new(session:)
-      chat = Render::Chat.new(session:, kernel:, branch_reader: nil)
+      chat = Render::Chat.new(session:, kernel:, branch_reader: nil, autocomplete:)
       chat.agent = Agent::Loop.new(
         chat: TestChat.build(@server, tools: tools.values, system_prompt: "test"),
         tools:, on_event: ->(event) { chat.on_agent_event(event) },
@@ -903,6 +1190,29 @@ module Tart
     # streaming source at its end).
     def live_region(session, chat)
       session.buffer_content[0, transcript_height(session, chat)].join
+    end
+
+    # The transcript rows with the scrollbar gutter glyph shaved — the
+    # overflow layout's dedicated column rides the row tail.
+    def transcript_view(session, chat)
+      transcript_lines(session, chat).map do |line|
+        (line.end_with?("│") || line.end_with?("┃")) ? line[..-2].rstrip : line
+      end
+    end
+
+    # One editor-block inner row (the side borders shaved).
+    def inner_row(session, y)
+      row = session.buffer_content[y]
+      row.length >= 2 ? row[1..-2] : row
+    end
+
+    # The editor block's input row and the suggestion-list rows below it:
+    # from the "❯" row down to (excluding) the block's bottom border.
+    def editor_rows(session)
+      h = session.buffer_content.size
+      input = h.times.find { |y| session.buffer_content[y].include?("❯") }
+      bottom = h.times.find { |y| session.buffer_content[y].include?("└") }
+      [input, ((input + 1)...bottom).map { |y| inner_row(session, y).rstrip }]
     end
 
     # The buffer's transcript rows, stripped and non-empty.
@@ -975,6 +1285,15 @@ module Tart
 
     def cursor_cell(session, x, row)
       [session.cell_symbol(x, row), session.cell_modifiers(x, row)]
+    end
+
+    # A SlashSource over bare builtin names (description = "<name>
+    # description") — the synthetic catalog for the editor's key paths.
+    def slash_source(*names)
+      Render::Chat::SlashSource.new(
+        commands: names.each_with_object({}) { |name, table| table[name] = {description: "#{name} description"} },
+        skills: []
+      )
     end
 
     # A branch reader that counts reads (the footer cache proof).

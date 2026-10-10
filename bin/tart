@@ -65,6 +65,9 @@ module Tart
           /new /compact /skills /settings /help /quit — /new starts a fresh
           session, /compact compacts the context now, /quit exits (when
           idle). Slash text matching no command goes to the model.
+          Autocomplete: type / to get a fuzzy list of commands and skills;
+          up/down pick, tab (or enter) apply, escape dismisses. PageUp/
+          PageDown scroll the transcript when the list is hidden.
 
         MCP servers:
           MCP stdio servers are loaded from ~/.tart/mcp.json (shape:
@@ -141,7 +144,12 @@ module Tart
 
       TUI.run(viewport: :fullscreen, bracketed_paste: true) do |session|
         kernel = Core::Loop.new(session:)
-        surface = Render::Chat.new(session:, kernel:)
+        surface = Render::Chat.new(
+          session:, kernel:,
+          # Autocomplete sources (AC1): the builtin slash commands + the
+          # loaded skills (the same catalog the Commands::Handler routes).
+          autocomplete: Render::Chat::SlashSource.new(commands: Commands::BUILTINS, skills: skills.skills)
+        )
         tools = build_tools(workdir, settings)
         prompt = system_prompt(workdir, skills.skills)
 

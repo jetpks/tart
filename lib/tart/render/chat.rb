@@ -56,6 +56,19 @@ module Tart
       # History depth (pi: editor.ts addToHistory caps at 100 entries).
       HISTORY_LIMIT = 100
 
+      # Suggestion-list window (pi editor.ts:322 default 5; the 3-20 clamp
+      # is settings-backed — cut, itemized deviation: fixed at the default).
+      AUTOCOMPLETE_MAX = 5
+
+      # pi status-indicator.ts:85-95 — the compaction-start border labels,
+      # minus the cancel hint (deviation: ctrl+c aborts the whole run in the
+      # port, not just the compaction — BRIEF §5.1, itemized).
+      COMPACTION_LABELS = {
+        manual: "Compacting context...",
+        threshold: "Auto-compacting...",
+        overflow: "Context overflow detected, Auto-compacting..."
+      }.freeze
+
       # The boundary classes of pi's word navigation (word-navigation.ts with
       # utils.ts:1006 PUNCTUATION_REGEX and :1011 isWhitespaceChar). The
       # Intl.Segmenter word-like segment is approximated by word-character
@@ -84,18 +97,35 @@ module Tart
       #   denominator), +:auto_compact+ (the compaction-enabled indicator).
       #   nil renders the footer from what the surface knows alone.
       # @param branch_reader [Proc] +call(cwd)+ → branch name or nil.
-      def initialize(session:, kernel:, footer_data: nil, branch_reader: DEFAULT_BRANCH_READER)
+      # @param autocomplete [Object, nil] the completion-source seam (AC1):
+      #   answers +items+ with the full {value:, label:, description:}
+      #   catalog the surface fuzzy-filters. nil (the default) offers no
+      #   suggestions — headless tests stay deterministic; bin/tart wires
+      #   the real command/skill sources (see {SlashSource}).
+      def initialize(session:, kernel:, footer_data: nil, branch_reader: DEFAULT_BRANCH_READER, autocomplete: nil)
         @session = session
         @kernel = kernel
         @footer_data = footer_data
         @branch_reader = branch_reader
         @agent = nil
+        @autocomplete = autocomplete
         @mutex = Mutex.new
         @input = +""
         @cursor = 0
         @history = []
         @history_index = -1 # -1 = not browsing (pi: editor.ts historyIndex)
         @history_draft = nil
+        # Active autocomplete list: the filtered items + the selection index
+        # (pi editor.ts autocompleteState/autocompleteList + SelectList).
+        @suggestions = nil
+        @selected = 0
+        # Transcript scroll state (pi ScrollView follow-end semantics): the
+        # viewport's top-line offset over the buffer; +@follow+ while pinned
+        # to the end (the default — the tail is what's visible).
+        @scroll_offset = 0
+        @follow = true
+        # The running compaction's reason (the border-status label's key).
+        @compaction_reason = nil
         @live = +""
         @busy = false
         @tool = nil
@@ -150,6 +180,23 @@ module Tart
       #   the only observable).
       def transcript_lines
         @mutex.synchronize { @transcript.map { |line| line.spans.map(&:content).join } }
+      end
+
+      # @return [Array<Hash>, nil] the active suggestion items (test
+      #   readback — the list is otherwise visible only in the drawn tree).
+      def suggestions
+        @mutex.synchronize { @suggestions }
+      end
+
+      # @return [Integer] the active list's selection index (test readback).
+      def suggestions_index
+        @mutex.synchronize { @selected }
+      end
+
+      # @return [Integer] the transcript viewport's top-line offset (test
+      #   readback; maintained at render time).
+      def scroll_offset
+        @mutex.synchronize { @scroll_offset }
       end
 
       # The kernel renderer proc: builds the fullscreen three-area widget.
@@ -217,17 +264,25 @@ module Tart
             @tool = nil
             handled = tool_line(event[:tool_call].name, event[:result])
             enqueue_scrollback(handled, fg: Theme[:tool_output])
+          when :compaction_start
+            # The frozen I12 contract (Agent::Loop#run_compaction, after
+            # prepare succeeds): the border shows pi's per-reason label
+            # (status-indicator.ts:85-95 minus the cancel hint) until the
+            # result (+:compaction+) or the run end clears it.
+            @compaction_reason = event[:reason]
           when :compaction
             # pi: after compaction, context tokens are unknown until the
             # next LLM response (footer "?"); the event itself renders a
-            # post-hoc compaction line (the port has no compaction-start
-            # seam — recorded).
+            # post-hoc compaction line (the compaction-start border status
+            # came from :compaction_start — the frozen I12 contract).
+            @compaction_reason = nil
             @usage_stale = true
             enqueue_scrollback(
               "✻ compacted (#{event[:reason]}, #{event[:tokens_before]} tokens)", fg: Theme[:dim]
             )
           when :agent_end
             @busy = false
+            @compaction_reason = nil
             if event[:interrupted] == true
               handled = "interrupted"
               enqueue_scrollback(handled, fg: Theme[:warning])
@@ -354,6 +409,78 @@ module Tart
           i
         end
 
+        # Hard cell-wise clip (pi truncateToWidth with an empty tail).
+        def clip_text(text, width)
+          out = []
+          budget = width
+          text.chars.each do |char|
+            w = TUI.text_width(char)
+            break if w > budget
+
+            out << char
+            budget -= w
+          end
+          out.join
+        end
+
+        # pi fuzzyMatch (fuzzy.ts:12-72): every query char in order (not
+        # necessarily consecutive) in the lowercased text; the score is ≤ 0,
+        # lower is better — consecutive matches −5·n, gaps +2·gap, word
+        # boundaries −10, position +0.1·i, an exact match −100. nil = no
+        # match. The alnum/num-alpha swap ("ab12" ⇄ "12ab") retries with a
+        # +5 penalty (fuzzy.ts:68-93).
+        def fuzzy_match(query, text)
+          query = query.downcase
+          text = text.downcase
+          score = fuzzy_subsequence_score(query, text)
+          return score if score
+
+          swapped = query.match(/\A(?<letters>[a-z]+)(?<digits>[0-9]+)\z/) { |m| "#{m[:digits]}#{m[:letters]}" } ||
+            query.match(/\A(?<digits>[0-9]+)(?<letters>[a-z]+)\z/) { |m| "#{m[:letters]}#{m[:digits]}" }
+          swapped && (swapped_score = fuzzy_subsequence_score(swapped, text)) ? swapped_score + 5 : nil
+        end
+
+        def fuzzy_subsequence_score(query, text)
+          return nil if query.length > text.length
+          return 0 if query.empty?
+
+          score = 0.0
+          last = -1
+          consecutive = 0
+          query.chars.each do |char|
+            i = text.index(char, last + 1)
+            return nil unless i
+
+            if last == i - 1
+              consecutive += 1
+              score -= consecutive * 5
+            else
+              consecutive = 0
+              score += (i - last - 1) * 2 if last >= 0
+            end
+            score -= 10 if i.zero? || /[\s\-_.\/:]/.match?(text[i - 1])
+            score += i * 0.1
+            last = i
+          end
+          score -= 100 if query == text
+          score
+        end
+
+        # pi fuzzyFilter (fuzzy.ts:75-106): whitespace/slash-separated query
+        # tokens must ALL match the search text; matches sort best-first.
+        def fuzzy_filter(items, query)
+          return items if query.strip.empty?
+
+          tokens = query.strip.split(/[\s\/]+/).reject(&:empty?)
+          return items if tokens.empty?
+
+          items.filter_map do |item|
+            text = yield(item)
+            scores = tokens.map { |token| fuzzy_match(token, text) }
+            scores.all? ? [item, scores.sum] : nil
+          end.sort_by { |_, score| score }.map(&:first)
+        end
+
         # Longest prefix of +line+ fitting +width+, preferring a word break.
         # Returns [head, chars_consumed].
         def fit(line, width)
@@ -397,6 +524,26 @@ module Tart
           return resolved unless resolved == resolved_home || resolved.start_with?(resolved_home + File::SEPARATOR)
 
           resolved == resolved_home ? "~" : "~#{File::SEPARATOR}#{resolved[(resolved_home.length + 1)..]}"
+        end
+      end
+
+      # The real completion source (bin/tart-wired): the builtin slash
+      # commands plus /skill:<name> entries — pi's command list
+      # (CombinedAutocompleteProvider; skills registered as "skill:<name>"
+      # at coding-agent interactive-mode.ts:809-818, plain descriptions —
+      # pi's [sourceTag] prefixes are extension/path-source metadata the
+      # port has no equivalent of, recorded). Items-only: the surface owns
+      # the fuzzy filter (mapping judgment — the port's provider seam is
+      # static, no async).
+      class SlashSource
+        def initialize(commands:, skills:)
+          @commands = commands
+          @skills = skills
+        end
+
+        def items
+          @commands.map { |name, meta| {value: name, label: name, description: meta[:description]} } +
+            @skills.map { |skill| {value: "skill:#{skill.name}", label: "skill:#{skill.name}", description: skill.description} }
         end
       end
 
@@ -499,19 +646,44 @@ module Tart
       def edit_input(event)
         if event.paste?
           insert(event.content)
+          cancel_autocomplete # pi editor.ts:1261 — paste cancels the list
           return
         end
 
         ctrl = event.modifiers.include?("ctrl")
         alt = event.modifiers.include?("alt")
+        printable = event.text? && !(event.modifiers & %w[ctrl alt]).any?
         case event.code
-        when "enter" then submit
-        when "backspace" then alt ? delete_word_backward : delete_backward
+        # Enter applies the selection and submits it (pi editor.ts:790-816
+        # tui.select.confirm: a "/"-prefix completion falls through to
+        # submit). Escape cancels the list WITHOUT interrupting (pi
+        # custom-editor.ts:103-111 — interrupt only when no list is shown).
+        when "enter"
+          apply_suggestion if @suggestions
+          submit
+        when "escape" then cancel_autocomplete if @suggestions
+        # While the list is active up/down navigate the LIST (history
+        # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
+        when "up" then @suggestions ? navigate_suggestions(-1) : history_previous
+        when "down" then @suggestions ? navigate_suggestions(1) : history_next
+        when "tab"
+          if @suggestions then apply_suggestion
+          else update_autocomplete # explicit trigger (pi handleTabCompletion)
+          end
+        # Transcript paging (pi keybindings.ts:114-115 tui.editor.pageUp/
+        # pageDown, defaultKeys pageUp/ctrl+pageUp, pageDown/ctrl+pageDown;
+        # the gem spells the codes "page_up"/"page_down") — the port maps
+        # the action onto the transcript viewport (the port's editor is
+        # single-line; mapping judgment, itemized). The list wins while
+        # active (pi's precedence: the list owns the vertical keys).
+        when "page_up" then scroll_page(-1) unless @suggestions
+        when "page_down" then scroll_page(1) unless @suggestions
+        when "backspace"
+          alt ? delete_word_backward : delete_backward
+          update_autocomplete # pi editor.ts:1449-1463 — re-filter/re-trigger
         when "delete" then alt ? delete_word_forward : delete_forward
         when "left" then (alt || ctrl) ? move_word_backward : move_left
         when "right" then (alt || ctrl) ? move_word_forward : move_right
-        when "up" then history_previous
-        when "down" then history_next
         when "home" then move_start
         when "end" then move_end
         when "a" then ctrl ? move_start : insert_printable(event)
@@ -522,6 +694,12 @@ module Tart
         when "w" then ctrl ? delete_word_backward : insert_printable(event)
         else insert_printable(event)
         end
+        # pi editor.ts:1228-1251 — the list re-filters on every printable
+        # while active; typing triggers when in slash context (pi gates the
+        # trigger to word chars/"/"; with a slash-only source the context
+        # check alone decides, so one re-query covers both — CJK trigger
+        # chars cut, itemized). Movement keys leave the list (pi literal).
+        update_autocomplete if printable
       end
 
       # pi's submit path (interactive-mode.ts:3200-3442): a leading "/"
@@ -533,8 +711,9 @@ module Tart
       # mid-turn (/compact aborts the turn first) — the port routes ALL
       # slash text through the steer path while a turn runs.
       def submit
-        text = @input.dup
-        return if text.strip.empty?
+        text = @input.dup.strip # pi onSubmit trims (interactive-mode.ts:3201)
+        cancel_autocomplete
+        return if text.empty?
 
         add_to_history(text)
         @input.clear
@@ -569,6 +748,105 @@ module Tart
 
         @history.unshift(trimmed)
         @history.pop if @history.size > HISTORY_LIMIT
+      end
+
+      # --- autocomplete (AC1, pi editor.ts autocomplete block + SelectList) ---
+
+      # The slash token before the cursor, or nil: an optional-whitespace-led
+      # "/" first token with no space before the cursor (pi
+      # isInSlashCommandContext custom-editor.ts:2202-2204 + the provider's
+      # no-space rule tui/autocomplete.ts:340-341 — a space means argument
+      # completion, which the port has none of).
+      def slash_token
+        lead = @input.index(/\S/)
+        return nil if lead.nil? || @input[lead] != "/" || lead >= @cursor
+
+        token = @input[lead...@cursor]
+        token unless token.match?(/\s/)
+      end
+
+      # Re-query the completion source from the current input/cursor (pi
+      # editor.ts:1228-1251 update-on-typing + applyAutocompleteSuggestions
+      # :2432-2442): in slash context, fuzzy-filter the catalog on the
+      # command text (pi CombinedAutocompleteProvider.getSuggestions
+      # tui/autocomplete.ts:336-365 — bare skill names first, then full
+      # "skill:" names); no context or no matches cancels the list.
+      def update_autocomplete
+        token = slash_token
+        items = token && @autocomplete ? filter_suggestions(token[1..]) : nil
+        @suggestions = items&.any? ? items : nil
+        return unless @suggestions
+
+        @selected = best_match_index(items, token[1..])
+      end
+
+      def filter_suggestions(query)
+        bare = Chat.fuzzy_filter(@autocomplete.items, query) { |item| item[:value].delete_prefix("skill:") }
+        bare + Chat.fuzzy_filter(@autocomplete.items - bare, query) { |item| item[:value] }
+      end
+
+      # pi getBestAutocompleteMatchIndex (editor.ts:2207-2232): the exact
+      # match always wins, else the first value with the prefix — else the
+      # default (first) item.
+      def best_match_index(items, prefix)
+        return 0 if prefix.empty?
+
+        first_prefix = nil
+        items.each_with_index do |item, i|
+          return i if item[:value] == prefix
+
+          first_prefix ||= i if item[:value].start_with?(prefix)
+        end
+        first_prefix || 0
+      end
+
+      def cancel_autocomplete
+        @suggestions = nil
+        @selected = 0
+      end
+
+      # pi SelectList.handleInput (select-list.ts:146-155): up/down WRAP.
+      def navigate_suggestions(direction)
+        size = @suggestions.size
+        @selected = direction == -1 ? (@selected.zero? ? size - 1 : @selected - 1) : (@selected == size - 1 ? 0 : @selected + 1)
+      end
+
+      # pi applyCompletion's slash branch (tui/autocomplete.ts:419-436):
+      # the token (before the cursor) is replaced with "/<value> " — the
+      # trailing space included — and the cursor lands after it.
+      def apply_suggestion
+        item = @suggestions[@selected]
+        cancel_autocomplete
+        return unless item
+
+        lead = @input.index(/\S/) || 0
+        tail = @input[@cursor..] || ""
+        @input = "#{@input[0, lead]}/#{item[:value]} #{tail}"
+        @cursor = lead + item[:value].length + 2 # +2 for "/" and the space
+      end
+
+      # --- transcript scroll state (pi scroll-view.ts follow-end) ---
+
+      # One page of transcript rows (pi keybindings.ts:114-115). A page
+      # away from the end detaches (+@follow+ false — pi scrollBy sets
+      # followingEnd = followEnd && next === maxScrollTop); the render
+      # ({transcript_widget}) re-follows whenever the offset lands at the
+      # end, and keeps a detached offset put as new output arrives.
+      def scroll_page(direction)
+        @follow = false
+        @scroll_offset = [@scroll_offset + direction * transcript_page_rows, 0].max
+      end
+
+      # The transcript area's row budget — the page size (pi chat-viewport
+      # geometry, shared with {build_widget}).
+      def transcript_page_rows
+        area = @session.viewport_area
+        height = area ? area.height : 24
+        [height - editor_area_rows(height) - FOOTER_ROWS, 1].max
+      end
+
+      def editor_area_rows(height)
+        [MIN_EDITOR_ROWS + (@pending ? APPROVAL_ROWS - 1 : 0) + autocomplete_rows, height - 1].min
       end
 
       # pi's navigateHistory (editor.ts:454-484): -1 is the live draft; up
@@ -606,7 +884,7 @@ module Tart
       def build_widget
         area = @session.viewport_area
         height = area ? area.height : 24
-        editor_rows = [MIN_EDITOR_ROWS + (@pending ? APPROVAL_ROWS - 1 : 0), height - 1].min
+        editor_rows = editor_area_rows(height)
         transcript_rows = [height - editor_rows - FOOTER_ROWS, 1].max
         TUI.layout(
           children: [
@@ -622,13 +900,43 @@ module Tart
         )
       end
 
-      # The transcript area: the scrollback buffer's visible tail with the
-      # streaming message's raw source at its end (the buffer is final
-      # content; the live tail is transient, recomputed per frame).
+      # The transcript area: the scroll buffer's viewport — pi ScrollView
+      # follow-end semantics (scroll-view.ts:127-135): while following, the
+      # visible tail tracks the content end; a scrolled-up offset stays put
+      # as new output arrives; any landing at the end re-follows
+      # (followingEnd = followEnd && next === maxScrollTop). A right-gutter
+      # scrollbar renders when the content overflows (pi "auto" —
+      # settings-defaults.ts:63; hidden when the view fits).
       def transcript_widget(rows)
         width = viewport_width
         lines = @transcript + live_lines(width)
-        TUI.paragraph(text: lines.last(rows), wrap: false)
+        max_offset = [lines.size - rows, 0].max
+        @scroll_offset = @follow ? max_offset : @scroll_offset.clamp(0, max_offset)
+        @follow = true if @scroll_offset == max_offset
+        window = lines[@scroll_offset, rows] || []
+        return TUI.paragraph(text: window, wrap: false) if lines.size <= rows
+
+        TUI.layout(
+          direction: :horizontal,
+          children: [
+            TUI.paragraph(text: window, wrap: false),
+            # pi paints onto the last column (replaceScrollbarCell); the
+            # port carves a dedicated 1-cell column instead (mapping
+            # judgment — same visible result, content clips one cell early).
+            TUI.paragraph(text: scrollbar_glyphs(lines.size, rows), wrap: false),
+          ],
+          constraints: [TUI.constraint_min(1), TUI.constraint_length(1)]
+        )
+      end
+
+      # The right-gutter scrollbar (pi layout.ts:307-330 paintScrollbar:
+      # track "│" / thumb "┃"). Theme routing: the port's token table has
+      # no scrollbarTrack/scrollbarThumb (RAISED in PHASE 0 — theme.rb
+      # read-only this iteration); the nearest analogs carry it (track →
+      # dim, thumb → muted) until the tokens are promoted.
+      def scrollbar_glyphs(total, rows)
+        TUI.scrollbar_lines(content_length: total, position: @scroll_offset, viewport: rows,
+          track_fg: Theme[:dim], thumb_fg: Theme[:muted])
       end
 
       # The bordered editor area (pi CustomEditor): the input line inside
@@ -642,7 +950,10 @@ module Tart
         content = if @pending
           approval_lines(inner).map { |text| TUI.line(text, fg: Theme[:warning]) }
         else
-          [TUI.line(clip_spans(input_spans, inner))]
+          # The suggestion list renders below the input row, inside the
+          # editor area (pi editor.ts:618-634 — the area height grows by
+          # the list height).
+          [TUI.line(clip_spans(input_spans, inner))] + autocomplete_lines(inner)
         end
         TUI.block(
           title: status_title,
@@ -653,12 +964,18 @@ module Tart
       end
 
       def status_title
-        return nil unless @busy
+        # pi shows the compaction indicator regardless of the streaming
+        # state (a manual /compact runs outside a turn in the port).
+        return nil unless @busy || @compaction_reason
 
         " #{status_line} "
       end
 
       def status_line
+        # The running compaction displaces the working/tool detail (pi
+        # status-indicator.ts:85-95 via interactive-mode.ts:3672-3681).
+        return "#{SPINNER[@frames % SPINNER.size]} #{COMPACTION_LABELS.fetch(@compaction_reason, "Compacting context...")}" if @compaction_reason
+
         detail = @tool ? "tool: #{@tool}" : (@live.empty? ? "thinking" : "…")
         "#{SPINNER[@frames % SPINNER.size]} #{detail}"
       end
@@ -900,6 +1217,66 @@ module Tart
           args.length > width ? args[0, width] : args,
           "y = yes, n = no"
         ]
+      end
+
+      # The editor area's extra rows while the suggestion list is active:
+      # the visible window plus the (i/N) scroll-info line (select-list.ts
+      # render). An approval prompt consumes the keys — no list alongside
+      # it.
+      def autocomplete_rows
+        return 0 unless @suggestions && !@pending
+
+        [@suggestions.size, AUTOCOMPLETE_MAX + (@suggestions.size > AUTOCOMPLETE_MAX ? 1 : 0)].min
+      end
+
+      # The list's display lines (pi select-list.ts renderItem +
+      # getVisibleRange, two-column with descriptions): the visible window
+      # centered on the selection (startIndex = max(0, min(selected −
+      # maxVisible/2, size − maxVisible))), "→ " marking the selection —
+      # accent-styled whole-line (theme.ts:1061-1068 selectedText) —
+      # unselected labels default with the description muted. Descriptions
+      # only fit when the editor's inner width affords them (width > 40,
+      # select-list.ts:189); the command column clamps to 12-32
+      # (SLASH_COMMAND_SELECT_LIST_LAYOUT, editor.ts:248-251, gap 2).
+      def autocomplete_lines(width)
+        return [] unless @suggestions && !@pending
+
+        items = @suggestions
+        start = [[@selected - AUTOCOMPLETE_MAX / 2, items.size - AUTOCOMPLETE_MAX].min, 0].max
+        column = autocomplete_column_width(items)
+        column = [column, width - 2 - 4].min # pi: effectivePrimaryColumnWidth (select-list.ts:191)
+        rows = items[start, AUTOCOMPLETE_MAX].map.with_index do |item, i|
+          autocomplete_row(item, start + i == @selected, column, width)
+        end
+        rows << TUI.line("  (#{@selected + 1}/#{items.size})", fg: Theme[:muted]) if items.size > AUTOCOMPLETE_MAX
+        rows
+      end
+
+      # clamp(widest label + gap, 12, 32) over the whole filtered list (pi
+      # select-list.ts getPrimaryColumnWidth, gap 2, slash layout 12/32).
+      def autocomplete_column_width(items)
+        widest = items.map { |item| TUI.text_width(item[:label]) + 2 }.max || 0
+        [[widest, 12].max, 32].min
+      end
+
+      def autocomplete_row(item, selected, column, width)
+        label = Chat.clip_text(item[:label], column - 2)
+        spacing = " " * [1, column - TUI.text_width(label)].max
+        desc = autocomplete_description(item[:description], width, label, spacing)
+        return TUI.line("→ #{label}#{spacing}#{desc}", fg: Theme[:accent]) if selected
+
+        TUI.line([TUI.span("  #{label}"), TUI.span("#{spacing}#{desc}", fg: Theme[:muted])])
+      end
+
+      # The description column (select-list.ts:189-210): only when the width
+      # affords it (> 40) and at least MIN_DESCRIPTION_WIDTH (10) columns
+      # remain after prefix + label + spacing − a two-cell safety margin;
+      # hard-clipped (truncateToWidth with an empty tail).
+      def autocomplete_description(desc, width, label, spacing)
+        return "" unless desc && width > 40
+
+        remaining = width - (2 + TUI.text_width(label) + spacing.length) - 2
+        remaining >= 10 ? Chat.clip_text(desc, remaining) : ""
       end
 
       # Completed lines move into the transcript buffer (pi: completed
