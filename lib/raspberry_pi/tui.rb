@@ -82,6 +82,13 @@ module RaspberryPi
         RatatuiRuby.get_cell_at(x, y).fg
       end
 
+      # Modifiers of the cell at (+x+, +y+) — modifier-style assertions on
+      # the headless test terminal (e.g. the input line's fake cursor reads
+      # back as [:reversed]).
+      def cell_modifiers(x, y)
+        RatatuiRuby.get_cell_at(x, y).modifiers
+      end
+
       # Inserts content above an inline viewport into scrollback (the chat
       # surface's completed-content path). Requires an inline viewport;
       # +height+ is the number of lines the widget renders. Follow with a
@@ -161,11 +168,21 @@ module RaspberryPi
       RatatuiRuby::Style::Style.new(fg:, modifiers:)
     end
 
-    # @return [RatatuiRuby::Text::Line] one display line as a single span,
-    #   optionally fg-colored (nil = the terminal default).
+    # @return [RatatuiRuby::Text::Span] one styled span — the seam's span
+    #   vocabulary (fg color name + modifiers, both optional; an unstyled
+    #   span carries no Style value at all).
+    def span(content, fg: nil, modifiers: [])
+      styled = (fg || modifiers.any?) ? style(fg:, modifiers:) : nil
+      RatatuiRuby::Text::Span.new(content:, style: styled)
+    end
+
+    # @return [RatatuiRuby::Text::Line] one display line. +text+ is a String
+    #   (a single span, optionally fg-colored — nil = the terminal default)
+    #   or an array of {span} objects (multi-span rows: the input line's
+    #   fake cursor, markdown styling).
     def line(text, fg: nil)
-      span = RatatuiRuby::Text::Span.new(content: text, style: fg && style(fg: fg))
-      RatatuiRuby::Text::Line.new(spans: [span])
+      spans = text.is_a?(String) ? [span(text, fg:)] : text
+      RatatuiRuby::Text::Line.new(spans:)
     end
 
     # @return [Integer] the display width of +string+ in terminal cells

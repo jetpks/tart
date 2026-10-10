@@ -317,8 +317,8 @@ module RaspberryPi
         chat.on_event(TUI.paste_event(" there"))
         chat.on_event(TUI.key_event("backspace"))
         assert_equal "hi ther", chat.input, "backspace removes the last character"
-        chat.on_event(TUI.key_event("e", modifiers: ["ctrl"])) # non-printing: ignored
-        assert_equal "hi ther", chat.input
+        chat.on_event(TUI.key_event("e", modifiers: ["ctrl"]))
+        assert_equal "hi ther", chat.input, "ctrl+e moves to line end without editing"
         chat.on_event(TUI.key_event("enter"))
         assert_equal "", chat.input, "enter submits and clears the input line"
         draw(chat, session) # the frame loop's flush inserts the echo
@@ -328,7 +328,224 @@ module RaspberryPi
       end
     end
 
+    # --- cursor (AC2): the insertion point is cell-readback-visible at all
+    # times — pi's fake cursor: the grapheme under it renders inverse-video,
+    # at end-of-input a highlighted trailing space (tui.ts renderFakeCursor
+    # via editor.ts:583-597); the port carries the reversed modifier. ---
+
+    def test_cursor_reads_back_at_end_of_input
+      with_inline_chat(width: 40) do |chat, session|
+        "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        draw(chat, session)
+        row = input_row(session)
+        assert_equal [" ", [:reversed]], cursor_cell(session, 4, row),
+          "end-of-input cursor: highlighted trailing space after 'hi'"
+        assert session.cell_modifiers(3, row).empty?, "the grapheme left of the cursor is unhighlighted"
+      end
+    end
+
+    def test_cursor_reads_back_mid_input_and_tracks_left_right
+      with_inline_chat(width: 40) do |chat, session|
+        "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("left"))
+        draw(chat, session)
+        row = input_row(session)
+        assert_equal ["i", [:reversed]], cursor_cell(session, 3, row),
+          "after cursor-left the insertion point sits on the 'i'"
+        assert session.cell_modifiers(4, row).empty?, "the trailing space is no longer highlighted"
+
+        chat.on_event(TUI.key_event("right"))
+        draw(chat, session)
+        assert_equal [" ", [:reversed]], cursor_cell(session, 4, row),
+          "cursor-right returns the insertion point to end-of-input"
+      end
+    end
+
+    def test_cursor_hides_while_an_approval_prompt_holds_the_input_row
+      with_inline_chat(width: 40) do |chat, session|
+        "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        thread = Thread.new { chat.approval(ToolCallDouble.new("bash")) }
+        wait_until { chat.pending_approval }
+        draw(chat, session)
+        refute live_region(session).include?("❯"), "input row displaced by the approval prompt"
+        chat.on_event(TUI.key_event("n"))
+        assert_equal false, thread.value
+      end
+    end
+
+    # --- mid-line editing (AC2) ---
+
+    def test_printable_characters_insert_at_the_cursor
+      with_headless_chat do |chat|
+        "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("left"))
+        chat.on_event(TUI.key_event("X"))
+        assert_equal "hXi", chat.input, "a printable character inserts at the cursor"
+        chat.on_event(TUI.key_event("left"))
+        chat.on_event(TUI.key_event("left"))
+        chat.on_event(TUI.key_event("!"))
+        assert_equal "!hXi", chat.input, "inserting at the start of the line"
+      end
+    end
+
+    def test_backspace_deletes_before_and_forward_delete_after_the_cursor
+      with_headless_chat do |chat|
+        "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("left"))
+        chat.on_event(TUI.key_event("backspace"))
+        assert_equal "i", chat.input, "backspace deletes before the cursor"
+        chat.on_event(TUI.key_event("delete"))
+        assert_equal "", chat.input, "forward-delete removes the character after the cursor"
+        chat.on_event(TUI.key_event("delete"))
+        assert_equal "", chat.input, "forward-delete at end-of-input is a no-op"
+        "ab".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("home"))
+        chat.on_event(TUI.key_event("delete"))
+        assert_equal "b", chat.input, "forward-delete at line start removes the first character"
+      end
+    end
+
+    def test_home_end_and_ctrl_b_f_move_the_cursor
+      with_headless_chat do |chat|
+        "abcd".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("home"))
+        chat.on_event(TUI.key_event("X"))
+        assert_equal "Xabcd", chat.input, "home jumps to line start"
+        chat.on_event(TUI.key_event("f", modifiers: ["ctrl"])) # over 'a'
+        chat.on_event(TUI.key_event("f", modifiers: ["ctrl"])) # over 'b'
+        chat.on_event(TUI.key_event("Y"))
+        assert_equal "XabYcd", chat.input, "ctrl+f steps right one character"
+        chat.on_event(TUI.key_event("b", modifiers: ["ctrl"]))
+        chat.on_event(TUI.key_event("Z"))
+        assert_equal "XabZYcd", chat.input, "ctrl+b steps left one character"
+        chat.on_event(TUI.key_event("e", modifiers: ["ctrl"]))
+        chat.on_event(TUI.key_event("!"))
+        assert_equal "XabZYcd!", chat.input, "ctrl+e jumps to line end"
+      end
+    end
+
+    # --- history (AC3): pi's editor.ts addToHistory/navigateHistory —
+    # most recent first, draft restored, recalled entries editable. ---
+
+    def test_history_recalls_entries_in_order
+      with_headless_chat do |chat|
+        send_message(chat, "A")
+        send_message(chat, "B")
+        chat.on_event(TUI.key_event("up"))
+        assert_equal "B", chat.input, "up recalls the most recent entry"
+        chat.on_event(TUI.key_event("up"))
+        assert_equal "A", chat.input, "up again walks to older entries"
+        chat.on_event(TUI.key_event("down"))
+        assert_equal "B", chat.input, "down returns toward the draft"
+        chat.on_event(TUI.key_event("down"))
+        assert_equal "", chat.input, "down past the newest entry restores the live draft"
+      end
+    end
+
+    def test_recalled_history_entry_is_editable_and_sends_as_edited
+      chat_idle_kernel = IdleKernel.new
+      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
+        chat = Render::Chat.new(session:, kernel: chat_idle_kernel)
+        send_message(chat, "A")
+        send_message(chat, "B")
+        chat.on_event(TUI.key_event("up"))
+        chat.on_event(TUI.key_event("up")) # "A", cursor at line start (pi: cursorPlacement start)
+        chat.on_event(TUI.key_event("!"))
+        assert_equal "!A", chat.input, "a recalled entry is editable at the cursor"
+        chat.on_event(TUI.key_event("enter"))
+        draw(chat, session) # the frame loop's flush inserts the echo
+        assert_equal ["❯ A", "❯ B", "❯ !A"], inserted_lines(session),
+          "the edited recall sends as edited (after the two original echoes)"
+      end
+    end
+
+    def test_history_skips_consecutive_duplicates
+      with_headless_chat do |chat|
+        send_message(chat, "A")
+        send_message(chat, "A")
+        chat.on_event(TUI.key_event("up"))
+        assert_equal "A", chat.input, "a duplicate submission enters history once"
+        chat.on_event(TUI.key_event("down"))
+        assert_equal "", chat.input, "down past the newest entry restores the empty draft"
+        chat.on_event(TUI.key_event("up"))
+        chat.on_event(TUI.key_event("up"))
+        assert_equal "A", chat.input, "history holds a single entry — walking past it is a no-op"
+      end
+    end
+
+    # --- word-wise operations (AC3): pi's word-navigation.ts boundary
+    # semantics — skip trailing whitespace, then one word/punctuation run. ---
+
+    def test_find_word_backward_boundaries
+      assert_equal 6, Render::Chat.find_word_backward("hello world", 11),
+        "deletes 'world' but keeps the separator space (pi segment semantics)"
+      assert_equal 0, Render::Chat.find_word_backward("hello ", 6), "trailing whitespace goes with the word"
+      assert_equal 4, Render::Chat.find_word_backward("foo.bar", 7), "ASCII punctuation stays a boundary"
+      assert_equal 3, Render::Chat.find_word_backward("foo.", 4), "a punctuation run goes as one unit"
+      assert_equal 0, Render::Chat.find_word_backward("hi", 0)
+      assert_equal 0, Render::Chat.find_word_backward("", 0)
+    end
+
+    def test_find_word_forward_boundaries
+      assert_equal 5, Render::Chat.find_word_forward("hello world", 0)
+      assert_equal 11, Render::Chat.find_word_forward("hello world", 5), "whitespace skipped to the next word"
+      assert_equal 2, Render::Chat.find_word_forward("hi.", 0), "a word stops at the punctuation"
+      assert_equal 3, Render::Chat.find_word_forward("hi.", 2), "a punctuation run is one unit"
+      assert_equal 2, Render::Chat.find_word_forward("hi", 3), "at end-of-line the cursor stays put"
+    end
+
+    def test_ctrl_w_deletes_word_backward_through_the_key_surface
+      with_headless_chat do |chat|
+        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("w", modifiers: ["ctrl"]))
+        assert_equal "hello ", chat.input, "ctrl+w removes the trailing word, keeping the separator"
+        chat.on_event(TUI.key_event("w", modifiers: ["ctrl"]))
+        assert_equal "", chat.input, "second ctrl+w removes the word plus trailing whitespace"
+      end
+    end
+
+    def test_alt_b_alt_f_jump_words
+      with_headless_chat do |chat|
+        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("b", modifiers: ["alt"]))
+        chat.on_event(TUI.key_event("X"))
+        assert_equal "hello Xworld", chat.input, "alt+b jumps one word backward"
+        chat.on_event(TUI.key_event("b", modifiers: ["alt"]))
+        chat.on_event(TUI.key_event("Y"))
+        assert_equal "hello YXworld", chat.input, "alt+b from the last word jumps to its start"
+        chat.on_event(TUI.key_event("f", modifiers: ["alt"]))
+        chat.on_event(TUI.key_event("Z"))
+        assert_equal "hello YXworldZ", chat.input, "alt+f jumps one word forward"
+      end
+    end
+
     private
+
+    # A chat surface on the headless test terminal for key-surface tests
+    # (draw/readback assertions use with_inline_chat; these only need the
+    # editor's key path, which never draws).
+    def with_headless_chat
+      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
+        yield Render::Chat.new(session:, kernel: IdleKernel.new)
+      end
+    end
+
+    # Types +text+ into the input line and presses Enter (direct key events
+    # — the render-level editor path, no kernel).
+    def send_message(chat, text)
+      text.chars.each { |char| chat.on_event(TUI.key_event(char)) }
+      chat.on_event(TUI.key_event("enter"))
+    end
+
+    # The input line's row: the chat's live region puts it at the top of the
+    # viewport (status/live/approval rows absent in these tests).
+    def input_row(session)
+      session.viewport_area.y
+    end
+
+    def cursor_cell(session, x, row)
+      [session.cell_symbol(x, row), session.cell_modifiers(x, row)]
+    end
 
     # Render-only tests: the real headless inline test terminal (buffer
     # readback) without the kernel. Width 9 makes wrapping observable

@@ -21,6 +21,22 @@ module RaspberryPi
       end
     end
 
+    def test_span_and_multispan_line_vocabulary_render_and_read_back
+      TUI.run(headless: true, width: 20, screen_height: 4) do |session|
+        line = TUI.line([
+          TUI.span("ab ", fg: :red),
+          TUI.span("cd", modifiers: [:reversed]),
+          TUI.span("ef"),
+        ])
+        session.draw(TUI.paragraph(text: [line]))
+        assert_equal :red, session.cell_fg(0, 0), "fg per span"
+        assert_equal [:reversed], session.cell_modifiers(3, 0), "modifier per span"
+        assert_equal "e", session.cell_symbol(5, 0), "unstyled trailing span renders"
+        assert_empty session.cell_modifiers(5, 0)
+        assert_empty TUI.span("x").style.to_a.compact, "an unstyled span carries no Style"
+      end
+    end
+
     def test_terminal_restored_after_normal_run
       TUI.run(headless: true) { |session| session.draw(TUI.status_panel("x")) }
       refute TUI::Session.active?
