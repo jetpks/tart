@@ -115,8 +115,9 @@ module Tart
     end
 
     def print_mode(options, workdir)
-      settings = Settings.load(cwd: workdir)
-      report_diagnostics(settings.diagnostics)
+      result = Settings.load(cwd: workdir)
+      settings = result.settings
+      report_diagnostics(result.diagnostics)
       require_api_key(settings)
       skills = Skills.load(cwd: workdir)
       abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
@@ -130,7 +131,8 @@ module Tart
     end
 
     def interactive(options, workdir)
-      settings = Settings.load(cwd: workdir)
+      result = Settings.load(cwd: workdir)
+      settings = result.settings
       skills = Skills.load(cwd: workdir)
       require_api_key(settings)
 
@@ -162,7 +164,7 @@ module Tart
 
         surface.commands = Commands::Handler.new(
           skills: skills.skills,
-          settings: settings.settings,
+          settings: settings,
           output: ->(text) { surface.command_line(text) },
           spawn: ->(&block) { kernel.async(&block) },
           agent: -> { surface.agent },
@@ -170,7 +172,7 @@ module Tart
           quit: -> { kernel.stop! }
         )
         start_session.call(options[:resume_given] && resolve_resume(options[:resume], workdir))
-        report_diagnostics(settings.diagnostics, surface:)
+        report_diagnostics(result.diagnostics, surface:)
         skills.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
 
         kernel.renderer = surface.renderer
