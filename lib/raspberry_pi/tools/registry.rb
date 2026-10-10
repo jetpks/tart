@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "../mcp"
+
 module RaspberryPi
   module Tools
     # The tool registry: builds the built-in tool instances and gates the
@@ -40,22 +42,29 @@ module RaspberryPi
       # @param cwd [String] working directory for all tools.
       # @param strip_trailing_whitespace [Boolean] §5 toggle (default off):
       #   edit/write strip trailing spaces/tabs from each committed line.
+      # @param mcp_servers [Hash{String => Hash}, nil] MCP server name =>
+      #   mcp.json-shaped stdio config ({Mcp::Config.load} shape); nil = no
+      #   MCP tools and no connections. Configured servers' tools register
+      #   behind the schema gate as mcp__<server>__<tool>, declared direct.
       # @return [Hash{String => RubyLLM::Tool}] instances for the selected
       #   tools only, keyed by wire name. Destructive tools are extended with
       #   requires_approval (ruby_llm native approval gating, verified in gem
       #   source: Chat#run_tools consults tool.requires_approval? before
       #   executing; undecided calls stay pending and Chat#awaiting_approval?
       #   reports them).
-      def build(selected:, cwd:, strip_trailing_whitespace: false)
+      def build(selected:, cwd:, strip_trailing_whitespace: false, mcp_servers: nil)
         selected.each do |name|
           raise ArgumentError, "Unknown tool: #{name}" unless TOOL_CLASSES.key?(name)
         end
 
-        TOOL_CLASSES.slice(*selected).transform_values do |class_name|
+        builtins = TOOL_CLASSES.slice(*selected).transform_values do |class_name|
           instance = build_tool(class_name, cwd:, strip_trailing_whitespace:)
           instance.extend(approval_module) if approval_required?(instance.name)
           instance
         end
+        return builtins unless mcp_servers
+
+        builtins.merge(Mcp.tools_for(mcp_servers))
       end
 
       # Only the write-boundary tools accept the §5 toggle; the others take
