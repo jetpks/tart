@@ -186,5 +186,31 @@ module Tart
       refute TUI.ctrl_c?(TUI.key_event("q", modifiers: ["ctrl"]))
       refute TUI.ctrl_c?(TUI.sync_event)
     end
+
+    # The gem mouse-event shape (I14 items 6/10): kind/x/y/button/modifiers
+    # — what the real terminal's crossterm parse produces (ext events.rs:552).
+    def test_mouse_event_seam_builds_the_gem_shape
+      scroll = TUI.mouse_event(kind: "scroll_down", x: 3, y: 4, modifiers: ["alt"])
+      assert scroll.mouse?
+      assert scroll.scroll?
+      assert_equal "scroll_down", scroll.kind
+      assert_equal 3, scroll.x
+      assert_equal 4, scroll.y
+      assert_equal ["alt"], scroll.modifiers
+      press = TUI.mouse_event(kind: "down", x: 1, y: 2, button: "left")
+      assert press.down? && press.left?
+    end
+
+    # Copy-on-select's clipboard write (item 10): pi tui-alt-screen.ts:1483
+    # — base64 payload under a bell-terminated OSC 52, buffer "c".
+    def test_osc52_copy_writes_the_base64_payload
+      captured = StringIO.new
+      previous = $stdout
+      $stdout = captured
+      TUI.osc52_copy("hi")
+    ensure
+      $stdout = previous
+      assert_equal "\e]52;c;#{["hi"].pack("m0")}\a", captured.string
+    end
   end
 end
