@@ -112,6 +112,7 @@ module RaspberryPi
 
           deadline = timeout_seconds && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
           status = nil
+          term_sent = false
           loop do
             # Cancellation checkpoint: an interrupted turn kills the whole
             # process group (pi checks signal.aborted between events).
@@ -119,7 +120,13 @@ module RaspberryPi
             now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
             if deadline && now >= deadline
               timed_out = true
-              kill_process_group(pid, "TERM")
+              # I03 backlog carry-in: -TERM exactly once, then a single -KILL
+              # once the grace elapses (re-signaling every poll iteration is
+              # dead weight; the escalation is what ends the command).
+              unless term_sent
+                term_sent = true
+                kill_process_group(pid, "TERM")
+              end
               kill_process_group(pid, "KILL") if now > deadline + TERM_GRACE_SECONDS
             end
             _, status = Process.waitpid2(pid, Process::WNOHANG)
@@ -133,9 +140,9 @@ module RaspberryPi
           exit_code = status.termsig ? 128 + status.termsig : status.exitstatus
           {exit_code:, timed_out:, cancelled: false}
         rescue RubyLLM::CancelledError
-          # Interrupted mid-command: kill the whole group (TERM then, on the
-          # grace elapsing, KILL), reap, and let cancellation propagate.
-          kill_process_group(pid, "TERM") if pid
+          # Interrupted mid-command: kill the whole group with a single -KILL
+          # (I03 backlog carry-in: the preceding -TERM was dead code — the
+          # rescue kills immediately), reap, and let cancellation propagate.
           kill_process_group(pid, "KILL") if pid
           Process.waitpid2(pid) if pid
           raise

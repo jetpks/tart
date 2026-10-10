@@ -20,8 +20,10 @@ module RaspberryPi
     class SessionError < StandardError; end
 
     # A live terminal session. The loop kernel and the bench hold one of
-    # these; tests may substitute any object answering the same three
-    # instance methods (+draw+, +poll_event+, +push_event+).
+    # these; tests may substitute any object answering the same instance
+    # methods (+draw+, +poll_event+, +push_event+, +drain_synthetic+,
+    # +synthetic_pending?+, +cell_symbol+, +insert_before+,
+    # +buffer_content+, +viewport_area+).
     class Session
       # @return [Boolean] whether a real terminal session is active.
       def self.active?
@@ -71,15 +73,41 @@ module RaspberryPi
       def cell_symbol(x, y)
         RatatuiRuby.get_cell_at(x, y).symbol
       end
+
+      # Inserts content above an inline viewport into scrollback (the chat
+      # surface's completed-content path). Requires an inline viewport;
+      # +height+ is the number of lines the widget renders. Follow with a
+      # +draw+ — the insertion may clobber or scroll the viewport (gem doc).
+      def insert_before(height, widget)
+        RatatuiRuby.insert_before(height, widget)
+      end
+
+      # The full terminal buffer as one line per row — render assertions on
+      # the headless test terminal.
+      def buffer_content
+        RatatuiRuby.get_buffer_content.split("\n")
+      end
+
+      # The live viewport Rect (width is the wrap width for the chat
+      # surface); nil is never returned by the real session, but callers
+      # duck-typed against test doubles should tolerate absence.
+      def viewport_area
+        RatatuiRuby.viewport_area
+      end
     end
 
     module_function
 
     # Acquires a terminal session and yields it, guaranteeing restore.
     #
-    # @param headless [Boolean] use the headless test terminal (80x24) —
-    #   for unit tests / bench scripts that are not on a real tty.
-    # @param viewport [:fullscreen, :inline] real-terminal viewport.
+    # @param headless [Boolean] use the headless test terminal — for unit
+    #   tests / bench scripts that are not on a real tty. With +viewport:+
+    #   the test terminal honors the same viewport types as the real path
+    #   (verified 1.5.0: +init_test_terminal+ parses "inline" identically),
+    #   so hermetic tests exercise the real inline/insert_before path.
+    # @param width [Integer] headless test-terminal width (default 80).
+    # @param screen_height [Integer] headless test-terminal height (default 24).
+    # @param viewport [:fullscreen, :inline] viewport.
     # @param height [Integer] height for an inline viewport.
     # @param focus_events [Boolean] enable focus gain/loss events.
     # @param bracketed_paste [Boolean] enable bracketed paste.
@@ -88,12 +116,13 @@ module RaspberryPi
     #
     # The ensure-based restore is the ISIG/raw-mode safety net: whatever the
     # block does — including raising — the terminal is restored.
-    def run(headless: false, viewport: :fullscreen, height: nil, focus_events: true, bracketed_paste: true)
+    def run(headless: false, viewport: :fullscreen, height: nil, width: nil, screen_height: nil,
+            focus_events: true, bracketed_paste: true)
       raise SessionError, "terminal session already active" if Session.active?
 
       session = Session.new
       if headless
-        RatatuiRuby.init_test_terminal(80, 24, "fullscreen", nil)
+        RatatuiRuby.init_test_terminal(width || 80, screen_height || 24, viewport.to_s, height)
         begin
           yield session
         ensure
@@ -112,6 +141,18 @@ module RaspberryPi
       RatatuiRuby::Widgets::Paragraph.new(text:, block:)
     end
 
+    # @return a Paragraph widget (the chat surface's live region / scrollback
+    #   line builder). +text+ is a String (newlines are rows).
+    def paragraph(text:, wrap: false)
+      RatatuiRuby::Widgets::Paragraph.new(text:, wrap:)
+    end
+
+    # @return [Integer] the display width of +string+ in terminal cells
+    #   (wrapping measurements; native, no terminal session required).
+    def text_width(string)
+      RatatuiRuby::Text.width(string)
+    end
+
     # @return [RatatuiRuby::Event::Key] a key event with the given code and
     #   modifiers (e.g. +key_event("c", modifiers: ["ctrl"])+ for Ctrl+C).
     def key_event(code, modifiers: [])
@@ -121,6 +162,12 @@ module RaspberryPi
     # @return [RatatuiRuby::Event::Sync] the synthetic sync event.
     def sync_event
       RatatuiRuby::Event::Sync.new
+    end
+
+    # @return [RatatuiRuby::Event::Paste] a bracketed-paste event (bracketed
+    #   paste is enabled on init; the whole block arrives as one event).
+    def paste_event(content)
+      RatatuiRuby::Event::Paste.new(content:)
     end
 
     # @return [Boolean] whether +event+ is the Ctrl+C key event (byte 0x03 in
