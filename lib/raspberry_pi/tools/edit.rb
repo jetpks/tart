@@ -44,8 +44,11 @@ module RaspberryPi
 
       attr_reader :cwd, :details
 
-      def initialize(cwd:)
+      # @param strip_trailing_whitespace [Boolean] §5 toggle (default off):
+      #   strip trailing spaces/tabs from each line of the committed bytes.
+      def initialize(cwd:, strip_trailing_whitespace: false)
         @cwd = cwd
+        @strip_trailing_whitespace = strip_trailing_whitespace
         @details = nil
       end
 
@@ -129,6 +132,7 @@ module RaspberryPi
             raise_if_cancelled
 
             final_content = bom[:bom] + EditDiff.restore_line_endings(result[:new_content], original_ending)
+            final_content = EditDiff.strip_trailing_whitespace(final_content) if @strip_trailing_whitespace
             File.binwrite(absolute_path, final_content)
             raise_if_cancelled
 

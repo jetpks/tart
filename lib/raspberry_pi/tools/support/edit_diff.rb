@@ -20,6 +20,18 @@ module RaspberryPi
     module EditDiff
       BOM = "\uFEFF"
 
+      # §5 toggle seam (port extension — NOT pi code; pi normalizes trailing
+      # whitespace only inside fuzzy matching). Applied to the exact bytes a
+      # write boundary commits to disk when enabled: trailing spaces and tabs
+      # removed from each line (lines split on "\n"); line count, final-newline
+      # presence, and every other byte unchanged. Non-string input passes
+      # through so error semantics downstream stay identical.
+      def self.strip_trailing_whitespace(content)
+        return content unless content.is_a?(String)
+
+        content.split("\n", -1).map { |line| line.sub(/[ \t]+\z/, "") }.join("\n")
+      end
+
       # The line ending detected in content (pi's detectLineEnding): CRLF wins
       # only when the first CRLF precedes the first LF.
       def self.detect_line_ending(content)

@@ -1,12 +1,14 @@
 # frozen_string_literal: true
 
 require_relative "safe_execute"
+require_relative "support/edit_diff"
 
 module RaspberryPi
   module Tools
     # The write tool (port of pi's write.ts): content is written verbatim —
     # no newline, whitespace, or encoding normalization at any write boundary
-    # (BRIEF §5 verbatim-parity). Creates parent directories automatically.
+    # (BRIEF §5 verbatim-parity), except the §5 trailing-whitespace toggle
+    # (default off). Creates parent directories automatically.
     class Write < RubyLLM::Tool
       include SafeExecute
 
@@ -26,8 +28,11 @@ module RaspberryPi
 
       attr_reader :cwd, :details
 
-      def initialize(cwd:)
+      # @param strip_trailing_whitespace [Boolean] §5 toggle (default off):
+      #   strip trailing spaces/tabs from each line of the committed bytes.
+      def initialize(cwd:, strip_trailing_whitespace: false)
         @cwd = cwd
+        @strip_trailing_whitespace = strip_trailing_whitespace
         @details = nil
       end
 
@@ -45,8 +50,9 @@ module RaspberryPi
             FileUtils.mkdir_p(dir)
             RubyLLM::Support::Cancellation.check
 
-            # Verbatim: bytes in, bytes out. No trailing-newline fixup here —
-            # the §5 normalization is post-parity work, explicitly out of scope.
+            # Verbatim: bytes in, bytes out — no trailing-newline fixup. The
+            # §5 toggle is the sole write-boundary normalization, and ships off.
+            content = EditDiff.strip_trailing_whitespace(content) if @strip_trailing_whitespace
             File.binwrite(absolute_path, content)
             RubyLLM::Support::Cancellation.check
 
