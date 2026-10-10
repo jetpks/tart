@@ -91,6 +91,11 @@ module RaspberryPi
         else
           respond_message(io, spec)
         end
+      rescue Errno::EPIPE
+        # The client was torn down mid-response (interrupt tests disconnect
+        # mid-stream); a dead socket must not pollute suite stderr (I03
+        # backlog carry-in).
+        nil
       ensure
         io.close rescue nil
       end
@@ -143,13 +148,26 @@ module RaspberryPi
       def write_sse(io, delta)
         if delta == :pause
           sleep(spec_pause) # real inter-chunk delay: the interrupt test races this
-          io.write(": keepalive\n\n")
+          # The keepalive comment must carry proper chunked framing — bare
+          # bytes into a chunked stream corrupt the chunk-size lines (raw
+          # net/http repro: Net::HTTPBadResponse after the first pause).
+          write_chunk(io, ": keepalive\n\n")
           return
         end
 
-        piece = "data: #{JSON.generate(delta)}\n\n"
-        io.write(format("%x\r\n%s\r\n", piece.bytesize, piece))
+        write_chunk(io, "data: #{JSON.generate(delta)}\n\n")
+      rescue Errno::EPIPE
+        nil
+      end
+
+      def write_chunk(io, payload)
+        # The client may be torn down mid-stream (interrupt tests disconnect
+        # mid-response); writing to a dead socket must not pollute suite
+        # stderr with EPIPE noise (I03 backlog carry-in).
+        io.write(format("%x\r\n%s\r\n", payload.bytesize, payload))
         io.flush
+      rescue Errno::EPIPE
+        nil
       end
 
       def spec_pause

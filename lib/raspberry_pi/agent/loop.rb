@@ -64,6 +64,13 @@ module RaspberryPi
         self
       end
 
+      # @return [Boolean] whether steering messages are queued but not yet
+      #   consumed (thread-safe; the chat surface checks it on agent_end to
+      #   close the submit/stop race).
+      def queued_messages?
+        !@steering_queue.empty?
+      end
+
       # Runs the agent to completion of the prompt and every queued message.
       # Must be called on the kernel reactor fiber (as the Core::Loop work
       # block): every model/tool step is bridged to a worker thread and this
@@ -109,10 +116,20 @@ module RaspberryPi
 
       def run_loop(prompt)
         # Outer loop (pi): keep going while queued messages keep arriving.
+        # pi also polls the steering queue at loop start (agent-loop.ts:175:
+        # "user may have typed while waiting"); the port consumes pre-run
+        # queued messages there only when no prompt opens the run — with a
+        # prompt they are consumed at the first turn boundary (I03-locked:
+        # test_queued_message_continues_the_outer_loop, two requests), a
+        # recorded parity deviation.
         first = true
         loop do
           emit(type: :turn_start)
-          add_user_message(prompt) if first && prompt
+          if first && prompt
+            add_user_message(prompt)
+          else
+            steering_messages.each { |text| add_user_message(text) }
+          end
           first = false
           inner_loop
           break if steering_messages.empty?
@@ -220,10 +237,16 @@ module RaspberryPi
 
       def install_chat_callbacks
         @chat.before_tool_call do |tool_call|
+          # ruby_llm calls after_tool_result with the result only (chat.rb:
+          # run_callbacks(:after_tool_result, result)); pair the call back by
+          # fiber/thread-local — before and after run in the same execution
+          # context, per call, in both of ToolConcurrency's modes.
+          Thread.current[:raspberry_pi_tool_call] = tool_call
           @sink&.call({type: :tool_execution_start, tool_call:})
         end
-        @chat.after_tool_result do |tool_call, result|
-          @sink&.call({type: :tool_execution_end, tool_call:, result:})
+        @chat.after_tool_result do |result|
+          @sink&.call({type: :tool_execution_end,
+                       tool_call: Thread.current[:raspberry_pi_tool_call], result:})
         end
         @chat.after_message do |message|
           # Tool result messages appear atomically; streamed assistant

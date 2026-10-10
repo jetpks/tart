@@ -29,13 +29,27 @@ module RaspberryPi
 
       # @param poll_timeout [Float] how long a blocking poll takes (models a
       #   real terminal's frame-budget block).
-      def initialize(poll_timeout: 0.005)
+      # @param width [Integer] reported viewport width (the chat surface's
+      #   wrap width in kernel tests).
+      # @param height [Integer] reported viewport height (the chat surface's
+      #   live-region row budget in kernel tests).
+      def initialize(poll_timeout: 0.005, width: 80, height: 4)
         @poll_timeout = poll_timeout
+        @width = width
+        @height = height
         @events = Queue.new
         @synthetic = Queue.new
         @drawn = []
+        @scrollback = []
         @draw_mutex = Mutex.new
       end
+
+      # The live viewport Rect double (the chat surface's wrap width).
+      def viewport_area
+        Rect.new(0, 0, @width, @height)
+      end
+
+      Rect = Struct.new(:x, :y, :width, :height)
 
       def push_native(event)
         @events << event
@@ -44,6 +58,15 @@ module RaspberryPi
       def draw(widget)
         @draw_mutex.synchronize { @drawn << widget }
       end
+
+      # Scrollback insertion (the chat surface's completed-content path);
+      # recorded, not rendered, like draw. Lines inserted above the viewport,
+      # in order (test assertions).
+      def insert_before(height, widget)
+        @draw_mutex.synchronize { @scrollback << [height, widget] }
+      end
+
+      attr_reader :scrollback
 
       def poll_event(timeout:)
         sleep(@poll_timeout)
@@ -70,12 +93,21 @@ module RaspberryPi
 
     # Minimal duck-typed event doubles for ScriptedSession scripts. The real
     # ratatui events answer the same predicate protocol (key?, ctrl?, code,
-    # sync?).
+    # sync?, text?, paste?).
     KeyEvent = Struct.new(:code, :modifiers) do
       def key? = true
       def none? = false
       def sync? = false
+      def paste? = false
+      def text? = code.length == 1 && !ctrl?
       def ctrl? = modifiers.include?("ctrl")
+    end
+    PasteEvent = Struct.new(:content) do
+      def key? = false
+      def none? = false
+      def sync? = false
+      def paste? = true
+      def text? = false
     end
     SyncEvent = Class.new do
       def key? = false

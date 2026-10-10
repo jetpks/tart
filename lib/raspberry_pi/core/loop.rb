@@ -41,8 +41,9 @@ module RaspberryPi
 
       # @param session [TUI::Session or duck-type: #draw, #poll_event,
       #   #push_event, #drain_synthetic, #synthetic_pending?]
-      # @param renderer [Proc, nil] called once per draw; returns the status
-      #   text rendered as a Paragraph in a Block.
+      # @param renderer [Proc, nil] called once per draw; returns a status
+      #   String (rendered as a Paragraph in a Block) or a widget tree drawn
+      #   as-is (I04: the chat surface's live region).
       # @param on_event [Proc, nil] called as +(event, source)+ for every
       #   dispatched event; +source+ is +:native+ or +:synthetic+.
       # @param frame_rate [Numeric] animation-window frame rate (Hz).
@@ -190,15 +191,24 @@ module RaspberryPi
         end
       end
 
+      # Renderer/event-handler setters (I04: the chat surface attaches itself
+      # after the kernel and chat are built together). Reactor-side only;
+      # set before {#run}.
+      attr_writer :renderer, :on_event
+
       private
 
-      # Cancels the in-flight work task subtree on Ctrl+C. With no live work,
-      # the interrupt stops the loop.
+      # Cancels the in-flight work task subtree on Ctrl+C. With no live work
+      # task, cancels any reactor tasks spawned via {#async} (I04: the chat
+      # surface submits agent runs this way); with nothing alive, the
+      # interrupt stops the loop.
       def interrupt!
         @stop_mutex.synchronize { @interrupted = true }
         work = @work_task
         if work&.alive?
           work.stop
+        elsif @tasks.any?(&:alive?)
+          @tasks.each(&:stop)
         else
           stop!
         end
@@ -289,7 +299,8 @@ module RaspberryPi
         return unless @dirty || animating?
         @dirty = false
         return unless @renderer
-        @session.draw(TUI.status_panel(@renderer.call))
+        rendered = @renderer.call
+        @session.draw(rendered.is_a?(String) ? TUI.status_panel(rendered) : rendered)
         @draws += 1
       end
 
