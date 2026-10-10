@@ -76,5 +76,46 @@ module Tart
       duplicated = Agent::SystemPrompt.build_rules(%w[read read])
       assert_equal 1, duplicated.scan("Use read to examine files").length
     end
+
+    # --- the <skills> section (pi system-prompt.ts:175-182; additive —
+    # with no skills the composed prompt is byte-identical to today's) ---
+
+    def skill(name = "sc", disable: false)
+      Skills::Skill.new(name:, description: "d", file_path: "/p/SKILL.md", base_dir: "/p",
+                        disable_model_invocation: disable)
+    end
+
+    def test_skills_section_sits_between_project_context_and_cwd
+      built = Agent::SystemPrompt.build(
+        cwd: "/tmp/p", docs_paths: DOCS,
+        context_files: [{path: "AGENTS.md", content: "x"}], skills: [skill]
+      )
+      skills_at = built.index("<skills>")
+      context_at = built.index("<project_instructions")
+      cwd_at = built.index("<cwd>")
+
+      assert context_at < skills_at && skills_at < cwd_at, "pi's section order"
+      assert_includes built, "Use the read tool to load a skill's file"
+      assert_includes built, "    <name>sc</name>"
+      assert_includes built, "    <location>/p/SKILL.md</location>"
+    end
+
+    def test_skills_section_names_bash_when_read_is_absent
+      built = Agent::SystemPrompt.build(cwd: "/tmp/p", docs_paths: DOCS,
+                                        selected_tools: %w[bash write], skills: [skill])
+      assert_includes built, "Use bash to load a skill's file"
+    end
+
+    def test_skills_section_requires_a_reader_tool
+      built = Agent::SystemPrompt.build(cwd: "/tmp/p", docs_paths: DOCS,
+                                        selected_tools: %w[write], skills: [skill])
+      refute_includes built, "<skills>", "pi: no read/bash reader reachable, no section"
+    end
+
+    def test_model_invocation_disabled_skills_emit_nothing_when_alone
+      built = Agent::SystemPrompt.build(cwd: "/tmp/p", docs_paths: DOCS, skills: [skill(disable: true)])
+      refute_includes built, "<skills>",
+        "pi: formatSkillsForPrompt returns \"\" for an all-invisible listing"
+    end
   end
 end

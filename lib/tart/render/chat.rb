@@ -101,6 +101,11 @@ module Tart
       # agent's on_event/approval procs reference this chat).
       attr_accessor :agent
 
+      # The slash-command handler (Commands::Handler, bin-wired): leading-
+      # "/" submit text routes through it before any agent call. nil (the
+      # default; e.g. tests) sends every text to the agent — pre-I10 shape.
+      attr_accessor :commands
+
       # @return [Object, nil] the tool call awaiting an approval decision.
       def pending_approval
         @mutex.synchronize { @pending }
@@ -432,6 +437,14 @@ module Tart
         end
       end
 
+      # pi's submit path (interactive-mode.ts:3200-3442): a leading "/"
+      # routes through the commands module before any agent call —
+      # /skill:<name> expands (unknown skill passes through as plain text),
+      # builtins dispatch when idle, and text matching nothing falls through
+      # to the agent as a plain message. Deviation (itemized): pi's builtin
+      # if-chain precedes its streaming branch, so pi dispatches builtins
+      # mid-turn (/compact aborts the turn first) — the port routes ALL
+      # slash text through the steer path while a turn runs.
       def submit
         text = @input.dup
         return if text.strip.empty?
@@ -441,11 +454,21 @@ module Tart
         @cursor = 0
         exit_history_browsing
         enqueue_scrollback("❯ #{text}", fg: FG[:user])
+        if @commands && text.start_with?("/")
+          text = @commands.expand_skill(text)
+          return if !busy? && @commands.dispatch(text)
+        end
         if busy?
           @agent.push_message(text) # steering: consumed at the next turn boundary
         else
           @kernel.async { @agent.run(text) }
         end
+      end
+
+      # Slash-command output (pi's chat-line status UX): a muted line in
+      # scrollback. Thread-safe — the kernel task calls this off-frame.
+      def command_line(text)
+        @mutex.synchronize { enqueue_scrollback(text, fg: FG[:tool]) }
       end
 
       # pi's editor history (components/editor.ts addToHistory): trimmed,
