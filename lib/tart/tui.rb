@@ -109,6 +109,12 @@ module Tart
       def viewport_area
         RatatuiRuby.viewport_area
       end
+
+      # Resizes the terminal to +width+×+height+ (the AC1 resize-redraw
+      # proof on the headless test terminal; a no-op without a session).
+      def resize(width, height)
+        RatatuiRuby.resize_terminal(width, height)
+      end
     end
 
     module_function
@@ -147,6 +153,48 @@ module Tart
         RatatuiRuby.run(viewport:, height:, focus_events:, bracketed_paste:) do |_tui|
           yield session
         end
+      end
+    end
+
+    # @return [RatatuiRuby::Layout::Layout] one layout split: +children[i]+
+    #   renders into the rect +constraints[i]+ carves (gem layout/layout.rb:44).
+    #   The fullscreen chat surface's root is a vertical split — transcript /
+    #   editor block / footer (pi chat-viewport.ts VStack root).
+    def layout(children:, constraints:, direction: :vertical)
+      RatatuiRuby::Layout::Layout.new(direction:, constraints:, children:)
+    end
+
+    # @return [RatatuiRuby::Layout::Constraint] exactly +n+ cells.
+    def constraint_length(n)
+      RatatuiRuby::Layout::Constraint.length(n)
+    end
+
+    # @return [RatatuiRuby::Layout::Constraint] at least +n+ cells, more if
+    #   the split affords it (the transcript area's take-the-rest rule).
+    def constraint_min(n)
+      RatatuiRuby::Layout::Constraint.min(n)
+    end
+
+    # @return [RatatuiRuby::Widgets::Block] a bordered container: +title+ on
+    #   the top border (the editor area's status line, pi custom-editor.ts
+    #   renderTopBorder), +border_style+/+title_style+ the border/title
+    #   colors, +children+ the widgets rendered inside the borders.
+    def block(title: nil, borders: [:all], border_style: nil, title_style: nil, children: [])
+      RatatuiRuby::Widgets::Block.new(title:, borders:, border_style:, title_style:, children:)
+    end
+
+    # @return [Array<String>] the display lines of a drawn widget tree —
+    #   the test/draw readback for composed layouts: a Paragraph yields its
+    #   text rows (String or Lines), a Layout/Block yields its children's
+    #   rows in order (a Block's title row is not display content).
+    def widget_lines(widget)
+      if widget.respond_to?(:text)
+        text = widget.text
+        text.is_a?(String) ? text.lines(chomp: true) : text.map { |line| line.spans.map(&:content).join }
+      elsif widget.respond_to?(:children)
+        widget.children.flat_map { |child| widget_lines(child) }
+      else
+        []
       end
     end
 

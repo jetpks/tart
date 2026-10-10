@@ -6,10 +6,12 @@ require "tmpdir"
 require "fileutils"
 
 module Tart
-  # The interactive chat surface (AC1/AC2): streaming render on the inline
-  # viewport, scrollback insertion on completion, input line, key-driven
-  # approval gates — hermetic via the headless inline test terminal (render,
-  # buffer readback) and ScriptedSession + MockLLMServer (kernel-driven
+  # The interactive chat surface (AC1/AC2/AC3/AC4): the fullscreen
+  # three-area composition — transcript buffer tail, bordered editor with
+  # the status line in its top border, footer — with streaming render,
+  # buffer-backed scrollback, input line, and key-driven approval gates —
+  # hermetic via the headless fullscreen test terminal (render, buffer
+  # readback) and ScriptedSession + MockLLMServer (kernel-driven
   # input/approval/interrupt; the real test terminal cannot feed the poller
   # without a tty — I01 finding).
   class ChatTest < Test
@@ -22,100 +24,107 @@ module Tart
       @server&.stop
     end
 
-    # --- render model (headless inline test terminal, buffer readback) ---
+    # --- render model (headless fullscreen test terminal, buffer readback) ---
 
     def test_streaming_deltas_grow_the_live_region
-      with_inline_chat do |chat, session|
+      with_chat do |chat, session|
         stream(chat, "hel")
         draw(chat, session)
-        assert_includes live_region(session), "hel"
+        assert_includes live_region(session, chat), "hel"
 
         stream(chat, "lo", start: false)
         draw(chat, session)
-        assert_includes live_region(session), "hello",
+        assert_includes live_region(session, chat), "hello",
           "the live region must grow with the deltas"
       end
     end
 
     def test_completed_message_lands_above_the_live_region_wrapped
-      with_inline_chat do |chat, session|
+      with_chat do |chat, session|
         stream(chat, "aaaa bbbb cccc dddd")
         finish_message(chat, "aaaa bbbb cccc dddd")
         draw(chat, session)
 
-        # The viewport is the last 4 rows; the wrapped message is above it.
-        assert_equal ["aaaa bbbb", "cccc dddd"], inserted_lines(session),
+        # The completed message is in the buffer; the editor's input line
+        # sits in the docked editor area below it.
+        assert_equal ["aaaa bbbb", "cccc dddd"], transcript_lines(session, chat),
           "the completed text lands above the live region, wrapped to width"
-        assert_includes live_region(session), "❯", "the input line stays in the live region"
+        assert_includes editor_area(session, chat), "❯", "the input line stays in the live region (the editor area)"
       end
     end
 
     def test_tool_call_lifecycle_is_rendered
-      with_inline_chat(width: 40) do |chat, session|
+      with_chat(width: 40) do |chat, session|
         chat.on_agent_event({type: :agent_start})
         tool_start(chat, "bash")
         draw(chat, session)
-        assert_includes live_region(session), "tool: bash"
+        assert_includes editor_area(session, chat), "tool: bash",
+          "the tool name renders in the editor's status border while it runs"
 
         tool_end(chat, "bash", "done\nmore")
         draw(chat, session)
-        assert_includes live_region(session), "❯", "input line visible after tool end"
-        # inserted_lines strips per-row whitespace (buffer rows are padded).
-        assert_equal ["⎿ bash: done", "more"], inserted_lines(session),
-          "the tool result lifecycle renders into scrollback as a multi-line excerpt"
+        assert_includes editor_area(session, chat), "❯", "input line visible after tool end"
+        # transcript_lines strips per-row whitespace (buffer rows are padded).
+        assert_equal ["⎿ bash: done", "more"], transcript_lines(session, chat),
+          "the tool result lifecycle renders into the transcript as a multi-line excerpt"
       end
     end
 
     def test_tool_result_preview_is_bounded_multiline
-      with_inline_chat(width: 40) do |chat, session|
+      with_chat(width: 40) do |chat, session|
         tool_start(chat, "bash")
         tool_end(chat, "bash", "one\ntwo\nthree\nfour\nfive")
         draw(chat, session)
-        assert_equal ["⎿ bash: one", "two", "three", "…"], inserted_lines(session),
+        assert_equal ["⎿ bash: one", "two", "three", "…"], transcript_lines(session, chat),
           "the preview shows a bounded multi-line excerpt, then an ellipsis"
       end
     end
 
-    # The style vocabulary (AC4): line kinds are distinguished by fg color,
-    # proven by cell readback on the headless terminal (not presence-greps).
+    # The style vocabulary (AC3): line kinds are distinguished by fg color
+    # through the theme, proven by cell readback on the headless terminal
+    # (not presence-greps).
     def test_user_assistant_tool_and_status_lines_read_back_distinct_fg_colors
-      with_inline_chat(width: 40, height: 10) do |chat, session|
+      with_chat(width: 40, screen_height: 14) do |chat, session|
         chat.on_agent_event({type: :agent_start})
         stream(chat, "streaming")
         draw(chat, session)
-        assert lead_cells(session).any? { |symbol, fg| Render::Chat::SPINNER.include?(symbol) && fg == Render::Chat::FG[:status] },
-          "the status line is dim (#{Render::Chat::FG[:status].inspect})"
+        # The status renders in the editor's top border (after the corner
+        # glyph) — scan cells, not lead cells.
+        assert all_cells(session).any? { |symbol, fg| Render::Chat::SPINNER.include?(symbol) && fg == Theme[:dim] },
+          "the status line is dim (#{Theme[:dim].inspect})"
 
-        finish_message(chat, "assistant answer") # scrollback: assistant, terminal default
-        tool_end(chat, "bash", "tool output")    # scrollback: tool, muted
+        finish_message(chat, "assistant answer") # transcript: assistant, terminal default
+        tool_end(chat, "bash", "tool output")    # transcript: tool, muted
         chat.on_agent_event({type: :agent_end})
         "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
-        chat.on_event(TUI.key_event("enter"))    # scrollback: user echo
+        chat.on_event(TUI.key_event("enter"))    # transcript: user echo
         draw(chat, session)
 
         leads = lead_cells(session)
         assert_includes leads, ["a", nil],
           "assistant text carries the terminal default fg (pi: userMessageText/text)"
-        assert_includes leads, ["⎿", Render::Chat::FG[:tool]],
+        assert_includes leads, ["⎿", Theme[:tool_output]],
           "tool output is muted (pi: toolOutput)"
-        assert_includes leads, ["❯", Render::Chat::FG[:user]],
+        assert_includes leads, ["❯", Theme[:user_message_text]],
           "the user echo carries the blue distinction (pi: userMessageBg)"
-        assert_includes leads, ["❯", nil],
+        # The input row sits inside the editor borders — its lead cell is
+        # the border glyph; read the prompt glyph's cell directly.
+        assert_nil session.cell_fg(1, input_row(session)),
           "the input line keeps the terminal default — visually apart from the colored echo"
       end
     end
 
     def test_pending_approval_stays_fully_visible_over_a_full_live_region
-      with_inline_chat(width: 40, height: 10) do |chat, session|
+      with_chat(width: 40, screen_height: 14) do |chat, session|
         chat.on_agent_event({type: :agent_start})
         stream(chat, "word " * 40, start: false)
         decision = Thread.new { chat.approval(ToolCallDouble.new("bash")) }
         wait_until { chat.pending_approval }
         draw(chat, session)
 
-        region = live_region(session)
+        region = editor_area(session, chat)
         assert_includes region, "approve bash?"
-        assert_includes region, "y = yes, n = no", "the full approval prompt stays in the viewport"
+        assert_includes region, "y = yes, n = no", "the full approval prompt stays in the editor area"
 
         chat.on_event(TUI.key_event("y"))
         assert decision.value == true, "the prompt remains answerable"
@@ -123,13 +132,57 @@ module Tart
     end
 
     def test_chat_runs_inside_the_seam_lifecycle_and_restores
-      TUI.run(headless: true, viewport: :inline, height: 4) do |session|
+      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new)
         stream(chat, "hi")
         draw(chat, session)
-        assert_includes live_region(session), "hi"
+        assert_includes live_region(session, chat), "hi"
       end
       refute TUI::Session.active?, "terminal restored after the chat surface exits"
+    end
+
+    # --- the fullscreen composition (AC1): transcript above, bordered
+    # editor (status in its top border), footer at the bottom. ---
+
+    def test_fullscreen_composition_draws_transcript_editor_and_footer
+      with_chat(width: 40, screen_height: 12, footer_data: {cwd: Dir.home, model: "test-model", context_window: 1000, auto_compact: true}, branch_reader: ->(_cwd) { "main" }) do |chat, session|
+        send_message(chat, "hello")
+        finish_message(chat, "answer")
+        draw(chat, session)
+
+        buffer = session.buffer_content
+        assert_includes buffer[0, transcript_height(session, chat)].join, "❯ hello", "transcript on top"
+        assert_includes buffer[transcript_height(session, chat), 3].join, "┌", "a bordered editor area below it"
+        assert_equal "└", buffer[transcript_height(session, chat) + 2][0], "the editor's bottom border"
+        footer = buffer[-2, 2].join
+        assert_includes footer, "~ (main)", "the footer carries the ~-contracted cwd and branch"
+        assert_includes footer, "?/1.0k (auto)", "the footer carries context usage vs the resolved window"
+        assert_includes footer, "test-model", "the footer carries the model id"
+      end
+    end
+
+    # Resize redraws without clobbering (AC1): the surface recomposes the
+    # whole three-area layout from the session viewport every frame, so a
+    # terminal resize repaints every row at the new geometry from surface
+    # state — proven on the headless test terminal with the gem's
+    # resize_terminal (ext mutations.rs:126).
+    def test_resize_repaints_the_full_surface_at_the_new_geometry
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        send_message(chat, "hello")
+        finish_message(chat, "answer")
+        draw(chat, session)
+
+        session.resize(60, 16)
+        draw(chat, session)
+        buffer = session.buffer_content
+        assert_equal 16, buffer.size, "the redraw repaints the full screen at the new size"
+        assert_equal 60, buffer.first.length
+        assert_includes buffer[0, transcript_height(session, chat)].join, "❯ hello",
+          "the transcript survives the resize"
+        assert_includes buffer[transcript_height(session, chat), 3].join, "┌",
+          "the editor area recomposes at the new geometry"
+        assert_includes buffer[-2, 2].join, "~", "the footer recomposes at the new geometry"
+      end
     end
 
     # --- kernel-driven input/approval/interrupt (ScriptedSession) ---
@@ -149,8 +202,8 @@ module Tart
 
       request = captured.first
       assert_equal "hi", request["messages"].select { |m| m["role"] == "user" }.last["content"]
-      assert_equal ["❯ hi"], scrollback_lines(session),
-        "the submitted prompt is echoed into scrollback"
+      assert_equal ["❯ hi"], chat.transcript_lines,
+        "the submitted prompt is echoed into the transcript"
     end
 
     def test_enter_while_running_steers
@@ -283,7 +336,7 @@ module Tart
         wait_until { chat.busy? }
         session.push_event(TUI.key_event("c", modifiers: ["ctrl"]))
         wait_until { !chat.busy? }
-        wait_until { scrollback_lines(session).join.include?("interrupted") }
+        wait_until { chat.transcript_lines.join.include?("interrupted") }
         kernel.stop!
       end
       kernel.run
@@ -292,11 +345,11 @@ module Tart
       assert kernel.interrupted?
       assert chat.agent.interrupted?
       refute kernel.poller&.thread&.alive?, "no orphan poller"
-      assert_includes scrollback_lines(session).join, "interrupted",
+      assert_includes chat.transcript_lines.join, "interrupted",
         "the interrupted turn renders coherently"
     end
 
-    # --- the submit seam: slash commands (AC3) ---
+    # --- the submit seam: slash commands (I10) ---
 
     # A real Commands::Handler with stub callables; skills load from the
     # tmp project dir.
@@ -337,8 +390,7 @@ module Tart
     end
 
     def test_slash_builtin_is_consumed_before_any_agent_call
-      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
-        chat = Render::Chat.new(session:, kernel: IdleKernel.new)
+      with_headless_chat do |chat|
         outputs = with_commands_handler(chat)
         runs = with_recording_agent(chat)
         send_message(chat, "/help")
@@ -351,8 +403,7 @@ module Tart
     end
 
     def test_skill_invocation_sends_the_expanded_block_to_the_agent
-      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
-        chat = Render::Chat.new(session:, kernel: IdleKernel.new)
+      with_headless_chat do |chat|
         with_commands_handler(chat)
         runs = with_recording_agent(chat)
         send_message(chat, "/skill:greet")
@@ -365,8 +416,7 @@ module Tart
     end
 
     def test_unknown_skill_and_unknown_command_pass_through_as_plain_text
-      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
-        chat = Render::Chat.new(session:, kernel: IdleKernel.new)
+      with_headless_chat do |chat|
         with_commands_handler(chat)
         runs = with_recording_agent(chat)
         send_message(chat, "/skill:missing")
@@ -403,16 +453,16 @@ module Tart
         "the reduced deviation: slash text mid-turn steers instead of dispatching"
     end
 
-    # --- markdown seam (AC5): assistant completions render through the
-    # converter into scrollback — styled cells proven by readback; the live
-    # region stays verbatim streaming text. ---
+    # --- markdown seam (I06/AC5): assistant completions render through the
+    # converter into the transcript — styled cells proven by readback; the
+    # live region stays verbatim streaming text. ---
 
-    def test_assistant_completion_renders_markdown_styled_in_scrollback
-      with_inline_chat(width: 40, height: 6) do |chat, session|
+    def test_assistant_completion_renders_markdown_styled_in_transcript
+      with_chat(width: 40) do |chat, session|
         finish_message(chat, "# Heading\n\nplain **bold** text")
         draw(chat, session)
 
-        cells = scrollback_cells(session) # [x, y, symbol, fg, modifiers]
+        cells = transcript_cells(session, chat) # [y, x, symbol, fg, modifiers]
         heading = cells.find { |cell| cell[2] == "H" }
         assert_equal :yellow, heading[3], "the markdown heading renders yellow (mdHeading)"
         assert_equal %i[bold underlined], heading[4], "h1 is bold+underlined (markdown.ts:481-483)"
@@ -420,16 +470,16 @@ module Tart
         assert_equal [:bold], bold[4], "strong renders the bold modifier (markdown.ts:683-687)"
         plain = cells.find { |cell| cell[2] == "p" }
         assert_equal [nil, []], plain[3, 2], "plain prose keeps the terminal default"
-        assert_equal 3, session.viewport_area.y,
-          "the heading, its spacing row, and the paragraph occupy three scrollback rows"
+        assert_equal 3, chat.transcript_lines.size,
+          "the heading, its spacing row, and the paragraph occupy three transcript rows"
       end
     end
 
     def test_live_region_streams_markdown_source_verbatim
-      with_inline_chat do |chat, session|
+      with_chat do |chat, session|
         stream(chat, "**bo")
         draw(chat, session)
-        assert_includes live_region(session), "**bo",
+        assert_includes live_region(session, chat), "**bo",
           "the live region carries the raw markdown source while streaming"
       end
     end
@@ -441,14 +491,14 @@ module Tart
 
       scenario = Thread.new do
         type(session, "hi")
-        wait_until { scrollback_lines(session).join.include?("Title") }
+        wait_until { chat.transcript_lines.join.include?("Title") }
         kernel.stop!
       end
       kernel.run
       scenario.join
 
-      assert_equal ["❯ hi", "Title", "", "plain body"], scrollback_lines(session),
-        "the assistant reply renders as markdown rows in scrollback (with the spacing row between blocks)"
+      assert_equal ["❯ hi", "Title", "", "plain body"], chat.transcript_lines,
+        "the assistant reply renders as markdown rows in the transcript (with the spacing row between blocks)"
     end
 
     def test_wrap_row_wraps_styled_rows_preserving_spans
@@ -474,11 +524,87 @@ module Tart
       assert_equal [""], Render::Chat.wrap("", 5)
     end
 
+    # --- footer formatting (AC4, pi footer.ts) ---
+
+    def test_format_tokens_compacts_counts_like_pi
+      assert_equal "999", Render::Chat.format_tokens(999)
+      assert_equal "1.0k", Render::Chat.format_tokens(1000)
+      assert_equal "12k", Render::Chat.format_tokens(12_345)
+      assert_equal "1.2M", Render::Chat.format_tokens(1_234_567)
+      assert_equal "12M", Render::Chat.format_tokens(12_345_678)
+      assert_equal "1235M", Render::Chat.format_tokens(1_234_567_890)
+    end
+
+    def test_format_cwd_contracts_the_home_prefix
+      home = Dir.home
+      assert_equal "~", Render::Chat.format_cwd(home, home)
+      assert_equal "~/sub/dir", Render::Chat.format_cwd(File.join(home, "sub", "dir"), home)
+      assert_equal "/elsewhere", Render::Chat.format_cwd("/elsewhere", home), "outside home renders absolute"
+    end
+
+    # The footer's token counters (AC4): session-cumulative usage totals
+    # accumulated at assistant completions; the context segment goes "?"
+    # until the first usage and after a compaction (pi's post-compaction
+    # "?"), with warning/error thresholds above 70%/90%.
+    def test_footer_counters_accumulate_from_assistant_completions
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, auto_compact: false},
+        branch_reader: ->(_cwd) { nil }) do |chat, session|
+        draw(chat, session)
+        assert_includes footer_text(session), "?/1.0k", "no usage yet: the context segment is '?'"
+
+        assistant_done(chat, TokensDouble.new(10, 5, 0, 0))
+        draw(chat, session)
+        footer = footer_text(session)
+        assert_includes footer, "↑10", "input totals accumulate"
+        assert_includes footer, "↓5", "output totals accumulate"
+        assert_includes footer, "1.5%/1.0k", "context usage uses the resolved window"
+        assert_includes footer, "m", "the model id renders"
+
+        chat.on_agent_event({type: :compaction, reason: :threshold, tokens_before: 900, summary: "s"})
+        draw(chat, session)
+        assert_includes footer_text(session), "?/1.0k", "after compaction the context segment is '?' again"
+      end
+    end
+
+    def test_footer_context_thresholds_color_the_segment
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: @dir, model: "m", context_window: 100}) do |chat, session|
+        assistant_done(chat, TokensDouble.new(0, 0, 71, 0))
+        draw(chat, session)
+        row = footer_stats_row(session)
+        cells = (0...40).filter_map { |x| [x, session.cell_fg(x, row)] if session.cell_symbol(x, row) != " " }
+        assert cells.any? { |_x, fg| fg == Theme[:warning] }, "context >70% renders warning"
+
+        assistant_done(chat, TokensDouble.new(0, 0, 91, 0))
+        draw(chat, session)
+        cells = (0...40).filter_map { |x| [x, session.cell_fg(x, row)] if session.cell_symbol(x, row) != " " }
+        assert cells.any? { |_x, fg| fg == Theme[:error] }, "context >90% renders error"
+      end
+    end
+
+    def test_footer_branch_is_cached_and_invalidated_per_turn
+      with_chat(width: 40, screen_height: 12, footer_data: {cwd: @dir, model: "m", context_window: 1000},
+        branch_reader: branch_counter) do |chat, session|
+        draw(chat, session)
+        draw(chat, session)
+        assert_equal 1, @branch_calls, "the branch is cached across frames"
+
+        send_message(chat, "new turn")
+        draw(chat, session)
+        assert_equal 2, @branch_calls, "a submission invalidates the branch cache"
+
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        assert_equal 3, @branch_calls, "an agent start invalidates the branch cache"
+      end
+    end
+
     # --- input line (minimal: chars, backspace, enter, paste) ---
 
     def test_input_line_edits_and_submits
       chat_idle_kernel = IdleKernel.new
-      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
+      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
         chat = Render::Chat.new(session:, kernel: chat_idle_kernel)
         "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
         chat.on_event(TUI.paste_event(" there"))
@@ -488,59 +614,61 @@ module Tart
         assert_equal "hi ther", chat.input, "ctrl+e moves to line end without editing"
         chat.on_event(TUI.key_event("enter"))
         assert_equal "", chat.input, "enter submits and clears the input line"
-        draw(chat, session) # the frame loop's flush inserts the echo
-        assert_equal ["❯ hi ther"], inserted_lines(session),
-          "the submitted prompt is echoed into scrollback"
+        draw(chat, session) # the frame's flush moves the echo into the buffer
+        assert_equal ["❯ hi ther"], chat.transcript_lines,
+          "the submitted prompt is echoed into the transcript"
         assert_equal 1, chat_idle_kernel.submitted.size, "an idle submit starts an agent run"
       end
     end
 
-    # --- cursor (AC2): the insertion point is cell-readback-visible at all
-    # times — pi's fake cursor: the grapheme under it renders inverse-video,
-    # at end-of-input a highlighted trailing space (tui.ts renderFakeCursor
-    # via editor.ts:583-597); the port carries the reversed modifier. ---
+    # --- cursor (I06/AC2): the insertion point is cell-readback-visible at
+    # all times — pi's fake cursor: the grapheme under it renders
+    # inverse-video, at end-of-input a highlighted trailing space (tui.ts
+    # renderFakeCursor via editor.ts:583-597); the port carries the
+    # reversed modifier. ---
 
     def test_cursor_reads_back_at_end_of_input
-      with_inline_chat(width: 40) do |chat, session|
+      with_chat(width: 40) do |chat, session|
         "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
         draw(chat, session)
         row = input_row(session)
-        assert_equal [" ", [:reversed]], cursor_cell(session, 4, row),
+        assert_equal [" ", [:reversed]], cursor_cell(session, 5, row),
           "end-of-input cursor: highlighted trailing space after 'hi'"
-        assert session.cell_modifiers(3, row).empty?, "the grapheme left of the cursor is unhighlighted"
+        assert session.cell_modifiers(4, row).empty?, "the grapheme left of the cursor is unhighlighted"
       end
     end
 
     def test_cursor_reads_back_mid_input_and_tracks_left_right
-      with_inline_chat(width: 40) do |chat, session|
+      with_chat(width: 40) do |chat, session|
         "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
         chat.on_event(TUI.key_event("left"))
         draw(chat, session)
         row = input_row(session)
-        assert_equal ["i", [:reversed]], cursor_cell(session, 3, row),
+        assert_equal ["i", [:reversed]], cursor_cell(session, 4, row),
           "after cursor-left the insertion point sits on the 'i'"
-        assert session.cell_modifiers(4, row).empty?, "the trailing space is no longer highlighted"
+        assert session.cell_modifiers(5, row).empty?, "the trailing space is no longer highlighted"
 
         chat.on_event(TUI.key_event("right"))
         draw(chat, session)
-        assert_equal [" ", [:reversed]], cursor_cell(session, 4, row),
+        assert_equal [" ", [:reversed]], cursor_cell(session, 5, row),
           "cursor-right returns the insertion point to end-of-input"
       end
     end
 
     def test_cursor_hides_while_an_approval_prompt_holds_the_input_row
-      with_inline_chat(width: 40) do |chat, session|
+      with_chat(width: 40, screen_height: 14) do |chat, session|
         "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
         thread = Thread.new { chat.approval(ToolCallDouble.new("bash")) }
         wait_until { chat.pending_approval }
         draw(chat, session)
-        refute live_region(session).include?("❯"), "input row displaced by the approval prompt"
+        refute editor_area(session, chat).include?("❯"), "input row displaced by the approval prompt"
+        assert_includes editor_area(session, chat), "approve bash?", "the prompt holds the editor area"
         chat.on_event(TUI.key_event("n"))
         assert_equal false, thread.value
       end
     end
 
-    # --- mid-line editing (AC2) ---
+    # --- mid-line editing (I06/AC2) ---
 
     def test_printable_characters_insert_at_the_cursor
       with_headless_chat do |chat|
@@ -591,7 +719,7 @@ module Tart
       end
     end
 
-    # --- history (AC3): pi's editor.ts addToHistory/navigateHistory —
+    # --- history (I06/AC3): pi's editor.ts addToHistory/navigateHistory —
     # most recent first, draft restored, recalled entries editable. ---
 
     def test_history_recalls_entries_in_order
@@ -611,7 +739,7 @@ module Tart
 
     def test_recalled_history_entry_is_editable_and_sends_as_edited
       chat_idle_kernel = IdleKernel.new
-      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
+      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
         chat = Render::Chat.new(session:, kernel: chat_idle_kernel)
         send_message(chat, "A")
         send_message(chat, "B")
@@ -620,8 +748,8 @@ module Tart
         chat.on_event(TUI.key_event("!"))
         assert_equal "!A", chat.input, "a recalled entry is editable at the cursor"
         chat.on_event(TUI.key_event("enter"))
-        draw(chat, session) # the frame loop's flush inserts the echo
-        assert_equal ["❯ A", "❯ B", "❯ !A"], inserted_lines(session),
+        draw(chat, session) # the frame's flush moves the echo into the buffer
+        assert_equal ["❯ A", "❯ B", "❯ !A"], chat.transcript_lines,
           "the edited recall sends as edited (after the two original echoes)"
       end
     end
@@ -640,7 +768,7 @@ module Tart
       end
     end
 
-    # --- word-wise operations (AC3): pi's word-navigation.ts boundary
+    # --- word-wise operations (I06/AC3): pi's word-navigation.ts boundary
     # semantics — skip trailing whitespace, then one word/punctuation run. ---
 
     def test_find_word_backward_boundaries
@@ -688,47 +816,31 @@ module Tart
 
     private
 
-    # A chat surface on the headless test terminal for key-surface tests
-    # (draw/readback assertions use with_inline_chat; these only need the
+    # A chat surface on the headless fullscreen test terminal for key-surface
+    # tests (draw/readback assertions use with_chat; these only need the
     # editor's key path, which never draws).
     def with_headless_chat
-      TUI.run(headless: true, viewport: :inline, height: 4, screen_height: 24) do |session|
+      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
         yield Render::Chat.new(session:, kernel: IdleKernel.new)
       end
     end
 
-    # Types +text+ into the input line and presses Enter (direct key events
-    # — the render-level editor path, no kernel).
-    def send_message(chat, text)
-      text.chars.each { |char| chat.on_event(TUI.key_event(char)) }
-      chat.on_event(TUI.key_event("enter"))
-    end
-
-    # The input line's row: the chat's live region puts it at the top of the
-    # viewport (status/live/approval rows absent in these tests).
-    def input_row(session)
-      session.viewport_area.y
-    end
-
-    def cursor_cell(session, x, row)
-      [session.cell_symbol(x, row), session.cell_modifiers(x, row)]
-    end
-
-    # Render-only tests: the real headless inline test terminal (buffer
-    # readback) without the kernel. Width 9 makes wrapping observable
-    # ("aaaa bbbb" is exactly 9 cells).
-    def with_inline_chat(width: 9, height: 4, &)
-      TUI.run(headless: true, viewport: :inline, height:, width:, screen_height: 24) do |session|
-        chat = Render::Chat.new(session:, kernel: IdleKernel.new)
+    # Render-only tests: the real headless fullscreen test terminal (buffer
+    # readback). Width 9 makes wrapping observable ("aaaa bbbb" is exactly 9
+    # cells).
+    def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil)
+      TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new,
+          footer_data:, branch_reader: branch_reader || ->(_cwd) { nil })
         yield chat, session
       end
     end
 
     # Kernel-driven tests: ScriptedSession feeds the real poller/frame loop.
     def chat_with_server(tools: {})
-      session = ScriptedSession.new
+      session = ScriptedSession.new(width: 80, height: 24)
       kernel = Core::Loop.new(session:)
-      chat = Render::Chat.new(session:, kernel:)
+      chat = Render::Chat.new(session:, kernel:, branch_reader: nil)
       chat.agent = Agent::Loop.new(
         chat: TestChat.build(@server, tools: tools.values, system_prompt: "test"),
         tools:, on_event: ->(event) { chat.on_agent_event(event) },
@@ -749,12 +861,23 @@ module Tart
       chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, content)})
     end
 
+    def assistant_done(chat, tokens)
+      chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "done", tokens)})
+    end
+
     def tool_start(chat, name)
       chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(name)})
     end
 
     def tool_end(chat, name, result)
       chat.on_agent_event({type: :tool_execution_end, tool_call: ToolCallDouble.new(name), result:})
+    end
+
+    # Types +text+ into the input line and presses Enter (direct key events
+    # — the render-level editor path, no kernel).
+    def send_message(chat, text)
+      text.chars.each { |char| chat.on_event(TUI.key_event(char)) }
+      chat.on_event(TUI.key_event("enter"))
     end
 
     # Types +text+ into the input line and presses Enter (synthetic events —
@@ -768,32 +891,61 @@ module Tart
       session.draw(chat.renderer.call)
     end
 
-    # The test terminal's inline viewport starts at the TOP of the screen
-    # (y=0) and shifts down as scrollback is inserted (verified gem source:
-    # ext .../init.rs Viewport::Inline starts at the origin) — so the live
-    # region and the inserted scrollback are located via the viewport Rect,
-    # not hardcoded rows.
-    def live_region(session)
-      area = session.viewport_area
-      session.buffer_content[area.y, area.height].join
+    # Layout geometry of the fullscreen composition (the driving values,
+    # mirrored from Render::Chat::FOOTER_ROWS/MIN_EDITOR_ROWS): transcript
+    # rows on top, then the 3-row editor block (5 with an approval pending —
+    # three prompt rows inside the borders), then the 2-row footer.
+    def transcript_height(session, chat)
+      session.buffer_content.size - 5 - (chat.pending_approval ? 2 : 0)
     end
 
-    # Lines the chat inserted above the viewport (rows 0...viewport.y).
-    def inserted_lines(session)
-      area = session.viewport_area
-      session.buffer_content[0, area.y].map(&:strip).reject(&:empty?)
+    # The transcript area (the surface-owned buffer's visible tail with the
+    # streaming source at its end).
+    def live_region(session, chat)
+      session.buffer_content[0, transcript_height(session, chat)].join
     end
 
-    # [x, y, symbol, fg, modifiers] of every non-blank cell in the rows the
-    # chat inserted above the viewport — the markdown-seam style readback.
-    def scrollback_cells(session)
-      area = session.viewport_area
-      (0...area.y).flat_map do |y|
-        (0...area.width).filter_map do |x|
+    # The buffer's transcript rows, stripped and non-empty.
+    def transcript_lines(session, chat)
+      session.buffer_content[0, transcript_height(session, chat)].map(&:strip).reject(&:empty?)
+    end
+
+    # The editor area rows (block borders + inner content).
+    def editor_area(session, chat)
+      h = session.buffer_content.size
+      session.buffer_content[(h - 5 - (chat.pending_approval ? 2 : 0))..(h - 3)].join
+    end
+
+    def footer_text(session)
+      session.buffer_content[-2, 2].join
+    end
+
+    def footer_stats_row(session)
+      session.buffer_content.size - 1
+    end
+
+    # [y, x, symbol, fg, modifiers] of every non-blank cell in the
+    # transcript rows — the markdown-seam style readback.
+    def transcript_cells(session, chat)
+      h = session.buffer_content.size
+      (0...(h - 5)).flat_map do |y|
+        (0...session.buffer_content[y].length).filter_map do |x|
           symbol = session.cell_symbol(x, y)
           next if symbol == " "
 
-          [x, y, symbol, session.cell_fg(x, y), session.cell_modifiers(x, y)]
+          [y, x, symbol, session.cell_fg(x, y), session.cell_modifiers(x, y)]
+        end
+      end
+    end
+
+    # [symbol, fg] of every non-blank screen cell — the style readback for
+    # cell-position-independent assertions.
+    def all_cells(session)
+      session.buffer_content.each_with_index.flat_map do |row, y|
+        row.chars.each_with_index.filter_map do |symbol, x|
+          next if symbol == " "
+
+          [symbol, session.cell_fg(x, y)]
         end
       end
     end
@@ -802,30 +954,36 @@ module Tart
     # — the style readback for line-kind assertions (lead glyphs ❯ / ⎿ /
     # spinner make the row kind identifiable).
     def lead_cells(session)
-      area = session.viewport_area
-      (0...session.buffer_content.size).filter_map do |row|
-        col = (0...area.width).find { |x| session.cell_symbol(x, row) != " " }
+      session.buffer_content.each_with_index.filter_map do |row, y|
+        col = row.chars.index { |cell| cell != " " }
         next unless col
 
-        [session.cell_symbol(col, row), session.cell_fg(col, row)]
+        [session.cell_symbol(col, y), session.cell_fg(col, y)]
       end
     end
 
     def drawn_text(session)
       widget = session.drawn.last
-      widget ? widget_lines(widget).join("\n") : ""
+      widget ? TUI.widget_lines(widget).join("\n") : ""
     end
 
-    # Widget texts recorded by ScriptedSession#insert_before, in order.
-    def scrollback_lines(session)
-      session.scrollback.flat_map { |(_height, widget)| widget_lines(widget) }
+    # The input line's row: the editor block's single inner row (3-row
+    # block: borders at h-5 and h-3).
+    def input_row(session)
+      session.buffer_content.size - 4
     end
 
-    # A Paragraph's text is a String or an array of styled Lines (the chat
-    # surface's style vocabulary); both normalize to display strings.
-    def widget_lines(widget)
-      text = widget.text
-      text.is_a?(String) ? text.lines(chomp: true) : text.map { |line| line.spans.map(&:content).join }
+    def cursor_cell(session, x, row)
+      [session.cell_symbol(x, row), session.cell_modifiers(x, row)]
+    end
+
+    # A branch reader that counts reads (the footer cache proof).
+    def branch_counter
+      @branch_calls = 0
+      lambda do |_cwd|
+        @branch_calls += 1
+        "counted-branch"
+      end
     end
 
     # Accumulating view of the mock server's captured request bodies.
@@ -837,10 +995,11 @@ module Tart
     end
 
     ChunkDouble = Struct.new(:content)
-    MessageDouble = Struct.new(:role, :content)
+    MessageDouble = Struct.new(:role, :content, :tokens)
     ToolCallDouble = Struct.new(:name) do
       def arguments = {}
     end
+    TokensDouble = Struct.new(:input, :output, :cache_read, :cache_write)
 
     # A kernel double for render-only tests (chat opens animation windows and
     # submits runs through the real one in kernel-driven tests).
