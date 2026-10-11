@@ -1,17 +1,17 @@
 # frozen_string_literal: true
 
-require_relative "../test_helper"
-require_relative "../../lib/tart/parity"
+require_relative "../../../test/test_helper"
+require_relative "../lib/tui_split_rig"
 require "open3"
 
-module Tart
+module TuiSplitRig
   # The frozen CLI contract (BRIEF §2): exit 0 = all difference lines
   # sanctioned; 1 = unknown-candidate lines exist; 2 = rig failure. Proven
   # cold against the shipped fixtures via the real binary.
-  class ParityCliTest < Test
-    REPO_ROOT = File.expand_path("#{__dir__}/../..")
-    BIN = File.join(REPO_ROOT, "bin/pty-tester")
-    FIXTURES = File.join(REPO_ROOT, "test/parity/fixtures")
+  class CliTest < Tart::Test
+    REPO_ROOT = File.expand_path("#{__dir__}/../../..")
+    BIN = File.join(REPO_ROOT, "gems/tui-split-rig/bin/tui-split-rig")
+    FIXTURES = File.expand_path("fixtures", __dir__)
 
     def test_covered_fixture_pair_exits_zero
       output, status = run_diff("covered-a.capture", "covered-b.capture", "registry-covers.yml")

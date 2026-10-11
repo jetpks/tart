@@ -1,13 +1,13 @@
 # frozen_string_literal: true
 
-require_relative "../test_helper"
-require_relative "../../lib/tart/parity"
+require_relative "../../../test/test_helper"
+require_relative "../lib/tui_split_rig"
 
-module Tart
+module TuiSplitRig
   # Differ + registry on the shipped synthetic fixtures — both directions of
   # AC2: every difference line covered (clean?) and at least one uncovered
   # (candidates). The fixture names are frozen (the gates reference them).
-  class ParityDifferTest < Test
+  class DifferTest < Tart::Test
     FIXTURES = File.expand_path("fixtures", __dir__)
 
     def test_covered_pair_classifies_every_difference_line
@@ -41,10 +41,10 @@ module Tart
     private
 
     def run_diff(a, b, registry)
-      Parity::Differ.diff(
+      Differ.diff(
         File.read(File.join(FIXTURES, a)),
         File.read(File.join(FIXTURES, b)),
-        Parity::Registry.load(File.join(FIXTURES, registry))
+        Registry.load(File.join(FIXTURES, registry))
       )
     end
   end

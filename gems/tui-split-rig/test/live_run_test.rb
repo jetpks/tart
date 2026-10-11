@@ -1,23 +1,24 @@
 # frozen_string_literal: true
 
-require_relative "../test_helper"
-require_relative "../../lib/tart/parity"
+require_relative "../../../test/test_helper"
+require_relative "../lib/tui_split_rig"
 require "open3"
 require "tmpdir"
 
-module Tart
+module TuiSplitRig
   # Live end-to-end integration (AC3/AC4/AC4 evidence): runs s1 through the
-  # real bin/pty-tester against installed pi and THIS worktree's tart.
+  # real bin/tui-split-rig against installed pi and THIS worktree's tart.
   # Opt-in — it drives tmux, boots real processes and takes tens of seconds:
   #
-  #   PTY_TESTER_LIVE=1 bundle exec rake test
-  class ParityLiveRunTest < Test
-    REPO_ROOT = File.expand_path("#{__dir__}/../..")
-    BIN = File.join(REPO_ROOT, "bin/pty-tester")
-    SCENARIO = File.join(REPO_ROOT, "parity/scenarios/s1_text_turn.yml")
+  #   TUI_SPLIT_RIG_LIVE=1 bundle exec rake test
+  class LiveRunTest < Tart::Test
+    REPO_ROOT = File.expand_path("#{__dir__}/../../..")
+    RIG_ROOT = File.join(REPO_ROOT, "gems/tui-split-rig")
+    BIN = File.join(RIG_ROOT, "bin/tui-split-rig")
+    SCENARIO = File.join(RIG_ROOT, "scenarios/s1_text_turn.yml")
 
     def test_s1_end_to_end_against_installed_pi_and_this_tart
-      skip "set PTY_TESTER_LIVE=1 to run the live parity rig" unless ENV["PTY_TESTER_LIVE"] == "1"
+      skip "set TUI_SPLIT_RIG_LIVE=1 to run the live parity rig" unless ENV["TUI_SPLIT_RIG_LIVE"] == "1"
 
       out = File.join(REPO_ROOT, "tmp", "parity-live-test-#{Process.pid}")
       FileUtils.rm_rf(out)
@@ -48,9 +49,9 @@ module Tart
         assert staged_took_writes?(root), "staged #{app} root has writes: #{`find #{root} -mindepth 1 | head -20`}"
       end
 
-      # AC4: no surviving app process, no leftover pty-tester-* tmux session.
-      leftover_sessions = `tmux ls 2>/dev/null`.lines.grep(/pty-tester-/)
-      assert_empty leftover_sessions, "leftover pty-tester sessions: #{leftover_sessions}"
+      # AC4: no surviving app process, no leftover tui-split-rig-* tmux session.
+      leftover_sessions = `tmux ls 2>/dev/null`.lines.grep(/tui-split-rig-/)
+      assert_empty leftover_sessions, "leftover tui-split-rig sessions: #{leftover_sessions}"
       survivors = `ps -eo command`.lines.grep(/bin\/tart/).grep(/#{Regexp.escape(out)}/)
       assert_empty survivors, "surviving tart processes: #{survivors}"
 
