@@ -295,26 +295,26 @@ module Tart
         end
       end
 
-      # Handles one queue item or synthetic event: control sentinels,
-      # in-band Ctrl+C, or dispatch to the handler.
+      # Handles one queue item or synthetic event: control sentinels or
+      # dispatch to the handler. In-band Ctrl+C is NOT intercepted here —
+      # the key reaches the editor (pi's app.clear: clear, twice exits;
+      # keybindings.ts:27, handleCtrlC) and ESCAPE is the interrupt (the
+      # editor's onEscape path). The trap net keeps real SIGINTs
+      # (interrupt_work! || stop!) for non-raw contexts.
       def process(event, source)
         case event
         when STOP then request_stop
         when INTERRUPT then interrupt!
         when WAKE then nil # wake only; the synthetic drain does the work
         else
-          if TUI.ctrl_c?(event)
-            interrupt!
-          else
-            @on_event&.call(event, source)
-            # Mouse events dispatch to the surface (wheel scroll, selection);
-            # a bare pointer move carries no state change (the surface
-            # ignores it — pi tui-alt-screen.ts applyMouseDispatchResult
-            # renders on press/click/drag/wheel, not motion), and with
-            # all-motion capture on (gem init.rs:67) moves stream on every
-            # pointer step: redrawing per move would burn the idle CPU.
-            @dirty = true unless event.respond_to?(:moved?) && event.moved?
-          end
+          @on_event&.call(event, source)
+          # Mouse events dispatch to the surface (wheel scroll, selection);
+          # a bare pointer move carries no state change (the surface
+          # ignores it — pi tui-alt-screen.ts applyMouseDispatchResult
+          # renders on press/click/drag/wheel, not motion), and with
+          # all-motion capture on (gem init.rs:67) moves stream on every
+          # pointer step: redrawing per move would burn the idle CPU.
+          @dirty = true unless event.respond_to?(:moved?) && event.moved?
         end
       end
 

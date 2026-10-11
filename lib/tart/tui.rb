@@ -331,7 +331,9 @@ module Tart
     #   app.interrupt binding, keybindings.ts:26 — the editor's onEscape
     #   path, custom-editor.ts:103-111).
     def escape?(event)
-      event.key? && event.code == "escape" && !(event.modifiers & %w[ctrl alt]).any?
+      # The gem's canonical code is "esc" (event/key/system.rb:36) — a
+      # real tty never delivers "escape".
+      event.key? && event.code == "esc" && !(event.modifiers & %w[ctrl alt]).any?
     end
   end
 end

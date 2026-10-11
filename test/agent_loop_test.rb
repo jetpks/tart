@@ -168,14 +168,23 @@ module Tart
       assert_equal "second", requests.last["messages"].select { |m| m["role"] == "user" }.last["content"]
     end
 
+    # The kernel-level interrupt (the trap-net sentinel — the non-raw
+    # SIGINT path): the in-flight turn cancels through Task#stop and
+    # surfaces through the agent_end event. (Backlog C: the EDITOR-side
+    # interrupt is escape — the surface's interrupt_work! call, pinned in
+    # loop_test; ctrl+c is app.clear. The kernel's trap net keeps the
+    # interrupted?-or-stop contract for real signals.)
     def test_kernel_interrupt_cancels_in_flight_turn
       @server.script([{type: :slow_stream, content: "x" * 40}])
-      session = ScriptedSession.new
-      session.push_native(TUI.key_event("c", modifiers: ["ctrl"]))
-      agent, events = agent_on_kernel(session:)
+      agent, events = agent_on_kernel
 
-      kernel = Core::Loop.new(session:)
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      th = Thread.new do
+        sleep 0.3 # the turn is streaming (40 chars × 0.1 s pauses)
+        Process.kill("INT", Process.pid)
+      end
       kernel.run { agent.run("long stream") }
+      th.join
 
       assert kernel.interrupted?
       types = events.map { |e| e[:type] }

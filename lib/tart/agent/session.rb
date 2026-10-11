@@ -146,10 +146,38 @@ module Tart
         message = entry["message"]
         return nil unless message.is_a?(Hash) && message["role"].is_a?(String)
 
+        return bash_execution_context_message(message) if message["role"] == "bashExecution"
+
         message = message.transform_keys(&:to_sym)
         message[:role] = message[:role].to_sym
         message[:content] = "" if !message.key?(:content) || message[:content].nil?
         message
+      end
+
+      # pi convertToLlm's bashExecution case (messages.ts:149-160): the
+      # !!-prefixed execution is SKIPPED from context; a plain ! execution
+      # rides as a USER message ("Ran `<cmd>`" + the fenced output, the
+      # bashExecutionToText bytes — messages.ts:82-97; ruby_llm supports
+      # no bashExecution role).
+      def bash_execution_context_message(message)
+        return nil if message["excludeFromContext"]
+
+        text = +"Ran `#{message["command"]}`\n"
+        if message["output"].is_a?(String) && !message["output"].empty?
+          text << "```\n#{message["output"]}\n```"
+        else
+          text << "(no output)"
+        end
+        exit_code = message["exitCode"]
+        if message["cancelled"]
+          text << "\n\n(command cancelled)"
+        elsif exit_code.is_a?(Integer) && exit_code != 0
+          text << "\n\nCommand exited with code #{exit_code}"
+        end
+        if message["truncated"] && message["fullOutputPath"].is_a?(String) && !message["fullOutputPath"].empty?
+          text << "\n\n[Output truncated. Full output: #{message["fullOutputPath"]}]"
+        end
+        {role: :user, content: text}
       end
 
       # pi's compactionSummary projection (messages.ts:109-121 + :176-184):
@@ -194,6 +222,17 @@ module Tart
       def message_entry_with_role?(entry, role)
         entry.is_a?(Hash) && entry["type"] == "message" &&
           entry["message"].is_a?(Hash) && entry["message"]["role"] == role
+      end
+
+      # The bashExecution message factory (pi BashExecutionMessage,
+      # messages.ts:28-42 — pi's exact keys: the record format, not the
+      # port's ruby_llm serialization).
+      def bash_execution_message(command:, output:, exit_code:, cancelled:, truncated:,
+                                 full_output_path:, timestamp: now_iso, exclude_from_context: false)
+        {
+          role: "bashExecution", command:, output:, exitCode: exit_code, cancelled:, truncated:,
+          fullOutputPath: full_output_path, timestamp:, excludeFromContext: exclude_from_context
+        }
       end
 
       # pi findMostRecentSession :749: *.jsonl by mtime descending; the first
@@ -322,6 +361,22 @@ module Tart
           entry[:id]
         end
 
+        # Appends a bashExecution message entry (pi recordBashResult
+        # agent-session.ts:3879 — the executor's BashResult as a message
+        # entry, same leaf chain). +message+ is the pi-shaped hash
+        # ({Session.bash_execution_message}). Returns the entry id.
+        def append_bash_execution(message)
+          entry = Session.message_entry(message,
+            id: Session.generate_id(@ids),
+            parent_id: @leaf_id,
+            timestamp: Session.now_iso)
+          @ids << entry[:id]
+          @leaf_id = entry[:id]
+          @entries << entry
+          persist(message)
+          entry[:id]
+        end
+
         # Appends a compaction entry as a child of the current leaf and
         # advances the leaf (pi SessionManager.appendCompaction :1260-1285,
         # the port's field subset). Returns the entry id.
@@ -352,11 +407,22 @@ module Tart
         def persist(message = nil)
           if @flushed
             File.write(@path, entry_line(@entries.last), mode: "a")
-          elsif message.nil? || %i[user assistant].include?(message.role)
+          elsif message.nil? || conversation_bearing?(message)
             File.open(@path, "wx") do |file|
               @entries.each { |entry| file.write(entry_line(entry)) }
             end
             @flushed = true
+          end
+        end
+
+        # The file-creation gate (pi _persist's _hasConversation): user
+        # and assistant messages open the file — and the bashExecution
+        # record does too (pi recordBashResult → appendMessage); tool
+        # results and other roles ride later appends.
+        def conversation_bearing?(message)
+          case message
+          when Hash then message[:role] == "bashExecution"
+          else %i[user assistant].include?(message.role)
           end
         end
 

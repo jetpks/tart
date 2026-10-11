@@ -41,6 +41,12 @@ module Tart
 
       attr_reader :cwd, :details
 
+      # The raw execution outcome (pi bash-executor.ts BashResult shape —
+      # the fields the !-prefix executor reports; the tool's contract is
+      # the model-facing text on top of the same core).
+      BashOutcome = Struct.new(:content, :exit_code, :cancelled, :truncation, :full_output_path,
+                               keyword_init: true)
+
       def initialize(cwd:)
         @cwd = cwd
         @details = nil
@@ -49,6 +55,40 @@ module Tart
       description DESCRIPTION
 
       parameters PARAMETERS_SCHEMA.dup
+
+      # The user-bash executor (pi bash-executor.ts executeBashWithOperations
+      # — the !-prefix executor over the same spawn core as the tool):
+      # pi's BashResult assembly — sanitized (the port strips \r; pi also
+      # strips ANSI, cut — no ansi utility, itemized), exit code,
+      # cancellation — NO model-facing notice, NO error wrapping (a
+      # non-zero exit REPORTS, it does not raise into an error result;
+      # bash-executor.ts:146-158). No timeout: pi's user bash runs until
+      # done or esc-cancelled. An aborted command still returns the
+      # output it produced so far (bash-executor.ts:135-141).
+      def run_user(command)
+        raise Errno::ENOENT, "Working directory does not exist: #{@cwd}\nCannot execute bash commands." unless
+          File.exist?(@cwd)
+
+        # The accumulator is owned HERE (not inside the spawn helper) so a
+        # cancellation — the raise arrives while the helper's frame is
+        # live — still leaves the partial output reachable: the aborted
+        # command returns the output it produced so far
+        # (bash-executor.ts:135-141). The spawn core's rescue has already
+        # killed the process group on the way out.
+        output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
+        cancelled = false
+        outcome =
+          begin
+            spawn_and_stream(command, output, nil)
+          rescue RubyLLM::CancelledError, Async::Cancel
+            cancelled = true
+            {exit_code: nil}
+          end
+        snapshot = finish_output(output)
+        BashOutcome.new(content: snapshot.content.to_s.gsub("\r", ""), exit_code: outcome[:exit_code],
+                        cancelled:, truncation: snapshot.truncation,
+                        full_output_path: snapshot.full_output_path)
+      end
 
       # @return [String] combined output (pi's model-facing text), or
       #   {error:} on failure — including timeout and non-zero exit, which pi
@@ -59,9 +99,8 @@ module Tart
           raise Errno::ENOENT, "Working directory does not exist: #{@cwd}\nCannot execute bash commands." unless
             File.exist?(@cwd)
 
-          output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
           started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          outcome = spawn_and_stream(command, output, timeout_seconds)
+          output, outcome = spawn_and_accumulate(command, timeout_seconds)
           wall_time_seconds = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at).round(1)
           snapshot = finish_output(output)
 
@@ -92,6 +131,16 @@ module Tart
       end
 
       private
+
+      # Spawns, streams to completion (or cancellation/timeout), and
+      # returns the accumulator with the raw outcome — the caller finishes
+      # and snapshots (the tool's model-facing assembly and the user-bash
+      # executor's BashResult assembly differ).
+      def spawn_and_accumulate(command, timeout_seconds)
+        output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
+        outcome = spawn_and_stream(command, output, timeout_seconds)
+        [output, outcome]
+      end
 
       def resolve_timeout(timeout)
         return if timeout.nil?
@@ -160,11 +209,14 @@ module Tart
 
           exit_code = status.termsig ? 128 + status.termsig : status.exitstatus
           {exit_code:, timed_out:, cancelled: false}
-        rescue RubyLLM::CancelledError
+        rescue RubyLLM::CancelledError, Async::Cancel
           # Interrupted mid-command: kill the whole group with a single -KILL
           # and let cancellation propagate. The reaper thread reaps — this
           # thread must not waitpid2 the pid itself (the reaper owns it; a
-          # second wait would raise ECHILD).
+          # second wait would raise ECHILD). Both cancellation classes:
+          # the agent-loop cancel rides RubyLLM's checkpoint error; the
+          # user-bash escape cancels the reactor task itself (Task#stop —
+          # Async::Cancel at the fiber's next yield), same group kill.
           kill_process_group(pid, "KILL") if pid
           reaper&.join(TERM_GRACE_SECONDS)
           raise

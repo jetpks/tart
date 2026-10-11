@@ -894,7 +894,10 @@ module Tart
       scenario = Thread.new do
         type(session, "long stream")
         wait_until { chat.busy? }
-        session.push_event(TUI.key_event("c", modifiers: ["ctrl"]))
+        # Backlog C: the interrupt is ESCAPE (pi app.interrupt — the
+        # editor's onEscape → interrupt_work!); ctrl+c is the editor's
+        # clear/exit (the loop is not the decider — the loop_test pin).
+        session.push_event(TUI.key_event("esc"))
         wait_until { !chat.busy? }
         wait_until { chat.transcript_lines.join.include?("interrupted") }
         kernel.stop!
@@ -902,7 +905,7 @@ module Tart
       kernel.run
       scenario.join
 
-      assert kernel.interrupted?
+      refute kernel.interrupted?, "the escape interrupt never stops the loop (I15)"
       assert chat.agent.interrupted?
       refute kernel.poller&.thread&.alive?, "no orphan poller"
       assert_includes chat.transcript_lines.join, "interrupted",
@@ -933,8 +936,14 @@ module Tart
     end
 
     # Runs (and drains) the agent-run blocks the idle submit branch queued.
+    # A real reactor: the user-bash block bridges to a worker thread and
+    # waits on an Async::Queue — no reactor, no wait.
     def drain_runs(chat)
-      kernel_runs(chat).slice!(0..).each(&:call)
+      kernel_runs(chat).slice!(0..).each do |block|
+        Async do |root|
+          root.async { block.call }.wait
+        end
+      end
     end
 
     # Records agent.run calls (the idle branch wraps the run in a kernel
@@ -1514,13 +1523,15 @@ module Tart
         send_message(chat, "B")
         chat.on_event(TUI.key_event("up"))
         chat.on_event(TUI.key_event("up")) # "A", cursor at line start (pi: cursorPlacement start)
-        chat.on_event(TUI.key_event("!"))
-        assert_equal "!A", chat.input, "a recalled entry is editable at the cursor"
+        chat.on_event(TUI.key_event("X"))
+        # A LEADING bang would now be the user-bash intercept (backlog C)
+        # — the edit types a plain char at the cursor instead.
+        assert_equal "XA", chat.input, "a recalled entry is editable at the cursor"
         chat.on_event(TUI.key_event("enter"))
         draw(chat, session) # the frame's flush moves the echo into the buffer
         # Echo 1 on an empty container: padY wrap only (no leading spacer,
         # interactive-mode.ts:3930-3931); later echoes get the spacer too.
-        assert_equal ["", " A", "", "", "", " B", "", "", "", " !A", ""], chat.transcript_lines,
+        assert_equal ["", " A", "", "", "", " B", "", "", "", " XA", ""], chat.transcript_lines,
           "the edited recall sends as edited (after the two original echoes: padY wrap + spacer + pad rows)"
       end
     end
@@ -1578,6 +1589,167 @@ module Tart
         chat.on_event(TUI.key_event("left")) # the char after the cursor is what dies
         chat.on_event(TUI.key_event("d", modifiers: ["ctrl"]))
         assert_equal "h", chat.input, "ctrl+d with content falls through to delete-char-forward (pi custom-editor.ts:123-125)"
+      end
+    end
+
+    # ---- the !-prefix user bash (backlog C — pi handleBashCommand over
+    # the BashExecutionComponent). ----
+
+    # The block renders bordered in the bashMode key with the header,
+    # muted output, and NO user echo (the component is the display — pi
+    # handleSubmit :3347-3360).
+    def test_bang_bash_runs_and_renders_the_bordered_block
+      with_chat(width: 60) do |chat, session|
+        send_message(chat, "! echo hi")
+        drain_runs(chat)
+        draw(chat, session)
+
+        rows = chat.transcript_lines
+        top = rows.index { |row| row.include?("─") }
+        assert top, "the block renders its top border"
+        assert_equal "─" * 60, rows[top].strip, "the border spans the viewport"
+        header = rows.index { |row| row.include?("$ echo hi") }
+        assert_equal " $ echo hi", rows[header], "the bold bashMode header"
+        assert rows.any? { |row| row.strip == "hi" }, "the command output renders below"
+        refute rows.any? { |row| row.include?("! echo hi") },
+          "the ! text never echoes as a user message (the block is the display)"
+      end
+    end
+
+    # pi's colorKey: "!!" marks the excluded execution dim (the component's
+    # border and header), the plain ! renders bashMode.
+    def test_bang_bang_renders_the_dim_keyed_block
+      with_chat(width: 60) do |chat, session|
+        send_message(chat, "!! echo secret")
+        drain_runs(chat)
+        draw(chat, session)
+
+        buffer = session.buffer_content
+        border_row = buffer.index { |row| row.include?("─") }
+        assert_equal Theme[:dim], session.cell_fg(0, border_row),
+          "the !! block's border renders the dim key (excludeFromContext)"
+      end
+    end
+
+    # pi's isBashRunning gate: a second ! while one runs shows the warning
+    # and runs nothing (showWarning's text, handleBashCommand's gate).
+    def test_bang_bash_single_flight_warns
+      with_chat(width: 60) do |chat, session|
+        send_message(chat, "! echo one")
+        send_message(chat, "! echo two")
+        draw(chat, session)
+
+        assert chat.transcript_lines.any? { |row| row.include?("already running") },
+          "the single-flight warning renders pi's text (wrapped to the pane)"
+        assert_equal 1, drain_runs(chat).size, "only the first execution queued"
+      end
+    end
+
+    # The completed execution records a bashExecution entry (pi
+    # recordBashResult — the pi-shaped message hash, the file-creation
+    # gate included).
+    def test_bang_bash_records_a_bash_execution_entry
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @dir)
+      with_chat(width: 60) do |chat, session|
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:record_bash_execution) { |m| recorder.append_bash_execution(m) }
+          a.define_singleton_method(:push_message) { |*| raise "not reached" }
+        end
+        send_message(chat, "! echo hi")
+        drain_runs(chat)
+      end
+
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      message = entries.last.fetch("message")
+      assert_equal "bashExecution", message["role"]
+      assert_equal "echo hi", message["command"]
+      # pi's appendText keeps the raw trailing newline (the display's
+      # trailing blank row and the context text's shape both derive
+      # from it) — recorded verbatim.
+      assert_equal "hi\n", message["output"]
+      assert_equal 0, message["exitCode"]
+      refute message["cancelled"]
+      refute message["truncated"]
+      refute message["excludeFromContext"]
+    end
+
+    # The recorded execution replays through the same block shape (pi
+    # addMessageToChat's bashExecution case).
+    def test_resume_replays_the_bash_execution_block
+      recorded = File.join(@dir, "bash-exec-replay.jsonl")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"bash-exec","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"bashExecution","command":"echo hi","output":"hi","exitCode":0,"cancelled":false,"truncated":false,"fullOutputPath":null,"timestamp":"2026-01-01T00:00:02.000Z","excludeFromContext":false}}
+      JSONL
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+
+        assert chat.transcript_lines.any? { |row| row.include?("$ echo hi") },
+          "the replayed block renders from the record"
+      end
+    end
+
+    # app.clear (pi handleCtrlC :6840-6848): the first press clears the
+    # editor; a second within 500 ms exits; the interrupt stays with
+    # escape.
+    def test_ctrl_c_clears_the_input_and_double_press_exits
+      with_headless_chat do |chat, _session|
+        kernel = chat.kernel
+        "abc".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("c", modifiers: ["ctrl"]))
+        assert_equal "", chat.input, "the first ctrl+c clears the editor"
+        refute kernel.stopped?, "one press never exits"
+
+        chat.on_event(TUI.key_event("c", modifiers: ["ctrl"]))
+        assert kernel.stopped?, "the double press exits (handleCtrlC's 500 ms window)"
+      end
+    end
+
+    # pi onEscape :3076-3080 — bash mode clears the input (the border
+    # announces the mode; escape backs out of it).
+    def test_escape_clears_bash_mode_input
+      with_headless_chat do |chat|
+        "!ech".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("esc"))
+        assert_equal "", chat.input, "escape in bash mode clears the input"
+      end
+    end
+
+    # A RUNNING user bash cancels on escape (pi abortBash — the
+    # single-flight warning names the binding): the checkpoint flag flips,
+    # the tool kills the group at its next check, and the cancelled block
+    # renders with the partial output.
+    def test_escape_cancels_the_running_user_bash
+      with_chat(width: 60) do |chat, session|
+        send_message(chat, "!sleep 5")
+        workers = chat.kernel.submitted.slice!(0..)
+        reactor = Thread.new do
+          Async do |root|
+            workers.each { |block| root.async { block.call } }
+          end
+        end
+        sleep 0.3 # the command is running
+        chat.on_event(TUI.key_event("esc"))
+        reactor.join(5)
+        draw(chat, session)
+
+        assert chat.transcript_lines.any? { |row| row.include?("cancelled") },
+          "the escape cancelled the running user bash"
+      end
+    end
+
+    # pi updateEditorBorderColor :1109-1117 — the editor's border renders
+    # the bashMode token while the input starts with "!".
+    def test_bash_mode_border_renders_the_bash_mode_token
+      with_chat(width: 40) do |chat, session|
+        "!ech".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        draw(chat, session)
+
+        buffer = session.buffer_content
+        border_row = buffer.index { |row| row.include?("─") }
+        assert_equal Theme[:bashMode], session.cell_fg(0, border_row),
+          "the editor border announces bash mode (getBashModeBorderColor)"
       end
     end
 
@@ -1751,7 +1923,7 @@ module Tart
       with_headless_chat(autocomplete: slash_source("architect")) do |chat|
         chat.on_agent_event({type: :agent_start})
         "/ar".each_char { |char| chat.on_event(TUI.key_event(char)) }
-        chat.on_event(TUI.key_event("escape"))
+        chat.on_event(TUI.key_event("esc"))
         assert_nil chat.suggestions, "escape cancels the list"
         assert_equal "/ar", chat.input, "the input is untouched"
         assert chat.busy?, "the run is NOT interrupted (pi custom-editor.ts:103-111)"
@@ -1760,7 +1932,7 @@ module Tart
 
     def test_escape_with_no_list_leaves_the_run_alone_and_is_a_noop
       with_headless_chat do |chat|
-        chat.on_event(TUI.key_event("escape"))
+        chat.on_event(TUI.key_event("esc"))
         assert_equal "", chat.input, "the port binds no escape action outside the list"
       end
     end
@@ -2167,7 +2339,7 @@ module Tart
         wait_until { chat.busy? }
         session.push_event(TUI.key_event("/")) # a bare slash: opens the list (no submit)
         wait_until { chat.suggestions }
-        session.push_event(TUI.key_event("escape"))
+        session.push_event(TUI.key_event("esc"))
         wait_until { chat.suggestions.nil? }
         wait_until { chat.transcript_lines.join.include?("answer") }
         kernel.stop!
@@ -2191,7 +2363,7 @@ module Tart
       scenario = Thread.new do
         type(session, "long stream")
         wait_until { chat.busy? }
-        session.push_event(TUI.key_event("escape"))
+        session.push_event(TUI.key_event("esc"))
         wait_until { !chat.busy? }
         wait_until { chat.transcript_lines.join.include?("interrupted") }
         @agent_interrupted = chat.agent.interrupted?
@@ -2211,7 +2383,7 @@ module Tart
       kernel, chat, session = chat_with_server
 
       scenario = Thread.new do
-        session.push_event(TUI.key_event("escape"))
+        session.push_event(TUI.key_event("esc"))
         type(session, "still there") # the loop must still be alive to submit
         wait_until { !captured.empty? }
         kernel.stop!
@@ -2239,7 +2411,7 @@ module Tart
         chat.on_event(TUI.key_event("up"))
         chat.on_event(TUI.key_event("up"))
         assert_equal 1, chat.picker_index, "up wraps to the last item (pi select-list wrap)"
-        chat.on_event(TUI.key_event("escape"))
+        chat.on_event(TUI.key_event("esc"))
         assert_nil chat.picker_items, "escape cancels (pi onCancel)"
         assert_empty resumed
         chat.on_event(TUI.key_event("enter"))
@@ -2636,17 +2808,20 @@ module Tart
 
       def request_draw = nil
 
-      # Reactor-task stand-in: records one-shot timer blocks (the
-      # scrollbar hide timer); tests fire them via {fire_timers} — no
-      # real second-scale sleeps.
+      # Reactor-task stand-in: records the submitted blocks (the submit
+      # seam's agent runs AND the one-shot timers — drain_runs runs them
+      # inside a real reactor; fire_timers stays for the timer-shape
+      # tests). Returns SELF — the task role: the escape-cancel's
+      # #stop lands here as a no-op (a real task raises the cancel in
+      # its fiber; the double's block is driven synchronously).
       def async(&block)
-        @timers << block
+        @submitted << block
         self
       end
 
       def fire_timers
-        timers, @timers = @timers, []
-        timers.each(&:call)
+        submitted, @submitted = @submitted, []
+        submitted.each(&:call)
       end
 
       # The /quit path (bin/tart wires quit: -> { kernel.stop! }) — ctrl+d's
@@ -2657,11 +2832,8 @@ module Tart
 
       def stopped? = !!@stopped
 
-      # Records the submitted agent-run block (a real kernel spawns it as a
-      # reactor task).
-      def async(&block)
-        @submitted << block
-      end
+      # The task role (async returns self).
+      def stop = nil
     end
   end
 end

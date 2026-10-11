@@ -102,6 +102,45 @@ module Tart
       assert File.exist?(tool.details[:full_output_path])
     end
 
+    # ---- run_user: the !-prefix executor (pi bash-executor.ts) over the
+    # same spawn core — the BashResult assembly, no model-facing notice,
+    # no error wrapping. ----
+
+    def test_run_user_reports_non_zero_exit_without_error_wrapping
+      outcome = tool.run_user("echo out; exit 3")
+
+      assert_equal 3, outcome.exit_code
+      refute outcome.cancelled, "a non-zero exit REPORTS — it does not raise into an error result"
+      assert_includes outcome.content, "out"
+      refute_includes outcome.content, "Showing lines", "no model-facing notice"
+      refute_includes outcome.content, "Command exited"
+    end
+
+    def test_run_user_carries_truncation_details_and_spills
+      outcome = tool.run_user("seq 1 2100")
+
+      assert outcome.truncation.truncated
+      assert_match(%r{/tart-bash-[0-9a-f]{16}\.log\z}, outcome.full_output_path,
+        "the spill name is pi's fixed 16-hex shape (output-files.ts:15-17)")
+      assert_equal 2000, outcome.truncation.output_lines
+      assert File.exist?(outcome.full_output_path)
+    end
+
+    def test_run_user_cancellation_returns_partial_output_and_kills_the_group
+      marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
+      outcome = nil
+      Async do |root|
+        task = root.async { outcome = tool.run_user("echo #{marker}; sleep 30") }
+        sleep 0.3 # the command is running
+        task.stop # the escape-cancel path (@user_bash_task.stop)
+      end
+
+      assert outcome.cancelled, "the aborted command reports cancelled"
+      assert_nil outcome.exit_code, "pi: exitCode undefined when cancelled"
+      assert_includes outcome.content, marker, "the output produced so far returns"
+      assert_no_probe(marker)
+    end
+
     # AC3: fast commands pay no poll quantum — exit detection is evented
     # (reaper thread + Queue), so `echo` rounds to Took 0.0s like pi.
     def test_fast_commands_pay_no_poll_quantum

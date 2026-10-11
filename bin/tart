@@ -9,8 +9,10 @@
 #   tart -p "prompt"        # headless single-shot
 #   tart --resume           # continue the most recent session
 #
-# Keys: type + Enter to send (steers a running agent); Ctrl+C interrupts
-# a running turn / quits when idle.
+# Keys: type + Enter to send (steers a running agent); Escape
+# interrupts a running turn; Ctrl+C clears the input (twice within
+# half a second exits); "!cmd" runs whole-line bash without the model
+# ("!!cmd" also keeps it out of context).
 #
 # Run from a REAL terminal (raw mode / alt-screen need a tty).
 
@@ -104,8 +106,10 @@ module Tart
           TART_MCP_CONFIG    MCP config path (default: ~/.tart/mcp.json)
           TART_IDENTITY      the face to show: pi (default) or tart (--identity overrides)
 
-        Keys: type + Enter to send (steers a running agent); Ctrl+C
-        interrupts a running turn / quits when idle.
+        Keys: type + Enter to send (steers a running agent); Escape
+        interrupts a running turn; Ctrl+C clears the input (twice exits);
+        "!cmd" runs whole-line bash without the model ("!!cmd" also keeps
+        it out of context).
 
         Surface: fullscreen three-area layout — transcript, bordered editor
         (its top border carries the working/tool status), footer (cwd, git

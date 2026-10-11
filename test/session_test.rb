@@ -143,6 +143,75 @@ module Tart
       assert_equal "and then?", entries[1]["message"]["content"]
     end
 
+    # The bashExecution record (pi recordBashResult agent-session.ts:3879)
+    # projects to a USER context message — pi convertToLlm's bashExecution
+    # case (messages.ts:149-160) with the bashExecutionToText bytes
+    # (messages.ts:82-97). The !!-prefixed execution (excludeFromContext)
+    # is skipped entirely.
+    def test_bash_execution_record_projects_to_user_context
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_bash_execution(Agent::Session.bash_execution_message(
+        command: "echo hi", output: "hi\n", exit_code: 0, cancelled: false,
+        truncated: false, full_output_path: nil))
+
+      entry = Agent::Session.load_entries(recorder.path).last
+      projected = Agent::Session.entry_to_context_message(entry)
+      assert_equal :user, projected[:role]
+      # pi's bytes: the raw output (its trailing newline included)
+      # fenced between the code markers.
+      assert_equal "Ran `echo hi`\n```\nhi\n\n```", projected[:content]
+    end
+
+    def test_bash_execution_context_text_variants
+      build = lambda do |overrides|
+        Agent::Session.bash_execution_message(command: "x", output: "out", exit_code: 0,
+          cancelled: false, truncated: false, full_output_path: nil, **overrides)
+      end
+      # The projection reads LOADED entries — the JSON round-trip (string
+      # keys), exactly what a resume reads.
+      text = lambda do |message|
+        entry = Agent::Session.message_entry(message, id: "e", parent_id: nil, timestamp: "t")
+        Agent::Session.entry_to_context_message(JSON.parse(JSON.generate(entry)))[:content]
+      end
+
+      assert_equal "Ran `x`\n(no output)", text.call(build.call(output: "")),
+        "empty output renders the placeholder (bashExecutionToText)"
+      assert_equal "Ran `x`\n```\nout\n```\n\nCommand exited with code 2",
+        text.call(build.call(exit_code: 2)), "the non-zero exit notice"
+      assert_equal "Ran `x`\n```\nout\n```\n\n(command cancelled)",
+        text.call(build.call(cancelled: true)), "the cancellation notice"
+      assert_equal "Ran `x`\n```\nout\n```\n\n[Output truncated. Full output: /tmp/x.log]",
+        text.call(build.call(truncated: true, full_output_path: "/tmp/x.log")),
+        "the truncation notice — pi's USER-bash wording, not the tool's"
+    end
+
+    def test_bang_bang_execution_is_skipped_from_context
+      message = Agent::Session.bash_execution_message(command: "echo secret", output: "s", exit_code: 0,
+        cancelled: false, truncated: false, full_output_path: nil, exclude_from_context: true)
+      entry = Agent::Session.message_entry(message, id: "e", parent_id: nil, timestamp: "t")
+      assert_nil Agent::Session.entry_to_context_message(JSON.parse(JSON.generate(entry)))
+    end
+
+    # The resumed run's model demonstrably sees the !-execution: the
+    # captured request payload carries the projected user message.
+    def test_resumed_run_sees_the_bash_execution_in_context
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_bash_execution(Agent::Session.bash_execution_message(
+        command: "echo hi", output: "hi\n", exit_code: 0, cancelled: false,
+        truncated: false, full_output_path: nil))
+
+      @server.script([{type: :message, content: "noted"}])
+      tools = Tools::Registry.build(selected: [], cwd: @dir)
+      seed = Agent::Session.context_messages(recorder.path)
+      resumed = Agent::Session::Recorder.new(cwd: @dir, root: @root, parent_session: recorder.path)
+      run_agent(agent_on_kernel(tools:, recorder: resumed, seed_messages: seed), "and then?")
+
+      payload = @server.captured_requests.last["messages"]
+        .reject { |m| %w[system developer].include?(m["role"]) }
+      assert_equal %w[user user], payload.map { |m| m["role"] }
+      assert_match(/\ARan `echo hi`/, payload[0]["content"])
+    end
+
     # AC4: the compaction entry shape (pi CompactionEntry session-manager.ts
     # :91-104, the port's field subset) and the null first-kept fallback
     # (appendCompaction's `firstKeptEntryId ?? id`).

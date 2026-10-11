@@ -190,9 +190,9 @@ module Tart
     # The escape predicate (item 5, pi app.interrupt = escape,
     # keybindings.ts:26): bare escape only — modified escapes are edits.
     def test_escape_predicate
-      assert TUI.escape?(TUI.key_event("escape"))
-      refute TUI.escape?(TUI.key_event("escape", modifiers: ["ctrl"])), "ctrl+escape is not the interrupt"
-      refute TUI.escape?(TUI.key_event("escape", modifiers: ["alt"]))
+      assert TUI.escape?(TUI.key_event("esc"))
+      refute TUI.escape?(TUI.key_event("esc", modifiers: ["ctrl"])), "ctrl+escape is not the interrupt"
+      refute TUI.escape?(TUI.key_event("esc", modifiers: ["alt"]))
       refute TUI.escape?(TUI.key_event("q"))
       refute TUI.escape?(TUI.sync_event)
     end

@@ -126,26 +126,22 @@ module Tart
       assert_operator event_loop.stats[:draws], :>, 1, "press/drag/wheel events redraw"
     end
 
-    def test_ctrl_c_interrupt_cancels_in_flight_task_subtree
+    # Backlog C — pi's keybindings: ctrl+c is app.clear (the EDITOR's
+    # clear/double-exit, keybindings.ts:27 + handleCtrlC); the loop is not
+    # the decider. The key reaches the surface handler; escape is the
+    # interrupt (the escape-path test below). The trap net keeps real
+    # SIGINTs for non-raw contexts.
+    def test_ctrl_c_reaches_the_surface_as_app_clear
       session = ScriptedSession.new
       session.push_native(KeyEvent.new("c", ["ctrl"]))
-      state = {steps: 0, cancelled: false}
-      work = ->(_task) do
-        loop do
-          state[:steps] += 1
-          sleep 0.01
-        end
-      rescue Async::Cancel
-        state[:cancelled] = true
-        raise
-      end
-
+      seen = []
       event_loop = Core::Loop.new(session:)
-      event_loop.run(&work)
+      event_loop.on_event = ->(event, _source) { seen << event }
+      event_loop.run { sleep 0.05 }
 
-      assert event_loop.interrupted?, "Ctrl+C must be seen in-band, not via SIGINT"
-      assert state[:cancelled], "the in-flight task subtree must be cancelled"
-      assert_operator state[:steps], :<, 50, "work must stop well before the loop tears down"
+      assert seen.any? { |e| e.respond_to?(:code) && e.code == "c" },
+        "the ctrl+c key reaches the surface (app.clear)"
+      refute event_loop.interrupted?, "ctrl+c no longer interrupts in-band"
     end
 
     # interrupt_work! (item 5/AC6, the escape path): cancels live work

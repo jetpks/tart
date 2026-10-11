@@ -252,6 +252,20 @@ module Tart
         # reduced): nil = closed; open it holds {items:, selected:} with
         # items the launcher-built [{path:, label:}] list (newest first).
         @picker = nil
+        # The !-prefix bash execution (backlog C, pi handleBashCommand):
+        # the in-flight task (single-flight — pi's isBashRunning gate),
+        # the escape-cancel handshake state, and the last ctrl+c timestamp
+        # (pi's lastSigintTime — the double-press exit window,
+        # handleCtrlC :6840).
+        @user_bash_task = nil
+        @user_bash_cancel_flag = false
+        @user_bash_slot = {}
+        @user_bash_command = nil
+        @user_bash_excluded = false
+        @last_ctrl_c = nil
+        # The bashExecution records deferred while a turn runs (pi's
+        # _pendingBashMessages, flushed on agent_end).
+        @pending_bash_records = []
         @live = +""
         # The in-flight message's reasoning (pi's live thinking block): the
         # joined chunk.thinking deltas, rendered dim while it grows and
@@ -317,6 +331,10 @@ module Tart
 
       # @return [String] the input line buffer.
       attr_reader :input
+
+      # The kernel handle (the escape-cancel path stops the user-bash task
+      # through it; tests read it too).
+      attr_reader :kernel
 
       # @return [Array<String>] the transcript buffer's display lines (test
       #   readback for kernel-driven tests, where the drawn widget tree is
@@ -441,6 +459,9 @@ module Tart
           when :agent_end
             @busy = false
             @compaction_reason = nil
+            # The deferred bashExecution records flush at agent end (pi's
+            # _pendingBashMessages flush) — never mid-tool-sequence.
+            flush_pending_bash_records
             if event[:interrupted] == true
               handled = "interrupted"
               enqueue_scrollback(handled, fg: Theme[:warning])
@@ -984,6 +1005,7 @@ module Tart
           case message["role"]
           when "user" then replay_user(message)
           when "assistant" then replay_assistant(message, results)
+          when "bashExecution" then replay_user_bash(message)
           end
         when "compaction"
           # pi :3903-3904 — a compaction summary is a spaced region,
@@ -999,6 +1021,24 @@ module Tart
 
         enqueue_user_echo(content)
         add_to_history(content) # pi renderInitialMessages populateHistory
+      end
+
+      # The replayed !-prefix bash execution (pi addMessageToChat's
+      # bashExecution case :3870-3887): the block rebuilt from the
+      # recorded fields — the recorded output is the executor's
+      # tail-truncated content, the exact display input.
+      def replay_user_bash(message)
+        return unless message.is_a?(Hash)
+
+        enqueue_user_bash_block(
+          message["command"].to_s,
+          content: message["output"].is_a?(String) ? message["output"] : "",
+          exit_code: message["exitCode"],
+          cancelled: message["cancelled"] == true,
+          truncated: message["truncated"] == true,
+          full_output_path: message["fullOutputPath"],
+          excluded: message["excludeFromContext"] == true
+        )
       end
 
       def replay_assistant(message, results)
@@ -1201,6 +1241,8 @@ module Tart
         end
       end
 
+      USER_BASH_PREVIEW_LINES = 20 # pi bash-execution.ts:19 PREVIEW_LINES
+
       # pi bash.ts:63-71 — the preview trims the output, and the model-
       # facing truncation footer ("…\n\n[… Full output: <path>]") splits
       # OFF the preview: the body collapses, the notice renders after it.
@@ -1227,6 +1269,57 @@ module Tart
 
         [expand_hint_row("... (#{rows.length - BASH_PREVIEW_LINES} earlier lines,"),
           *rows.last(BASH_PREVIEW_LINES)]
+      end
+
+      # The !-prefix bash block (pi BashExecutionComponent, backlog C): a
+      # BORERED block — Spacer, DynamicBorder in the colorKey ("dim" for
+      # the !!-excluded, bashMode otherwise), then the content: the bold
+      # `$ command` header, the muted output (tail-truncated to pi's
+      # context limits by the executor; collapsed to the last 20 VISUAL
+      # rows of the last 20 LOGICAL lines — PREVIEW_LINES 20, keep "end",
+      # visual-truncate.ts), the status rows (each its own row,
+      # statusParts.join("\n")): the "... N more lines (ctrl+o to expand)"
+      # hint (N = hidden LOGICAL lines), "(cancelled)" warning,
+      # "(exit N)" error, "Output truncated. Full output: <path>"
+      # warning — then the bottom border. The ctrl+o global toggle is the
+      # next slice (the hint's TEXT renders for byte parity); streaming
+      # loader frames are execution-transient (itemized).
+      def enqueue_user_bash_block(command, content:, exit_code:, cancelled:, truncated:,
+                                  full_output_path:, excluded:)
+        color = excluded ? Theme[:dim] : Theme[:bashMode]
+        region = [blank_line, TUI.line([TUI.span("─" * viewport_width, fg: color)])]
+        region.concat(padded_fg_rows("$ #{command}", fg: color, modifiers: [:bold]))
+        available = content.empty? ? [] : content.split("\n", -1)
+        unless available.empty?
+          region << blank_line
+          preview_logical = available.last(USER_BASH_PREVIEW_LINES)
+          visual = padded_fg_rows(preview_logical.join("\n"), fg: Theme[:muted])
+          region.concat(visual.last(USER_BASH_PREVIEW_LINES))
+        end
+        hidden_logical = available.length - available.last(USER_BASH_PREVIEW_LINES).length
+        status = user_bash_status_rows(exit_code:, cancelled:, truncated:,
+                                       full_output_path:, hidden_logical:)
+        unless status.empty?
+          region << blank_line
+          region.concat(status)
+        end
+        region << TUI.line([TUI.span("─" * viewport_width, fg: color)])
+        @scrollback << region
+      end
+
+      # The status rows (pi statusParts order: hidden-hint, cancelled/
+      # exit, truncation warning).
+      def user_bash_status_rows(exit_code:, cancelled:, truncated:, full_output_path:, hidden_logical:)
+        rows = []
+        rows << expand_hint_row("... #{hidden_logical} more lines (", gap: "") if hidden_logical.positive?
+        rows.concat(padded_fg_rows("(cancelled)", fg: Theme[:warning])) if cancelled
+        if !cancelled && exit_code.is_a?(Integer) && exit_code != 0
+          rows.concat(padded_fg_rows("(exit #{exit_code})", fg: Theme[:error]))
+        end
+        if truncated && full_output_path
+          rows.concat(padded_fg_rows("Output truncated. Full output: #{full_output_path}", fg: Theme[:warning]))
+        end
+        rows
       end
 
       # Wrapped themed rows through the {OUTPUT_PAD} rule (pi's render-box
@@ -1350,13 +1443,15 @@ module Tart
       end
 
       # The expand-hint row family (pi keybinding-hints.ts keyHint over the
-      # muted count prefix — write.ts:117-118, bash.ts:82-84): muted prefix,
-      # plain space, dim key, muted tail. The ctrl+o binding itself is cut
-      # (backlog C) — the bytes are the contract.
-      def expand_hint_row(prefix)
+      # muted count prefix — write.ts:117-118, bash.ts:82-84,
+      # bash-execution.ts:146): muted prefix, the gap (keyHint composes
+      # `prefix${keyText}` with NO space in the user-bash shape), dim key,
+      # muted tail. The ctrl+o binding itself is the next slice — the
+      # bytes are the contract.
+      def expand_hint_row(prefix, gap: " ")
         TUI.line([TUI.span(OUTPUT_PAD),
                   TUI.span(prefix, fg: Theme[:muted]),
-                  TUI.span(" "),
+                  TUI.span(gap),
                   TUI.span("ctrl+o", fg: Theme[:dim]),
                   TUI.span(" to expand)", fg: Theme[:muted])])
       end
@@ -1499,11 +1594,41 @@ module Tart
         when "enter"
           apply_suggestion if @suggestions
           submit
-        when "escape"
+        when "esc"
+          # pi onEscape (interactive-mode.ts:3069-3092): a streaming run
+          # aborts through the kernel's interrupt path; a running user
+          # bash cancels (abortBash); bash mode clears the input; idle
+          # no-op (the double-escape /tree//fork is cut — no session
+          # branching). The gem's canonical code is "esc"
+          # (event/key/system.rb:36) — "escape" never matched a real tty
+          # (the live-smoke find: I15's escape interrupt was silently
+          # dead on real terminals).
           if @suggestions
             cancel_autocomplete
           elsif busy?
             @kernel.interrupt_work!
+          elsif @user_bash_task
+            cancel_user_bash
+          elsif bash_mode?
+            @input.clear
+            @cursor = 0
+          end
+        when "c"
+          # app.clear (pi handleCtrlC :6840-6848): clear the editor; a
+          # second press within 500 ms exits. The loop's in-band ctrl+c
+          # intercept is REMOVED (loop.rb) — pi's escape is the interrupt,
+          # ctrl+c is clear/exit (keybindings.ts:27).
+          if ctrl
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            if @last_ctrl_c && now - @last_ctrl_c < 0.5
+              @kernel.stop!
+            else
+              @input.clear
+              @cursor = 0
+              @last_ctrl_c = now
+            end
+          else
+            insert_printable(event)
           end
         # While the list is active up/down navigate the LIST (history
         # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
@@ -1576,16 +1701,149 @@ module Tart
         exit_history_browsing
         @branch = nil # per-turn branch invalidation
         @branch_fetched = false
-        enqueue_user_echo(text)
         if @commands && text.start_with?("/")
           text = @commands.expand_skill(text)
           return if !busy? && @commands.dispatch(text)
         end
+        # The !-prefix bash intercepts BEFORE the user echo (pi handleSubmit
+        # :3347-3360 — the BashExecutionComponent is the display, no user
+        # echo; the bare prefix falls through as plain text).
+        parsed = user_bash_command(text)
+        return user_bash(*parsed) if parsed
+
+        enqueue_user_echo(text)
         if busy?
           @agent.push_message(text) # steering: consumed at the next turn boundary
         else
           @kernel.async { @agent.run(text) }
         end
+      end
+
+      # pi handleSubmit :3347-3356 — "!" runs whole-line bash, "!!" runs it
+      # excluded from the model context; the bare prefix (no command) is
+      # plain text. Returns [command, excluded] or nil.
+      def user_bash_command(text)
+        return unless text.start_with?("!")
+
+        excluded = text.start_with?("!!")
+        command = text[(excluded ? 2 : 1)..].to_s.strip
+        return if command.empty?
+
+        [command, excluded]
+      end
+
+      # The user-bash execution (pi handleBashCommand :6987): one at a time
+      # (pi's isBashRunning gate — the warning is pi's showWarning text).
+      # The tool run BRIDGES to a worker thread (Agent::Bridge — the tool's
+      # pop-loop blocks its thread; the reactor must keep drawing), and the
+      # block renders on completion; the RECORD defers to agent_end while
+      # a turn runs (pi's _pendingBashMessages — the entry must not
+      # interleave a tool sequence in the record). Streaming chunks are
+      # execution-transient in pi's Loader frames — the port renders the
+      # completed block (itemized).
+      def user_bash(command, excluded)
+        if @user_bash_task
+          enqueue_scrollback("A bash command is already running. Press Esc to cancel it first.",
+            fg: Theme[:warning])
+          return
+        end
+        tool = Tools::Bash.new(cwd: Dir.pwd)
+        # The escape-cancel handshake: the flag flips the worker's
+        # cancellation checkpoint (the tool aborts at its next 50 ms
+        # check — the group kill + partial-output outcome are the tool's
+        # own {Tools::Bash#run_user} rescue), the task stop kills the
+        # reactor-side wait, and the handler renders from the slot the
+        # worker filled (read after the bridge's bounded join).
+        @user_bash_command = command
+        @user_bash_excluded = excluded
+        @user_bash_cancel_flag = false
+        @user_bash_slot = {}
+        @user_bash_task = @kernel.async do
+          terminal = Agent::Bridge.new
+            .on_cancel { @user_bash_cancel_flag = true }
+            .run(lambda do |sink|
+              RubyLLM::Support::Cancellation.watch(
+                -> { raise RubyLLM::CancelledError if @user_bash_cancel_flag }
+              ) do
+                outcome = tool.run_user(command)
+                @user_bash_slot[:outcome] = outcome
+                sink.call({})
+              end
+            end) { |_item| }
+          finish_user_bash(terminal)
+        end
+      end
+
+      # The worker's terminal: the outcome rendered + recorded; a worker
+      # error surfaces as an error line (the ENOENT class — no block).
+      def finish_user_bash(terminal)
+        @user_bash_task = nil
+        if (outcome = @user_bash_slot[:outcome])
+          enqueue_user_bash_block(@user_bash_command, **user_bash_fields(outcome),
+            excluded: @user_bash_excluded)
+          record_user_bash(user_bash_record(@user_bash_command, outcome, excluded: @user_bash_excluded))
+        elsif terminal&.dig(:type) == :error
+          enqueue_scrollback("bash: #{terminal[:error].message}", fg: Theme[:error])
+        end
+        @kernel.request_draw
+      end
+
+      # The record defers while a turn runs (pi's _pendingBashMessages);
+      # idle executions record immediately.
+      def record_user_bash(message)
+        if busy?
+          @pending_bash_records << message
+        else
+          @agent&.record_bash_execution(message)
+        end
+      end
+
+      # The escape-cancel (pi abortBash): flip the worker's checkpoint
+      # flag, stop the reactor-side wait (the bridge joins the worker
+      # bounded — its cancelled outcome, partial output included, lands
+      # in the slot), then render from the slot after a bounded yield
+      # loop (this handler runs in the frame-loop fiber — sleep yields).
+      def cancel_user_bash
+        @user_bash_cancel_flag = true
+        @user_bash_task.stop
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+        sleep 0.05 while @user_bash_slot.empty? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+        outcome = @user_bash_slot[:outcome]
+        @user_bash_task = nil
+        enqueue_user_bash_block(@user_bash_command,
+          **(outcome ? user_bash_fields(outcome) : {content: "", exit_code: nil, cancelled: true,
+                                                    truncated: false, full_output_path: nil}),
+          excluded: @user_bash_excluded)
+        record_user_bash(user_bash_record(@user_bash_command,
+          outcome || Tools::Bash::BashOutcome.new(content: "", exit_code: nil, cancelled: true,
+                                                  truncation: nil, full_output_path: nil),
+          excluded: @user_bash_excluded))
+        @kernel.request_draw
+      end
+
+      # The block's primitive fields off the executor's outcome (the live
+      # and replay compositions share them — pi's setComplete arguments,
+      # bash-execution.ts:108-121).
+      def user_bash_fields(outcome)
+        {content: outcome.content, exit_code: outcome.exit_code, cancelled: outcome.cancelled,
+         truncated: outcome.truncation&.truncated == true,
+         full_output_path: outcome.truncation&.truncated == true ? outcome.full_output_path : nil}
+      end
+
+      def user_bash_record(command, outcome, excluded:)
+        fields = user_bash_fields(outcome)
+        Agent::Session.bash_execution_message(
+          command:, output: fields[:content], exit_code: fields[:exit_code],
+          cancelled: fields[:cancelled], truncated: outcome.truncation&.truncated == true,
+          full_output_path: outcome.full_output_path,
+          exclude_from_context: excluded
+        )
+      end
+
+      # The agent_end flush (pi's agent-end _pendingBashMessages flush).
+      def flush_pending_bash_records
+        @pending_bash_records.each { |message| @agent&.record_bash_execution(message) }
+        @pending_bash_records.clear
       end
 
       # The completed thinking block (pi assistant-message.ts:99-175 order —
@@ -2143,10 +2401,21 @@ module Tart
         TUI.block(
           title: status_title,
           borders: [:top, :bottom],
-          border_style: TUI.style(fg: Theme[:border]),
+          # pi updateEditorBorderColor (interactive-mode.ts:1109-1117): the
+          # border follows the input — bash mode (a leading "!") renders
+          # the bashMode token; otherwise pi colors by thinking level
+          # (getThinkingBorderColor — the port's thinking tokens are cut,
+          # the I11 border token stands; itemized residual).
+          border_style: TUI.style(fg: bash_mode? ? Theme[:bashMode] : Theme[:border]),
           title_style: TUI.style(fg: Theme[:dim]),
           children: [TUI.paragraph(text: content, wrap: false)]
         )
+      end
+
+      # pi isBashMode (interactive-mode.ts:3125): the trimmed input starts
+      # with "!" — the editor's border announces the whole-line bash.
+      def bash_mode?
+        @input.start_with?("!")
       end
 
       def status_title
@@ -2555,7 +2824,7 @@ module Tart
           item = @picker[:items][@picker[:selected]]
           @picker = nil
           @on_resume&.call(item[:path]) if item
-        when "escape" then @picker = nil
+        when "esc" then @picker = nil
         end
       end
 

@@ -152,6 +152,15 @@ module Tart
         run_compaction(reason: :manual)
       end
 
+      # The !-prefix bash execution record (pi recordBashResult
+      # agent-session.ts:3879): a bashExecution message entry on the same
+      # leaf chain — the chat surface calls this when the executor
+      # completes. +message+ is the pi-shaped hash
+      # ({Session.bash_execution_message}).
+      def record_bash_execution(message)
+        @recorder&.append_bash_execution(message)
+      end
+
       private
 
       # Session recording (pi SessionManager.appendMessage): the recorder
