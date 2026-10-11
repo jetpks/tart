@@ -61,6 +61,10 @@ module Tart
       # render unexpanded, then the expand hint.
       WRITE_PREVIEW_LINES = 10
 
+      # pi bash.ts:14 (BASH_PREVIEW_LINES): at most this many visual rows
+      # of shell output render unexpanded, then the earlier-lines hint.
+      BASH_PREVIEW_LINES = 5
+
       # pi read.ts:56 (COMPACT_RESOURCE_FILE_NAMES) — the file names whose
       # read collapses to the compact `read resource` shape.
       COMPACT_RESOURCE_FILE_NAMES = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"].freeze
@@ -1117,18 +1121,25 @@ module Tart
       # formatShellCall; colorKey bashMode — the port carries no
       # context-exclusion state, the dim variant is unreachable, itemized),
       # the output lines blank-separated from the header (bash.ts:78-84 —
-      # the Text children's leading "\n"), and the muted `Took <duration>`
-      # line (bash.ts:105-109 — a nil/absent duration, the replay path,
-      # renders none; the recorded gap is itemized, never invented).
+      # the Text children's leading "\n") collapsed to the preview's last
+      # rows plus the earlier-lines hint (I19 — {collapse_bash_preview};
+      # the truncation notice rides after, {split_truncation_notice}), and
+      # the muted `Took <duration>` line (bash.ts:105-109 — a nil/absent
+      # duration, the replay path, renders none; the recorded gap is
+      # itemized, never invented).
       def enqueue_bash_block(command, output, duration)
         @chat_started = true
         region = [blank_line, blank_line]
         region.concat(padded_fg_rows("$ #{command.to_s.empty? ? "..." : command}",
           fg: Theme[:bashMode], modifiers: [:bold]))
-        output_lines = output.strip.lines(chomp: true)
-        unless output_lines.empty?
+        body, notice = split_truncation_notice(output)
+        unless body.empty?
           region << blank_line
-          region.concat(padded_fg_rows(output_lines.join("\n"), fg: Theme[:tool_output]))
+          region.concat(collapse_bash_preview(padded_fg_rows(body, fg: Theme[:tool_output])))
+        end
+        unless notice.empty?
+          region << blank_line
+          region.concat(padded_fg_rows(notice, fg: Theme[:tool_output]))
         end
         if duration
           region << blank_line
@@ -1136,6 +1147,34 @@ module Tart
         end
         region << blank_line
         @scrollback << region
+      end
+
+      # pi bash.ts:63-71 — the preview trims the output, and the model-
+      # facing truncation footer ("…\n\n[… Full output: <path>]") splits
+      # OFF the preview: the body collapses, the notice renders after it.
+      # pi guards on the tool's truncation details; the render layer sees
+      # only the result text, so the guard is the footer's shape itself
+      # (recorded — see the I19 report).
+      def split_truncation_notice(output)
+        text = output.strip
+        footer_start = text.rindex("\n\n[")
+        return [text, ""] unless footer_start && text.end_with?("]") &&
+          text[footer_start..].include?("Full output: ")
+
+        [text[0, footer_start].strip, text[(footer_start + 2)..]]
+      end
+
+      # pi bash.ts:78-90 + visual-truncate.ts VisualLinePreview (keep
+      # "end"): more than BASH_PREVIEW_LINES visual rows renders the
+      # muted earlier-lines hint row before the LAST 5 (wrapped rows —
+      # a long line spanning the screen counts like pi's); 5 or fewer
+      # render whole. Presentation-only: the model sees the full output
+      # (the tools' tail truncation is upstream and composes after).
+      def collapse_bash_preview(rows)
+        return rows if rows.length <= BASH_PREVIEW_LINES
+
+        [expand_hint_row("... (#{rows.length - BASH_PREVIEW_LINES} earlier lines,"),
+          *rows.last(BASH_PREVIEW_LINES)]
       end
 
       # Wrapped themed rows through the {OUTPUT_PAD} rule (pi's render-box
@@ -1243,14 +1282,20 @@ module Tart
         display = lines.first(WRITE_PREVIEW_LINES)
         rows = padded_fg_rows(display.join("\n"), fg: Theme[:tool_output])
         remaining = lines.length - display.length
-        if remaining.positive?
-          rows << TUI.line([TUI.span(OUTPUT_PAD),
-                            TUI.span("... (#{remaining} more lines, #{lines.length} total,", fg: Theme[:muted]),
-                            TUI.span(" "),
-                            TUI.span("ctrl+o", fg: Theme[:dim]),
-                            TUI.span(" to expand)", fg: Theme[:muted])])
-        end
+        rows << expand_hint_row("... (#{remaining} more lines, #{lines.length} total,") if remaining.positive?
         rows
+      end
+
+      # The expand-hint row family (pi keybinding-hints.ts keyHint over the
+      # muted count prefix — write.ts:117-118, bash.ts:82-84): muted prefix,
+      # plain space, dim key, muted tail. The ctrl+o binding itself is cut
+      # (backlog C) — the bytes are the contract.
+      def expand_hint_row(prefix)
+        TUI.line([TUI.span(OUTPUT_PAD),
+                  TUI.span(prefix, fg: Theme[:muted]),
+                  TUI.span(" "),
+                  TUI.span("ctrl+o", fg: Theme[:dim]),
+                  TUI.span(" to expand)", fg: Theme[:muted])])
       end
 
       # pi read.ts:35-42 formatReadCall vs :79-90 formatCompactReadCall —
