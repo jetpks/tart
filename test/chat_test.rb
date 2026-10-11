@@ -1753,6 +1753,129 @@ module Tart
       end
     end
 
+    # ---- the ctrl+o global tool-output toggle (pi app.tools.expand,
+    # setToolsExpanded :6810-6826) ----
+
+    # The bash block rebuilds in place: collapsed = the hint + last 5,
+    # expanded = all rows, no hint; the truncation notice and Took ride
+    # in both states; the border status reports (pi showStatus).
+    def test_ctrl_o_expands_and_collapses_the_bash_block
+      output = Array.new(8) { |i| "line #{i + 1}" }.join("\n")
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", output, duration: 0.0, arguments: {"command" => "seq"})
+        draw(chat, session)
+        assert_equal [" ... (3 earlier lines, ctrl+o to expand)", " line 4", " line 5", " line 6", " line 7", " line 8"],
+          chat.transcript_lines[4, 6], "collapsed at enqueue (the I19 shape)"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_equal [" line 1", " line 2", " line 3", " line 4", " line 5", " line 6", " line 7", " line 8"],
+          chat.transcript_lines[4, 8],
+          "expanded in place — all rows, no hint, no re-enqueue"
+        assert chat.transcript_lines.none? { |row| row.include?("earlier lines") },
+          "the expand hint dies expanded"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_equal [" ... (3 earlier lines, ctrl+o to expand)", " line 4"],
+          chat.transcript_lines[4, 2], "the second press collapses again"
+      end
+    end
+
+    def test_ctrl_o_reports_the_toggle_in_the_border_status
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", "out", arguments: {"command" => "x"})
+        draw(chat, session)
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert chat.renderer.call.to_s.include?("Tool output: expanded"),
+          "the border status reports the toggle (pi showStatus)"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert chat.renderer.call.to_s.include?("Tool output: collapsed"),
+          "the border status reports the collapse"
+      end
+    end
+
+    # The write block's content preview uncaps expanded (write.ts:117) —
+    # and the LATER blocks keep their transcript positions through the
+    # splice (the registry's start/size bookkeeping).
+    def test_ctrl_o_expands_the_write_preview_and_keeps_later_blocks_in_place
+      content = Array.new(12) { |i| "wline #{i + 1}" }.join("\n")
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "write", "", arguments: {"path" => "n.txt", "content" => content})
+        tool_end(chat, "bash", "tail-output", arguments: {"command" => "tail"})
+        draw(chat, session)
+        assert_equal 10, chat.transcript_lines.count { |row| row.include?("wline") },
+          "collapsed: the 10-line cap"
+        assert chat.transcript_lines.any? { |row| row.include?("2 more lines, 12 total,") },
+          "the write hint"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_equal 12, chat.transcript_lines.count { |row| row.include?("wline") },
+          "expanded: the whole content"
+        assert chat.transcript_lines.any? { |row| row.include?("tail-output") },
+          "the later block survives the splice"
+        refute chat.transcript_lines.any? { |row| row.include?("more lines") },
+          "the hint dies expanded"
+      end
+    end
+
+    # The read block expanded: the PLAIN call line forces over the compact
+    # shape (read.ts:155) and the content renders uncapped
+    # (formatReadResult:130).
+    def test_ctrl_o_expands_the_read_block_to_content_rows
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "read", "file body", arguments: {"path" => "AGENTS.md"})
+        draw(chat, session)
+        assert chat.transcript_lines.any? { |row| row.include?("read resource") },
+          "collapsed: the compact resource shape"
+        refute chat.transcript_lines.any? { |row| row.include?("file body") },
+          "collapsed: the content renders nothing (read.ts:121)"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert chat.transcript_lines.any? { |row| row.include?(" read AGENTS.md") },
+          "expanded: the plain call line (the compact shape is gated on !expanded)"
+        assert chat.transcript_lines.any? { |row| row.include?("file body") },
+          "expanded: the content rows render"
+      end
+    end
+
+    # The user-bash block expands too (pi's expandable children include
+    # the BashExecutionComponent): whole output + the collapse hint.
+    def test_ctrl_o_expands_the_user_bash_block
+      with_chat(width: 60) do |chat, session|
+        send_message(chat, "!echo hi")
+        drain_runs(chat)
+        draw(chat, session)
+        refute chat.transcript_lines.any? { |row| row.include?("to collapse") },
+          "collapsed: the hidden count is 0 — no hint either way"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert chat.transcript_lines.any? { |row| row.include?("$ echo hi") },
+          "the block survives the rebuild"
+      end
+    end
+
+    # pi updateEditorBorderColor :1109-1117 — the editor's border renders
+    # the bashMode token while the input starts with "!".
+    def test_bash_mode_border_renders_the_bash_mode_token
+      with_chat(width: 40) do |chat, session|
+        "!ech".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        draw(chat, session)
+
+        buffer = session.buffer_content
+        border_row = buffer.index { |row| row.include?("─") }
+        assert_equal Theme[:bashMode], session.cell_fg(0, border_row),
+          "the editor border announces bash mode (getBashModeBorderColor)"
+      end
+    end
+
     def test_ctrl_w_deletes_word_backward_through_the_key_surface
       with_headless_chat do |chat|
         "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }

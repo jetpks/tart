@@ -158,6 +158,12 @@ module Tart
       # Spacer renders empty rows).
       OUTPUT_PAD = " ".freeze
 
+      # An expandable block riding the scrollback queue: the rows built at
+      # the CURRENT toggle state + the builder (re-invoked with the new
+      # state at the ctrl+o toggle; the drain records the transcript
+      # range). pi's expandable tool children.
+      MarkedRegion = Struct.new(:rows, :builder)
+
       # One random art piece's lines (empty collection → no logo lines).
       def motd_logo_lines
         file = Dir[File.join(LOGOS_DIR, "*.txt")].sample
@@ -252,6 +258,15 @@ module Tart
         # reduced): nil = closed; open it holds {items:, selected:} with
         # items the launcher-built [{path:, label:}] list (newest first).
         @picker = nil
+        # The ctrl+o global tool-output toggle (pi toolOutputExpanded,
+        # setToolsExpanded — interactive-mode.ts:6810-6826): every
+        # expandable block rebuilds in place; the border status reports.
+        # The expandable registry tracks each block's transcript row range
+        # + row builder (recorded at drain time — the scrollback is a
+        # cross-thread queue, the transcript is flat).
+        @tool_output_expanded = false
+        @expandable_blocks = []
+        @border_status = nil
         # The !-prefix bash execution (backlog C, pi handleBashCommand):
         # the in-flight task (single-flight — pi's isBashRunning gate),
         # the escape-cancel handshake state, and the last ctrl+c timestamp
@@ -412,6 +427,7 @@ module Tart
           case event[:type]
           when :agent_start
             @busy = true
+            @border_status = nil # pi's status indicators clear on agent events
             @branch = nil # per-turn branch invalidation (pi's provider cache, reduced)
             @branch_fetched = false
           when :message_start
@@ -1092,6 +1108,7 @@ module Tart
       def clear_transcript
         @transcript = []
         @scrollback.clear
+        @expandable_blocks.clear
         @scroll_offset = 0
         @follow = true
         @selection = nil
@@ -1195,13 +1212,23 @@ module Tart
       # itemized, never invented).
       def enqueue_bash_block(command, output, duration)
         @chat_started = true
+        push_expandable(->(expanded) { bash_block_rows(command, output, duration, expanded:) })
+      end
+
+      # The bash tool block (I17 — pi's shell renderer over the tool-turn
+      # component), +expanded+ = pi's toolOutputExpanded state: the output
+      # renders whole (no collapse, no hint — bash.ts:67-70 `if
+      # (options.expanded) addChild(Text)` vs the VisualLinePreview); the
+      # notice + Took compose identically in both states.
+      def bash_block_rows(command, output, duration, expanded:)
         region = [blank_line, blank_line]
         region.concat(padded_fg_rows("$ #{command.to_s.empty? ? "..." : command}",
           fg: Theme[:bashMode], modifiers: [:bold]))
         body, notice = split_truncation_notice(output)
         unless body.empty?
           region << blank_line
-          region.concat(collapse_bash_preview(padded_fg_rows(body, fg: Theme[:tool_output])))
+          rows = padded_fg_rows(body, fg: Theme[:tool_output])
+          region.concat(expanded ? rows : collapse_bash_preview(rows))
         end
         unless notice.empty?
           region << blank_line
@@ -1216,7 +1243,14 @@ module Tart
           region.concat(padded_fg_rows("Took #{format_duration(duration * 1000.0)}", fg: Theme[:tool_output]))
         end
         region << blank_line
-        @scrollback << region
+        region
+      end
+
+      # The expandable-block enqueue: the block rides the scrollback as a
+      # {MarkedRegion} (the drain records its transcript range for the
+      # ctrl+o toggle's in-place rebuild).
+      def push_expandable(builder)
+        @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder)
       end
 
       # pi renderers/bash.ts:88-99 — the DISPLAYED notice is composed from
@@ -1286,32 +1320,52 @@ module Tart
       # loader frames are execution-transient (itemized).
       def enqueue_user_bash_block(command, content:, exit_code:, cancelled:, truncated:,
                                   full_output_path:, excluded:)
+        push_expandable(->(expanded) do
+          user_bash_block_rows(command, content:, exit_code:, cancelled:, truncated:,
+                               full_output_path:, excluded:, expanded:)
+        end)
+      end
+
+      # The !-prefix bash block (pi BashExecutionComponent, backlog C),
+      # +expanded+ = pi's toolOutputExpanded: the output renders WHOLE
+      # (all tail-truncated lines — bash-execution.ts:104-108) and the
+      # hidden-hint row becomes the collapse hint (statusParts' expanded
+      # branch). The borders, header, and other status rows are
+      # state-invariant.
+      def user_bash_block_rows(command, content:, exit_code:, cancelled:, truncated:,
+                               full_output_path:, excluded:, expanded:)
         color = excluded ? Theme[:dim] : Theme[:bashMode]
         region = [blank_line, TUI.line([TUI.span("─" * viewport_width, fg: color)])]
         region.concat(padded_fg_rows("$ #{command}", fg: color, modifiers: [:bold]))
         available = content.empty? ? [] : content.split("\n", -1)
         unless available.empty?
           region << blank_line
-          preview_logical = available.last(USER_BASH_PREVIEW_LINES)
-          visual = padded_fg_rows(preview_logical.join("\n"), fg: Theme[:muted])
-          region.concat(visual.last(USER_BASH_PREVIEW_LINES))
+          shown = expanded ? available : available.last(USER_BASH_PREVIEW_LINES)
+          visual = padded_fg_rows(shown.join("\n"), fg: Theme[:muted])
+          region.concat(expanded ? visual : visual.last(USER_BASH_PREVIEW_LINES))
         end
         hidden_logical = available.length - available.last(USER_BASH_PREVIEW_LINES).length
         status = user_bash_status_rows(exit_code:, cancelled:, truncated:,
-                                       full_output_path:, hidden_logical:)
+                                       full_output_path:, hidden_logical:, expanded:)
         unless status.empty?
           region << blank_line
           region.concat(status)
         end
         region << TUI.line([TUI.span("─" * viewport_width, fg: color)])
-        @scrollback << region
+        region
       end
 
       # The status rows (pi statusParts order: hidden-hint, cancelled/
       # exit, truncation warning).
-      def user_bash_status_rows(exit_code:, cancelled:, truncated:, full_output_path:, hidden_logical:)
+      def user_bash_status_rows(exit_code:, cancelled:, truncated:, full_output_path:, hidden_logical:, expanded:)
         rows = []
-        rows << expand_hint_row("... #{hidden_logical} more lines (", gap: "") if hidden_logical.positive?
+        if hidden_logical.positive?
+          rows << if expanded
+            expand_hint_row("(", gap: "", tail: " to collapse)")
+          else
+            expand_hint_row("... #{hidden_logical} more lines (", gap: "")
+          end
+        end
         rows.concat(padded_fg_rows("(cancelled)", fg: Theme[:warning])) if cancelled
         if !cancelled && exit_code.is_a?(Integer) && exit_code != 0
           rows.concat(padded_fg_rows("(exit #{exit_code})", fg: Theme[:error]))
@@ -1367,9 +1421,16 @@ module Tart
       # C) — the hint's TEXT renders for byte parity.
       def enqueue_write_block(args, result)
         @chat_started = true
+        push_expandable(->(expanded) { write_block_rows(args, result, expanded:) })
+      end
+
+      # The write tool block (I18 — pi write.ts renderers), +expanded+ =
+      # the content preview uncapped (write.ts:117 maxLines = expanded ?
+      # lines.length : 10 — the hint dies with the cap).
+      def write_block_rows(args, result, expanded:)
         region = [blank_line, blank_line]
         region.concat(write_call_rows(args))
-        content_rows = write_content_rows(args)
+        content_rows = write_content_rows(args, expanded:)
         unless content_rows.empty?
           region << blank_line
           region.concat(content_rows)
@@ -1380,7 +1441,7 @@ module Tart
           region.concat(padded_fg_rows(error.to_s, fg: Theme[:error]))
         end
         region << blank_line
-        @scrollback << region
+        region
       end
 
       # The read tool block (I18 — pi read.ts renderers): the Spacer + box
@@ -1393,15 +1454,37 @@ module Tart
       # toolOutput rows (formatReadResult's isError path).
       def enqueue_read_block(args, result)
         @chat_started = true
+        push_expandable(->(expanded) { read_block_rows(args, result, expanded:) })
+      end
+
+      # The read tool block (I18 — pi read.ts renderers), +expanded+ =
+      # pi's toolOutputExpanded: the PLAIN call line forces over the
+      # compact shape (read.ts:155 — getCompactReadClassification is
+      # gated on !expanded) and the result content renders as toolOutput
+      # rows, uncapped (formatReadResult:130 — maxLines = expanded ?
+      # lines.length : 10; trailing-empty lines trimmed). The error text
+      # renders in both states.
+      def read_block_rows(args, result, expanded:)
         region = [blank_line, blank_line]
-        region.concat(read_call_rows(args))
+        region.concat(read_call_rows(args, expanded))
         error = result.is_a?(Hash) ? result[:error] : nil
-        if error
+        rows = error ? padded_fg_rows(error.to_s, fg: Theme[:tool_output]) : (expanded ? read_content_rows(result) : [])
+        unless rows.empty?
           region << blank_line
-          region.concat(padded_fg_rows(error.to_s, fg: Theme[:tool_output]))
+          region.concat(rows)
         end
         region << blank_line
-        @scrollback << region
+        region
+      end
+
+      # pi read.ts:122-131 formatReadResult's expanded body: the result
+      # text (trailing-empty lines trimmed) as toolOutput rows, uncapped.
+      def read_content_rows(result)
+        lines = tool_result_text(result).split("\n", -1)
+        lines.pop while !lines.empty? && lines.last.empty?
+        return [] if lines.empty?
+
+        padded_fg_rows(lines.join("\n"), fg: Theme[:tool_output])
       end
 
       # pi write.ts:99-100 — the bold toolTitle `write` header + the
@@ -1430,12 +1513,12 @@ module Tart
       # (trimTrailingEmptyLines), at most 10 lines, then the expand hint
       # row (keyHint app.tools.expand — the dim key + muted text bytes;
       # the ctrl+o binding is cut, the bytes are the contract).
-      def write_content_rows(args)
+      def write_content_rows(args, expanded: false)
         lines = args["content"].to_s.gsub("\r", "").split("\n", -1)
         lines.pop while !lines.empty? && lines.last.empty?
         return [] if lines.empty?
 
-        display = lines.first(WRITE_PREVIEW_LINES)
+        display = expanded ? lines : lines.first(WRITE_PREVIEW_LINES)
         rows = padded_fg_rows(display.join("\n"), fg: Theme[:tool_output])
         remaining = lines.length - display.length
         rows << expand_hint_row("... (#{remaining} more lines, #{lines.length} total,") if remaining.positive?
@@ -1444,16 +1527,15 @@ module Tart
 
       # The expand-hint row family (pi keybinding-hints.ts keyHint over the
       # muted count prefix — write.ts:117-118, bash.ts:82-84,
-      # bash-execution.ts:146): muted prefix, the gap (keyHint composes
-      # `prefix${keyText}` with NO space in the user-bash shape), dim key,
-      # muted tail. The ctrl+o binding itself is the next slice — the
-      # bytes are the contract.
-      def expand_hint_row(prefix, gap: " ")
+      # bash-execution.ts:146 + the collapse variant): muted prefix, the
+      # gap (keyHint composes `prefix${keyText}` with NO space in the
+      # user-bash shapes), dim key, muted tail.
+      def expand_hint_row(prefix, gap: " ", tail: " to expand)")
         TUI.line([TUI.span(OUTPUT_PAD),
                   TUI.span(prefix, fg: Theme[:muted]),
                   TUI.span(gap),
                   TUI.span("ctrl+o", fg: Theme[:dim]),
-                  TUI.span(" to expand)", fg: Theme[:muted])])
+                  TUI.span(tail, fg: Theme[:muted])])
       end
 
       # pi read.ts:35-42 formatReadCall vs :79-90 formatCompactReadCall —
@@ -1461,8 +1543,8 @@ module Tart
       # expand hint (the [skill] label rides customMessageLabel violet —
       # the port's accent analog — over customMessageText muted), wrapped
       # through the call-row family ({wrapped_call_rows}).
-      def read_call_rows(args)
-        classification = compact_read_classification(args)
+      def read_call_rows(args, expanded = false)
+        classification = expanded ? nil : compact_read_classification(args)
         if classification
           label_spans = if classification[:kind] == :skill
             [Markdown::Span.new(text: "[skill] ", fg: Theme[:accent], modifiers: [:bold]),
@@ -1630,6 +1712,10 @@ module Tart
           else
             insert_printable(event)
           end
+        when "o"
+          # app.tools.expand (pi keybindings.ts:50, default ctrl+o — the
+          # GLOBAL tool-output toggle, setToolsExpanded).
+          ctrl ? set_tool_output_expanded(!@tool_output_expanded) : insert_printable(event)
         # While the list is active up/down navigate the LIST (history
         # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
         when "up" then @suggestions ? navigate_suggestions(-1) : history_previous
@@ -2420,7 +2506,10 @@ module Tart
 
       def status_title
         # pi shows the compaction indicator regardless of the streaming
-        # state (a manual /compact runs outside a turn in the port).
+        # state (a manual /compact runs outside a turn in the port); the
+        # toggle status rides the same slot until the next agent event.
+        # Direct ivars — this runs inside render_frame's synchronize.
+        return " #{@border_status} " if @border_status && !@busy
         return nil unless @busy || @compaction_reason
 
         " #{status_line} "
@@ -2872,13 +2961,42 @@ module Tart
       end
 
       # Completed lines move into the transcript buffer (pi: completed
-      # content into scrollback). Entries are final display Lines. The
-      # inline insert_before path is retired from the interactive surface —
-      # the buffer is drawn wholesale every frame.
+      # content into scrollback). Entries are final display Lines — or a
+      # {MarkedRegion}: an expandable block, whose transcript range is
+      # recorded at drain time so the ctrl+o toggle can rebuild it in
+      # place (pi setToolsExpanded's child sweep). The inline
+      # insert_before path is retired from the interactive surface — the
+      # buffer is drawn wholesale every frame.
       def flush_scrollback
         until @scrollback.empty?
-          @transcript.concat(@scrollback.pop)
+          item = @scrollback.pop
+          if item.is_a?(MarkedRegion)
+            @expandable_blocks << {start: @transcript.size, size: item.rows.length,
+                                   builder: item.builder}
+            @transcript.concat(item.rows)
+          else
+            @transcript.concat(item)
+          end
         end
+      end
+
+      # app.tools.expand (pi setToolsExpanded :6810-6826): the GLOBAL
+      # toggle — every expandable block rebuilds collapsed↔expanded in
+      # place; the border status reports (pi showStatus). Cuts, itemized:
+      # the header's startup-help flip (the expanded header's full hint
+      # list + loaded-resources sections are unported) — the block sweep
+      # is the feature.
+      def set_tool_output_expanded(expanded)
+        return if expanded == @tool_output_expanded
+
+        @tool_output_expanded = expanded
+        @expandable_blocks.each do |registered|
+          rows = registered[:builder].call(expanded)
+          @transcript[registered[:start], registered[:size]] = rows
+          registered[:size] = rows.length
+        end
+        @border_status = "Tool output: #{expanded ? "expanded" : "collapsed"}"
+        @kernel.request_draw
       end
     end
   end
