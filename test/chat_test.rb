@@ -165,27 +165,27 @@ module Tart
     def test_tool_call_lifecycle_is_rendered
       with_chat(width: 40) do |chat, session|
         chat.on_agent_event({type: :agent_start})
-        tool_start(chat, "bash")
+        tool_start(chat, "read")
         draw(chat, session)
-        assert_includes editor_area(session, chat), "tool: bash",
+        assert_includes editor_area(session, chat), "tool: read",
           "the tool name renders in the editor's status border while it runs"
 
-        tool_end(chat, "bash", "done\nmore")
+        tool_end(chat, "read", "done\nmore")
         draw(chat, session)
         assert_equal [:reversed], session.cell_modifiers(0, input_row(session)),
           "input line visible after tool end (the empty line's fake cursor)"
         # transcript_lines strips per-row whitespace (buffer rows are padded).
-        assert_equal ["  ⎿ bash: done", "    more"], transcript_lines(session, chat),
+        assert_equal ["  ⎿ read: done", "    more"], transcript_lines(session, chat),
           "the tool result lifecycle renders into the transcript as a multi-line excerpt"
       end
     end
 
     def test_tool_result_preview_is_bounded_multiline
       with_chat(width: 40) do |chat, session|
-        tool_start(chat, "bash")
-        tool_end(chat, "bash", "one\ntwo\nthree\nfour\nfive")
+        tool_start(chat, "read")
+        tool_end(chat, "read", "one\ntwo\nthree\nfour\nfive")
         draw(chat, session)
-        assert_equal ["  ⎿ bash: one", "    two", "    three", "    …"], transcript_lines(session, chat),
+        assert_equal ["  ⎿ read: one", "    two", "    three", "    …"], transcript_lines(session, chat),
           "the preview shows a bounded multi-line excerpt, then an ellipsis"
       end
     end
@@ -204,7 +204,7 @@ module Tart
           "the status line is dim (#{Theme[:dim].inspect})"
 
         finish_message(chat, "assistant answer") # transcript: assistant, terminal default
-        tool_end(chat, "bash", "tool output")    # transcript: tool, muted
+        tool_end(chat, "read", "tool output")    # transcript: tool, muted
         chat.on_agent_event({type: :agent_end})
         "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
         chat.on_event(TUI.key_event("enter"))    # transcript: user echo
@@ -250,14 +250,109 @@ module Tart
         chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
         chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("answer")})
         chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "answer")})
-        tool_end(chat, "bash", "done\nmore")                 # tool block
+        tool_end(chat, "read", "done\nmore")                 # tool block (non-bash shape)
         send_message(chat, "again")                          # echo: container non-empty → blank
         finish_message(chat, "second")                       # assistant
         draw(chat, session) # the frame's flush moves every region into the buffer
 
-        assert_equal ["", " hi", "", "", " pondering", "", " answer", "", "  ⎿ bash: done", "    more", "", "", " again", "", "", " second"],
+        assert_equal ["", " hi", "", "", " pondering", "", " answer", "", "  ⎿ read: done", "    more", "", "", " again", "", "", " second"],
           chat.transcript_lines,
           "pi's region padding: the first echo rides its padY wrap (no container spacer), later regions get the spacer + pad rows"
+      end
+    end
+
+    # The bash tool block (I17, AC3 — pi's shell renderer over the
+    # tool-turn component, bash.ts:31-149 + tool-execution.ts:85,87):
+    # the capture's rows 11-18 — tool spacer, render-box pad, the bold
+    # bashMode `$ <command>` header, blank, muted output, blank, muted
+    # Took, box pad. `duration:` rides the frozen :tool_execution_end
+    # contract (Float seconds; 0.0 legitimate).
+    def test_bash_tool_block_renders_pis_shell_shapes
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", "pty-tester", duration: 0.0, arguments: {"command" => "echo pty-tester"})
+        draw(chat, session)
+
+        assert_equal ["", "", " $ echo pty-tester", "", " pty-tester", "", " Took 0.0s", ""],
+          chat.transcript_lines,
+          "the capture's rows 11-18: spacer, box pad, header, blank, output, blank, Took, box pad"
+        # Cell reads scan the buffer (the 9-row transcript scrolls on the
+        # 7-row viewport — transcript index ≠ buffer row).
+        rows = session.buffer_content
+        header = rows.index { |row| row.include?("$ echo pty-tester") }
+        x = rows[header].index("$")
+        assert_equal Theme[:bashMode], session.cell_fg(x, header),
+          "the header renders the bashMode token (dark.json:71)"
+        assert_includes session.cell_modifiers(x, header), :bold, "the header is bold (bash.ts:36 theme.bold)"
+        out = rows.index { |row| row.start_with?(" pty-tester") }
+        assert_equal Theme[:tool_output], session.cell_fg(rows[out].index("p"), out),
+          "the output line renders pi's muted token's true value (toolOutput = muted, dark.json:41)"
+        took = rows.index { |row| row.include?("Took 0.0s") }
+        assert_equal Theme[:tool_output], session.cell_fg(rows[took].index("T"), took),
+          "the Took line renders muted (bash.ts:106)"
+      end
+    end
+
+    # Each output line is its own muted row, blank-separated from the
+    # header (bash.ts:78-84 — the output Text children's leading "\n").
+    def test_bash_block_output_renders_one_muted_row_per_line
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", "one\ntwo", duration: 0.0, arguments: {"command" => "echo one; echo two"})
+        draw(chat, session)
+        assert_equal ["", "", " $ echo one; echo two", "", " one", " two", "", " Took 0.0s", ""],
+          chat.transcript_lines,
+          "the output lines render blank-separated from the header, one row per line"
+      end
+    end
+
+    # A nil/absent duration renders no Took line (bash.ts:105 — the
+    # replay path's recorded gap, itemized; never invented).
+    def test_bash_block_without_duration_omits_the_took_line
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", "pty-tester", arguments: {"command" => "echo pty-tester"})
+        draw(chat, session)
+        assert_equal ["", "", " $ echo pty-tester", "", " pty-tester", ""],
+          chat.transcript_lines, "no duration → no Took line"
+      end
+    end
+
+    # pi bash.ts:20-28 formatDuration through the rendered Took line
+    # (ms = the contract's Float seconds × 1000): <60s → %.1fs (toFixed
+    # rounds — 59_960ms → "60.0s"); <60m → Xm Ys; else Xh Ym Zs.
+    def test_bash_took_line_format_matches_pis_format_duration
+      {
+        0.0 => "0.0s", 54.9 => "54.9s", 59.96 => "60.0s",
+        61.5 => "1m 1s", 3725.4 => "1h 2m 5s",
+      }.each do |seconds, expected|
+        with_chat(width: 40) do |chat, session|
+          tool_end(chat, "bash", "", duration: seconds, arguments: {"command" => "x"})
+          draw(chat, session)
+          assert_includes chat.transcript_lines, " Took #{expected}",
+            "formatDuration(#{seconds}s = #{seconds * 1000}ms) renders #{expected.inspect} (bash.ts:20-28)"
+        end
+      end
+    end
+
+    # The bash block replays through the same shapes (I17): command from
+    # the recorded arguments, output from the recorded result, NO Took —
+    # the recorded entries carry no duration (the frozen contract's
+    # replay gap, itemized).
+    def test_resume_session_replays_the_bash_block_without_a_took_line
+      dir = File.join(@dir, "sessions")
+      FileUtils.mkpath(dir)
+      recorded = File.join(dir, "bash_replay_test-session.jsonl")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"bash-replay","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"run the echo"}}
+        {"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":"","tool_calls":{"call_1":{"id":"call_1","name":"bash","arguments":{"command":"echo pty-tester"}}},"finish_reason":"tool_calls","input_tokens":10,"output_tokens":5}}
+        {"type":"message","id":"e3","parentId":"e2","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"tool","content":"pty-tester","tool_call_id":"call_1"}}
+      JSONL
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+        assert_equal ["", " run the echo", "", "", "", " $ echo pty-tester", "", " pty-tester", ""],
+          chat.transcript_lines.first(9),
+          "the bash block replays through pi's shapes (header + blank + output); the recorded duration gap keeps no Took"
+        refute chat.transcript_lines.any? { |row| row.include?("Took") }, "no invented duration on replay"
       end
     end
 
@@ -1847,8 +1942,11 @@ module Tart
       chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(name)})
     end
 
-    def tool_end(chat, name, result)
-      chat.on_agent_event({type: :tool_execution_end, tool_call: ToolCallDouble.new(name), result:})
+    # `duration:` rides the frozen :tool_execution_end contract (Float
+    # seconds, nil = absent); bash blocks read the call's arguments.
+    def tool_end(chat, name, result, duration: nil, arguments: {})
+      chat.on_agent_event({type: :tool_execution_end, tool_call: ToolCallDouble.new(name, arguments), result:,
+                           duration:})
     end
 
     # Types +text+ into the input line and presses Enter (direct key events
@@ -2028,8 +2126,10 @@ module Tart
 
     ChunkDouble = Struct.new(:content, :thinking)
     MessageDouble = Struct.new(:role, :content, :tokens)
-    ToolCallDouble = Struct.new(:name) do
-      def arguments = {}
+    ToolCallDouble = Struct.new(:name, :arguments) do
+      def initialize(name, arguments = {})
+        super
+      end
     end
     TokensDouble = Struct.new(:input, :output, :cache_read, :cache_write)
 

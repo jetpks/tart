@@ -23,6 +23,7 @@ module Tart
       user_message_text: "#dee0e1",   # dark.json:32 — userMessageText = the "text" token
       user_message_bg: "#213b49",     # dark.json:13/:33 — blueBg okhsl(233 41% 24%)
       tool_output: "#9da5a9",         # dark.json:35 "toolOutput" = muted okhsl(229 6% 67%)
+      bashMode: "#5eb286",            # dark.json:71 okhsl(159 64% 65%) — the bash header (I17)
       md_heading: :yellow,            # dark.json:42
       md_link: :light_blue,           # dark.json:43 blue
       md_link_url: :gray,             # dark.json:44 muted
