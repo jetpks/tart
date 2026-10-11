@@ -187,6 +187,29 @@ module Tart
       refute TUI.ctrl_c?(TUI.sync_event)
     end
 
+    # The escape predicate (item 5, pi app.interrupt = escape,
+    # keybindings.ts:26): bare escape only — modified escapes are edits.
+    def test_escape_predicate
+      assert TUI.escape?(TUI.key_event("escape"))
+      refute TUI.escape?(TUI.key_event("escape", modifiers: ["ctrl"])), "ctrl+escape is not the interrupt"
+      refute TUI.escape?(TUI.key_event("escape", modifiers: ["alt"]))
+      refute TUI.escape?(TUI.key_event("q"))
+      refute TUI.escape?(TUI.sync_event)
+    end
+
+    # Hex fg+bg through the seam (item 4/AC4, PHASE 0 — verified live
+    # before implementing): the gem parses "#rrggbb" into Color::Rgb (ext
+    # style.rs:20-33) and the test terminal reads both slots back verbatim.
+    def test_hex_fg_and_bg_render_and_read_back
+      TUI.run(headless: true, width: 20, screen_height: 4) do |session|
+        line = TUI.line([TUI.span("ab", fg: "#dee0e1", bg: "#213b49")])
+        session.draw(TUI.paragraph(text: [line]))
+        assert_equal "#dee0e1", session.cell_fg(0, 0), "hex fg reads back as the hex string"
+        assert_equal "#213b49", session.cell_bg(0, 0), "hex bg reads back as the hex string"
+        assert_nil session.cell_bg(1, 1), "untouched cells carry no background"
+      end
+    end
+
     # The gem mouse-event shape (I14 items 6/10): kind/x/y/button/modifiers
     # — what the real terminal's crossterm parse produces (ext events.rs:552).
     def test_mouse_event_seam_builds_the_gem_shape

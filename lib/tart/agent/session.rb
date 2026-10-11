@@ -203,15 +203,7 @@ module Tart
       # with a valid header whose resolved cwd matches (+cwd+ nil = any).
       # Unreadable/racy paths are skipped; nothing found is nil.
       def find_most_recent(dir, cwd: nil)
-        return nil unless File.directory?(dir)
-
-        files = Dir.children(dir)
-          .select { |file| file.end_with?(".jsonl") }
-          .map { |file| File.join(dir, file) }
-          .sort_by { |path| File.mtime(path) }
-          .reverse
-
-        files.each do |path|
+        session_files(dir).each do |path|
           header = read_header(path)
           next unless header
           next if cwd && !cwd_matches?(header["cwd"], cwd)
@@ -219,6 +211,48 @@ module Tart
           return path
         end
         nil
+      end
+
+      # pi SessionManager.list (session-manager.ts, the discovery shape the
+      # /resume SessionSelectorComponent loads): the cwd's sessions, *.jsonl
+      # by mtime descending, valid headers only, header cwd resolved to
+      # +cwd+ (pi listCurrentSessions over getDefaultSessionDirPath).
+      def list(cwd:, root: default_root)
+        dir = dir_path(cwd, root:)
+        session_files(dir).filter_map do |path|
+          header = read_header(path)
+          next unless header && cwd_matches?(header["cwd"], cwd)
+
+          path
+        end
+      end
+
+      # The picker's one-line label (pi SessionSelectorComponent renders
+      # session.firstMessage): the first user message's text, squashed.
+      # nil when the session holds none (setup-only files).
+      def preview(path)
+        first = load_entries(path).find do |entry|
+          message_entry_with_role?(entry, "user")
+        end
+        return nil unless first
+
+        content = first["message"]["content"].to_s
+        squashed = content.strip.gsub(/\s+/, " ")
+        squashed.empty? ? nil : squashed
+      end
+
+      # *.jsonl paths under +dir+, mtime descending (the shared discovery
+      # enumeration; unreadable/racy mtimes skipped).
+      def session_files(dir)
+        return [] unless File.directory?(dir)
+
+        Dir.children(dir)
+          .select { |file| file.end_with?(".jsonl") }
+          .map { |file| File.join(dir, file) }
+          .sort_by { |path| File.mtime(path) }
+          .reverse
+      rescue StandardError
+        []
       end
 
       # First parsed entry, or nil unless it is a valid session header
@@ -268,6 +302,13 @@ module Tart
           @ids = Set.new
           @leaf_id = nil
           @flushed = false
+        end
+
+        # @return [Boolean] whether the session file exists on disk yet (pi
+        #   isPersisted :1166 — setup-only sessions leave no file; the exit
+        #   resume hint gates on this).
+        def persisted?
+          @flushed
         end
 
         # Appends one message entry, chained to the current leaf (pi

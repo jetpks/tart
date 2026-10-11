@@ -244,6 +244,50 @@ module Tart
         "no recorder, no files anywhere under the root"
     end
 
+    # Session.list (item 2/AC2, pi SessionManager.list's discovery shape):
+    # the cwd's valid-header sessions, mtime descending, fixture-rooted.
+    def test_lists_the_cwd_s_sessions_newest_first
+      dir = Agent::Session.ensure_dir(@dir, root: @root)
+      other_cwd = File.join(@dir, "elsewhere")
+      old = write_session_file(dir, cwd: @dir)
+      newest = write_session_file(dir, cwd: @dir)
+      foreign = write_session_file(dir, cwd: other_cwd)
+      broken = File.join(dir, "broken.jsonl")
+      File.write(broken, "not a session header\n")
+      FileUtils.touch(old, mtime: Time.at(1_000))
+      FileUtils.touch(newest, mtime: Time.at(2_000))
+      FileUtils.touch(foreign, mtime: Time.at(3_000))
+      FileUtils.touch(broken, mtime: Time.at(4_000))
+
+      assert_equal [newest, old], Agent::Session.list(cwd: @dir, root: @root),
+        "mtime descending, valid headers only, header cwd resolved to the requested cwd"
+      assert_empty Agent::Session.list(cwd: File.join(@dir, "nowhere"), root: @root)
+    end
+
+    def test_preview_carries_the_first_user_message
+      dir = Agent::Session.ensure_dir(@dir, root: @root)
+      path = File.join(dir, "#{Agent::Session.uuidv7}.jsonl")
+      header = Agent::Session.header(id: Agent::Session.uuidv7, cwd: @dir)
+      entry = Agent::Session.message_entry({role: "user", content: "  fix the\n  flaky test  "},
+        id: Agent::Session.generate_id(Set.new), parent_id: nil, timestamp: Agent::Session.now_iso)
+      File.write(path, "#{JSON.generate(header)}\n#{JSON.generate(entry)}\n")
+
+      assert_equal "fix the flaky test", Agent::Session.preview(path),
+        "squashed first user message (pi renders session.firstMessage)"
+      assert_nil Agent::Session.preview(File.join(dir, "absent.jsonl"))
+    end
+
+    # persisted? (item 1/AC1, pi isPersisted :1166): false until the first
+    # user/assistant message flushes the file; true after.
+    def test_persisted_tracks_the_first_flush
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      refute recorder.persisted?, "a setup-only session leaves no file"
+
+      message = RubyLLM::Message.new(role: :user, content: "hi")
+      recorder.append_message(message)
+      assert recorder.persisted?, "the file exists once a user message landed"
+    end
+
     private
 
     def agent_on_kernel(tools: {}, recorder: nil, seed_messages: [])

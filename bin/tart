@@ -79,9 +79,11 @@ module Tart
           message; loaded skills are listed with /skills.
 
         Commands:
-          /new /compact /skills /settings /help /quit — /new starts a fresh
-          session, /compact compacts the context now, /quit exits (when
-          idle). Slash text matching no command goes to the model.
+          /new /compact /resume /skills /settings /help /quit — /new starts
+          a fresh session, /compact compacts the context now, /resume opens
+          the session picker (arrows navigate, enter resumes, escape
+          cancels), /quit exits (when idle). Slash text matching no command
+          goes to the model.
           Autocomplete: type / to get a fuzzy list of commands and skills;
           up/down pick, tab (or enter) apply, escape dismisses. PageUp/
           PageDown scroll the transcript when the list is hidden.
@@ -163,13 +165,23 @@ module Tart
       skills = Skills.load(cwd: workdir)
       require_api_key(settings)
 
+      # The resume path is known before the surface is built: a resumed
+      # boot skips the MOTD (item 3 — pi's chat container gets the
+      # session's entries only; the fresh header would be a boot shape).
+      resume_path = options[:resume_given] ? resolve_resume(options[:resume], workdir) : nil
+      # The exit resume hint's subject — the /new-swapped recorder (outer
+      # local: the TUI.run block updates it, the post-restore read below
+      # uses it).
+      current_recorder = nil
+
       TUI.run(viewport: :fullscreen, bracketed_paste: true) do |session|
         kernel = Core::Loop.new(session:)
         surface = Render::Chat.new(
           session:, kernel:,
           # Autocomplete sources (AC1): the builtin slash commands + the
           # loaded skills (the same catalog the Commands::Handler routes).
-          autocomplete: Render::Chat::SlashSource.new(commands: Commands::BUILTINS, skills: skills.skills)
+          autocomplete: Render::Chat::SlashSource.new(commands: Commands::BUILTINS, skills: skills.skills),
+          motd: resume_path.nil?
         )
         tools = build_tools(workdir, settings)
         prompt = system_prompt(workdir, skills.skills)
@@ -178,9 +190,10 @@ module Tart
         # file, no parent) plus a fresh Agent::Loop on the same settings,
         # system prompt, skills, and tools. The surface then clears itself
         # and re-renders the MOTD + accent line (Chat#new_session).
-        start_session = lambda do |resume_path|
-          recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
-          seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
+        start_session = lambda do |resume_target|
+          recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_target)
+          current_recorder = recorder
+          seed_messages = resume_target ? Agent::Session.context_messages(resume_target) : []
           chat = build_chat(settings)
           surface.footer_data = footer_data(workdir, settings, chat:)
           surface.agent = Agent::Loop.new(
@@ -195,6 +208,15 @@ module Tart
           )
         end
 
+        # The resume seam (item 2/3): the picker's enter and the CLI
+        # --resume land here — a fresh recorder linked to the old file
+        # (pi switchSession), then the surface replays the recorded
+        # entries + the "Resumed session" status (Chat#resume_session).
+        resume = lambda do |path|
+          start_session.call(path)
+          surface.resume_session(path)
+        end
+
         surface.commands = Commands::Handler.new(
           skills: skills.skills,
           settings: settings,
@@ -202,9 +224,19 @@ module Tart
           spawn: ->(&block) { kernel.async(&block) },
           agent: -> { surface.agent },
           reset: lambda { start_session.call(nil); surface.new_session },
+          resume: lambda do
+            sessions = Agent::Session.list(cwd: workdir)
+            if sessions.empty?
+              surface.command_line("no sessions found")
+            else
+              surface.open_session_picker(sessions.map { |path| {path:, label: session_label(path)} })
+            end
+          end,
           quit: -> { kernel.stop! }
         )
-        start_session.call(options[:resume_given] && resolve_resume(options[:resume], workdir))
+        surface.on_resume = resume
+        resume.call(resume_path) if resume_path
+        start_session.call(nil) unless resume_path
         report_diagnostics(result.diagnostics, surface:)
         skills.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
 
@@ -212,6 +244,31 @@ module Tart
         kernel.on_event = ->(event, source) { surface.on_event(event, source) }
         kernel.run
       end
+
+      # The exit resume hint (item 1, pi interactive-mode.ts:4324-4327 +
+      # formatResumeCommand :339-355): every interactive exit path —
+      # ctrl+d, the ctrl+c quit, /quit — prints the copy-paste resume
+      # command after the terminal restore, only when the session was
+      # persisted (pi gates on stdout TTY + isPersisted + the file
+      # existing; the port's interactive exit only ever runs on a
+      # terminal — the TTY gate is itemized). --print never reaches here.
+      hint = resume_hint(current_recorder)
+      $stdout.write("#{hint}\n") if hint
+    end
+
+    # pi formatResumeCommand :339-355, the port's flag shape (--resume
+    # [ID] IS the specific-id flag; pi's --session <id> is an itemized
+    # deviation): the id resolves through find_session_by_id.
+    def resume_hint(recorder)
+      return nil unless recorder && recorder.persisted?
+
+      "\e[2mTo resume this session:\e[0m tart --resume #{recorder.id}" # dim label, plain command
+    end
+
+    # The picker's one-line label: the session's first user message (pi
+    # renders session.firstMessage, session-selector.ts:453).
+    def session_label(path)
+      Agent::Session.preview(path) || File.basename(path)
     end
 
     def require_api_key(settings)
@@ -274,30 +331,19 @@ module Tart
       ENV.fetch("TART_MCP_CONFIG", Mcp::Config::DEFAULT_PATH)
     end
 
-    # --resume [ID]: no ID = the most recent session for the workdir (the
-    # port has no session-picker UI); an ID is a session-file path or a
-    # session id (the file name's trailing _<id> or the header id) in the
-    # workdir's session dir.
+    # --resume [ID]: no ID = the most recent session for the workdir; an
+    # ID is a session-file path or a session id (the file name's trailing
+    # _<id> or the header id) among the workdir's sessions.
     def resolve_resume(id, workdir)
-      return require_session(Agent::Session.find_most_recent(session_dir(workdir), cwd: workdir),
+      return require_session(Agent::Session.list(cwd: workdir).first,
         "for #{File.expand_path(workdir)}") if id.nil?
       return id if File.file?(id)
 
-      require_session(find_session_by_id(session_dir(workdir), id), "matching #{id}")
+      require_session(find_session_by_id(workdir, id), "matching #{id}")
     end
 
-    def session_dir(workdir)
-      Agent::Session.dir_path(workdir)
-    end
-
-    def find_session_by_id(dir, id)
-      return nil unless File.directory?(dir)
-
-      files = Dir.children(dir).select { |file| file.end_with?(".jsonl") }
-        .map { |file| File.join(dir, file) }
-        .sort_by { |path| File.mtime(path) }
-        .reverse
-      files.find do |path|
+    def find_session_by_id(workdir, id)
+      Agent::Session.list(cwd: workdir).find do |path|
         File.basename(path, ".jsonl").end_with?("_#{id}") ||
           Agent::Session.read_header(path)&.fetch("id", nil) == id
       end
