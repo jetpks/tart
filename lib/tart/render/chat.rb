@@ -65,17 +65,6 @@ module Tart
       # chat-viewport.ts:33 editor minSize 3).
       MIN_EDITOR_ROWS = 3
 
-      # The tool name that dispatches to pi's shell renderers (bash.ts:115
-      # createShellRenderers — shared by bash and powershell; the port
-      # runs bash only).
-      BASH_TOOL = "bash".freeze
-
-      # The file tools that dispatch to pi's per-tool renderers (I18 —
-      # write.ts/read.ts renderCall/renderResult); everything else
-      # non-bash keeps the generic ⎿ line (I17's ruling).
-      WRITE_TOOL = "write".freeze
-      READ_TOOL = "read".freeze
-
       # pi status-indicator.ts:85-95 — the compaction-start border labels,
       # minus the cancel hint (deviation: ctrl+c aborts the whole run in the
       # port, not just the compaction — BRIEF §5.1, itemized).
@@ -695,20 +684,6 @@ module Tart
         else
           @kernel.async { @agent.run(text) }
         end
-      end
-
-      # The completed thinking block (pi assistant-message.ts:99-175 order —
-      # thinking before the content): the live reasoning buffer flushed as
-      # dim italic transcript rows, then cleared. Retained on the
-      # coordinator for the live region; the completion path's flush
-      # happens inside {Transcript#enqueue_message} (the reasoning text
-      # threads in at the :message_end event — I25).
-      def flush_reasoning
-        text = @reasoning
-        @reasoning = +""
-        return if text.empty?
-
-        @transcript_state.enqueue_region(Transcript.reasoning_lines(text, viewport_width))
       end
 
       # --- transcript scroll state (pi scroll-view.ts follow-end) ---
