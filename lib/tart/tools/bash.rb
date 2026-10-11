@@ -33,6 +33,12 @@ module Tart
       # raised as a parity deviation).
       TERM_GRACE_SECONDS = 5.0
 
+      # Cadence of the coordinator's deadline/cancellation checkpoints while a
+      # command runs. Exit detection is evented (see spawn_and_stream); this
+      # bounds only how fast a timeout -TERM fires and an interrupt is
+      # observed (pi checks signal.aborted between events).
+      CHECKPOINT_INTERVAL = 0.05
+
       attr_reader :cwd, :details
 
       def initialize(cwd:)
@@ -99,6 +105,7 @@ module Tart
         out_rd, out_wr = IO.pipe
         err_rd, err_wr = IO.pipe
         pid = nil
+        reaper = nil
         timed_out = false
 
         begin
@@ -111,28 +118,42 @@ module Tart
           readers = [Thread.new { drain_pipe(out_rd, output) }, Thread.new { drain_pipe(err_rd, output) }]
 
           deadline = timeout_seconds && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
+
+          # Evented exit detection (pi's child "exit" event, bash.ts:112 —
+          # Node learns of exit without polling). Ruby has no evented child
+          # exit, so the idiomatic analog: a dedicated reaper thread does a
+          # BLOCKING Process.waitpid2 and hands the status over a Queue — the
+          # pop below returns the moment the child exits, so fast commands pay
+          # no poll quantum. The bounded pop keeps the deadline and
+          # cancellation checkpoints ticking while the command runs
+          # (cancellation is cooperative: the checkpoint raises in this
+          # thread, so the wait must yield).
+          completed = Queue.new
+          reaper = Thread.new { completed << Process.waitpid2(pid)[1] }
           status = nil
           term_sent = false
+          killed = false
           loop do
             # Cancellation checkpoint: an interrupted turn kills the whole
             # process group (pi checks signal.aborted between events).
             RubyLLM::Support::Cancellation.check
-            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-            if deadline && now >= deadline
-              timed_out = true
-              # I03 backlog carry-in: -TERM exactly once, then a single -KILL
-              # once the grace elapses (re-signaling every poll iteration is
-              # dead weight; the escalation is what ends the command).
-              unless term_sent
-                term_sent = true
-                kill_process_group(pid, "TERM")
-              end
-              kill_process_group(pid, "KILL") if now > deadline + TERM_GRACE_SECONDS
-            end
-            _, status = Process.waitpid2(pid, Process::WNOHANG)
+            status = completed.pop(timeout: CHECKPOINT_INTERVAL)
             break if status
 
-            sleep 0.05
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            next unless deadline && now >= deadline
+            unless term_sent
+              timed_out = true
+              term_sent = true
+              # I03 backlog carry-in: -TERM exactly once, then a single -KILL
+              # once the grace elapses (the escalation is what ends the
+              # command).
+              kill_process_group(pid, "TERM")
+            end
+            next if killed || now <= deadline + TERM_GRACE_SECONDS
+
+            killed = true
+            kill_process_group(pid, "KILL")
           end
           readers.each(&:join)
           RubyLLM::Support::Cancellation.check
@@ -141,10 +162,11 @@ module Tart
           {exit_code:, timed_out:, cancelled: false}
         rescue RubyLLM::CancelledError
           # Interrupted mid-command: kill the whole group with a single -KILL
-          # (I03 backlog carry-in: the preceding -TERM was dead code — the
-          # rescue kills immediately), reap, and let cancellation propagate.
+          # and let cancellation propagate. The reaper thread reaps — this
+          # thread must not waitpid2 the pid itself (the reaper owns it; a
+          # second wait would raise ECHILD).
           kill_process_group(pid, "KILL") if pid
-          Process.waitpid2(pid) if pid
+          reaper&.join(TERM_GRACE_SECONDS)
           raise
         ensure
           readers&.each { |t| t.join(1) rescue nil }
