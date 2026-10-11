@@ -434,11 +434,16 @@ module Tart
           # fiber/thread-local — before and after run in the same execution
           # context, per call, in both of ToolConcurrency's modes.
           Thread.current[:tart_tool_call] = tool_call
+          # I17: arm the per-execution clock (monotonic — pi's
+          # performance.now() delta, nested-tool-calls.ts:82).
+          Thread.current[:tart_tool_started_at] = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           @sink&.call({type: :tool_execution_start, tool_call:})
         end
         @chat.after_tool_result do |result|
+          duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) -
+                     Thread.current[:tart_tool_started_at]
           @sink&.call({type: :tool_execution_end,
-                       tool_call: Thread.current[:tart_tool_call], result:})
+                       tool_call: Thread.current[:tart_tool_call], result:, duration:})
         end
         @chat.after_message do |message|
           # Tool result messages appear atomically; streamed assistant
@@ -479,7 +484,8 @@ module Tart
         when :tool_execution_start
           emit(type: :tool_execution_start, tool_call: item[:tool_call])
         when :tool_execution_end
-          emit(type: :tool_execution_end, tool_call: item[:tool_call], result: item[:result])
+          emit(type: :tool_execution_end, tool_call: item[:tool_call], result: item[:result],
+               duration: item[:duration])
         end
       end
 

@@ -56,6 +56,15 @@ module Tart
       assert types.index(:tool_execution_end) < types.rindex(:agent_end)
       deltas = events.select { |e| e[:type] == :message_update }
       assert deltas.any? { |e| e[:chunk].content == "listing" }, "streamed text deltas must flow"
+
+      # I17 AC2: :tool_execution_end carries the execution's wall duration —
+      # Float seconds off the monotonic clock, always present, 0.0 legitimate
+      # (pi's durationMs; rendered as `Took 0.0s`). Session recording stays
+      # untouched — the replay gap is itemized, not closed.
+      durations = events.select { |e| e[:type] == :tool_execution_end }.map { |e| e[:duration] }
+      assert_equal 1, durations.size
+      assert durations.first.is_a?(Float) && durations.first >= 0.0,
+        "duration must be non-negative Float seconds, got #{durations.first.inspect}"
     end
 
     def test_schema_gating_disabled_tools_never_reach_the_model
