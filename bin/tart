@@ -102,6 +102,7 @@ module Tart
                              context window; the default fireworks model resolves to
                              #{Settings::MODEL_CONTEXT_WINDOWS[Settings::DEFAULTS["defaultModel"]]})
           TART_MCP_CONFIG    MCP config path (default: ~/.tart/mcp.json)
+          TART_IDENTITY      the face to show: pi (default) or tart (--identity overrides)
 
         Keys: type + Enter to send (steers a running agent); Ctrl+C
         interrupts a running turn / quits when idle.
@@ -123,6 +124,10 @@ module Tart
           "resume a session in WORKDIR: ID is a session id or session-file path; default: the most recent") do |id|
           options[:resume] = id
           options[:resume_given] = true
+        end
+        parser.on("--identity IDENTITY",
+          "the face to show: pi (default) or tart (see Identity)") do |identity|
+          options[:identity] = identity
         end
         parser.on("-h", "--help", "show this help") { $stdout.write(usage); exit 0 }
       end.parse!(argv)
@@ -162,6 +167,9 @@ module Tart
     def interactive(options, workdir)
       result = Settings.load(cwd: workdir)
       settings = result.settings
+      # The identity seam (I16): CLI > TART_IDENTITY env > settings
+      # "identity" (Tart::Identity is the one resolution point).
+      identity = resolve_identity(options, settings)
       skills = Skills.load(cwd: workdir)
       require_api_key(settings)
 
@@ -181,7 +189,8 @@ module Tart
           # Autocomplete sources (AC1): the builtin slash commands + the
           # loaded skills (the same catalog the Commands::Handler routes).
           autocomplete: Render::Chat::SlashSource.new(commands: Commands::BUILTINS, skills: skills.skills),
-          motd: resume_path.nil?
+          motd: resume_path.nil?,
+          identity:
         )
         tools = build_tools(workdir, settings)
         prompt = system_prompt(workdir, skills.skills)
@@ -252,17 +261,27 @@ module Tart
       # persisted (pi gates on stdout TTY + isPersisted + the file
       # existing; the port's interactive exit only ever runs on a
       # terminal — the TTY gate is itemized). --print never reaches here.
-      hint = resume_hint(current_recorder)
+      hint = resume_hint(current_recorder, identity)
       $stdout.write("#{hint}\n") if hint
+    end
+
+    # Identity.resolve's invalid value aborts the launch — pi's CLI prints
+    # its errors bare ("Error: <message>", cli.ts:333); the port's
+    # app-name prefix stays (no comparable pi prefix, itemized).
+    def resolve_identity(options, settings)
+      Identity.resolve(cli: options[:identity], settings:)
+    rescue Identity::Error => e
+      abort "tart: #{e.message}"
     end
 
     # pi formatResumeCommand :339-355, the port's flag shape (--resume
     # [ID] IS the specific-id flag; pi's --session <id> is an itemized
-    # deviation): the id resolves through find_session_by_id.
-    def resume_hint(recorder)
+    # deviation): the id resolves through find_session_by_id. The command
+    # word follows the identity (pi-mode's hint reads `pi --resume <id>`).
+    def resume_hint(recorder, identity)
       return nil unless recorder && recorder.persisted?
 
-      "\e[2mTo resume this session:\e[0m tart --resume #{recorder.id}" # dim label, plain command
+      "\e[2mTo resume this session:\e[0m #{identity} --resume #{recorder.id}" # dim label, plain command
     end
 
     # The picker's one-line label: the session's first user message (pi
@@ -276,12 +295,17 @@ module Tart
     end
 
     # Footer facts (AC4): the I10 resolved window is the context-usage
-    # denominator; the model id is the settings-resolved one; the thinking
-    # level rides the settings-resolved value (pi footer.ts:236-239).
+    # denominator; the model id is the settings-resolved one; the model
+    # metadata (provider label + reasoning capability — the footer's model
+    # segment, pi footer.ts:226-258) resolves off the chat's registry
+    # model, stageable via TART_MODEL_PROVIDER / TART_MODEL_REASONING
+    # (Settings); the thinking level rides the settings-resolved value.
     def footer_data(workdir, settings, chat:)
       {
         cwd: workdir,
         model: Settings.resolve_setting("defaultModel", settings),
+        provider: Settings.model_provider_label(settings, chat.model),
+        reasoning: Settings.model_reasoning_capable(settings, chat.model),
         context_window: Settings.resolve_context_window(settings:, model: chat.model),
         auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
         thinking_level: Settings.resolve_thinking_level(settings)

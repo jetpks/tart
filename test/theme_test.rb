@@ -36,6 +36,9 @@ module Tart
       thinkingText: "#96a0a4",        # dark.json:26 okhsl(226 7% 65%) — truecolor
       scrollbarTrack: :blue,      # dark.json:28 okhsl(237 7% 33%) — dark member of the blue pair
       scrollbarThumb: :light_blue, # dark.json:29 okhsl(232 7% 65%) — light member of the blue pair
+      logoCoral: "#e48a7a",       # rgb(228,138,122) — pi-logo.ts:5 (fixed RGB, direct hex)
+      logoBlue: "#4f8eb3",        # rgb(79,142,179) — pi-logo.ts:6
+      logoYellow: "#eab65d",      # rgb(234,182,93) — pi-logo.ts:7
     }.freeze
 
     def test_token_table_carries_the_pi_transcription

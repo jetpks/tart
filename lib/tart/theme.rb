@@ -53,6 +53,11 @@ module Tart
       thinkingText: "#96a0a4",  # dark.json:26 "thinkingText" okhsl(226 7% 65%) → #96a0a4 (pi's own converter)
       scrollbarTrack: :blue,      # dark.json:28 "scrollbarTrack" okhsl(237 7% 33%) — the dark member of the blue pair (transcript gutter track, Chat::scrollbar_glyphs)
       scrollbarThumb: :light_blue, # dark.json:29 "scrollbarThumb" okhsl(232 7% 65%) — the light member of the blue pair (transcript gutter thumb, Chat::scrollbar_glyphs)
+      # The pi logo's brand colors (pi-logo.ts:5-7 — fixed RGB across
+      # themes, direct rgbColor, not okhsl → the hex IS the spec).
+      logoCoral: "#e48a7a",       # rgb(228,138,122) (pi-logo.ts:5)
+      logoBlue: "#4f8eb3",        # rgb(79,142,179) (pi-logo.ts:6)
+      logoYellow: "#eab65d",      # rgb(234,182,93) (pi-logo.ts:7)
     }.freeze
 
     # The markdown converter (Render::Markdown::FG, read-only) emits raw

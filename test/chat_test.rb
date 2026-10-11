@@ -41,15 +41,17 @@ module Tart
     end
 
     def test_completed_message_lands_above_the_live_region_wrapped
-      with_chat do |chat, session|
+      with_chat(width: 12) do |chat, session|
         stream(chat, "aaaa bbbb cccc dddd")
         finish_message(chat, "aaaa bbbb cccc dddd")
         draw(chat, session)
 
         # The completed message is in the buffer; the editor's input line
-        # sits in the docked editor area below it.
-        assert_equal ["aaaa bbbb", "cccc dddd"], transcript_lines(session, chat),
-          "the completed text lands above the live region, wrapped to width"
+        # sits in the docked editor area below it. Every content row carries
+        # pi's outputPad (I16) — the wrap hits the content width (width
+        # minus paddingX both sides, markdown.ts:289).
+        assert_equal [" aaaa bbbb", " cccc dddd"], transcript_lines(session, chat),
+          "the completed text lands above the live region, wrapped to the content width"
         assert_equal [:reversed], session.cell_modifiers(0, input_row(session)),
           "the input line stays in the editor area (the empty line's fake cursor)"
       end
@@ -59,7 +61,7 @@ module Tart
     # deltas render dim (thinkingText, italic) above the live content while
     # it grows.
     def test_streaming_reasoning_renders_dim_above_the_live_content
-      with_chat do |chat, session|
+      with_chat(width: 18) do |chat, session|
         chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
         chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
         draw(chat, session)
@@ -80,7 +82,7 @@ module Tart
     # no toggle/collapse — itemized cut). Text source: the live reasoning
     # buffer — the loop strips Message#thinking before :message_end.
     def test_completed_reasoning_lands_dim_before_the_content
-      with_chat do |chat, session|
+      with_chat(width: 14) do |chat, session|
         chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
         chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
         chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("hi")})
@@ -88,7 +90,7 @@ module Tart
         draw(chat, session)
 
         lines = transcript_lines(session, chat)
-        assert_equal ["pondering", "hi"], lines,
+        assert_equal [" pondering", " hi"], lines,
           "the thinking block lands in the transcript before the content, cleared from the live region"
         y = session.buffer_content.index { |row| row.include?("pondering") }
         x = session.buffer_content[y].index("p")
@@ -102,26 +104,26 @@ module Tart
     # follows; a reasoning-only message gets NO trailing blank. Raw
     # readback — chat.transcript_lines keeps the blank rows.
     def test_blank_line_between_the_reasoning_block_and_the_content
-      with_chat do |chat, session|
+      with_chat(width: 14) do |chat, session|
         chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
         chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
         chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("hi")})
         chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "hi")})
         draw(chat, session)
 
-        assert_equal ["", "pondering", "", "hi"], chat.transcript_lines,
+        assert_equal ["", " pondering", "", " hi"], chat.transcript_lines,
           "leading blank + reasoning + separator + content (pi updateContent order)"
       end
     end
 
     def test_reasoning_only_message_gets_no_trailing_blank
-      with_chat do |chat, session|
+      with_chat(width: 14) do |chat, session|
         chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
         chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
         chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "")})
         draw(chat, session)
 
-        assert_equal ["", "pondering"], chat.transcript_lines,
+        assert_equal ["", " pondering"], chat.transcript_lines,
           "the reasoning-only message ends at the reasoning block (pi :172-174 gates the spacer on content)"
       end
     end
@@ -135,7 +137,7 @@ module Tart
         finish_message(chat, "two")
         draw(chat, session)
 
-        assert_equal ["", "one", "", "two"], chat.transcript_lines,
+        assert_equal ["", " one", "", " two"], chat.transcript_lines,
           "each assistant message opens with the blank line (the between-item separation)"
       end
     end
@@ -173,7 +175,7 @@ module Tart
         assert_equal [:reversed], session.cell_modifiers(0, input_row(session)),
           "input line visible after tool end (the empty line's fake cursor)"
         # transcript_lines strips per-row whitespace (buffer rows are padded).
-        assert_equal ["⎿ bash: done", "more"], transcript_lines(session, chat),
+        assert_equal ["  ⎿ bash: done", "    more"], transcript_lines(session, chat),
           "the tool result lifecycle renders into the transcript as a multi-line excerpt"
       end
     end
@@ -183,7 +185,7 @@ module Tart
         tool_start(chat, "bash")
         tool_end(chat, "bash", "one\ntwo\nthree\nfour\nfive")
         draw(chat, session)
-        assert_equal ["⎿ bash: one", "two", "three", "…"], transcript_lines(session, chat),
+        assert_equal ["  ⎿ bash: one", "    two", "    three", "    …"], transcript_lines(session, chat),
           "the preview shows a bounded multi-line excerpt, then an ellipsis"
       end
     end
@@ -253,9 +255,9 @@ module Tart
         finish_message(chat, "second")                       # assistant
         draw(chat, session) # the frame's flush moves every region into the buffer
 
-        assert_equal ["hi", "", "pondering", "", "answer", "", "  ⎿ bash: done", "    more", "", "again", "", "second"],
+        assert_equal ["", " hi", "", "", " pondering", "", " answer", "", "  ⎿ bash: done", "    more", "", "", " again", "", "", " second"],
           chat.transcript_lines,
-          "every region opens with the leading blank (the first echo on an empty container does not)"
+          "pi's region padding: the first echo rides its padY wrap (no container spacer), later regions get the spacer + pad rows"
       end
     end
 
@@ -353,8 +355,8 @@ module Tart
 
       request = captured.first
       assert_equal "hi", request["messages"].select { |m| m["role"] == "user" }.last["content"]
-      assert_equal ["hi"], chat.transcript_lines,
-        "the submitted prompt is echoed into the transcript"
+      assert_equal ["", " hi", ""], chat.transcript_lines,
+        "the submitted prompt is echoed into the transcript (paddingY wrap, outputPad)"
     end
 
     def test_enter_while_running_steers
@@ -492,12 +494,14 @@ module Tart
 
     # --- the startup MOTD (item 12/AC9) and /new (item 11/AC8) ---
 
-    # The MOTD block on the first frame: logo placeholder, version, hints
-    # (the PORT's real keys), then [Context] (the config sources the port
-    # actually loads — fixture roots only) and [Skills] (sorted names, dim,
-    # one wrapped compact list — pi formatCompactList). pi's [Prompts],
-    # [Extensions], [Themes], package-updates, expand machinery and
-    # onboarding line are cut — the port loads none of them, itemized.
+    # The MOTD block on the first frame (tart-mode): the owner's art,
+    # version, hints (the PORT's real keys), then [Context] (the config
+    # sources the port actually loads — fixture roots only) and [Skills]
+    # (sorted names, dim, one wrapped compact list — pi formatCompactList).
+    # pi's [Prompts], [Extensions], [Themes], package-updates and expand
+    # machinery are cut — the port loads none of them, itemized. Every
+    # content row carries the outputPad; the header rides its Spacer(1)
+    # pair (interactive-mode.ts:1075-1077).
     def test_motd_renders_logo_version_hints_context_and_skills
       FileUtils.mkpath(File.join(@dir, ".tart", "skills", "greet"))
       File.write(File.join(@dir, ".tart", "skills", "greet", "SKILL.md"),
@@ -507,15 +511,16 @@ module Tart
       source = Render::Chat::SlashSource.new(commands: {"new" => {description: "x"}}, skills: skills)
       TUI.run(headless: true, viewport: :fullscreen, width: 60, screen_height: 24) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
-          settings_root: @dir, autocomplete: source,
+          settings_root: @dir, autocomplete: source, identity: "tart",
           footer_data: {cwd: @dir})
         draw(chat, session)
         lines = chat.transcript_lines
 
+        assert_equal "", lines.first, "the header container opens with its Spacer(1)"
         art = Dir[File.join(Render::Chat::LOGOS_DIR, "*.txt")].map { |f| File.readlines(f, chomp: true) }
-        assert art.any? { |piece| (piece - lines).empty? },
-          "a random logo piece from the owner's collection renders in full"
-        assert_includes lines, "tart v#{Tart::VERSION}", "the version line renders Tart::VERSION"
+        assert art.any? { |piece| (piece.map { |line| " #{line}" } - lines).empty? },
+          "a random logo piece from the owner's collection renders in full (padded)"
+        assert_includes lines, " tart v#{Tart::VERSION}", "the version line renders Tart::VERSION (padded)"
         assert_includes lines.join, "/ commands", "the hints line carries the port's real keys"
         refute_includes lines.join, "! ", "no `!` bash hint — the port has no bash mode"
 
@@ -523,7 +528,10 @@ module Tart
         skills_i = lines.index { |line| line.include?("[Skills]") }
         refute_nil context_i, "the [Context] section renders"
         refute_nil skills_i, "the [Skills] section renders"
-        assert_includes lines[context_i + 1, 3].join, File.join(@dir, ".tart", "settings.json"),
+        # The compact list word-wraps (pi formatCompactList); every wrapped
+        # row re-carries the outputPad, so the joined rows read the path
+        # with pad spaces at the breaks.
+        assert_includes lines[context_i + 1, 3].join.delete(" "), File.join(@dir, ".tart", "settings.json"),
           "the loaded project settings file is listed"
         assert_includes lines[skills_i + 1].strip, "greet", "the loaded skills are listed"
         refute_includes lines.join, "[Prompts]", "the sections the port doesn't load are cut"
@@ -539,11 +547,40 @@ module Tart
     def test_motd_is_omitted_sections_when_nothing_loaded
       TUI.run(headless: true, viewport: :fullscreen, width: 60, screen_height: 24) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
+          settings_root: @dir, footer_data: {cwd: @dir}, identity: "tart")
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_includes lines.join, "tart v#{Tart::VERSION}", "the art + version always render"
+        refute_includes lines.join, "[Skills]", "no skills → no section (pi gates each on entries)"
+      end
+    end
+
+    # pi-mode's MOTD (I16 AC2): the oracle's built-in header bytes — the
+    # half-block mark with the tracked oracle version on its first line,
+    # the hints on its second, the ctrl+o notice, then the onboarding
+    # line (pi interactive-mode.ts:1028-1063) — and NO resource sections
+    # (pi's collapsed header shows none). No tart art/version/hints.
+    def test_motd_renders_pi_header_bytes_in_pi_mode
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 24) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
           settings_root: @dir, footer_data: {cwd: @dir})
         draw(chat, session)
         lines = chat.transcript_lines
-        assert_includes lines.join, "tart v#{Tart::VERSION}", "the logo + version always render"
-        refute_includes lines.join, "[Skills]", "no skills → no section (pi gates each on entries)"
+
+        assert_equal "", lines.first, "the header container opens with its Spacer(1)"
+        assert_equal " ▀▀█  v#{Identity::ORACLE_VERSION}", lines[1], "the mark's first line carries the version"
+        assert_equal " █▀ █ #{Render::Chat::PI_HINTS_LINE}", lines[2], "the mark's second line carries the hints"
+        assert_equal " #{Render::Chat::PI_NOTICE_LINE}", lines[3], "the ctrl+o notice"
+        assert_equal "", lines[4], "the header text's blank row"
+        assert_equal " #{Render::Chat::PI_ONBOARDING_LINE}", lines[5], "the onboarding line"
+        assert_equal "", lines[6], "the header container closes with its Spacer(1)"
+        assert_empty lines[7..], "no [Context]/[Skills] in pi's collapsed header"
+
+        mark = session.buffer_content[1]
+        assert_equal Theme[:logoCoral], session.cell_fg(1, 1), "the top pixel renders coral (pi-logo.ts)"
+        assert_equal Theme[:logoBlue], session.cell_bg(1, 1), "the top pixel's blue under-half"
+        assert_equal Theme[:logoYellow], session.cell_fg(4, 2), "the bottom mark's yellow pixel"
+        assert_equal Theme[:dim], session.cell_fg(6, 1), "the version renders dim"
       end
     end
 
@@ -556,7 +593,7 @@ module Tart
     def test_new_command_clears_the_transcript_and_renders_the_motd
       @server = MockLLMServer.new.start
       @server.script([{type: :message, content: "answer"}])
-      kernel, chat, session = chat_with_server(motd: true)
+      kernel, chat, session = chat_with_server(motd: true, identity: "tart")
       chat.commands = Commands::Handler.new(
         skills: [], settings: {},
         output: ->(text) { chat.command_line(text) },
@@ -696,8 +733,8 @@ module Tart
       kernel.run
       scenario.join
 
-      assert_equal ["hi", "", "Title", "", "plain body"], chat.transcript_lines,
-        "the assistant reply renders as markdown rows in the transcript (leading blank, then the spacing row between blocks)"
+      assert_equal ["", " hi", "", "", " Title", " ", " plain body"], chat.transcript_lines,
+        "the assistant reply renders as markdown rows in the transcript (the echo's padY bottom + the message's leading blank, then the spacing row between blocks)"
     end
 
     def test_wrap_row_wraps_styled_rows_preserving_spans
@@ -782,23 +819,35 @@ module Tart
       end
     end
 
-    # Thinking level in the footer (item 8/AC6, pi footer.ts:226-244): the
-    # right side renders +model • <level>+ from the injected
-    # footer_data[:thinking_level]; nil → the model alone (the frozen
-    # cross-lane contract — in this worktree the key is not yet wired, the
-    # test injects it directly).
+    # The footer's model segment (I16, pi footer.ts:226-258): the level
+    # rides as +model • <level>+ ONLY when the model is reasoning-capable
+    # (state.model?.reasoning), and the provider label prefixes the
+    # segment — +(<provider>) <model>+.
     def test_footer_renders_the_thinking_level_right_aligned
       with_chat(width: 40, screen_height: 12,
-        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "high"}) do |chat, session|
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "high", reasoning: true}) do |chat, session|
         draw(chat, session)
         assert_includes footer_text(session), "m • high", "model • <level> on the right side"
         assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("m • high"),
           "the model+level right-aligns (footer.ts padding rule)"
 
-        chat.footer_data = {cwd: @dir, model: "m", context_window: 1000}
+        chat.footer_data = {cwd: @dir, model: "m", context_window: 1000, thinking_level: "high"}
         draw(chat, session)
-        assert_includes footer_text(session), "m", "nil → the model alone"
-        refute_includes footer_text(session), "•", "no level bullet without the key"
+        assert_includes footer_text(session), "m", "the model alone"
+        refute_includes footer_text(session), "•", "no level bullet without reasoning capability"
+      end
+    end
+
+    # The provider label (I16, pi footer.ts:246-258): the launcher-
+    # resolved provider label prefixes the model segment; no label → the
+    # bare model (pi's single-provider fallthrough).
+    def test_footer_renders_the_provider_label
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, provider: "mock"}) do |chat, session|
+        draw(chat, session)
+        assert_includes footer_text(session), "(mock) m", "the provider label prefixes the model"
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("(mock) m"),
+          "the labeled model right-aligns"
       end
     end
 
@@ -847,7 +896,7 @@ module Tart
         chat.on_event(TUI.key_event("enter"))
         assert_equal "", chat.input, "enter submits and clears the input line"
         draw(chat, session) # the frame's flush moves the echo into the buffer
-        assert_equal ["hi ther"], chat.transcript_lines,
+        assert_equal ["", " hi ther", ""], chat.transcript_lines,
           "the submitted prompt is echoed into the transcript"
         assert_equal 1, chat_idle_kernel.submitted.size, "an idle submit starts an agent run"
       end
@@ -968,8 +1017,10 @@ module Tart
         assert_equal "!A", chat.input, "a recalled entry is editable at the cursor"
         chat.on_event(TUI.key_event("enter"))
         draw(chat, session) # the frame's flush moves the echo into the buffer
-        assert_equal ["A", "", "B", "", "!A"], chat.transcript_lines,
-          "the edited recall sends as edited (after the two original echoes)"
+        # Echo 1 on an empty container: padY wrap only (no leading spacer,
+        # interactive-mode.ts:3930-3931); later echoes get the spacer too.
+        assert_equal ["", " A", "", "", "", " B", "", "", "", " !A", ""], chat.transcript_lines,
+          "the edited recall sends as edited (after the two original echoes: padY wrap + spacer + pad rows)"
       end
     end
 
@@ -1167,7 +1218,7 @@ module Tart
         chat.on_event(TUI.key_event("enter"))
         assert_equal "", chat.input
         draw(chat, session)
-        assert_equal ["/architect"], transcript_lines(session, chat),
+        assert_equal [" /architect"], transcript_lines(session, chat),
           "enter applies AND submits (pi editor.ts:790-816 — a /-prefix completion falls through to submit, trimmed)"
       end
     end
@@ -1251,18 +1302,18 @@ module Tart
       with_chat(width: 20, screen_height: 12) do |chat, session|
         20.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session)
-        assert_equal "line19", transcript_view(session, chat).last, "following: the tail is visible"
+        assert_equal " line19", transcript_view(session, chat).last, "following: the tail is visible"
 
         chat.on_event(TUI.key_event("page_up"))
         draw(chat, session)
         visible = transcript_view(session, chat)
         refute_includes visible, "line19", "a page up detaches from the end"
         assert_equal 26, chat.scroll_offset, "one page = the transcript viewport rows (7 off 33)"
-        assert_includes visible, "line13", "the window sits a page back into the transcript"
+        assert_includes visible, " line13", "the window sits a page back into the transcript"
 
         chat.on_event(TUI.key_event("page_down"))
         draw(chat, session)
-        assert_equal "line19", transcript_view(session, chat).last,
+        assert_equal " line19", transcript_view(session, chat).last,
           "a page down from the page-up position lands at the end and re-follows"
       end
     end
@@ -1285,7 +1336,7 @@ module Tart
         refute_includes transcript_view(session, chat), "late", "a paged view pans one page, not to the end"
         chat.on_event(TUI.key_event("page_down"))
         draw(chat, session)
-        assert_equal "late", transcript_view(session, chat).last,
+        assert_equal " late", transcript_view(session, chat).last,
           "landing at the end re-follows the new output"
       end
     end
@@ -1351,7 +1402,7 @@ module Tart
         draw(chat, session)
         finish_message(chat, "late")
         draw(chat, session)
-        assert_equal "late", transcript_view(session, chat).last,
+        assert_equal " late", transcript_view(session, chat).last,
           "landing at the end re-arms follow-end (scroll-view.ts:127-135)"
       end
     end
@@ -1362,17 +1413,17 @@ module Tart
         draw(chat, session)
         y = buffer_row(chat, "hello world")
 
-        chat.on_event(TUI.mouse_event(kind: "down", x: 6, y:, button: "left"))
-        chat.on_event(TUI.mouse_event(kind: "drag", x: 10, y:, button: "left"))
+        chat.on_event(TUI.mouse_event(kind: "down", x: 7, y:, button: "left"))
+        chat.on_event(TUI.mouse_event(kind: "drag", x: 11, y:, button: "left"))
         draw(chat, session)
-        (6..10).each do |x|
+        (7..11).each do |x|
           assert_equal [:reversed], session.cell_modifiers(x, y), "cell #{x} is inverse-highlighted"
         end
-        assert_empty session.cell_modifiers(5, y), "the cell before the anchor is unhighlighted"
-        assert_empty session.cell_modifiers(11, y), "the cell after the focus is unhighlighted"
+        assert_empty session.cell_modifiers(6, y), "the cell before the anchor is unhighlighted"
+        assert_empty session.cell_modifiers(12, y), "the cell after the focus is unhighlighted"
 
         copied = capture_stdout do
-          chat.on_event(TUI.mouse_event(kind: "up", x: 10, y:, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "up", x: 11, y:, button: "left"))
         end
         assert_equal "world", copied_text(copied), "copy-on-select copies the drag range (OSC 52)"
       end
@@ -1415,10 +1466,11 @@ module Tart
           chat.on_event(TUI.mouse_event(kind: "down", x: 4, y:, button: "left"))
         end
         draw(chat, session)
-        (0...line_width).each do |x|
+        # The line's outputPad is part of the row (and of the selection).
+        (0...(line_width + 1)).each do |x|
           assert_equal [:reversed], session.cell_modifiers(x, y), "line cell #{x} is highlighted"
         end
-        assert_empty session.cell_modifiers(line_width, y), "nothing beyond the line"
+        assert_empty session.cell_modifiers(line_width + 1, y), "nothing beyond the line"
       end
     end
 
@@ -1589,7 +1641,7 @@ module Tart
       request = captured.first
       assert_equal "still there", request["messages"].select { |m| m["role"] == "user" }.last["content"],
         "idle escape neither quit the loop nor disturbed the editor"
-      assert_equal ["still there"], chat.transcript_lines, "only the echo — no interrupt residue"
+      assert_equal ["", " still there", ""], chat.transcript_lines, "only the echo — no interrupt residue"
     end
 
     # --- /resume picker (item 2/AC2, pi SessionSelectorComponent reduced)
@@ -1764,10 +1816,10 @@ module Tart
     # Kernel-driven tests: ScriptedSession feeds the real poller/frame loop.
     # (motd: false — the MOTD block is pinned by its own tests; these pin
     # transcript/editor behavior. The bin/tart default renders it.)
-    def chat_with_server(tools: {}, autocomplete: nil, motd: false)
+    def chat_with_server(tools: {}, autocomplete: nil, motd: false, identity: Identity::DEFAULT)
       session = ScriptedSession.new(width: 80, height: 24)
       kernel = Core::Loop.new(session:)
-      chat = Render::Chat.new(session:, kernel:, branch_reader: nil, autocomplete:, motd:)
+      chat = Render::Chat.new(session:, kernel:, branch_reader: nil, autocomplete:, motd:, identity:)
       chat.agent = Agent::Loop.new(
         chat: TestChat.build(@server, tools: tools.values, system_prompt: "test"),
         tools:, on_event: ->(event) { chat.on_agent_event(event) }
@@ -1858,7 +1910,7 @@ module Tart
 
     # The buffer's transcript rows, stripped and non-empty.
     def transcript_lines(session, chat)
-      session.buffer_content[0, transcript_height(session, chat)].map(&:strip).reject(&:empty?)
+      session.buffer_content[0, transcript_height(session, chat)].map(&:rstrip).reject(&:empty?)
     end
 
     # The editor area rows (block borders + inner content).

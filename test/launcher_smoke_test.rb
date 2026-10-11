@@ -78,6 +78,11 @@ module Tart
       assert_equal "/somewhere", data[:cwd]
       assert_equal "medium", data[:thinking_level]
       assert data.key?(:model) && data.key?(:context_window) && data.key?(:auto_compact)
+      # The model metadata (I16, pi footer.ts:226-258): the assumed model
+      # falls back to the provider slug it was built with; not
+      # reasoning-capable.
+      assert_equal "openai", data[:provider]
+      refute data[:reasoning], "an assumed model carries no reasoning capability"
 
       data = Executable.footer_data("/somewhere", settings.merge("thinkingLevel" => "off"), chat: chat)
       assert_equal "off", data[:thinking_level]
@@ -106,21 +111,25 @@ module Tart
     # interactive-mode.ts:339-355 + the :4324 print): exact shape (dim
     # label, plain command) when the session was persisted; nothing when
     # not (pi's isPersisted gate; the isTTY gate is itemized — the port's
-    # interactive exit only ever runs on a terminal).
+    # interactive exit only ever runs on a terminal). The command word
+    # follows the identity (I16).
     def test_resume_hint_shape_and_not_persisted_branch
       launcher
       recorder = Object.new.tap do |r|
         r.define_singleton_method(:persisted?) { true }
         r.define_singleton_method(:id) { "abc123" }
       end
-      assert_equal "\e[2mTo resume this session:\e[0m tart --resume abc123", Executable.resume_hint(recorder)
+      assert_equal "\e[2mTo resume this session:\e[0m tart --resume abc123",
+        Executable.resume_hint(recorder, "tart")
+      assert_equal "\e[2mTo resume this session:\e[0m pi --resume abc123",
+        Executable.resume_hint(recorder, "pi"), "pi-mode's hint reads pi --resume"
 
       unpersisted = Object.new.tap do |r|
         r.define_singleton_method(:persisted?) { false }
         r.define_singleton_method(:id) { "abc123" }
       end
-      assert_nil Executable.resume_hint(unpersisted), "nothing when the session was never persisted"
-      assert_nil Executable.resume_hint(nil), "no recorder (boot failure) — nothing"
+      assert_nil Executable.resume_hint(unpersisted, "tart"), "nothing when the session was never persisted"
+      assert_nil Executable.resume_hint(nil, "tart"), "no recorder (boot failure) — nothing"
     end
 
     def smoke_env(home, server)

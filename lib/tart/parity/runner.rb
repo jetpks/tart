@@ -141,12 +141,12 @@ module Tart
       # survives teardown, and no real HOME dotfile is ever touched (staged
       # HOME on every pane, pi included).
       def pi_command(home, agent_dir)
-        "exec env #{env_list(
+        "exec env #{env_list(staged_env("pi",
           "HOME" => home,
           "PATH" => "#{File.dirname(@pi_bin)}:#{ENV.fetch('PATH', '')}",
           "PI_CODING_AGENT_DIR" => agent_dir,
           "PI_OFFLINE" => "1"
-        )} #{Shellwords.escape(@pi_bin)} --model mock/mock-1"
+        ))} #{Shellwords.escape(@pi_bin)} --model mock/mock-1"
       end
 
       def tart_command(sandbox, home, port)
@@ -156,7 +156,7 @@ module Tart
         # `bundle check` clean under a staged HOME, no .bundle/ created). An
         # empty BUNDLE_PATH HIDES those gems (bundler exits before boot),
         # which is why I01 shipped a pre-populated bundle dir.
-        "cd #{Shellwords.escape(@tart_dir)} && exec env #{env_list(
+        "cd #{Shellwords.escape(@tart_dir)} && exec env #{env_list(staged_env("tart",
           "HOME" => home,
           "PATH" => "#{File.dirname(@bundle_bin)}:#{ENV.fetch('PATH', '')}",
           "BUNDLE_FROZEN" => "true",
@@ -165,7 +165,14 @@ module Tart
           "TART_API_KEY" => "mock-key",
           "TART_API_BASE" => "http://127.0.0.1:#{port}",
           "TART_CONTEXT_WINDOW" => "32768"
-        )} #{Shellwords.escape(@bundle_bin)} exec bin/tart #{Shellwords.escape(sandbox)}"
+        ))} #{Shellwords.escape(@bundle_bin)} exec bin/tart #{Shellwords.escape(sandbox)}"
+      end
+
+      # The scenario's per-app env overrides (Scenario#env — the
+      # branding/staging seam) layered over the runner's staged env;
+      # overrides win.
+      def staged_env(app, env)
+        env.merge(@scenario.env.fetch(app, {}))
       end
 
       def env_list(env)
