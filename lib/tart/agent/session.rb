@@ -2,6 +2,7 @@
 
 require_relative "../compaction"
 
+require "fast/uuid"
 require "json"
 require "securerandom"
 require "fileutils"
@@ -51,11 +52,7 @@ module Tart
 
       # Time-ordered session id (pi createSessionId :264 uses uuidv7).
       def uuidv7(time: Time.now)
-        hex = ((time.to_f * 1000).round & 0xFFFFFFFFFFFF).to_s(16).rjust(12, "0")
-        hex << format("%04x", rand(1 << 12) | 0x7000) # version 7
-        hex << format("%04x", rand(1 << 14) | 0x8000) # variant 10
-        hex << format("%012x", rand(1 << 48))
-        [hex[0, 8], hex[8, 4], hex[12, 4], hex[16, 4], hex[20, 12]].join("-")
+        Fast::UUID.uuid_v7(time:)
       end
 
       # 8-hex entry id, collision-checked (pi generateId :275; falls back to
@@ -65,7 +62,7 @@ module Tart
           id = SecureRandom.hex(4)
           return id unless taken.include?(id)
         end
-        SecureRandom.uuid
+        Fast::UUID.uuid_v4
       end
 
       # The port's agent root (~/.tart; pi's is ~/.pi/agent, config.ts
