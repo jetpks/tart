@@ -1121,12 +1121,15 @@ module Tart
       def skill_panel_rows(block, expanded:)
         bg = Theme[:custom_message_bg]
         # pi: theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) —
-        # the trailing space rides the LABEL's run.
-        label = TUI.span("[skill] ", fg: Theme[:custom_message_label], modifiers: [:bold])
+        # the trailing space rides the LABEL's run. Every span carries the
+        # panel bg itself — the bg is per-SPAN in the gem's emission, and
+        # a span without one resets it (^[[49m — the transparent-text
+        # defect).
+        label = TUI.span("[skill] ", fg: Theme[:custom_message_label], modifiers: [:bold], bg: bg)
         unless expanded
           line = padded_spans_row(
-            [label, TUI.span(block.name, fg: Theme[:custom_message_text]),
-             TUI.span(" (ctrl+o to expand)", fg: Theme[:dim])], bg
+            [label, TUI.span(block.name, fg: Theme[:custom_message_text], bg: bg),
+             TUI.span(" (ctrl+o to expand)", fg: Theme[:dim], bg: bg)], bg
           )
           return [panel_blank_line(bg), line, panel_blank_line(bg)]
         end

@@ -1276,8 +1276,15 @@ module Tart
         assert_includes session.cell_modifiers(buffer_row.index("["), y_abs), :bold
         assert_equal Theme[:custom_message_text], session.cell_fg(buffer_row.index("greet"), y_abs)
         assert_equal Theme[:dim], session.cell_fg(buffer_row.index("(ctrl+o"), y_abs)
+        # The bg is per-SPAN in the gem's emission — every styled cell of
+        # the row carries the panel bg, not just the pad/tail (the
+        # transparent-text defect: an unstyled span resets it, ^[[49m).
         assert_equal Theme[:custom_message_bg], session.cell_bg(0, y_abs),
-          "the panel rides the customMessageBg container"
+          "the pad cell rides the customMessageBg container"
+        assert_equal Theme[:custom_message_bg], session.cell_bg(buffer_row.index("greet"), y_abs),
+          "the NAME cell rides the panel bg too"
+        assert_equal Theme[:custom_message_bg], session.cell_bg(buffer_row.index("(ctrl+o"), y_abs),
+          "the hint cell rides the panel bg too"
         prompt_y = session.buffer_content.index { |buffer_row| buffer_row.include?("hello world") }
         assert_equal Theme[:user_message_bg], session.cell_bg(0, prompt_y),
           "the prompt below echoes as a normal user message"
