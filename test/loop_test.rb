@@ -16,6 +16,24 @@ module Tart
         "the first frame must render at boot, before any input event"
     end
 
+    # request_draw (I20, pi requestRenderCallback): exactly one frame, no
+    # animation window — the scrollbar-hide timer's hide redraw. A wake
+    # alone never draws (the poller's synthetic-drain wake); the explicit
+    # dirty mark does.
+    def test_request_draw_wakes_exactly_one_frame
+      session = ScriptedSession.new
+      event_loop = Core::Loop.new(session:, renderer: -> { "frame" })
+
+      event_loop.run do
+        wait_until { !session.drawn.empty? } # the boot frame
+        event_loop.async { event_loop.request_draw }
+        wait_until { event_loop.stats[:draws] > 1 }
+      end
+
+      assert_equal 2, event_loop.stats[:draws],
+        "request_draw = one dirty frame, then the loop is event-driven again"
+    end
+
     def test_native_events_round_trip_through_poller_and_queue
       session = ScriptedSession.new
       received = Queue.new

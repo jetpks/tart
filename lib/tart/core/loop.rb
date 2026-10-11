@@ -141,6 +141,16 @@ module Tart
         @animation_deadline && now < @animation_deadline
       end
 
+      # Requests exactly one redraw (pi requestRenderCallback): marks the
+      # next frame dirty and wakes an idle loop. Unlike {#animate} it opens
+      # no animation window — one frame, then the loop is event-driven
+      # again (the I20 scrollbar-hide timer's hide redraw). Reactor context
+      # only (the dirty flag is reactor state).
+      def request_draw
+        @dirty = true
+        signal(WAKE)
+      end
+
       # Spawns a task on the reactor. Reactor context only (call from the
       # work block or tasks it spawned).
       def async(&block)

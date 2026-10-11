@@ -465,6 +465,22 @@ module Tart
       end
     end
 
+    # The notice's fg (AC6, the I19 carry-forward): pi renders the
+    # model-facing truncation notice in the warning fg (bash.ts:88-99
+    # theme.fg("warning", ...)), not the inherited tool_output.
+    def test_bash_truncation_notice_renders_the_warning_fg
+      output = Array.new(8) { |i| "line #{i + 1}" }.join("\n") +
+               "\n\n[Showing lines 5-8 of 8. Full output: /tmp/full.txt]"
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", output, arguments: {"command" => "big"})
+        draw(chat, session)
+
+        y = session.buffer_content.index { |row| row.include?("Full output") }
+        assert_equal Theme[:warning], session.cell_fg(1, y),
+          "the truncation notice renders pi's warning fg (bash.ts:88-99)"
+      end
+    end
+
     # The replay path shares enqueue_bash_block (I17's shape-sharing
     # ruling): the recorded 12-line output collapses through the same
     # rows, no Took (the recorded duration gap).
@@ -713,16 +729,52 @@ module Tart
         draw(chat, session)
 
         buffer = session.buffer_content
-        assert_includes buffer[0, transcript_height(session, chat)].join, "hello", "transcript on top"
-        assert_includes buffer[transcript_height(session, chat), 3].join, "─", "the edit box below it"
-        assert_equal "─", buffer[transcript_height(session, chat) + 2][0],
+        top = transcript_height(session, chat)
+        assert_includes buffer[0, top].join, "hello", "transcript on top"
+        assert_equal "", buffer[top].rstrip, "the dock's widgets-above spacer row sits between transcript and editor"
+        assert_includes buffer[top + 1, 3].join, "─", "the edit box below it"
+        assert_equal "─", buffer[top + 3][0],
           "the editor's bottom border, full-width from column 0 (pi editor.ts)"
-        refute_includes buffer[transcript_height(session, chat), 3].join, "│",
+        refute_includes buffer[top + 1, 3].join, "│",
           "no east/west borders (pi: horizontal borders only)"
         footer = buffer[-2, 2].join
         assert_includes footer, "~ (main)", "the footer carries the ~-contracted cwd and branch"
         assert_includes footer, "0.0%/1.0k (auto)", "the footer carries context usage vs the resolved window (pi's 0.0% boot state)"
         assert_includes footer, "test-model", "the footer carries the model id"
+      end
+    end
+
+    # The transcript viewport budget = pi's dock accounting (AC2):
+    # dock = widgets-above Spacer(1) + editor + footer (chat-viewport.ts
+    # :22-45; interactive-mode.ts:966-968 renderWidgetContainer
+    # spacerWhenEmpty: true) — the blank dock row renders between the
+    # transcript and the editor and the budget drops by one row.
+    def test_dock_spacer_row_renders_between_transcript_and_editor
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        4.times { |i| finish_message(chat, "p#{i}") } # 8 display rows, viewport 6
+        draw(chat, session)
+
+        buffer = session.buffer_content
+        assert_equal 2, chat.scroll_offset, "the settled window shows the last 6 of 8 buffer rows"
+        assert_equal " p3", buffer[5].rstrip, "the transcript viewport ends at row 5 — the budget dropped one row"
+        assert_equal "", buffer[6].rstrip, "the widgets-above default Spacer(1) renders a blank dock row"
+        assert_equal "─", buffer[7][0], "the editor's top border follows the spacer row"
+      end
+    end
+
+    # The Grounds' probe shape (AC1): buffer rows = viewport + 1 — the
+    # settled follow-end window starts one row down; the top mark row is
+    # scrolled off (the mechanism behind pi offset 2 / pre-I20 tart
+    # offset 1 on the 25-paragraph probe).
+    def test_settled_window_overflow_by_one_scrolls_the_top_mark_off
+      with_chat(width: 40, screen_height: 13) do |chat, session| # viewport 7
+        4.times { |i| finish_message(chat, "probe p0#{i + 1}") } # 8 display rows
+        draw(chat, session)
+
+        assert_equal 1, chat.scroll_offset, "overflow-by-one settles exactly one row down"
+        view = transcript_view(session, chat)
+        assert_equal " probe p01", view.first, "the window starts at the second buffer row — the top row is off-window"
+        assert_equal " probe p04", view.last, "the window ends at the final reply"
       end
     end
 
@@ -1720,8 +1772,8 @@ module Tart
         draw(chat, session)
         visible = transcript_view(session, chat)
         refute_includes visible, "line19", "a page up detaches from the end"
-        assert_equal 26, chat.scroll_offset, "one page = the transcript viewport rows (7 off 33)"
-        assert_includes visible, " line13", "the window sits a page back into the transcript"
+        assert_equal 28, chat.scroll_offset, "one page = the transcript viewport rows (6 off 34)"
+        assert_includes visible, " line14", "the window sits a page back into the transcript"
 
         chat.on_event(TUI.key_event("page_down"))
         draw(chat, session)
@@ -1739,7 +1791,7 @@ module Tart
 
         finish_message(chat, "late")
         draw(chat, session)
-        assert_equal 26, chat.scroll_offset,
+        assert_equal 28, chat.scroll_offset,
           "the detached view stays put while output streams"
         refute_includes transcript_view(session, chat), "late"
 
@@ -1762,24 +1814,104 @@ module Tart
       end
     end
 
-    def test_scrollbar_renders_only_when_content_overflows
-      with_chat(width: 20, screen_height: 12) do |chat, session|
+    # The auto rail's transient semantics (AC2, pi scroll-view.ts): it
+    # paints ONLY while scroll activity is fresh — a settled screen never
+    # shows it, even on overflow (the I19-era "renders when the view
+    # overflows" shape is retired; pi isScrollbarVisible :74-78).
+    def test_scrollbar_is_hidden_at_settle_and_when_content_fits
+      with_chat(width: 20, screen_height: 12) do |chat, session, _kernel|
         2.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session)
-        assert_equal " ", session.cell_symbol(19, 0), "no gutter glyphs when the view fits (pi 'auto')"
+        (0...transcript_height(session, chat)).each do |y|
+          assert_equal " ", session.cell_symbol(19, y), "no rail glyphs when the view fits (scroll-view.ts:74-78)"
+        end
 
         20.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session)
-        assert_equal "┃", session.cell_symbol(19, 5), "the thumb pins to the track bottom while following"
-        assert_equal Theme[:scrollbarThumb], session.cell_fg(19, 5), "the thumb routes through the theme (pi's blue-tinted token)"
+        (0...transcript_height(session, chat)).each do |y|
+          assert_equal " ", session.cell_symbol(19, y),
+            "no rail glyphs at settle even on overflow — the transient rail never painted (scroll-view.ts:74-78)"
+        end
+      end
+    end
+
+    def test_scrollbar_shows_while_fresh_and_hides_after_the_delay
+      with_chat(width: 20, screen_height: 12) do |chat, session, kernel|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session) # settle: the buffer flushes, follow pins to the end
+        chat.scrollbar_hide_delay_ms = 10_000 # fresh for the duration of the test — no real sleeps
+        chat.on_event(TUI.key_event("page_up"))
+        draw(chat, session)
+        assert_equal "┃", session.cell_symbol(19, 4), "the thumb paints the last column while activity is fresh (offset 28 of 34 → thumb rows 3-4)"
+        assert_equal Theme[:scrollbarThumb], session.cell_fg(19, 4), "the thumb routes through the theme (pi's blue-tinted token)"
         assert_equal "│", session.cell_symbol(19, 0), "the track fills above the thumb"
+        assert_equal "│", session.cell_symbol(19, 5), "the track fills below the thumb"
         assert_equal Theme[:scrollbarTrack], session.cell_fg(19, 0)
+
+        chat.scrollbar_hide_delay_ms = 0 # the timer reads the delay at fire time
+        kernel.fire_timers
+        draw(chat, session)
+        assert_equal " ", session.cell_symbol(19, 4),
+          "auto-hidden after scrollbarHideDelayMs (scroll-view.ts:55, 97-118) — the hide frame repaints rail-less"
+      end
+    end
+
+    # Mark sites (AC2): the user-scroll seams (pi scrollTo/scrollBy/
+    # scrollToStart/scrollToEnd analogs — page keys and the wheel) mark
+    # activity; the render-time follow-end adjustment never does (pi
+    # updateLayout :180-192), and a clamped no-op scroll marks nothing
+    # (pi scrollBy: moved === 0).
+    def test_user_scroll_marks_scrollbar_activity_follow_end_does_not
+      with_chat(width: 20, screen_height: 12) do |chat, session, kernel|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        chat.scrollbar_hide_delay_ms = 10_000 # fresh for the duration of the test — no real sleeps
+
+        finish_message(chat, "late") # new output lands while following
+        draw(chat, session)
+        assert_equal " ", session.cell_symbol(19, 5),
+          "the follow-end adjustment never marks activity (pi updateLayout)"
 
         chat.on_event(TUI.key_event("page_up"))
         draw(chat, session)
-        assert_equal "┃", session.cell_symbol(19, 4), "the thumb moves with the scroll offset (offset 26 of 33)"
-        assert_equal "│", session.cell_symbol(19, 3)
-        assert_equal "│", session.cell_symbol(19, 0)
+        assert_equal "┃", session.cell_symbol(19, 4), "the page-key seam marks"
+        assert_equal "│", session.cell_symbol(19, 5), "the thumb is not pinned at the bottom — the view is detached"
+        chat.scrollbar_hide_delay_ms = 0 # the timer reads the delay at fire time
+        kernel.fire_timers
+        draw(chat, session)
+        assert_equal " ", session.cell_symbol(19, 5), "the timer hid the rail again"
+
+        chat.scrollbar_hide_delay_ms = 10_000 # re-mark with a fresh window
+        chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0))
+        draw(chat, session)
+        assert_equal "┃", session.cell_symbol(19, 4), "the wheel seam marks"
+        chat.scrollbar_hide_delay_ms = 0
+        kernel.fire_timers
+
+        chat.on_event(TUI.mouse_event(kind: "scroll_down", x: 0, y: 0)) # clamped while following
+        draw(chat, session)
+        assert_equal " ", session.cell_symbol(19, 4), "a clamped no-op scroll marks nothing (pi: moved === 0)"
+      end
+    end
+
+    # Overlay, not carved column (AC2, B2): content wraps the FULL width
+    # for "auto" (scroll-view.ts:80-82 getContentWidth — only "always"
+    # reserves a column); the rail REPLACES the last column's cells while
+    # visible (layout.ts:307-330 replaceScrollbarCell) and leaves no
+    # trailing pad on the rows when hidden.
+    def test_scrollbar_overlays_the_last_column_without_a_carved_gutter
+      with_chat(width: 20, screen_height: 12) do |chat, session, _kernel|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        chat.scrollbar_hide_delay_ms = 10_000 # fresh for the duration of the test — no real sleeps
+        draw(chat, session)
+        rows = TUI.widget_lines(chat.renderer.call)
+        assert_equal " line19", rows[5], "content ends at content — no carved column pads overflow rows"
+        assert_equal "", rows[4], "the settled window's rows carry no padding"
+
+        chat.on_event(TUI.key_event("page_up"))
+        draw(chat, session)
+        rows = TUI.widget_lines(chat.renderer.call)
+        assert_equal "│", rows[0][-1], "the track paints the last column while visible"
+        assert_equal " line14", rows[1][0, 7], "the row's content survives under the overlay (clipped at width−1, padded, then the glyph)"
       end
     end
 
@@ -2219,9 +2351,10 @@ module Tart
     # cells). motd: false — the MOTD block is pinned by its own tests.
     def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
-        chat = Render::Chat.new(session:, kernel: IdleKernel.new,
+        kernel = IdleKernel.new
+        chat = Render::Chat.new(session:, kernel:,
           footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:)
-        yield chat, session
+        yield(chat, session, kernel)
       end
     end
 
@@ -2292,11 +2425,13 @@ module Tart
     end
 
     # Layout geometry of the fullscreen composition (the driving values,
-    # mirrored from Render::Chat::FOOTER_ROWS/MIN_EDITOR_ROWS): transcript
-    # rows on top, then the 3-row edit box (top border, input row, bottom
-    # border — pi's horizontal-borders-only shape), then the 2-row footer.
+    # mirrored from Render::Chat::FOOTER_ROWS/MIN_EDITOR_ROWS/
+    # DOCK_SPACER_ROWS): transcript rows on top, then the dock — the blank
+    # widgets-above spacer row, the 3-row edit box (top border, input row,
+    # bottom border — pi's horizontal-borders-only shape), the 2-row
+    # footer.
     def transcript_height(session, chat)
-      session.buffer_content.size - 5
+      session.buffer_content.size - 6
     end
 
     # The transcript area (the surface-owned buffer's visible tail with the
@@ -2457,9 +2592,25 @@ module Tart
 
       def initialize
         @submitted = []
+        @timers = []
       end
 
       def animate(duration:) = nil
+
+      def request_draw = nil
+
+      # Reactor-task stand-in: records one-shot timer blocks (the
+      # scrollbar hide timer); tests fire them via {fire_timers} — no
+      # real second-scale sleeps.
+      def async(&block)
+        @timers << block
+        self
+      end
+
+      def fire_timers
+        timers, @timers = @timers, []
+        timers.each(&:call)
+      end
 
       # The /quit path (bin/tart wires quit: -> { kernel.stop! }) — ctrl+d's
       # exit route (pi app.exit).
