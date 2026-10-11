@@ -51,6 +51,20 @@ module Tart
       # runs bash only).
       BASH_TOOL = "bash".freeze
 
+      # The file tools that dispatch to pi's per-tool renderers (I18 —
+      # write.ts/read.ts renderCall/renderResult); everything else
+      # non-bash keeps the generic ⎿ line (I17's ruling).
+      WRITE_TOOL = "write".freeze
+      READ_TOOL = "read".freeze
+
+      # pi write.ts:113 (formatWriteCall): at most this many content lines
+      # render unexpanded, then the expand hint.
+      WRITE_PREVIEW_LINES = 10
+
+      # pi read.ts:56 (COMPACT_RESOURCE_FILE_NAMES) — the file names whose
+      # read collapses to the compact `read resource` shape.
+      COMPACT_RESOURCE_FILE_NAMES = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"].freeze
+
       # History depth (pi: editor.ts addToHistory caps at 100 entries).
       HISTORY_LIMIT = 100
 
@@ -372,19 +386,11 @@ module Tart
           when :tool_execution_end
             @tool = nil
             call = event[:tool_call]
-            if call.name == BASH_TOOL
-              # pi's shell renderers own the bash block (bash.ts:115
-              # createShellRenderers); the frozen :tool_execution_end
-              # contract carries `duration:` (Float seconds, nil on the
-              # replay path — no Took, the recorded gap).
-              enqueue_bash_block(call.arguments["command"], tool_result_text(event[:result]), event[:duration])
-            else
-              handled = tool_line(call.name, event[:result])
-              # Every tool block opens with a leading blank (pi
-              # tool-execution.ts:85 — the constructor's Spacer).
-              @scrollback << [blank_line]
-              enqueue_scrollback(handled, fg: Theme[:tool_output])
-            end
+            # The per-tool block dispatch (pi's per-tool renderers): bash
+            # owns the shell shapes (I17 — the frozen :tool_execution_end
+            # contract carries `duration:`), write/read their file-tool
+            # shapes (I18), the rest the generic ⎿ line.
+            enqueue_tool_block(call.name, call.arguments, event[:result], event[:duration])
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after
             # prepare succeeds): the border shows pi's per-reason label
@@ -986,16 +992,11 @@ module Tart
         tool_calls.each_value do |call|
           next unless call.is_a?(Hash) && call["name"].is_a?(String)
 
-          if call["name"] == BASH_TOOL
-            # The bash block replays through pi's shell shapes (I17):
-            # command from the recorded arguments, output from the recorded
-            # result, NO Took — the recorded entries carry no duration
-            # (the frozen contract's replay gap, itemized).
-            enqueue_bash_block(call.dig("arguments", "command"), tool_result_text(results[call["id"]]), nil)
-          else
-            @scrollback << [blank_line] # every tool block opens with a blank (pi tool-execution.ts:85)
-            enqueue_scrollback(tool_line(call["name"], results[call["id"]]), fg: Theme[:tool_output])
-          end
+          # The replay dispatches through the same per-tool shapes (I18):
+          # call lines from the recorded arguments, outputs from the
+          # recorded results, NO duration — the recorded entries carry
+          # none (the frozen contract's replay gap, never invented).
+          enqueue_tool_block(call["name"], call["arguments"], results[call["id"]], nil)
         end
       end
 
@@ -1146,8 +1147,197 @@ module Tart
         end
       end
 
+      # The per-tool block dispatch (pi's per-tool renderCall/renderResult,
+      # I18): bash owns the shell shapes (I17 — carries the duration),
+      # write/read their file-tool shapes, everything else the generic ⎿
+      # line. Shared by the live and replay paths (I17's shape-sharing
+      # ruling); +duration+ is nil on replay (the recorded gap).
+      def enqueue_tool_block(name, args, result, duration)
+        args = {} unless args.is_a?(Hash)
+        case name
+        when BASH_TOOL
+          enqueue_bash_block(args["command"], tool_result_text(result), duration)
+        when WRITE_TOOL
+          enqueue_write_block(args, result)
+        when READ_TOOL
+          enqueue_read_block(args, result)
+        else
+          # Every tool block opens with a leading blank (pi
+          # tool-execution.ts:85 — the constructor's Spacer).
+          @scrollback << [blank_line]
+          enqueue_scrollback(tool_line(name, result), fg: Theme[:tool_output])
+        end
+      end
+
+      # The write tool block (I18 — pi write.ts renderers over the
+      # tool-turn component): the constructor's Spacer + render-box
+      # paddingY (tool-execution.ts:85,87 — the bash block's shape), the
+      # bold toolTitle `write` header + the renderToolPath display
+      # (write.ts:99-100), blank, the content as toolOutput rows
+      # (write.ts:108-122), box pad. The SUCCESS result renders NOTHING
+      # (formatWriteResult is undefined unless error, write.ts:128-143);
+      # an error renders its text in the error token after a blank (the
+      # leading "\n", write.ts:143). Cuts, itemized: the syntax
+      # highlighting (highlightCode — the port has no highlighter;
+      # invisible to text files) and the ctrl+o expand binding (backlog
+      # C) — the hint's TEXT renders for byte parity.
+      def enqueue_write_block(args, result)
+        @chat_started = true
+        region = [blank_line, blank_line]
+        region.concat(write_call_rows(args))
+        content_rows = write_content_rows(args)
+        unless content_rows.empty?
+          region << blank_line
+          region.concat(content_rows)
+        end
+        error = result.is_a?(Hash) ? result[:error] : nil
+        if error
+          region << blank_line
+          region.concat(padded_fg_rows(error.to_s, fg: Theme[:error]))
+        end
+        region << blank_line
+        @scrollback << region
+      end
+
+      # The read tool block (I18 — pi read.ts renderers): the Spacer + box
+      # padding (tool-execution.ts:85,87), then the call line alone —
+      # formatReadCall's bold toolTitle `read` + renderToolPath + the
+      # warning :start-end range (read.ts:35-42), or the compact resource
+      # shape (getCompactReadClassification, read.ts:63-88). The result
+      # renders NOTHING unless error or expanded (read.ts:68-70 — the
+      # expand binding is cut, itemized); an error renders its text as
+      # toolOutput rows (formatReadResult's isError path).
+      def enqueue_read_block(args, result)
+        @chat_started = true
+        region = [blank_line, blank_line]
+        region.concat(read_call_rows(args))
+        error = result.is_a?(Hash) ? result[:error] : nil
+        if error
+          region << blank_line
+          region.concat(padded_fg_rows(error.to_s, fg: Theme[:tool_output]))
+        end
+        region << blank_line
+        @scrollback << region
+      end
+
+      # pi write.ts:99-100 — the bold toolTitle `write` header + the
+      # renderToolPath display (accent token). Mixed spans, so the row
+      # bypasses {padded_fg_rows} for a hand-built span line (recorded
+      # gap: pi's Text wraps the header to the viewport; a call line
+      # wider than the width overflows here).
+      def write_call_rows(args)
+        [TUI.line([TUI.span(OUTPUT_PAD), tool_title_span("write"), TUI.span(" "),
+                   TUI.span(tool_path_display(args), fg: Theme[:accent])])]
+      end
+
+      # pi write.ts:108-122 — the content preview: \r stripped
+      # (normalizeDisplayText), trailing empty lines trimmed
+      # (trimTrailingEmptyLines), at most 10 lines, then the expand hint
+      # row (keyHint app.tools.expand — the dim key + muted text bytes;
+      # the ctrl+o binding is cut, the bytes are the contract).
+      def write_content_rows(args)
+        lines = args["content"].to_s.gsub("\r", "").split("\n", -1)
+        lines.pop while !lines.empty? && lines.last.empty?
+        return [] if lines.empty?
+
+        display = lines.first(WRITE_PREVIEW_LINES)
+        rows = padded_fg_rows(display.join("\n"), fg: Theme[:tool_output])
+        remaining = lines.length - display.length
+        if remaining.positive?
+          rows << TUI.line([TUI.span(OUTPUT_PAD),
+                            TUI.span("... (#{remaining} more lines, #{lines.length} total,", fg: Theme[:muted]),
+                            TUI.span(" "),
+                            TUI.span("ctrl+o", fg: Theme[:dim]),
+                            TUI.span(" to expand)", fg: Theme[:muted])])
+        end
+        rows
+      end
+
+      # pi read.ts:35-42 formatReadCall vs :79-90 formatCompactReadCall —
+      # the plain call line, or the compact resource shape with the dim
+      # expand hint (the [skill] label rides customMessageLabel violet —
+      # the port's accent analog — over customMessageText muted).
+      def read_call_rows(args)
+        classification = compact_read_classification(args)
+        if classification
+          label_spans = if classification[:kind] == :skill
+            [TUI.span("[skill] ", fg: Theme[:accent], modifiers: [:bold]),
+             TUI.span(classification[:label], fg: Theme[:muted])]
+          else
+            [tool_title_span("read resource"), TUI.span(" "),
+             TUI.span(classification[:label], fg: Theme[:accent])]
+          end
+          [TUI.line([TUI.span(OUTPUT_PAD), *label_spans, *line_range_spans(args),
+                     TUI.span(" (ctrl+o to expand)", fg: Theme[:dim])])]
+        else
+          [TUI.line([TUI.span(OUTPUT_PAD), tool_title_span("read"), TUI.span(" "),
+                     TUI.span(tool_path_display(args), fg: Theme[:accent]), *line_range_spans(args)])]
+        end
+      end
+
+      # pi write.ts:99 theme.fg("toolTitle", theme.bold(...)) — the tool
+      # call header token (dark.json:40 toolTitle = text, the truecolor
+      # prose value).
+      def tool_title_span(title)
+        TUI.span(title, fg: Theme[:toolTitle], modifiers: [:bold])
+      end
+
+      # pi render-utils.ts:102-110 renderToolPath over :10-18 shortenPath
+      # — the display path: the ~ contraction under home, verbatim
+      # otherwise; the empty/absent path renders the toolOutput "..."
+      # (write.ts:105 / read.ts:104 fallback). linkPath's OSC8 hyperlink
+      # is capability-gated — the port's TUI carries none (recorded).
+      def tool_path_display(args)
+        raw_path = args["file_path"] || args["path"]
+        return "..." if raw_path.nil? || raw_path.empty?
+
+        home = Dir.home
+        raw_path.start_with?(home) ? "~#{raw_path[home.length..]}" : raw_path
+      end
+
+      # pi read.ts:35-42 formatReadLineRange — the warning-colored
+      # :start-end suffix when offset/limit narrow the read (start
+      # defaults to 1; a limit without offset still ranges from 1).
+      def line_range_spans(args)
+        offset = args["offset"]
+        limit = args["limit"]
+        return [] if offset.nil? && limit.nil?
+
+        start_line = offset || 1
+        end_line = limit ? start_line + limit - 1 : ""
+        [TUI.span(":#{start_line}-#{end_line}", fg: Theme[:warning])]
+      end
+
+      # pi read.ts:63-88 getCompactReadClassification — the compact shape
+      # for resource-like reads: SKILL.md → the [skill] shape (label =
+      # the skill directory), the AGENTS.md/CLAUDE.md resource names →
+      # the `read resource` shape (label = the cwd-relative or absolute
+      # path, formatPathRelativeToCwdOrAbsolute). pi's own-package docs
+      # class (getPiDocsClassification) is cut, itemized: the port has no
+      # pi package root.
+      def compact_read_classification(args)
+        raw_path = tool_path_display(args)
+        return if raw_path == "..."
+
+        absolute_path = File.expand_path(raw_path)
+        name = File.basename(absolute_path)
+        return {kind: :skill, label: File.basename(File.dirname(absolute_path))} if name == "SKILL.md"
+        return {kind: :resource, label: cwd_relative_path(absolute_path)} if COMPACT_RESOURCE_FILE_NAMES.include?(name)
+
+        nil
+      end
+
+      # pi utils/paths.ts:120-123 formatPathRelativeToCwdOrAbsolute —
+      # cwd-relative when under the cwd, absolute otherwise.
+      def cwd_relative_path(absolute_path)
+        cwd = "#{Dir.pwd}/"
+        absolute_path.start_with?(cwd) ? absolute_path[cwd.length..] : absolute_path
+      end
+
       # Bounded multi-line preview (pi truncates tool output): the first
-      # TOOL_PREVIEW_LINES non-empty lines, then an ellipsis row.
+      # TOOL_PREVIEW_LINES non-empty lines, then an ellipsis row. The
+      # generic non-bash shape (I17's ruling, kept for edit/grep/ls/find
+      # — write/read dispatch to their own shapes, I18).
       def tool_line(name, result)
         text = tool_result_text(result)
         lines = text.lines(chomp: true).map(&:rstrip).reject(&:empty?)

@@ -24,6 +24,7 @@ module Tart
       user_message_bg: "#213b49",     # dark.json:13/:33 — blueBg okhsl(233 41% 24%)
       tool_output: "#9da5a9",         # dark.json:35 "toolOutput" = muted okhsl(229 6% 67%)
       bashMode: "#5eb286",            # dark.json:71 okhsl(159 64% 65%) — the bash header (I17)
+      toolTitle: "#dee0e1",           # dark.json:40 toolTitle = the text token — the tool-call headers (I18)
       md_heading: :yellow,            # dark.json:42
       md_link: :light_blue,           # dark.json:43 blue
       md_link_url: :gray,             # dark.json:44 muted
@@ -74,6 +75,7 @@ module Tart
       assert_equal Theme[:dim], :gray, "the footer-dim analog (I14 item 9: pi's whole footer is dim, okhsl 56%)"
       assert_equal Theme[:warning], :yellow
       assert_equal Theme[:error], :red
+      assert_equal Theme[:text], Theme[:toolTitle], "pi toolTitle = text (dark.json:40) — the I18 tool headers"
     end
 
     # The I13 promotions (dark.json:26-29, blue-tinted family): the

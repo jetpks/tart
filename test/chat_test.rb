@@ -165,27 +165,27 @@ module Tart
     def test_tool_call_lifecycle_is_rendered
       with_chat(width: 40) do |chat, session|
         chat.on_agent_event({type: :agent_start})
-        tool_start(chat, "read")
+        tool_start(chat, "grep")
         draw(chat, session)
-        assert_includes editor_area(session, chat), "tool: read",
+        assert_includes editor_area(session, chat), "tool: grep",
           "the tool name renders in the editor's status border while it runs"
 
-        tool_end(chat, "read", "done\nmore")
+        tool_end(chat, "grep", "done\nmore")
         draw(chat, session)
         assert_equal [:reversed], session.cell_modifiers(0, input_row(session)),
           "input line visible after tool end (the empty line's fake cursor)"
         # transcript_lines strips per-row whitespace (buffer rows are padded).
-        assert_equal ["  ⎿ read: done", "    more"], transcript_lines(session, chat),
+        assert_equal ["  ⎿ grep: done", "    more"], transcript_lines(session, chat),
           "the tool result lifecycle renders into the transcript as a multi-line excerpt"
       end
     end
 
     def test_tool_result_preview_is_bounded_multiline
       with_chat(width: 40) do |chat, session|
-        tool_start(chat, "read")
-        tool_end(chat, "read", "one\ntwo\nthree\nfour\nfive")
+        tool_start(chat, "grep")
+        tool_end(chat, "grep", "one\ntwo\nthree\nfour\nfive")
         draw(chat, session)
-        assert_equal ["  ⎿ read: one", "    two", "    three", "    …"], transcript_lines(session, chat),
+        assert_equal ["  ⎿ grep: one", "    two", "    three", "    …"], transcript_lines(session, chat),
           "the preview shows a bounded multi-line excerpt, then an ellipsis"
       end
     end
@@ -204,7 +204,7 @@ module Tart
           "the status line is dim (#{Theme[:dim].inspect})"
 
         finish_message(chat, "assistant answer") # transcript: assistant, terminal default
-        tool_end(chat, "read", "tool output")    # transcript: tool, muted
+        tool_end(chat, "grep", "tool output")    # transcript: tool, muted
         chat.on_agent_event({type: :agent_end})
         "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
         chat.on_event(TUI.key_event("enter"))    # transcript: user echo
@@ -250,12 +250,12 @@ module Tart
         chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
         chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("answer")})
         chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "answer")})
-        tool_end(chat, "read", "done\nmore")                 # tool block (non-bash shape)
+        tool_end(chat, "grep", "done\nmore")                 # tool block (non-bash shape)
         send_message(chat, "again")                          # echo: container non-empty → blank
         finish_message(chat, "second")                       # assistant
         draw(chat, session) # the frame's flush moves every region into the buffer
 
-        assert_equal ["", " hi", "", "", " pondering", "", " answer", "", "  ⎿ read: done", "    more", "", "", " again", "", "", " second"],
+        assert_equal ["", " hi", "", "", " pondering", "", " answer", "", "  ⎿ grep: done", "    more", "", "", " again", "", "", " second"],
           chat.transcript_lines,
           "pi's region padding: the first echo rides its padY wrap (no container spacer), later regions get the spacer + pad rows"
       end
@@ -353,6 +353,188 @@ module Tart
           chat.transcript_lines.first(9),
           "the bash block replays through pi's shapes (header + blank + output); the recorded duration gap keeps no Took"
         refute chat.transcript_lines.any? { |row| row.include?("Took") }, "no invented duration on replay"
+      end
+    end
+
+    # ---- the write/read tool blocks (I18 — pi write.ts/read.ts
+    # renderers over the tool-turn component). ----
+
+    # The capture's rows 11-16: spacer, box pad, the bold toolTitle
+    # `write` + renderToolPath header, blank, the content as toolOutput
+    # rows, box pad. The SUCCESS result renders NOTHING (write.ts:128-143
+    # — formatWriteResult is undefined unless error), so the block is the
+    # call side alone.
+    def test_write_tool_block_renders_pis_write_shapes
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "write", "Successfully wrote to s3-tool-turn-note.txt",
+                 arguments: {"path" => "s3-tool-turn-note.txt", "content" => "parity s3 sandbox note"})
+        draw(chat, session)
+
+        assert_equal ["", "", " write s3-tool-turn-note.txt", "", " parity s3 sandbox note", ""],
+          chat.transcript_lines,
+          "the capture's rows 11-16: spacer, box pad, header, blank, content, box pad — NO result row on success"
+        rows = session.buffer_content
+        header = rows.index { |row| row.include?("write s3-tool-turn-note.txt") }
+        assert_equal Theme[:toolTitle], session.cell_fg(rows[header].index("w"), header),
+          "the header renders the toolTitle token (dark.json:40 toolTitle = text)"
+        assert_includes session.cell_modifiers(rows[header].index("w"), header), :bold,
+          "the header is bold (write.ts:99 theme.bold)"
+        assert_equal Theme[:accent], session.cell_fg(rows[header].index("s3-tool-turn-note.txt"), header),
+          "the path renders the accent token (renderToolPath)"
+        content = rows.index { |row| row.include?("parity s3 sandbox note") }
+        assert_equal Theme[:tool_output], session.cell_fg(rows[content].index("p"), content),
+          "the content preview renders the toolOutput truecolor (write.ts:119)"
+      end
+    end
+
+    # pi write.ts:113-116 — at most 10 content lines unexpanded, then the
+    # muted expand-hint row (the dim key + muted text bytes; the ctrl+o
+    # binding itself is cut, backlog C).
+    def test_write_block_previews_ten_lines_then_the_expand_hint
+      content = Array.new(12) { |i| "line #{i + 1}" }.join("\n")
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "write", "ok", arguments: {"path" => "big.txt", "content" => content})
+        draw(chat, session)
+
+        assert_equal(
+          ["", "", " write big.txt", ""] +
+            Array.new(10) { |i| " line #{i + 1}" } +
+            [" ... (2 more lines, 12 total, ctrl+o to expand)", ""],
+          chat.transcript_lines,
+          "ten content lines, then the expand hint row (write.ts:113-122)"
+        )
+      end
+    end
+
+    # pi write.ts:115 trimTrailingEmptyLines — trailing blank lines drop
+    # from the preview.
+    def test_write_block_trims_trailing_empty_lines
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "write", "ok", arguments: {"path" => "x.txt", "content" => "hello\n\n\n"})
+        draw(chat, session)
+        assert_equal ["", "", " write x.txt", "", " hello", ""], chat.transcript_lines,
+          "trailing empty lines are trimmed (write.ts:115 trimTrailingEmptyLines)"
+      end
+    end
+
+    # An absent content arg renders the call line alone (write.ts:107 —
+    # no content block).
+    def test_write_block_without_content_renders_the_call_line_alone
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "write", "ok", arguments: {"path" => "x.txt"})
+        draw(chat, session)
+        assert_equal ["", "", " write x.txt", ""], chat.transcript_lines, "no content → call line alone"
+      end
+    end
+
+    # A write ERROR renders its text in the error token after a blank
+    # (write.ts:128-143 formatWriteResult — the leading "\n" + error fg).
+    def test_write_block_error_renders_the_error_text
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "write", {error: "Permission denied"}, arguments: {"path" => "x.txt", "content" => "hi"})
+        draw(chat, session)
+        assert_equal ["", "", " write x.txt", "", " hi", "", " Permission denied", ""],
+          chat.transcript_lines, "the error text renders after a blank (write.ts:143)"
+        rows = session.buffer_content
+        error_row = rows.index { |row| row.include?("Permission denied") }
+        assert_equal Theme[:error], session.cell_fg(rows[error_row].index("P"), error_row),
+          "the error text renders the error token (write.ts:143)"
+      end
+    end
+
+    # The renderToolPath display: the ~ contraction under home
+    # (render-utils.ts:10-18 shortenPath), verbatim otherwise.
+    def test_write_block_path_contracts_under_home
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "write", "ok", arguments: {"path" => File.join(Dir.home, "notes.txt"), "content" => "hi"})
+        draw(chat, session)
+        assert_includes chat.transcript_lines, " write ~/notes.txt",
+          "paths under home contract to ~/ (render-utils.ts shortenPath)"
+      end
+    end
+
+    # The read call line (the capture's row 19): the bold toolTitle
+    # `read` + renderToolPath. The result renders NOTHING unless error or
+    # expanded (read.ts:68-70) — the settled screen is the call line
+    # alone, even though the result carried text.
+    def test_read_tool_block_renders_pis_read_call_shape
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "read", "hello\nworld", arguments: {"path" => "notes.txt"})
+        draw(chat, session)
+        assert_equal ["", "", " read notes.txt", ""], chat.transcript_lines,
+          "the capture's row 19: the read call line alone — the unexpanded result renders nothing (read.ts:68-70)"
+      end
+    end
+
+    # pi read.ts:35-42 formatReadLineRange — offset/limit reads append
+    # the warning-colored :start-end range.
+    def test_read_block_line_range_renders_the_warning_suffix
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "read", "hello", arguments: {"path" => "notes.txt", "offset" => 5, "limit" => 10})
+        draw(chat, session)
+        assert_includes chat.transcript_lines, " read notes.txt:5-14",
+          "the :start-end range renders (formatReadLineRange)"
+        rows = session.buffer_content
+        y = rows.index { |line| line.include?(":5-14") }
+        assert_equal Theme[:warning], session.cell_fg(rows[y].index(":5-14"), y),
+          "the range renders the warning token (read.ts:38)"
+      end
+    end
+
+    # A read ERROR renders its text as toolOutput rows (read.ts:68-73 —
+    # the isError path bypasses the expanded gate).
+    def test_read_block_error_renders_the_error_text_as_tool_output
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "read", {error: "File not found: notes.txt"}, arguments: {"path" => "notes.txt"})
+        draw(chat, session)
+        assert_equal ["", "", " read notes.txt", "", " File not found: notes.txt", ""],
+          chat.transcript_lines, "the error text renders as tool output rows (read.ts isError path)"
+      end
+    end
+
+    # pi read.ts:63-88 getCompactReadClassification — the resource names
+    # collapse to the compact `read resource` shape, SKILL.md to the
+    # [skill] shape, both with the dim expand hint. pi's own-package docs
+    # class is cut (no pi package root in the port — itemized).
+    def test_read_block_compact_resource_shapes
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "read", "guide", arguments: {"path" => "AGENTS.md"})
+        draw(chat, session)
+        assert_includes chat.transcript_lines, " read resource AGENTS.md (ctrl+o to expand)",
+          "AGENTS.md collapses to the compact resource shape (read.ts:79-90)"
+      end
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "read", "guide", arguments: {"path" => "skills/parith/SKILL.md"})
+        draw(chat, session)
+        assert_includes chat.transcript_lines, " [skill] parith (ctrl+o to expand)",
+          "SKILL.md collapses to the [skill] shape (read.ts:81-83)"
+      end
+    end
+
+    # The write/read blocks replay through the same shapes (I18): path
+    # and content from the recorded arguments, results from the recorded
+    # entries — NO ⎿ line, NO invented duration. The recorded result is a
+    # bare string, so replay cannot distinguish a write error (the same
+    # gap pi's own replay has — success renders nothing either way).
+    def test_resume_session_replays_the_write_and_read_blocks
+      dir = File.join(@dir, "sessions")
+      FileUtils.mkpath(dir)
+      recorded = File.join(dir, "file_replay_test-session.jsonl")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"file-replay","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"write then read"}}
+        {"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":"","tool_calls":{"call_1":{"id":"call_1","name":"write","arguments":{"path":"note.txt","content":"parity note"}},"call_2":{"id":"call_2","name":"read","arguments":{"path":"note.txt"}}},"finish_reason":"tool_calls","input_tokens":10,"output_tokens":5}}
+        {"type":"message","id":"e3","parentId":"e2","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"tool","content":"Successfully wrote to note.txt","tool_call_id":"call_1"}}
+        {"type":"message","id":"e4","parentId":"e3","timestamp":"2026-01-01T00:00:04.000Z","message":{"role":"tool","content":"parity note","tool_call_id":"call_2"}}
+      JSONL
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+        assert_equal ["", " write then read", "", "", "", " write note.txt", "", " parity note", "", "", "", " read note.txt"],
+          chat.transcript_lines.first(12),
+          "the write and read blocks replay through pi's shapes: call + blank + content, call — no result rows"
+        refute chat.transcript_lines.any? { |row| row.include?("Took") || row.include?("⎿") },
+          "no invented duration, no generic ⎿ line for write/read"
       end
     end
 
@@ -1796,7 +1978,7 @@ module Tart
         joined = lines.join("\n")
         assert_includes joined, "what is in notes.txt?", "the user echo replays"
         assert_includes joined, "Let me look.", "the assistant markdown replays"
-        assert_includes joined, "⎿ read: hello", "the tool block replays (call name + recorded result)"
+        assert_includes joined, " read notes.txt", "the read block replays through pi's read.ts call shape (I18)"
         assert_includes joined, "The file contains: hello", "the follow-up replays"
         assert_includes joined, "Resumed session", "the status line renders (interactive-mode.ts:5756)"
         refute_includes joined, "tart v#{Tart::VERSION}", "NO fresh MOTD on resume (itemized cut)"

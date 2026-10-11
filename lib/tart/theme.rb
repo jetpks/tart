@@ -45,6 +45,9 @@ module Tart
       # pi's system-theme "green" (system-theme.ts:112) is the 16-color
       # fallback, not the dark value the port renders.
       bashMode: "#5eb286",
+      # dark.json:40 "toolTitle" = the "text" token → #dee0e1 (the I18
+      # tool-call headers: the bold `write`/`read`).
+      toolTitle: "#dee0e1",
       md_heading: :yellow,      # dark.json:42
       md_link: :light_blue,     # dark.json:43 "mdLink" blue → :light_blue (markdown.rb)
       md_link_url: :gray,       # dark.json:44 muted
