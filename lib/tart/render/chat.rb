@@ -46,6 +46,11 @@ module Tart
       # lines, then an ellipsis row (pi truncates tool output previews).
       TOOL_PREVIEW_LINES = 3
 
+      # The tool name that dispatches to pi's shell renderers (bash.ts:115
+      # createShellRenderers — shared by bash and powershell; the port
+      # runs bash only).
+      BASH_TOOL = "bash".freeze
+
       # History depth (pi: editor.ts addToHistory caps at 100 entries).
       HISTORY_LIMIT = 100
 
@@ -366,11 +371,20 @@ module Tart
             @tool = event[:tool_call].name
           when :tool_execution_end
             @tool = nil
-            handled = tool_line(event[:tool_call].name, event[:result])
-            # Every tool block opens with a leading blank (pi
-            # tool-execution.ts:85 — the constructor's Spacer).
-            @scrollback << [blank_line]
-            enqueue_scrollback(handled, fg: Theme[:tool_output])
+            call = event[:tool_call]
+            if call.name == BASH_TOOL
+              # pi's shell renderers own the bash block (bash.ts:115
+              # createShellRenderers); the frozen :tool_execution_end
+              # contract carries `duration:` (Float seconds, nil on the
+              # replay path — no Took, the recorded gap).
+              enqueue_bash_block(call.arguments["command"], tool_result_text(event[:result]), event[:duration])
+            else
+              handled = tool_line(call.name, event[:result])
+              # Every tool block opens with a leading blank (pi
+              # tool-execution.ts:85 — the constructor's Spacer).
+              @scrollback << [blank_line]
+              enqueue_scrollback(handled, fg: Theme[:tool_output])
+            end
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after
             # prepare succeeds): the border shows pi's per-reason label
@@ -972,8 +986,16 @@ module Tart
         tool_calls.each_value do |call|
           next unless call.is_a?(Hash) && call["name"].is_a?(String)
 
-          @scrollback << [blank_line] # every tool block opens with a blank (pi tool-execution.ts:85)
-          enqueue_scrollback(tool_line(call["name"], results[call["id"]]), fg: Theme[:tool_output])
+          if call["name"] == BASH_TOOL
+            # The bash block replays through pi's shell shapes (I17):
+            # command from the recorded arguments, output from the recorded
+            # result, NO Took — the recorded entries carry no duration
+            # (the frozen contract's replay gap, itemized).
+            enqueue_bash_block(call.dig("arguments", "command"), tool_result_text(results[call["id"]]), nil)
+          else
+            @scrollback << [blank_line] # every tool block opens with a blank (pi tool-execution.ts:85)
+            enqueue_scrollback(tool_line(call["name"], results[call["id"]]), fg: Theme[:tool_output])
+          end
         end
       end
 
@@ -1065,10 +1087,69 @@ module Tart
         @usage_stale = false
       end
 
+      # The result's text (tool-execution.ts getTextOutput shape): a result
+      # Hash carries :content or :error, recorded entries carry the string
+      # content itself.
+      def tool_result_text(result)
+        result.is_a?(Hash) ? (result[:error] || result[:content] || "").to_s : result.to_s
+      end
+
+      # pi bash.ts:20-28 formatDuration — seconds <60 → %.1fs (toFixed
+      # rounds: 59_960ms → "60.0s"); <60m → "Xm Ys"; else "Xh Ym Zs".
+      def format_duration(ms)
+        seconds = ms / 1000.0
+        return format("%.1fs", seconds) if seconds < 60
+
+        total_seconds = seconds.floor
+        minutes = total_seconds / 60
+        remainder = total_seconds % 60
+        return "#{minutes}m #{remainder}s" if minutes < 60
+
+        "#{minutes / 60}h #{minutes % 60}m #{remainder}s"
+      end
+
+      # The bash tool block (I17 — pi's shell renderer over the tool-turn
+      # component): the constructor's Spacer (1 blank, tool-execution.ts:85),
+      # the render box's paddingY (1 blank above and below the children,
+      # tool-execution.ts:87 Box(1,1)), then the children — the bold
+      # bashMode `$ <command>` header (bash.ts:36 theme.bold over
+      # formatShellCall; colorKey bashMode — the port carries no
+      # context-exclusion state, the dim variant is unreachable, itemized),
+      # the output lines blank-separated from the header (bash.ts:78-84 —
+      # the Text children's leading "\n"), and the muted `Took <duration>`
+      # line (bash.ts:105-109 — a nil/absent duration, the replay path,
+      # renders none; the recorded gap is itemized, never invented).
+      def enqueue_bash_block(command, output, duration)
+        @chat_started = true
+        region = [blank_line, blank_line]
+        region.concat(padded_fg_rows("$ #{command.to_s.empty? ? "..." : command}",
+          fg: Theme[:bashMode], modifiers: [:bold]))
+        output_lines = output.strip.lines(chomp: true)
+        unless output_lines.empty?
+          region << blank_line
+          region.concat(padded_fg_rows(output_lines.join("\n"), fg: Theme[:tool_output]))
+        end
+        if duration
+          region << blank_line
+          region.concat(padded_fg_rows("Took #{format_duration(duration * 1000.0)}", fg: Theme[:tool_output]))
+        end
+        region << blank_line
+        @scrollback << region
+      end
+
+      # Wrapped themed rows through the {OUTPUT_PAD} rule (pi's render-box
+      # paddingX, tool-execution.ts:87 — one pad cell, content wrapped to
+      # width minus both pads).
+      def padded_fg_rows(text, fg:, modifiers: [])
+        Chat.wrap(text, viewport_width - OUTPUT_PAD.length * 2).map do |row|
+          TUI.line([TUI.span(OUTPUT_PAD), TUI.span(row, fg:, modifiers:)])
+        end
+      end
+
       # Bounded multi-line preview (pi truncates tool output): the first
       # TOOL_PREVIEW_LINES non-empty lines, then an ellipsis row.
       def tool_line(name, result)
-        text = result.is_a?(Hash) ? (result[:error] || result[:content] || "").to_s : result.to_s
+        text = tool_result_text(result)
         lines = text.lines(chomp: true).map(&:rstrip).reject(&:empty?)
         return "  ⎿ #{name}" if lines.empty?
 

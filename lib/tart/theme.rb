@@ -40,6 +40,11 @@ module Tart
       user_message_text: "#dee0e1",   # = the "text" token (dark.json:32)
       user_message_bg: "#213b49",     # okhsl(233 41% 24%) → #213b49 (dark.json:13 "blueBg", :33)
       tool_output: "#9da5a9",   # "toolOutput" = muted okhsl(229 6% 67%) → #9da5a9 (dark.json:35, vars :5)
+      # dark.json:71 "bashMode" okhsl(159 64% 65%) → #5eb286 (pi's own
+      # converter) — the bash tool block's `$ <command>` header (I17);
+      # pi's system-theme "green" (system-theme.ts:112) is the 16-color
+      # fallback, not the dark value the port renders.
+      bashMode: "#5eb286",
       md_heading: :yellow,      # dark.json:42
       md_link: :light_blue,     # dark.json:43 "mdLink" blue → :light_blue (markdown.rb)
       md_link_url: :gray,       # dark.json:44 muted
