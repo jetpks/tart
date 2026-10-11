@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "tart/version"
+require_relative "tart/identity"
 require_relative "tart/tui"
 require_relative "tart/core/loop"
 require_relative "tart/tools"

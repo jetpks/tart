@@ -49,6 +49,20 @@ a file that fails to parse counts as absent (defaults hold) with a warning.
 | `compaction.reserveTokens` | `16384` |
 | `compaction.keepRecentTokens` | `20000` |
 | `defaultTools` | all built-in tools (`read write edit bash find grep ls`) |
+| `identity` | `pi` |
+| `modelProvider` | — (the model's registry provider) |
+| `modelReasoning` | — (the model's registry capability) |
+
+`identity` picks the face the port shows: `pi` (the default — the oracle's
+header bytes) or `tart` (the owner's art collection, `tart v<version>`, the
+port's hints line). The same choice reads from the `--identity` CLI flag and
+the `TART_IDENTITY` env var — flag > env > settings, anything else errors
+naming the valid values. Structural behavior (transcript padding, blank-line
+spacers, footer format) is identity-independent. `modelProvider` /
+`modelReasoning` stage the footer's model segment (`(<provider>) <model>`;
+`• <level>` only for reasoning-capable models) — the env forms are
+`TART_MODEL_PROVIDER` / `TART_MODEL_REASONING`; unset, the facts resolve off
+the model's registry entry (RubyLLM's).
 
 `defaultTools` takes plain names (replacing the default loadout), `+name`
 (adds), and `-name` (removes), in list order; a project list of only
@@ -243,6 +257,12 @@ IS the app process, and teardown kills -9 the app and all descendants before
 dropping the session (tmux kill-session alone does not kill tart — I01).
 After any run: no surviving app process, no leftover `pty-tester-*` tmux
 session, worktree clean.
+
+**Per-app env overrides:** a scenario may carry an optional `env:` mapping
+(app name → `{ENV_VAR => value}`, validated at load; unknown apps and
+non-mapping shapes are rig errors). The runner layers the overrides over its
+staged env for that app — the branding/staging seam (e.g. `s1_tart.yml` boots
+tart with `TART_IDENTITY=tart`).
 
 Live integration test (drives real pi + tart, tens of seconds):
 `PTY_TESTER_LIVE=1 bundle exec rake test`.

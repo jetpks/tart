@@ -94,22 +94,38 @@ module Tart
       # end (word/line granularity — pi SelectionPoint.boundary).
       Point = Struct.new(:row, :col, :boundary)
 
-      # The MOTD logo (identity deviation, itemized): the owner's
-      # ascii-art collection — one random piece per MOTD render (boot and
-      # /new). pi's half-block mark (components/pi-logo.ts) is a shape
-      # reference only — never copied.
+      # The owner's ascii-art collection (tart-mode's mark) — one random
+      # piece per MOTD render (boot and /new). pi-mode renders pi's actual
+      # half-block mark instead ({pi_mark}).
       LOGOS_DIR = File.expand_path("logos", __dir__)
+
+      # The MOTD hints line — the PORT's real keys only (pi's `!` bash
+      # mode, escape-to-clear, ctrl+c-twice and the thinking/model cycles
+      # have no port binding; cut, itemized).
+      HINTS_LINE = "ctrl+c interrupt/quit · ctrl+d exit (empty) · / commands · pgup/pgdn scroll".freeze
+
+      # pi-mode's built-in header text (pi interactive-mode.ts:1045-1053 —
+      # compactInstructions joined with muted " · ", compactOnboarding,
+      # onboarding). The keybindings behind escape-to-clear, `!` bash and
+      # the ctrl+o expand are cut (itemized) — the hint TEXT renders for
+      # byte parity, per the identity contract.
+      PI_HINTS_LINE = "escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more".freeze
+      PI_NOTICE_LINE = "Press ctrl+o to show full startup help and loaded resources.".freeze
+      PI_ONBOARDING_LINE = "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.".freeze
+
+      # pi's outputPad (interactive-mode.ts:516, default 1): one leading
+      # space on every content row of the chat surface — the header's Text
+      # paddingX (interactive-mode.ts:1060-1063), the echo's and the
+      # assistant's Markdown paddingX (user-message.ts:23,
+      # assistant-message.ts:120-127). Blank rows carry no pad (pi's
+      # Spacer renders empty rows).
+      OUTPUT_PAD = " ".freeze
 
       # One random art piece's lines (empty collection → no logo lines).
       def motd_logo_lines
         file = Dir[File.join(LOGOS_DIR, "*.txt")].sample
         file ? File.readlines(file, chomp: true) : []
       end
-
-      # The MOTD hints line — the PORT's real keys only (pi's `!` bash
-      # mode, escape-to-clear, ctrl+c-twice and the thinking/model cycles
-      # have no port binding; cut, itemized).
-      HINTS_LINE = "ctrl+c interrupt/quit · ctrl+d exit (empty) · / commands · pgup/pgdn scroll".freeze
 
       # The boundary classes of pi's word navigation (word-navigation.ts with
       # utils.ts:1006 PUNCTUATION_REGEX and :1011 isWhitespaceChar). The
@@ -149,11 +165,15 @@ module Tart
       # @param motd [Boolean] render the startup MOTD block on the first
       #   frame (and on {new_session}); tests that pin plain transcript
       #   content opt out, the launcher's default renders it.
+      # @param identity [String] the resolved face (Tart::Identity) the
+      #   MOTD renders — pi's header bytes vs the owner's art + tart
+      #   header. Structural items (padding, spacers, footer format) are
+      #   identity-independent.
       # @param settings_root [String] the user config dir the MOTD's
       #   [Context] section reports (injectable so tests never touch
       #   ~/.tart).
       def initialize(session:, kernel:, footer_data: nil, branch_reader: DEFAULT_BRANCH_READER, autocomplete: nil,
-        motd: true, settings_root: Agent::Session.default_root)
+        motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root)
         @session = session
         @kernel = kernel
         @footer_data = footer_data
@@ -214,7 +234,13 @@ module Tart
         @branch = nil
         @branch_fetched = false
         @settings_root = settings_root
+        @identity = identity
         @motd_pending = motd # rendered on the first frame, once wired
+        # pi's chat container is a separate component from the header
+        # (interactive-mode.ts:633-639); its leading-spacer gate (children
+        # non-empty, :3930-3931) reads this — any chat region since the
+        # boot/new/resume reset, header excluded.
+        @chat_started = false
       end
 
       # The agent loop this surface drives (wired after construction: the
@@ -697,6 +723,7 @@ module Tart
         has_content = !content.nil?
         return unless has_reasoning || has_content
 
+        @chat_started = true
         @scrollback << [blank_line]
         # The joined thinking renders as a dim block BEFORE the content
         # (pi assistant-message.ts:99-175 render order). The live
@@ -715,22 +742,78 @@ module Tart
         TUI.line("")
       end
 
-      # The startup MOTD block (I14 item 12): the logo placeholder, the
-      # version line, the hints line, then the [Context] and [Skills]
-      # resource sections (pi's header interactive-mode.ts:1040-1080 +
-      # showLoadedResources :1778-1860; the [Prompts]/[Extensions]/[Themes]
-      # sections, package-update notices, the expand machinery and the
-      # onboarding line are cut — the port loads none of them, itemized).
+      # The startup MOTD block: the header-container shape (pi
+      # interactive-mode.ts:1075-1077 — Spacer(1), the header, Spacer(1))
+      # around the identity's header content. In tart-mode the content is
+      # the owner's art, the version line, the hints line, then the
+      # [Context] and [Skills] resource sections (pi's showLoadedResources
+      # :1778-1860; the [Prompts]/[Extensions]/[Themes] sections and
+      # package-update notices are cut — the port loads none of them,
+      # itemized). pi-mode renders pi's actual built-in header bytes.
       def enqueue_motd
-        width = viewport_width
-        lines = motd_logo_lines.map { |line| TUI.line(line) }
-        lines << TUI.line([TUI.span("tart"), TUI.span(" v#{Tart::VERSION}", fg: Theme[:dim])])
-        lines << TUI.line(Chat.wrap(HINTS_LINE, width).map { |row| TUI.span(row, fg: Theme[:dim]) })
-        motd_sections(width).each do |header, rows|
-          lines << blank_line << TUI.line(header, fg: Theme[:md_heading])
+        lines = [blank_line]
+        lines.concat(@identity == Identity::PI ? pi_header_lines : tart_header_lines(viewport_width))
+        lines << blank_line
+        @scrollback << lines
+      end
+
+      # tart-mode's header: the owner's art collection, the tart version
+      # line, the port's hints line, the resource sections — every content
+      # row through the {OUTPUT_PAD} rule.
+      def tart_header_lines(width)
+        content_width = width - OUTPUT_PAD.length * 2
+        lines = motd_logo_lines.map { |line| TUI.line("#{OUTPUT_PAD}#{line}") }
+        lines << TUI.line([TUI.span(OUTPUT_PAD), TUI.span("tart"), TUI.span(" v#{Tart::VERSION}", fg: Theme[:dim])])
+        lines.concat(Chat.wrap(HINTS_LINE, content_width).map { |row| TUI.line("#{OUTPUT_PAD}#{row}", fg: Theme[:dim]) })
+        motd_sections(content_width).each do |header, rows|
+          lines << blank_line << TUI.line("#{OUTPUT_PAD}#{header}", fg: Theme[:md_heading])
           lines.concat(rows)
         end
-        @scrollback << lines
+        lines
+      end
+
+      # pi-mode's built-in header (interactive-mode.ts:1028-1063 +
+      # pi-logo.ts): the 2-line half-block mark with the version on the
+      # mark's first line and the hints on its second, the ctrl+o notice,
+      # a blank (the header text's "\\n\\n"), the onboarding line. The
+      # mark's brand colors are fixed (pi-logo.ts:9); Apple Terminal gets
+      # the wordmark fallback (supportsPiLogo — it misrenders half
+      # blocks). The expand machinery behind the notice is cut, itemized.
+      def pi_header_lines
+        top, bottom = pi_mark
+        hints = TUI.span(bottom.empty? ? PI_HINTS_LINE : " #{PI_HINTS_LINE}", fg: Theme[:dim])
+        [
+          TUI.line([TUI.span(OUTPUT_PAD), *top, TUI.span(" v#{Identity::ORACLE_VERSION}", fg: Theme[:dim])]),
+          TUI.line([TUI.span(OUTPUT_PAD), *bottom, hints]),
+          TUI.line([TUI.span(OUTPUT_PAD), TUI.span(PI_NOTICE_LINE, fg: Theme[:dim])]),
+          blank_line,
+          TUI.line([TUI.span(OUTPUT_PAD), TUI.span(PI_ONBOARDING_LINE, fg: Theme[:dim])])
+        ]
+      end
+
+      # pi piLogoLines (pi-logo.ts:26-30): 4 cells wide, 2 lines tall —
+      # the top line coral-on-blue, then coral, then empty; the bottom
+      # blue, empty, yellow. Returns [first-line spans, second-line
+      # spans]; the wordmark fallback's second line is empty (the hints
+      # ride alone).
+      def pi_mark
+        if apple_terminal?
+          [[TUI.span("P", fg: Theme[:logoCoral]), TUI.span("i", fg: Theme[:logoYellow])], []]
+        else
+          top = [
+            TUI.span("▀", fg: Theme[:logoCoral], bg: Theme[:logoBlue]),
+            TUI.span("▀█", fg: Theme[:logoCoral]),
+            TUI.span(" ")
+          ]
+          bottom = [TUI.span("█▀", fg: Theme[:logoBlue]), TUI.span(" "), TUI.span("█", fg: Theme[:logoYellow])]
+          [top, bottom]
+        end
+      end
+
+      # pi isAppleTerminalSession (pi-tui terminal.ts:44-45): darwin +
+      # TERM_PROGRAM.
+      def apple_terminal?
+        RUBY_PLATFORM.include?("darwin") && ENV["TERM_PROGRAM"] == "Apple_Terminal"
       end
 
       # The loaded-resource sections (pi showLoadedResources): [Context] —
@@ -777,36 +860,47 @@ module Tart
       end
 
       # pi formatCompactList (:1791-1797): trimmed entries joined ", ",
-      # two-space indent, dim — word-wrapped to the viewport width. (The
-      # sort, when wanted, happens at the call site: pi's [Context] list
-      # passes sort: false — registration order.)
+      # two-space indent, dim — word-wrapped to the content width, every
+      # row through the {OUTPUT_PAD} rule. (The sort, when wanted, happens
+      # at the call site: pi's [Context] list passes sort: false —
+      # registration order.)
       def dim_compact_list(entries, width)
-        Chat.wrap("  #{entries.join(", ")}", width).map { |row| TUI.line(row, fg: Theme[:dim]) }
+        Chat.wrap("  #{entries.join(", ")}", width).map { |row| TUI.line("#{OUTPUT_PAD}#{row}", fg: Theme[:dim]) }
       end
 
       # Verbatim completed text (tool output, status): wrapped to
-      # the transcript width, one line-level fg.
+      # the transcript width, one line-level fg. Everything routed here is
+      # a chat-container child in pi (tool blocks, chat lines, compaction
+      # and status lines), so it arms the leading-spacer gate.
       def enqueue_scrollback(text, fg:)
         return if text.nil? || text.empty?
 
+        @chat_started = true
         @scrollback << Chat.wrap(text, viewport_width).map { |line| TUI.line(line, fg:) }
       end
 
       # The submitted prompt's echo (item 4, pi UserMessageComponent,
       # user-message.ts:40-51): the "text" token's color on the
       # "userMessageBg" background — pi's echo carries no prompt char
-      # (the port's I05 prompt-char invention; gone). A leading blank
-      # separates the echo from the previous region — but not on an empty
-      # container (pi interactive-mode.ts:3930-3931 gates the spacer on
-      # children.length > 0; the port's container is @transcript plus its
-      # pending scrollback). Reduced: plain wrapped text with bg on the
-      # text rows only — pi pads a full-width Markdown block.
+      # (the port's I05 prompt-char invention; gone). pi's shape: a
+      # leading blank ONLY when the chat container is non-empty
+      # (interactive-mode.ts:3930-3931 — the fresh boot's first echo has
+      # none; the port's container flag is {@chat_started}), then the
+      # component's Markdown paddingY=1 (user-message.ts:23) — one blank
+      # row above and below the content — every content row through the
+      # {OUTPUT_PAD} rule. Reduced: bg on the text rows only — pi pads a
+      # full-width Markdown block.
       def enqueue_user_echo(text)
-        rows = Chat.wrap(text, viewport_width).map do |row|
-          TUI.line([TUI.span(row, fg: Theme[:user_message_text], bg: Theme[:user_message_bg])])
+        rows = Chat.wrap(text, viewport_width - OUTPUT_PAD.length * 2).map do |row|
+          TUI.line([TUI.span(OUTPUT_PAD), TUI.span(row, fg: Theme[:user_message_text], bg: Theme[:user_message_bg])])
         end
-        rows = [blank_line] + rows unless @transcript.empty? && @scrollback.empty?
-        @scrollback << rows
+        region = []
+        region << blank_line if @chat_started # the container's non-empty gate
+        region << blank_line # paddingY top (user-message.ts:23)
+        region.concat(rows)
+        region << blank_line # paddingY bottom
+        @chat_started = true
+        @scrollback << region
       end
 
       # The resume replay (item 3, pi renderSessionEntries, interactive-
@@ -915,6 +1009,10 @@ module Tart
         @usage_totals = {input: 0, output: 0, cache_read: 0, cache_write: 0}
         @last_usage = nil
         @usage_stale = false
+        # The chat container emptied with the transcript (pi
+        # renderCurrentSessionState, interactive-mode.ts:2210-2216) — the
+        # leading-spacer gate restarts.
+        @chat_started = false
       end
 
       # Assistant completions render through the markdown converter (AC5):
@@ -928,16 +1026,26 @@ module Tart
 
       # Markdown text as themed display lines (the Render::Markdown
       # converter is read-only — theme colors apply at the span level via
-      # {Theme.md_fg}; rows re-wrapped to the width). Shared by the
-      # completion path and the live region (item 3: pi re-renders the
-      # whole streaming message as markdown on every update —
-      # interactive-mode.ts:3519-3535, assistant-message.ts:107-109).
+      # {Theme.md_fg}; rows re-wrapped to the content width — pi's
+      # Markdown wraps to width minus its paddingX on both sides,
+      # markdown.ts:289 — every row through the {OUTPUT_PAD} rule).
+      # Shared by the completion path and the live region (item 3: pi
+      # re-renders the whole streaming message as markdown on every
+      # update — interactive-mode.ts:3519-3535, assistant-message.ts
+      # :107-109).
       def markdown_lines(text, width)
-        rows = Render::Markdown.rows(text, width:).flat_map { |row| Chat.wrap_row(row, width) }
+        content_width = width - OUTPUT_PAD.length * 2
+        rows = Render::Markdown.rows(text, width: content_width).flat_map { |row| Chat.wrap_row(row, content_width) }
         rows.map do |row|
           themed = row.map { |span| Render::Markdown::Span.new(text: span.text, fg: Theme.md_fg(span.fg), modifiers: span.modifiers) }
-          TUI.markdown_line(themed)
+          padded_row(themed)
         end
+      end
+
+      # One content row with the {OUTPUT_PAD} leading the spans (pi's
+      # Markdown paddingX — the pad renders unstyled before the row).
+      def padded_row(spans)
+        TUI.markdown_line([Render::Markdown::Span.new(text: OUTPUT_PAD)] + spans)
       end
 
       # Session-cumulative usage totals + the latest assistant usage (the
@@ -1113,7 +1221,7 @@ module Tart
       # :140-150: thinkingText fg, italic; markdown-of-reasoning is cut,
       # plain dim text — itemized reduction).
       def reasoning_lines(text, width)
-        self.class.wrap(text, width).map { |line| TUI.line([TUI.span(line, fg: Theme[:thinkingText], modifiers: [:italic])]) }
+        self.class.wrap(text, width - OUTPUT_PAD.length * 2).map { |line| TUI.line([TUI.span(OUTPUT_PAD), TUI.span(line, fg: Theme[:thinkingText], modifiers: [:italic])]) }
       end
 
       # pi's editor history (components/editor.ts addToHistory): trimmed,
@@ -1630,9 +1738,14 @@ module Tart
       # R(ead) W(rite) CH% when present, the context segment, then the
       # model right-aligned (min 2 spaces padding, stats truncated with
       # "..." when they would crowd it out). The thinking level rides the
-      # right side as +model • <level>+ (footer.ts:226-244; nil → the
-      # model alone — the frozen cross-lane contract; pi's "thinking off"
-      # state is unreachable through the contract key, itemized).
+      # right side as +model • <level>+ ONLY when the model is
+      # reasoning-capable (pi footer.ts:233-244 reads
+      # state.model?.reasoning; otherwise the model alone), and the
+      # provider label prefixes the segment (pi :246-258 — the
+      # launcher-resolved model metadata; pi's own >1-available-provider
+      # gate is unimplementable without a catalog, itemized). pi's
+      # "thinking off" state is unreachable through the port's level
+      # resolution, itemized.
       def footer_stats(data, width)
         totals = @usage_totals
         parts = []
@@ -1643,7 +1756,8 @@ module Tart
         parts << "CH#{format("%.1f%%", cache_hit_rate)}" if cache_hit_rate
 
         model = data[:model] || "no-model"
-        right = data[:thinking_level] ? "#{model} • #{data[:thinking_level]}" : model
+        right = data[:reasoning] ? "#{model} • #{data[:thinking_level]}" : model
+        right = "(#{data[:provider]}) #{right}" if data[:provider]
         left = parts.map { |part| TUI.span("#{part} ", fg: Theme[:dim]) }
         left << TUI.span(context_segment(data), fg: context_fg)
         pad = width - left.sum { |span| TUI.text_width(span.content) } - TUI.text_width(right)

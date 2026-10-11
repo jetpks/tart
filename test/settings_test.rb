@@ -98,6 +98,61 @@ module Tart
       assert_equal "env-key", Settings.resolve_setting("apiKey", load_settings.settings)
     end
 
+    # --- the identity seam (I16 AC2): CLI > TART_IDENTITY env > settings
+    # identity > default "pi" — the resolution precedence table ---
+
+    def test_identity_resolves_cli_over_env_over_settings_over_default
+      assert_equal "pi", Identity.resolve(settings: {}, env: {}), "no config → the default"
+      assert_equal "tart", Identity.resolve(settings: {"identity" => "tart"}, env: {}), "settings row"
+      assert_equal "tart", Identity.resolve(settings: {"identity" => "pi"}, env: {"TART_IDENTITY" => "tart"}),
+        "env over settings"
+      assert_equal "pi", Identity.resolve(cli: "pi", settings: {"identity" => "tart"}, env: {"TART_IDENTITY" => "tart"}),
+        "CLI over everything"
+    end
+
+    def test_settings_layer_defaults_the_identity_key
+      assert_equal Identity::DEFAULT, load_settings.settings["identity"],
+        "the identity key rides Settings::DEFAULTS (no unknown-key warning, the pi default)"
+      write_settings(@user_path, '{"identity": "tart"}')
+      assert_equal "tart", load_settings.settings["identity"]
+      assert load_settings.diagnostics.none? { |d| d.message.include?("identity") },
+        "identity is a known key — no warning"
+    end
+
+    def test_invalid_identity_errors_naming_the_valid_values
+      error = assert_raises(Identity::Error) { Identity.resolve(settings: {"identity" => "bogus"}, env: {}) }
+      assert_match(/bogus/, error.message)
+      assert_match(/pi/, error.message)
+      assert_match(/tart/, error.message)
+
+      error = assert_raises(Identity::Error) { Identity.resolve(cli: "nope", settings: {}, env: {}) }
+      assert_match(/nope/, error.message)
+    end
+
+    # --- footer model metadata (I16): staged env/settings over the model ---
+
+    def test_model_provider_label_and_reasoning_resolve_staged_over_model
+      model = RubyLLM::Model.default("mock-1", "openai") # an assumed model: provider slug, no reasoning
+      assert_equal "openai", Settings.model_provider_label({}, model)
+      refute Settings.model_reasoning_capable({}, model)
+
+      assert_equal "mock", Settings.model_provider_label({"modelProvider" => "mock"}, model)
+      assert Settings.model_reasoning_capable({"modelReasoning" => true}, model)
+      refute Settings.model_reasoning_capable({"modelReasoning" => false}, model)
+      assert Settings.model_reasoning_capable({"modelReasoning" => "true"}, model), "the env layer stages strings"
+    end
+
+    def test_model_provider_label_and_reasoning_read_the_registry_model
+      # A registry entry (real model) carries its provider slug and — when
+      # the entry lists reasoning — the reasoning capability (pi reads
+      # state.model.provider / state.model.reasoning, footer.ts:226-258).
+      model = RubyLLM.models.find("gpt-5.6")
+      assert_equal "openai", Settings.model_provider_label({}, model)
+      assert_equal model.supports?(:reasoning), Settings.model_reasoning_capable({}, model)
+      assert_nil Settings.model_provider_label({}, nil), "no model → no label"
+      refute Settings.model_reasoning_capable({}, nil)
+    end
+
     # --- context window: kwarg → env → settings → model → registry table ---
 
     def test_context_window_resolution_order

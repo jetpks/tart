@@ -35,13 +35,18 @@ module Tart
     CONFIG_DIR = ".tart"
 
     DEFAULTS = {
+      "identity" => Identity::DEFAULT,
       "defaultModel" => "accounts/fireworks/models/glm-5p3-flash",
       "defaultProvider" => "openai",
       "apiBase" => "https://api.fireworks.ai/inference/v1",
       "apiKey" => nil,
       "contextWindow" => nil,
       "thinkingLevel" => "medium",
-      "compaction" => {"enabled" => true, "reserveTokens" => 16_384, "keepRecentTokens" => 20_000}
+      "compaction" => {"enabled" => true, "reserveTokens" => 16_384, "keepRecentTokens" => 20_000},
+      # Footer model-metadata staging (rarely set; nil = resolve from the
+      # model, see {model_provider_label}/{model_reasoning_capable}).
+      "modelProvider" => nil,
+      "modelReasoning" => nil
     }.freeze
 
     # pi's ThinkingLevel vocabulary (model-schema.ts:2-3, agent types.ts:349).
@@ -58,7 +63,9 @@ module Tart
       "defaultModel" => "TART_MODEL",
       "defaultProvider" => "TART_PROVIDER",
       "apiBase" => "TART_API_BASE",
-      "apiKey" => "TART_API_KEY"
+      "apiKey" => "TART_API_KEY",
+      "modelProvider" => "TART_MODEL_PROVIDER",
+      "modelReasoning" => "TART_MODEL_REASONING"
     }.freeze
 
     MODEL_CONTEXT_WINDOWS = {
@@ -121,6 +128,25 @@ module Tart
     def resolve_thinking_level(settings)
       level = settings["thinkingLevel"]
       THINKING_LEVELS.include?(level) ? level : DEFAULTS.fetch("thinkingLevel")
+    end
+
+    # The footer's model metadata (pi footer.ts:246-258 reads
+    # state.model.provider / state.model.reasoning off the registry's
+    # model entry; the port's registry is RubyLLM's — a found entry
+    # answers .provider and .supports?(:reasoning), an assumed model
+    # falls back to the provider slug it was built with and is not
+    # reasoning-capable). Stageable for rigs/mocks: the modelProvider /
+    # modelReasoning settings (TART_MODEL_PROVIDER / TART_MODEL_REASONING
+    # env) override the model.
+    def model_provider_label(settings, model)
+      resolve_setting("modelProvider", settings) || (model.provider if model.respond_to?(:provider))
+    end
+
+    def model_reasoning_capable(settings, model)
+      staged = resolve_setting("modelReasoning", settings)
+      return staged == true || staged == "true" unless staged.nil?
+
+      model.respond_to?(:supports?) ? model.supports?(:reasoning) : false
     end
 
     # The compaction settings as Agent::Loop kwargs (camelCase JSON keys →
