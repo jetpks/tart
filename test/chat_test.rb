@@ -1095,7 +1095,7 @@ module Tart
         lines = chat.transcript_lines
 
         assert_equal "", lines.first, "the header container opens with its Spacer(1)"
-        art = Dir[File.join(Render::Chat::LOGOS_DIR, "*.txt")].map { |f| File.readlines(f, chomp: true) }
+        art = Dir[File.join(Render::Motd::LOGOS_DIR, "*.txt")].map { |f| File.readlines(f, chomp: true) }
         assert art.any? { |piece| (piece.map { |line| " #{line}" } - lines).empty? },
           "a random logo piece from the owner's collection renders in full (padded)"
         assert_includes lines, " tart v#{Tart::VERSION}", "the version line renders Tart::VERSION (padded)"
@@ -1149,14 +1149,14 @@ module Tart
         lines = chat.transcript_lines
 
         assert_equal "", lines.first, "the header container opens with its Spacer(1)"
-        hints_text = Render::Chat::PI_HINTS.flat_map.with_index do |(key, description), index|
-          [key, " #{description}#{index == Render::Chat::PI_HINTS.length - 1 ? "" : " · "}"]
+        hints_text = Render::Motd::PI_HINTS.flat_map.with_index do |(key, description), index|
+          [key, " #{description}#{index == Render::Motd::PI_HINTS.length - 1 ? "" : " · "}"]
         end.join
         assert_equal " ▀▀█  v#{Identity::ORACLE_VERSION}", lines[1], "the mark's first line carries the version"
         assert_equal " █▀ █ #{hints_text}", lines[2], "the mark's second line carries the hints (the byte-identical join over the span family)"
-        assert_equal " #{Render::Chat::PI_NOTICE_LINE}", lines[3], "the ctrl+o notice"
+        assert_equal " #{Render::Motd::PI_NOTICE_LINE}", lines[3], "the ctrl+o notice"
         assert_equal "", lines[4], "the header text's blank row"
-        assert_equal " #{Render::Chat::PI_ONBOARDING_LINE}", lines[5], "the onboarding line"
+        assert_equal " #{Render::Motd::PI_ONBOARDING_LINE}", lines[5], "the onboarding line"
         assert_equal "", lines[6], "the header container closes with its Spacer(1)"
         assert_empty lines[7..], "no resources loaded → no sections (pi gates each on entries)"
 
