@@ -233,18 +233,19 @@ Word operations stop at whitespace, punctuation, and word boundaries (pi's
 `word-navigation.ts` semantics — on `hello world|`, Ctrl+W deletes `world`
 and keeps the separator space).
 
-## Parity rig: pty-tester
+## Parity rig: tui-split-rig
 
-`bin/pty-tester` is the scripted side-by-side parity instrument (BRIEF §1–§3,
-built in I02 from the I01 spike): it runs **pi** (installed oracle) and
+`gems/tui-split-rig/bin/tui-split-rig` is the scripted side-by-side parity
+instrument (BRIEF §1–§3, built in I02 from the I01 spike): it runs **pi**
+(installed oracle) and
 **tart** under identical scripted conditions — same mock LLM, same prompt,
 same 120x40 tmux geometry — captures each app's settled screen, and diffs the
 two captures with attribution.
 
 ```sh
-bin/pty-tester run parity/scenarios/s1_text_turn.yml   # full rig: pi + tart, diff, report
-bin/pty-tester run parity/scenarios/s2_tool_turn.yml --runs 3 --app pi
-bin/pty-tester diff a.capture b.capture --registry parity/registry.yml
+gems/tui-split-rig/bin/tui-split-rig run gems/tui-split-rig/scenarios/s1_text_turn.yml   # full rig: pi + tart, diff, report
+gems/tui-split-rig/bin/tui-split-rig run gems/tui-split-rig/scenarios/s2_tool_turn.yml --runs 3 --app pi
+gems/tui-split-rig/bin/tui-split-rig diff a.capture b.capture --registry gems/tui-split-rig/registry.yml
 ```
 
 `run` stages everything under the out dir (default `tmp/parity/<timestamp>`):
@@ -262,10 +263,11 @@ boot, settle timeout, request-count mismatch, teardown survivor).
 glyph classes. Today's known divergences (MOTD art, `❯` glyph, `⎿` tool
 transcript, footer model string) surface as `unknown-candidate` lines — that
 is correct behavior, not noise. The seed registry
-(`parity/registry.yml`) contains only per-run path/sandbox normalization.
+(`gems/tui-split-rig/registry.yml`) contains only per-run path/sandbox
+normalization.
 
 **Pinning a new class** (when the owner rules a difference out of scope): add
-a `classes:` entry to `parity/registry.yml` with a name and a regex
+a `classes:` entry to `gems/tui-split-rig/registry.yml` with a name and a regex
 `pattern` — first match wins; keep the class as narrow as the finding.
 Classes are data, never code, so a pin is reviewable in a one-line diff. The
 exact-parity direction is one-way: candidates shrink, classes only ever get
@@ -276,7 +278,7 @@ Isolation/teardown: every pane runs with a staged `HOME` (pi also gets a
 staged `PI_CODING_AGENT_DIR`), pane commands are exec-wrapped so the pane pid
 IS the app process, and teardown kills -9 the app and all descendants before
 dropping the session (tmux kill-session alone does not kill tart — I01).
-After any run: no surviving app process, no leftover `pty-tester-*` tmux
+After any run: no surviving app process, no leftover `tui-split-rig-*` tmux
 session, worktree clean.
 
 **Per-app env overrides:** a scenario may carry an optional `env:` mapping
@@ -286,7 +288,7 @@ staged env for that app — the branding/staging seam (e.g. `s1_tart.yml` boots
 tart with `TART_IDENTITY=tart`).
 
 Live integration test (drives real pi + tart, tens of seconds):
-`PTY_TESTER_LIVE=1 bundle exec rake test`.
+`TUI_SPLIT_RIG_LIVE=1 bundle exec rake test`.
 
 ## Development
 

@@ -1,15 +1,15 @@
 # frozen_string_literal: true
 
-require_relative "../test_helper"
-require_relative "../../lib/tart/parity"
-require_relative "../support/mock_llm_server"
+require_relative "../../../test/test_helper"
+require_relative "../lib/tui_split_rig"
+require_relative "../../../test/support/mock_llm_server"
 require "net/http"
 require "socket"
 
-module Tart
+module TuiSplitRig
   # The parity-rig extensions of MockLLMServer (I02): per-request wire
   # logging and the re-armable script — over a real TCP socket, no doubles.
-  class ParityMockLLMExtensionTest < Test
+  class MockLLMExtensionTest < Tart::Test
     def test_request_logs_capture_method_path_headers_and_parsed_body
       with_server([{type: :message, content: "hi"}]) do |server|
         post(server, "/v1/chat/completions", {model: "mock-1", stream: false}.to_json,

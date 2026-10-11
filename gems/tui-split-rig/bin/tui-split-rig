@@ -1,11 +1,11 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# pty-tester — the side-by-side parity rig (BRIEF §2, frozen CLI surface).
+# tui-split-rig — the side-by-side parity rig (BRIEF §2, frozen CLI surface).
 #
-#   pty-tester run <scenario.yml> [--runs N] [--app both|pi|tart]
+#   tui-split-rig run <scenario.yml> [--runs N] [--app both|pi|tart]
 #                  [--out <dir>] [--tart-dir <path>] [--pi-bin <path>]
-#   pty-tester diff <capture-a> <capture-b> [--registry <file>]
+#   tui-split-rig diff <capture-a> <capture-b> [--registry <file>]
 #
 # Exit codes: 0 = all difference lines sanctioned; 1 = unknown-candidate
 # lines exist (listed); 2 = rig failure.
@@ -14,7 +14,7 @@
 
 require "optparse"
 
-require_relative "../lib/tart/parity"
+require_relative "../lib/tui_split_rig"
 
 def run_verb(argv)
   options = {runs: 1, app: "both", out: nil, tart_dir: nil, pi_bin: nil}
@@ -29,8 +29,8 @@ def run_verb(argv)
   scenario_path = argv.shift
   usage! if scenario_path.nil? || argv.shift
 
-  scenario = Tart::Parity::Scenario.load(scenario_path)
-  runner = Tart::Parity::Runner.new(
+  scenario = TuiSplitRig::Scenario.load(scenario_path)
+  runner = TuiSplitRig::Runner.new(
     scenario:, runs: options.fetch(:runs), app: options.fetch(:app),
     out: options[:out],
     tart_dir: options[:tart_dir],
@@ -39,17 +39,17 @@ def run_verb(argv)
   result = runner.run!
   warn "out dir: #{result.out_dir}"
   exit result.exit_code
-rescue Tart::Parity::Error => e
-  warn "pty-tester: #{e.message}"
+rescue TuiSplitRig::Error => e
+  warn "tui-split-rig: #{e.message}"
   exit 2
 rescue OptionParser::ParseError
   usage!
 end
 
 def diff_verb(argv)
-  options = {registry: File.expand_path("../parity/registry.yml", __dir__)}
+  options = {registry: File.expand_path("../registry.yml", __dir__)}
   parser = OptionParser.new do |p|
-    p.on("--registry FILE", "difference registry (default parity/registry.yml)") { |f| options[:registry] = f }
+    p.on("--registry FILE", "difference registry (default registry.yml)") { |f| options[:registry] = f }
   end
   parser.parse!(argv)
   a_path = argv.shift
@@ -58,12 +58,12 @@ def diff_verb(argv)
 
   [a_path, b_path].each do |path|
     unless File.readable?(path)
-      warn "pty-tester: #{path}: no such capture file"
+      warn "tui-split-rig: #{path}: no such capture file"
       exit 2
     end
   end
-  registry = Tart::Parity::Registry.load(options.fetch(:registry))
-  differ = Tart::Parity::Differ.diff(File.read(a_path), File.read(b_path), registry)
+  registry = TuiSplitRig::Registry.load(options.fetch(:registry))
+  differ = TuiSplitRig::Differ.diff(File.read(a_path), File.read(b_path), registry)
 
   puts "--- #{a_path}"
   puts "+++ #{b_path}"
@@ -77,8 +77,8 @@ def diff_verb(argv)
     puts format("%s %s -> %s", sign, classified.op.line, verdict)
   end
   exit differ.clean? ? 0 : 1
-rescue Tart::Parity::Error => e
-  warn "pty-tester: #{e.message}"
+rescue TuiSplitRig::Error => e
+  warn "tui-split-rig: #{e.message}"
   exit 2
 rescue OptionParser::ParseError
   usage!
@@ -90,8 +90,8 @@ def usage!
 end
 
 def usage_line
-  "usage: pty-tester run <scenario.yml> [--runs N] [--app both|pi|tart] [--out <dir>] [--tart-dir <path>] [--pi-bin <path>]\n" \
-    "       pty-tester diff <capture-a> <capture-b> [--registry <file>]"
+  "usage: tui-split-rig run <scenario.yml> [--runs N] [--app both|pi|tart] [--out <dir>] [--tart-dir <path>] [--pi-bin <path>]\n" \
+    "       tui-split-rig diff <capture-a> <capture-b> [--registry <file>]"
 end
 
 verb = ARGV.shift
