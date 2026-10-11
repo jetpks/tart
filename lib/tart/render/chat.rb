@@ -10,6 +10,8 @@ require_relative "tool_block"
 require_relative "editor"
 require_relative "autocomplete"
 require_relative "picker"
+require_relative "selection"
+require_relative "viewport"
 require_relative "slash_source"
 
 module Tart
@@ -57,11 +59,6 @@ module Tart
       # transcript + spacer(1) + editor + footer.
       DOCK_SPACER_ROWS = 1
 
-      # The auto scrollbar's transient hide delay (pi scroll-view.ts:55
-      # scrollbarHideDelayMs, default 1000 — AC2). Injectable so tests
-      # never sleep real seconds.
-      SCROLLBAR_HIDE_DELAY_MS = 1000
-
       # Smallest editor area: top border, one input row, bottom border (pi
       # chat-viewport.ts:33 editor minSize 3).
       MIN_EDITOR_ROWS = 3
@@ -77,27 +74,6 @@ module Tart
       WRITE_TOOL = "write".freeze
       READ_TOOL = "read".freeze
 
-      # Wheel scroll (item 6, pi tui-alt-screen.ts): lines per event — the
-      # library default (:271, `options.wheelScrollLines ?? 1`; the app-level
-      # "auto" accelerator and its fullscreen-wheel-scroll-lines settings
-      # knob are cut, itemized) — and the alt+wheel multiplier (:79
-      # ALT_WHEEL_SCROLL_MULTIPLIER = 5).
-      WHEEL_LINES_PER_EVENT = 1
-      ALT_WHEEL_MULTIPLIER = 5
-
-      # Wheel direction → scroll delta (pi parseWheelEvent :705-723: wheel up
-      # scrolls up).
-      WHEEL_DIRECTION = {"scroll_up" => -1, "scroll_down" => 1}.freeze
-
-      # Double/triple-click window (pi DOUBLE_CLICK_INTERVAL_MS :82 = 500ms;
-      # the count cycles 1 → 2 → 3 → 1 on the same row and word range —
-      # getClickCount :1247-1267).
-      DOUBLE_CLICK_SECONDS = 0.5
-
-      # Word-selection joiners (pi TERMINAL_WORD_SELECTION_JOINERS :85): paths
-      # and kebab-case tokens stay whole across a word boundary.
-      WORD_JOINERS = "/-".freeze
-
       # pi status-indicator.ts:85-95 — the compaction-start border labels,
       # minus the cancel hint (deviation: ctrl+c aborts the whole run in the
       # port, not just the compaction — BRIEF §5.1, itemized).
@@ -106,14 +82,6 @@ module Tart
         threshold: "Auto-compacting...",
         overflow: "Context overflow detected, Auto-compacting..."
       }.freeze
-
-      # A selection endpoint in transcript-buffer coordinates (pi
-      # SelectionPoint reduced to content rows: the port's selection is
-      # anchored to buffer lines, so it survives scrolling — pi stores
-      # scrollView content rows exactly the same way,
-      # getScrollSelectionPoint :1133-1155). +boundary+ marks an exclusive
-      # end (word/line granularity — pi SelectionPoint.boundary).
-      Point = Struct.new(:row, :col, :boundary)
 
       # The owner's ascii-art collection (tart-mode's mark) — one random
       # piece per MOTD render (boot and /new). pi-mode renders pi's actual
@@ -170,10 +138,6 @@ module Tart
         file = Dir[File.join(LOGOS_DIR, "*.txt")].sample
         file ? File.readlines(file, chomp: true) : []
       end
-
-      # The selection granularity's word-char class (the editor's full
-      # boundary-class set lives on {Editor} — word-navigation.ts).
-      WORD_CHAR = Editor::WORD_CHAR
 
       # The git branch reader (pi footer-data-provider.ts:52-70, reduced):
       # one +git symbolic-ref+ per turn, nil when not on a branch (detached
@@ -233,25 +197,14 @@ module Tart
         # SelectList). Both unsynchronized — see the class comment.
         @editor = Editor.new
         @autocomplete = Autocomplete.new(source: autocomplete)
-        # Transcript scroll state (pi ScrollView follow-end semantics): the
-        # viewport's top-line offset over the buffer; +@follow+ while pinned
-        # to the end (the default — the tail is what's visible).
-        @scroll_offset = 0
-        @follow = true
-        # The auto scrollbar's transient state (pi scroll-view.ts:74-123):
-        # the activity timestamp a user scroll marks (transientScrollbarVisible
-        # — fresh while younger than the hide delay) and the epoch that
-        # retires stale one-shot hide timers (pi clearTimeout). Reactor-
-        # thread-only state, like the scroll state.
-        @scrollbar_activity_at = nil
-        @scrollbar_timer_epoch = 0
-        # Mouse selection state (item 10, pi tui-alt-screen.ts:83-107):
-        # anchor/focus points, granularity (:character/:word/:line), the
-        # initial word/line range a drag extends, and the multi-click
-        # bookkeeping. Reactor-side only (the kernel's event sink and the
-        # renderer share the frame loop's thread).
-        @selection = nil
-        @last_click = nil
+        # The viewport state machines (I23 wave 3): the transcript scroll
+        # state — the offset over the buffer, the follow-end pin and the
+        # auto scrollbar's transient rail (pi ScrollView) — and the mouse
+        # selection state (item 10, pi tui-alt-screen.ts:83-107). Both
+        # unsynchronized — see the class comments; the selection reads
+        # this surface's live transcript through its content seam.
+        @viewport = Viewport.new
+        @selection_state = Selection.new(line_reader: ->(row) { plain_content_line(row) })
         # The running compaction's reason (the border-status label's key).
         @compaction_reason = nil
         # The /resume session picker (item 2, pi SessionSelectorComponent
@@ -341,8 +294,11 @@ module Tart
 
       # The auto scrollbar's hide delay in ms (pi scrollbarHideDelayMs,
       # scroll-view.ts:55) — a test seam: tests inject a short delay
-      # instead of sleeping real seconds.
-      attr_writer :scrollbar_hide_delay_ms
+      # instead of sleeping real seconds. The state lives on the viewport;
+      # the seam stays on the Chat surface (the readbacks' shape).
+      def scrollbar_hide_delay_ms=(ms)
+        @viewport.hide_delay_ms = ms
+      end
 
       # @return [Boolean] whether an agent run is in flight.
       def busy?
@@ -409,7 +365,7 @@ module Tart
       # @return [Integer] the transcript viewport's top-line offset (test
       #   readback; maintained at render time).
       def scroll_offset
-        @mutex.synchronize { @scroll_offset }
+        @mutex.synchronize { @viewport.offset }
       end
 
       # The kernel renderer proc: builds the fullscreen three-area widget.
@@ -979,10 +935,8 @@ module Tart
         @transcript = []
         @scrollback.clear
         @expandable_blocks.clear
-        @scroll_offset = 0
-        @follow = true
-        @selection = nil
-        @last_click = nil
+        @viewport.reset
+        @selection_state.reset
         @live = +""
         @reasoning = +""
         # pi's footer stats re-derive from the fresh (empty) session.
@@ -1247,8 +1201,14 @@ module Tart
         # the action onto the transcript viewport (the port's editor is
         # single-line; mapping judgment, itemized). The list wins while
         # active (pi's precedence: the list owns the vertical keys).
-        when "page_up" then scroll_page(-1) unless @autocomplete.suggestions
-        when "page_down" then scroll_page(1) unless @autocomplete.suggestions
+        when "page_up"
+          unless @autocomplete.suggestions
+            mark_scrollbar_activity(@viewport.scroll_page(-1, display_lines.size, transcript_area_rows))
+          end
+        when "page_down"
+          unless @autocomplete.suggestions
+            mark_scrollbar_activity(@viewport.scroll_page(1, display_lines.size, transcript_area_rows))
+          end
         when "backspace"
           alt ? @editor.delete_word_backward : @editor.delete_backward
           @autocomplete.update(@editor) # pi editor.ts:1449-1463 — re-filter/re-trigger
@@ -1468,55 +1428,26 @@ module Tart
 
       # --- transcript scroll state (pi scroll-view.ts follow-end) ---
 
-      # One page of transcript rows (pi keybindings.ts:114-115). A page
-      # away from the end detaches (+@follow+ false — pi scrollBy sets
-      # followingEnd = followEnd && next === maxScrollTop); the render
-      # ({transcript_widget}) re-follows whenever the offset lands at the
-      # end, and keeps a detached offset put as new output arrives.
-      def scroll_page(direction)
-        scroll_by(direction * transcript_area_rows)
-      end
+      # The scrollbar hide timer's kernel arm (pi scroll-view.ts:97-110
+      # markScrollbarActivity — the timer lives on the host reactor; the
+      # port's host is the kernel). The viewport owns the stamp+epoch
+      # state machine ({Viewport#mark}, whose epoch the user-scroll seams
+      # thread back): this arm sleeps the hide delay, no-ops on a stale
+      # epoch (pi clearTimeout + re-set) and hides the rail + requests
+      # exactly one redraw — the hide frame ({kernel.request_draw}).
+      # Movement already implies overflow (a fitting view's max_offset is
+      # 0 — nothing can move), matching pi's contentHeight >
+      # viewportHeight guard.
+      def mark_scrollbar_activity(epoch)
+        return unless epoch
 
-      # Scrolls the transcript by +lines+ rows (pi ScrollView.scrollBy,
-      # scroll-view.ts:127-135): any move away from the end detaches; the
-      # render re-arms follow whenever the offset lands at the end (wheel
-      # back down = re-arm; a wheel down while following clamps and stays
-      # armed — pi's next === maxScrollTop rule). While following,
-      # +@scroll_offset+ tracks the last rendered end, so the wheel moves
-      # relative to it. A scroll that MOVED marks scrollbar activity (pi
-      # scrollBy: `if (moved !== 0) markScrollbarActivity()` — a clamped
-      # no-op marks nothing).
-      def scroll_by(lines)
-        max_offset = [display_lines.size - transcript_area_rows, 0].max
-        start = @follow ? max_offset : @scroll_offset # pi: followingEnd ? maxScrollTop : scrollTop
-        previous = @scroll_offset
-        @scroll_offset = [[start + lines, max_offset].min, 0].max
-        @follow = false
-        mark_scrollbar_activity if @scroll_offset != previous
-      end
-
-      # The auto rail's transient show (pi ScrollView.markScrollbarActivity,
-      # scroll-view.ts:97-110): a moved user scroll marks the activity
-      # timestamp and arms a one-shot hide timer on the reactor; a re-mark
-      # bumps the epoch so the stale timer no-ops (pi clearTimeout +
-      # re-set). The timer clears the timestamp and requests exactly one
-      # redraw — the hide frame (kernel.request_draw). Movement already
-      # implies overflow (a fitting view's max_offset is 0 — nothing can
-      # move), matching pi's contentHeight > viewportHeight guard.
-      def mark_scrollbar_activity
-        @scrollbar_activity_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        epoch = (@scrollbar_timer_epoch += 1)
         @kernel.async do
-          sleep(scrollbar_hide_delay_ms / 1000.0)
-          next if @scrollbar_timer_epoch != epoch
+          sleep(@viewport.hide_delay_ms / 1000.0)
+          next if @viewport.stale?(epoch)
 
-          @scrollbar_activity_at = nil
+          @viewport.hide_scrollbar
           @kernel.request_draw
         end
-      end
-
-      def scrollbar_hide_delay_ms
-        @scrollbar_hide_delay_ms || SCROLLBAR_HIDE_DELAY_MS
       end
 
       # The transcript area's row budget — the page size and the mouse
@@ -1540,122 +1471,25 @@ module Tart
       # scrolls it, the left button owns selection (pi
       # handleSelectionMouseEvent :1322 — button&3 == 0; right-click paste
       # is Windows-only in pi — cut, itemized), bare motion is ignored.
+      # The pointer's buffer point is composed here ({content_point} —
+      # viewport state + geometry) and threaded into the selection.
       def handle_mouse(event)
         return wheel(event) if event.scroll?
         return unless event.left?
 
         case event.kind
-        when "down" then selection_press(event.y, event.x)
-        when "drag" then selection_drag(event.y, event.x)
-        when "up" then selection_release(event.y, event.x)
+        when "down" then @selection_state.press(content_point(event.y, event.x))
+        when "drag" then @selection_state.drag(content_point(event.y, event.x))
+        when "up" then @selection_state.release(content_point(event.y, event.x))
         end
       end
 
-      # One wheel event: lines-per-event (alt+wheel 5×, pi :710) in the
-      # event's direction.
+      # One wheel event: the lines-per-event math and the wheel constants
+      # live on the viewport ({Viewport#wheel} — pi tui-alt-screen.ts wheel
+      # → scrollView.scrollBy); this is the routing + the hide timer's
+      # arm.
       def wheel(event)
-        lines = WHEEL_LINES_PER_EVENT * (event.modifiers.include?("alt") ? ALT_WHEEL_MULTIPLIER : 1)
-        scroll_by(WHEEL_DIRECTION.fetch(event.kind) * lines)
-      end
-
-      # Press: anchor at the pointer (pi :1397-1416). A double click takes
-      # the pointer's word, a triple the whole line (granularity + initial
-      # range — a following drag extends word-/line-wise, pi
-      # updateSelectionFocus :1226-1244). A press outside the transcript
-      # area drops the selection (pi: the press lands on another component).
-      def selection_press(y, x)
-        point = content_point(y, x)
-        return @selection = nil unless point
-
-        word = word_range(point)
-        count = next_click_count(point, word)
-        range = count == 2 ? word : (count == 3 ? line_range(point) : nil)
-        @selection = {
-          anchor: range ? range.first : point,
-          focus: range ? range.last : point,
-          granularity: range ? (count == 2 ? :word : :line) : :character,
-          initial: range
-        }
-      end
-
-      # Drag: extend the focus (pi :1370-1380). pi's edge auto-scroll while
-      # dragging past the viewport (updateSelectionAutoScroll :1270-1320,
-      # 50ms timer) is cut — itemized.
-      def selection_drag(y, x)
-        return unless @selection
-
-        point = content_point(y, x)
-        update_selection_focus(point) if point
-      end
-
-      # Release: a press without a move (anchor == focus) collapses to no
-      # selection; otherwise copy-on-select (pi :1332-1366, default on —
-      # :269) via the seam's OSC 52 write.
-      def selection_release(y, x)
-        return unless @selection
-
-        point = content_point(y, x)
-        update_selection_focus(point) if point
-        text = selection_text
-        @selection = nil if text.nil?
-        TUI.osc52_copy(text) if text
-      end
-
-      # Focus extension (pi updateSelectionFocus :1226-1244): character
-      # granularity moves the focus point; word/line re-selects at the
-      # pointer and flips the anchor to the opposite end of the initial
-      # range (dragging backwards grows the head end).
-      def update_selection_focus(point)
-        s = @selection
-        if s[:granularity] == :character || !s[:initial]
-          s[:focus] = point
-        else
-          range = s[:granularity] == :word ? word_range(point) : line_range(point)
-          return unless range
-
-          if before?(range.first, s[:initial].first)
-            s[:anchor], s[:focus] = s[:initial].last, range.first
-          else
-            s[:anchor], s[:focus] = s[:initial].first, range.last
-          end
-        end
-      end
-
-      # @return the ordered [start, focus] selection bounds, or nil when
-      #   there is no selection (the endpoints coincide — pi
-      #   getSelectionBounds :1403-1426).
-      def selection_bounds
-        return nil unless @selection
-
-        a, b = @selection[:anchor], @selection[:focus]
-        return nil if a == b
-
-        before?(a, b) ? [a, b] : [b, a]
-      end
-
-      def before?(a, b)
-        a.row < b.row || (a.row == b.row && a.col < b.col)
-      end
-
-      # The selected text (pi getActiveSelectionText :1414-1437): each
-      # covered buffer row's cell slice, trailing whitespace trimmed,
-      # joined with newlines. nil when nothing (or only whitespace) is
-      # selected.
-      def selection_text
-        bounds = selection_bounds
-        return nil unless bounds
-
-        start, focus = bounds
-        text = (start.row..focus.row).map do |row|
-          source = plain_content_line(row)
-          width = TUI.text_width(source)
-          from = start.row == row ? start.col : 0
-          to = focus.row == row ? (focus.boundary ? focus.col : focus.col + 1) : width
-          from = from.clamp(0, width)
-          to = to.clamp(from, width)
-          slice_cells(source, from, to - from).rstrip
-        end.join("\n")
-        text.empty? ? nil : text
+        mark_scrollbar_activity(@viewport.wheel(event, display_lines.size, transcript_area_rows))
       end
 
       # Maps a terminal cell to a selection point in buffer coordinates (pi
@@ -1671,93 +1505,18 @@ module Tart
         lines = display_lines
         return nil if lines.empty?
 
-        row = (@scroll_offset + y).clamp(0, lines.size - 1)
+        row = (@viewport.offset + y).clamp(0, lines.size - 1)
         # pi clamps to the scrollview box — full width for "auto" (the
         # rail overlays the last column, no reserved gutter to exclude;
         # scroll-view.ts:80-82 getContentWidth).
-        Point.new(row, x.clamp(0, viewport_width - 1))
+        Selection::Point.new(row, x.clamp(0, viewport_width - 1))
       end
 
-      # The word selection at +point+ (pi getWordSelection :1167-1212): the
-      # maximal run of word characters joined by "/"/"-" (paths and
-      # kebab-case stay whole); any other single character selects itself
-      # (pi: a non-word segment is its own selection). nil beyond the
-      # line's cells.
-      def word_range(point)
-        text = plain_content_line(point.row)
-        return nil if point.col >= TUI.text_width(text)
-
-        idx = char_index_at_cell(text, point.col)
-        if text[idx].match?(WORD_CHAR) || WORD_JOINERS.include?(text[idx])
-          from = idx
-          from -= 1 while from > 0 && word_char?(text[from - 1])
-          upto = idx
-          upto += 1 while upto < text.length - 1 && word_char?(text[upto + 1])
-        else
-          from = upto = idx
-        end
-        [Point.new(point.row, TUI.text_width(text[0, from])),
-         Point.new(point.row, TUI.text_width(text[0, upto + 1]), true)]
-      end
-
-      def word_char?(ch)
-        ch.match?(WORD_CHAR) || WORD_JOINERS.include?(ch)
-      end
-
-      # The line selection at +point+ (pi getLineSelection :1214-1219): the
-      # whole row, exclusive end at its width.
-      def line_range(point)
-        width = TUI.text_width(plain_content_line(point.row))
-        [Point.new(point.row, 0), Point.new(point.row, width, true)]
-      end
-
-      # pi getClickCount :1247-1267: clicks within the double-click window
-      # on the same row and word range cycle 1 → 2 → 3 → 1.
-      def next_click_count(point, word)
-        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        last = @last_click
-        count = if word && last && now - last[:at] <= DOUBLE_CLICK_SECONDS &&
-          last[:row] == point.row && last[:start] == word.first.col && last[:end] == word.last.col
-          (last[:count] % 3) + 1
-        else
-          1
-        end
-        @last_click = word && {row: point.row, start: word.first.col, end: word.last.col, count:, at: now}
-        count
-      end
-
-      # The buffer row's plain text (the display Line's span contents).
+      # The buffer row's plain text (the display Line's span contents) —
+      # the selection's content seam (the {Selection} machine reads it
+      # through its injected reader).
       def plain_content_line(row)
         display_lines[row].spans.map(&:content).join
-      end
-
-      # The character covering cell +col+ of +text+.
-      def char_index_at_cell(text, col)
-        cell = 0
-        text.each_char.with_index do |ch, i|
-          cell += TUI.text_width(ch)
-          return i if cell > col
-        end
-        text.length - 1
-      end
-
-      # The leading text fitting +width+ cells (whole characters; a wide
-      # character that would straddle the bound moves whole to the
-      # remainder — widths stay additive).
-      def take_cells(text, width)
-        out = +""
-        text.each_char do |ch|
-          break if TUI.text_width(out) + TUI.text_width(ch) > width
-
-          out << ch
-        end
-        out
-      end
-
-      # The +width+-cell substring of +text+ starting at cell +start+.
-      def slice_cells(text, start, width)
-        rest = take_cells(text, start)
-        take_cells(text[rest.length..] || "", width)
       end
 
       def editor_area_rows(height)
@@ -1819,59 +1578,19 @@ module Tart
       # — only the user-scroll seams mark). Content wraps the FULL width
       # for "auto" (scroll-view.ts:80-82 getContentWidth — only "always"
       # reserves a column); the rail overlays the last column while fresh
-      # and the settled screen shows none (AC2).
+      # and the settled screen shows none (AC2). The offset maintenance
+      # and the rail paint are Viewport ops; the highlight is the
+      # selection's render query ({Selection#highlight_row}).
       def transcript_widget(rows)
         width = viewport_width
         lines = display_lines
-        max_offset = [lines.size - rows, 0].max
-        @scroll_offset = @follow ? max_offset : @scroll_offset.clamp(0, max_offset)
-        @follow = true if @scroll_offset == max_offset
-        # pi updateLayout force-hide (scroll-view.ts:200): content fits →
-        # the transient rail hides immediately.
-        @scrollbar_activity_at = nil if lines.size <= rows
-        window = (lines[@scroll_offset, rows] || []).map.with_index do |line, i|
-          highlight_row(line, @scroll_offset + i)
+        window = @viewport.window(lines, rows).map.with_index do |line, i|
+          @selection_state.highlight_row(line, @viewport.offset + i)
         end
-        return TUI.paragraph(text: window, wrap: false) unless scrollbar_visible?(lines, rows)
+        return TUI.paragraph(text: window, wrap: false) unless @viewport.scrollbar_visible?(lines, rows)
 
-        glyphs = scrollbar_glyphs(lines.size, rows)
-        TUI.paragraph(text: window.map.with_index { |line, i| overlay_rail_cell(line, glyphs[i], width) }, wrap: false)
-      end
-
-      # pi scroll-view.ts isScrollbarVisible (:74-78): the auto rail paints
-      # only while the content overflows AND scroll activity is fresh
-      # (transientScrollbarVisible, younger than scrollbarHideDelayMs) — a
-      # settled screen never shows it (AC2).
-      def scrollbar_visible?(lines, rows)
-        stamp = @scrollbar_activity_at
-        return false if stamp.nil? || lines.size <= rows
-
-        Process.clock_gettime(Process::CLOCK_MONOTONIC) - stamp < scrollbar_hide_delay_ms / 1000.0
-      end
-
-      # One rail row (pi paintScrollbar layout.ts:307-330 via
-      # replaceScrollbarCell): the glyph REPLACES the last column's cell —
-      # content clips at width−1, plain padding spaces carry it to the
-      # rail column, the glyph keeps its theme fg (grafted from
-      # {scrollbar_glyphs}' own span — scrollbarTrack/scrollbarThumb).
-      # pi's hover-driven active thumb `█` (setScrollbarActive,
-      # tui-alt-screen.ts:1057-1065) has no port seam and is unreachable
-      # in the rig — cut, itemized; the at-rest `┃` is the reachable
-      # subset.
-      def overlay_rail_cell(line, glyph, width)
-        head = Text.clip_spans(line.spans, width - 1)
-        pad = width - 1 - head.sum { |span| TUI.text_width(span.content) }
-        spans = pad.positive? ? [*head, TUI.span(" " * pad)] : head
-        TUI.line([*spans, glyph.spans.first])
-      end
-
-      # The right-gutter scrollbar (pi layout.ts:307-330 paintScrollbar:
-      # track "│" / thumb "┃"). pi's actual scrollbarTrack/scrollbarThumb
-      # tokens (dark.json:28-29, blue-tinted) — promoted in the theme table
-      # (I12 ruling 2 carry-in; the interim dim/muted routing retired).
-      def scrollbar_glyphs(total, rows)
-        TUI.scrollbar_lines(content_length: total, position: @scroll_offset, viewport: rows,
-          track_fg: Theme[:scrollbarTrack], thumb_fg: Theme[:scrollbarThumb])
+        glyphs = @viewport.scrollbar_glyphs(lines.size, rows)
+        TUI.paragraph(text: window.map.with_index { |line, i| @viewport.overlay_rail_cell(line, glyphs[i], width) }, wrap: false)
       end
 
       # The edit box (pi CustomEditor, item 5): full-width from column 0,
@@ -2077,62 +1796,6 @@ module Tart
       # rows).
       def display_lines
         @transcript + live_lines(viewport_width)
-      end
-
-      # One transcript row re-styled with the selection's inverse highlight
-      # (pi applySelection :1589-1638 + applySelectionHighlight :1572-1584:
-      # SGR 7 over the covered cells — the port's [:reversed] modifier on
-      # the covered spans, fg kept). Rows outside the selection pass
-      # through untouched.
-      def highlight_row(line, row)
-        bounds = selection_bounds
-        return line unless bounds
-        return line if row < bounds.first.row || row > bounds.last.row
-
-        from, to = selection_columns(row, TUI.text_width(line.spans.map(&:content).join))
-        return line if to <= from
-
-        reverse_cells(line, from, to)
-      end
-
-      # The selection's cell range on +row+ (pi getSelectionColumns
-      # :1429-1447): the start/end columns only bite on their own rows;
-      # the char-granularity end is inclusive (+1), a word/line end is
-      # exclusive (boundary).
-      def selection_columns(row, width)
-        start, focus = selection_bounds
-        from = start.row == row ? start.col : 0
-        to = focus.row == row ? (focus.boundary ? focus.col : focus.col + 1) : width
-        [from.clamp(0, width), to.clamp(0, width)]
-      end
-
-      # Rebuilds one display line with the cell range [from, to) inverse-
-      # highlighted: spans are split at the range's bounds, covered pieces
-      # carry [:reversed] (fg kept — pi's SGR 7 composes over SGR).
-      def reverse_cells(line, from, to)
-        cell = 0
-        spans = line.spans.flat_map do |span|
-          pieces = span_pieces(span, cell, from, to)
-          cell += TUI.text_width(span.content)
-          pieces
-        end
-        TUI.line(spans)
-      end
-
-      # One span split at the selection bounds (cuts strictly inside the
-      # span); pieces inside [from, to) are reversed.
-      def span_pieces(span, cell, from, to)
-        width = TUI.text_width(span.content)
-        cuts = [from, to].select { |c| cell < c && c < cell + width }.uniq.sort
-        fg = span.style&.fg
-        modifiers = span.style&.modifiers || []
-        [cell, *cuts, cell + width].each_cons(2).filter_map do |a, b|
-          next if a == b
-
-          piece = slice_cells(span.content, a - cell, b - a)
-          reversed = a >= from && b <= to
-          TUI.span(piece, fg:, modifiers: reversed ? modifiers + [:reversed] : modifiers)
-        end
       end
 
       # The streaming region (item 3, pi interactive-mode.ts:3519-3535 +
