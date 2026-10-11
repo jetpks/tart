@@ -7,6 +7,10 @@ require_relative "panel"
 require_relative "bash_block"
 require_relative "file_blocks"
 require_relative "tool_block"
+require_relative "editor"
+require_relative "autocomplete"
+require_relative "picker"
+require_relative "slash_source"
 
 module Tart
   module Render
@@ -72,16 +76,6 @@ module Tart
       # non-bash keeps the generic ⎿ line (I17's ruling).
       WRITE_TOOL = "write".freeze
       READ_TOOL = "read".freeze
-
-      # History depth (pi: editor.ts addToHistory caps at 100 entries).
-      HISTORY_LIMIT = 100
-
-      # Suggestion-list window (pi editor.ts:322 default 5; the 3-20 clamp
-      # is settings-backed — cut, itemized deviation: fixed at the default).
-      AUTOCOMPLETE_MAX = 5
-
-      # Session-picker window (pi session-selector.ts:302 maxVisible 10).
-      PICKER_MAX = 10
 
       # Wheel scroll (item 6, pi tui-alt-screen.ts): lines per event — the
       # library default (:271, `options.wheelScrollLines ?? 1`; the app-level
@@ -177,14 +171,9 @@ module Tart
         file ? File.readlines(file, chomp: true) : []
       end
 
-      # The boundary classes of pi's word navigation (word-navigation.ts with
-      # utils.ts:1006 PUNCTUATION_REGEX and :1011 isWhitespaceChar). The
-      # Intl.Segmenter word-like segment is approximated by word-character
-      # runs (recorded simplification); ASCII punctuation stays a boundary
-      # either way — pi's PUNCTUATION_REGEX sub-rule.
-      PUNCTUATION = /[(){}\[\]<>.,;:'"!?+\-=*\/\\|&%^$#@~`]/.freeze
-      WORD_CHAR = /[[:alnum:]_]/.freeze
-      WHITESPACE = /\s/.freeze
+      # The selection granularity's word-char class (the editor's full
+      # boundary-class set lives on {Editor} — word-navigation.ts).
+      WORD_CHAR = Editor::WORD_CHAR
 
       # The git branch reader (pi footer-data-provider.ts:52-70, reduced):
       # one +git symbolic-ref+ per turn, nil when not on a branch (detached
@@ -209,7 +198,7 @@ module Tart
       # @param branch_reader [Proc] +call(cwd)+ → branch name or nil.
       # @param autocomplete [Object, nil] the completion-source seam (AC1):
       #   answers +items+ with the full {value:, label:, description:}
-      #   catalog the surface fuzzy-filters. nil (the default) offers no
+      #   catalog the list fuzzy-filters. nil (the default) offers no
       #   suggestions — headless tests stay deterministic; bin/tart wires
       #   the real command/skill sources (see {SlashSource}).
       # @param motd [Boolean] render the startup MOTD block on the first
@@ -237,17 +226,13 @@ module Tart
         @footer_data = footer_data
         @branch_reader = branch_reader
         @agent = nil
-        @autocomplete = autocomplete
         @mutex = Mutex.new
-        @input = +""
-        @cursor = 0
-        @history = []
-        @history_index = -1 # -1 = not browsing (pi: editor.ts historyIndex)
-        @history_draft = nil
-        # Active autocomplete list: the filtered items + the selection index
-        # (pi editor.ts autocompleteState/autocompleteList + SelectList).
-        @suggestions = nil
-        @selected = 0
+        # The input-line editor (pi's Input — the editor state and
+        # operations) and its suggestion list over the injected completion
+        # source (pi editor.ts autocompleteState/autocompleteList +
+        # SelectList). Both unsynchronized — see the class comment.
+        @editor = Editor.new
+        @autocomplete = Autocomplete.new(source: autocomplete)
         # Transcript scroll state (pi ScrollView follow-end semantics): the
         # viewport's top-line offset over the buffer; +@follow+ while pinned
         # to the end (the default — the tail is what's visible).
@@ -270,8 +255,8 @@ module Tart
         # The running compaction's reason (the border-status label's key).
         @compaction_reason = nil
         # The /resume session picker (item 2, pi SessionSelectorComponent
-        # reduced): nil = closed; open it holds {items:, selected:} with
-        # items the launcher-built [{path:, label:}] list (newest first).
+        # reduced): nil = closed; open it holds the {Picker} over the
+        # launcher-built [{path:, label:}] list (newest first).
         @picker = nil
         # The ctrl+o global tool-output toggle (pi toolOutputExpanded,
         # setToolsExpanded — interactive-mode.ts:6810-6826): every
@@ -364,8 +349,10 @@ module Tart
         @mutex.synchronize { @busy }
       end
 
-      # @return [String] the input line buffer.
-      attr_reader :input
+      # @return [String] the input line buffer (the editor's).
+      def input
+        @mutex.synchronize { @editor.input }
+      end
 
       # The kernel handle (the escape-cancel path stops the user-bash task
       # through it; tests read it too).
@@ -400,23 +387,23 @@ module Tart
       # @return [Array<Hash>, nil] the active suggestion items (test
       #   readback — the list is otherwise visible only in the drawn tree).
       def suggestions
-        @mutex.synchronize { @suggestions }
+        @mutex.synchronize { @autocomplete.suggestions }
       end
 
       # @return [Integer] the active list's selection index (test readback).
       def suggestions_index
-        @mutex.synchronize { @selected }
+        @mutex.synchronize { @autocomplete.selected }
       end
 
       # @return [Array<Hash>, nil] the open session picker's items (test
       #   readback; nil = closed).
       def picker_items
-        @mutex.synchronize { @picker&.fetch(:items) }
+        @mutex.synchronize { @picker&.items }
       end
 
       # @return [Integer] the picker's selection index (test readback).
       def picker_index
-        @mutex.synchronize { @picker ? @picker[:selected] : 0 }
+        @mutex.synchronize { @picker ? @picker.selected : 0 }
       end
 
       # @return [Integer] the transcript viewport's top-line offset (test
@@ -578,11 +565,11 @@ module Tart
 
       # The /resume picker (item 2, pi showSessionSelector →
       # SessionSelectorComponent, interactive-mode.ts:3335-3338, :5708-5735,
-      # reduced — see the picker methods at the bottom): +items+ is the
-      # launcher-built [{path:, label:}] list, newest first; keys route
-      # through {picker_input} while open, enter fires {on_resume}.
+      # reduced): +items+ is the launcher-built [{path:, label:}] list,
+      # newest first; keys route into the picker's +handle+ while open,
+      # enter fires {on_resume} through the picker's on_select wiring.
       def open_session_picker(items)
-        @mutex.synchronize { @picker = {items:, selected: 0} }
+        @mutex.synchronize { @picker = Picker.new(items:, on_select: ->(item) { @on_resume&.call(item[:path]) }) }
       end
 
       # Slash-command output (pi's chat-line status UX): a muted line in
@@ -592,138 +579,6 @@ module Tart
       # (the I13 /skills NoMethodError).
       def command_line(text)
         @mutex.synchronize { enqueue_scrollback(text, fg: Theme[:muted]) }
-      end
-
-      class << self
-
-        # pi's findWordBackward (word-navigation.ts:17-70): from the cursor,
-        # skip trailing whitespace, then stop at the next word/punctuation
-        # boundary — one word run (ASCII punctuation inside it stays a
-        # boundary) or one punctuation run. On "hello world" this lands at 6
-        # (the separator space is kept); on "hello " it lands at 0 (the
-        # whitespace is trailing). Pure function.
-        def find_word_backward(text, cursor)
-          return 0 if cursor <= 0
-
-          i = cursor
-          i -= 1 while i.positive? && WHITESPACE.match?(text[i - 1])
-          return i if i.zero?
-
-          if WORD_CHAR.match?(text[i - 1])
-            i -= 1 while i.positive? && WORD_CHAR.match?(text[i - 1])
-          elsif PUNCTUATION.match?(text[i - 1])
-            i -= 1 while i.positive? && PUNCTUATION.match?(text[i - 1])
-          else
-            i -= 1 # non-word, non-punct (e.g. an emoji): one char
-          end
-          i
-        end
-
-        # pi's findWordForward (word-navigation.ts:73-124): the mirror of
-        # {find_word_backward} — skip leading whitespace, then stop at the
-        # next word/punctuation boundary. Pure function.
-        def find_word_forward(text, cursor)
-          return text.length if cursor >= text.length
-
-          i = cursor
-          i += 1 while i < text.length && WHITESPACE.match?(text[i])
-          return i if i == text.length
-
-          if WORD_CHAR.match?(text[i])
-            i += 1 while i < text.length && WORD_CHAR.match?(text[i])
-          elsif PUNCTUATION.match?(text[i])
-            i += 1 while i < text.length && PUNCTUATION.match?(text[i])
-          else
-            i += 1
-          end
-          i
-        end
-
-        # pi fuzzyMatch (fuzzy.ts:12-72): every query char in order (not
-        # necessarily consecutive) in the lowercased text; the score is ≤ 0,
-        # lower is better — consecutive matches −5·n, gaps +2·gap, word
-        # boundaries −10, position +0.1·i, an exact match −100. nil = no
-        # match. The alnum/num-alpha swap ("ab12" ⇄ "12ab") retries with a
-        # +5 penalty (fuzzy.ts:68-93).
-        def fuzzy_match(query, text)
-          query = query.downcase
-          text = text.downcase
-          score = fuzzy_subsequence_score(query, text)
-          return score if score
-
-          swapped = query.match(/\A(?<letters>[a-z]+)(?<digits>[0-9]+)\z/) { |m| "#{m[:digits]}#{m[:letters]}" } ||
-            query.match(/\A(?<digits>[0-9]+)(?<letters>[a-z]+)\z/) { |m| "#{m[:letters]}#{m[:digits]}" }
-          swapped && (swapped_score = fuzzy_subsequence_score(swapped, text)) ? swapped_score + 5 : nil
-        end
-
-        def fuzzy_subsequence_score(query, text)
-          return nil if query.length > text.length
-          return 0 if query.empty?
-
-          score = 0.0
-          last = -1
-          consecutive = 0
-          query.chars.each do |char|
-            i = text.index(char, last + 1)
-            return nil unless i
-
-            if last == i - 1
-              consecutive += 1
-              score -= consecutive * 5
-            else
-              consecutive = 0
-              score += (i - last - 1) * 2 if last >= 0
-            end
-            score -= 10 if i.zero? || /[\s\-_.\/:]/.match?(text[i - 1])
-            score += i * 0.1
-            last = i
-          end
-          score -= 100 if query == text
-          score
-        end
-
-        # pi fuzzyFilter (fuzzy.ts:75-106): whitespace/slash-separated query
-        # tokens must ALL match the search text; matches sort best-first.
-        # pi's Array#sort is stable (ties keep the pre-sort catalog order —
-        # item 4); Ruby's sort_by is not, so the pre-sort index is the
-        # tie-break (item 4 fix: /ar's architect-family ties land where
-        # pi's do).
-        def fuzzy_filter(items, query)
-          return items if query.strip.empty?
-
-          tokens = query.strip.split(/[\s\/]+/).reject(&:empty?)
-          return items if tokens.empty?
-
-          items.each_with_index.filter_map do |item, i|
-            text = yield(item)
-            scores = tokens.map { |token| fuzzy_match(token, text) }
-            scores.all? ? [item, scores.sum, i] : nil
-          end.sort_by { |_, score, i| [score, i] }.map(&:first)
-        end
-
-      end
-
-      # The real completion source (bin/tart-wired): the builtin slash
-      # commands plus /skill:<name> entries plus the prompt templates —
-      # pi's command list (CombinedAutocompleteProvider; skills registered
-      # as "skill:<name>" at coding-agent interactive-mode.ts:809-818,
-      # templates as bare names :787-791, plain descriptions —
-      # pi's [sourceTag] prefixes are extension/path-source metadata the
-      # port has no equivalent of, recorded). Items-only: the surface owns
-      # the fuzzy filter (mapping judgment — the port's provider seam is
-      # static, no async).
-      class SlashSource
-        def initialize(commands:, skills:, prompts: [])
-          @commands = commands
-          @skills = skills
-          @prompts = prompts
-        end
-
-        def items
-          @commands.map { |name, meta| {value: name, label: name, description: meta[:description]} } +
-            @skills.map { |skill| {value: "skill:#{skill.name}", label: "skill:#{skill.name}", description: skill.description} } +
-            @prompts.map { |template| {value: template.name, label: template.name, description: template.description} }
-        end
       end
 
       private
@@ -894,9 +749,9 @@ module Tart
       # The MOTD's [Skills] names: the wired completion source's skill
       # entries (SlashSource carries exactly the launcher's loaded skills).
       def motd_skill_names
-        return [] unless @autocomplete
+        return [] unless @autocomplete.source
 
-        @autocomplete.items.filter_map { |item|
+        @autocomplete.source.items.filter_map { |item|
           item[:value].delete_prefix("skill:") if item[:value].start_with?("skill:")
         }.sort
       end
@@ -1051,7 +906,7 @@ module Tart
         return unless content.is_a?(String) && !content.strip.empty?
 
         enqueue_user_submission(content)
-        add_to_history(content) # pi renderInitialMessages populateHistory
+        @editor.add_to_history(content) # pi renderInitialMessages populateHistory
       end
 
       # The replayed !-prefix bash execution (pi addMessageToChat's
@@ -1307,24 +1162,23 @@ module Tart
         area ? area.width : 80
       end
 
-      # The input-line editor (pi's Input, components/input.ts): a cursor
-      # into the buffer, mid-line editing, in-memory history, and word-wise
-      # operations (word-navigation.ts boundary semantics). The key surface
-      # is exactly the events the kernel forwards (code + ctrl/alt/shift
-      # modifiers), bound per pi's keybindings.ts defaults. Editing and
-      # movement keys leave history browsing (pi: exitHistoryBrowsing);
-      # edit units are chars where pi uses graphemes (single-line input,
-      # recorded simplification).
+      # The key dispatch (pi interactive-mode.ts's component wiring): every
+      # key routes into the editor, the suggestion list, or the picker —
+      # the coordinator owns the routing, the objects own the state.
       def edit_input(event)
         if event.paste?
-          insert(event.content)
-          cancel_autocomplete # pi editor.ts:1261 — paste cancels the list
+          @editor.insert(event.content)
+          @autocomplete.cancel # pi editor.ts:1261 — paste cancels the list
           return
         end
 
         # The picker owns every key while open (pi: the selector takes
-        # focus — showSelector { focus: selector }).
-        return picker_input(event) if @picker
+        # focus — showSelector { focus: selector }); it closes itself on
+        # enter/esc and the holder drops.
+        if @picker
+          @picker = nil unless @picker.handle(event)
+          return
+        end
 
         ctrl = event.modifiers.include?("ctrl")
         alt = event.modifiers.include?("alt")
@@ -1339,7 +1193,7 @@ module Tart
         # mechanism, Task#stop — no second path), idle escape is a no-op;
         # pi's double-escape /tree//fork is cut — no session branching).
         when "enter"
-          apply_suggestion if @suggestions
+          @autocomplete.apply(@editor) if @autocomplete.suggestions
           submit
         when "esc"
           # pi onEscape (interactive-mode.ts:3069-3092): a streaming run
@@ -1350,15 +1204,14 @@ module Tart
           # (event/key/system.rb:36) — "escape" never matched a real tty
           # (the live-smoke find: I15's escape interrupt was silently
           # dead on real terminals).
-          if @suggestions
-            cancel_autocomplete
+          if @autocomplete.suggestions
+            @autocomplete.cancel
           elsif busy?
             @kernel.interrupt_work!
           elsif @user_bash_task
             cancel_user_bash
-          elsif bash_mode?
-            @input.clear
-            @cursor = 0
+          elsif @editor.bash_mode?
+            @editor.clear
           end
         when "c"
           # app.clear (pi handleCtrlC :6840-6848): clear the editor; a
@@ -1370,24 +1223,23 @@ module Tart
             if @last_ctrl_c && now - @last_ctrl_c < 0.5
               @kernel.stop!
             else
-              @input.clear
-              @cursor = 0
+              @editor.clear
               @last_ctrl_c = now
             end
           else
-            insert_printable(event)
+            @editor.insert_printable(event)
           end
         when "o"
           # app.tools.expand (pi keybindings.ts:50, default ctrl+o — the
           # GLOBAL tool-output toggle, setToolsExpanded).
-          ctrl ? set_tool_output_expanded(!@tool_output_expanded) : insert_printable(event)
+          ctrl ? set_tool_output_expanded(!@tool_output_expanded) : @editor.insert_printable(event)
         # While the list is active up/down navigate the LIST (history
         # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
-        when "up" then @suggestions ? navigate_suggestions(-1) : history_previous
-        when "down" then @suggestions ? navigate_suggestions(1) : history_next
+        when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.history_previous
+        when "down" then @autocomplete.suggestions ? @autocomplete.navigate(1) : @editor.history_next
         when "tab"
-          if @suggestions then apply_suggestion
-          else update_autocomplete # explicit trigger (pi handleTabCompletion)
+          if @autocomplete.suggestions then @autocomplete.apply(@editor)
+          else @autocomplete.update(@editor) # explicit trigger (pi handleTabCompletion)
           end
         # Transcript paging (pi keybindings.ts:114-115 tui.editor.pageUp/
         # pageDown, defaultKeys pageUp/ctrl+pageUp, pageDown/ctrl+pageDown;
@@ -1395,42 +1247,42 @@ module Tart
         # the action onto the transcript viewport (the port's editor is
         # single-line; mapping judgment, itemized). The list wins while
         # active (pi's precedence: the list owns the vertical keys).
-        when "page_up" then scroll_page(-1) unless @suggestions
-        when "page_down" then scroll_page(1) unless @suggestions
+        when "page_up" then scroll_page(-1) unless @autocomplete.suggestions
+        when "page_down" then scroll_page(1) unless @autocomplete.suggestions
         when "backspace"
-          alt ? delete_word_backward : delete_backward
-          update_autocomplete # pi editor.ts:1449-1463 — re-filter/re-trigger
-        when "delete" then alt ? delete_word_forward : delete_forward
-        when "left" then (alt || ctrl) ? move_word_backward : move_left
-        when "right" then (alt || ctrl) ? move_word_forward : move_right
-        when "home" then move_start
-        when "end" then move_end
-        when "a" then ctrl ? move_start : insert_printable(event)
-        when "e" then ctrl ? move_end : insert_printable(event)
-        when "b" then alt ? move_word_backward : (ctrl ? move_left : insert_printable(event))
-        when "f" then alt ? move_word_forward : (ctrl ? move_right : insert_printable(event))
+          alt ? @editor.delete_word_backward : @editor.delete_backward
+          @autocomplete.update(@editor) # pi editor.ts:1449-1463 — re-filter/re-trigger
+        when "delete" then alt ? @editor.delete_word_forward : @editor.delete_forward
+        when "left" then (alt || ctrl) ? @editor.move_word_backward : @editor.move_left
+        when "right" then (alt || ctrl) ? @editor.move_word_forward : @editor.move_right
+        when "home" then @editor.move_start
+        when "end" then @editor.move_end
+        when "a" then ctrl ? @editor.move_start : @editor.insert_printable(event)
+        when "e" then ctrl ? @editor.move_end : @editor.insert_printable(event)
+        when "b" then alt ? @editor.move_word_backward : (ctrl ? @editor.move_left : @editor.insert_printable(event))
+        when "f" then alt ? @editor.move_word_forward : (ctrl ? @editor.move_right : @editor.insert_printable(event))
         when "d"
           # app.exit (pi custom-editor.ts:118-125, keybindings.ts:28 —
           # default ctrl+d): on an empty editor the run exits (the /quit
           # path); non-empty falls through to delete-char-forward.
-          if ctrl && @input.empty?
+          if ctrl && @editor.input.empty?
             @kernel.stop!
           elsif alt
-            delete_word_forward
+            @editor.delete_word_forward
           elsif ctrl
-            delete_forward
+            @editor.delete_forward
           else
-            insert_printable(event)
+            @editor.insert_printable(event)
           end
-        when "w" then ctrl ? delete_word_backward : insert_printable(event)
-        else insert_printable(event)
+        when "w" then ctrl ? @editor.delete_word_backward : @editor.insert_printable(event)
+        else @editor.insert_printable(event)
         end
         # pi editor.ts:1228-1251 — the list re-filters on every printable
         # while active; typing triggers when in slash context (pi gates the
         # trigger to word chars/"/"; with a slash-only source the context
         # check alone decides, so one re-query covers both — CJK trigger
         # chars cut, itemized). Movement keys leave the list (pi literal).
-        update_autocomplete if printable
+        @autocomplete.update(@editor) if printable
       end
 
       # pi's submit path (interactive-mode.ts:3200-3442): a leading "/"
@@ -1442,14 +1294,13 @@ module Tart
       # mid-turn (/compact aborts the turn first) — the port routes ALL
       # slash text through the steer path while a turn runs.
       def submit
-        text = @input.dup.strip # pi onSubmit trims (interactive-mode.ts:3201)
-        cancel_autocomplete
+        text = @editor.input.dup.strip # pi onSubmit trims (interactive-mode.ts:3201)
+        @autocomplete.cancel
         return if text.empty?
 
-        add_to_history(text)
-        @input.clear
-        @cursor = 0
-        exit_history_browsing
+        @editor.add_to_history(text)
+        @editor.clear
+        @editor.exit_history_browsing
         @branch = nil # per-turn branch invalidation
         @branch_fetched = false
         if @commands && text.start_with?("/")
@@ -1613,91 +1464,6 @@ module Tart
       # plain dim text — itemized reduction).
       def reasoning_lines(text, width)
         Text.wrap(text, width - Panel::OUTPUT_PAD.length * 2).map { |line| TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(line, fg: Theme[:thinkingText], modifiers: [:italic])]) }
-      end
-
-      # pi's editor history (components/editor.ts addToHistory): trimmed,
-      # no consecutive duplicates, capped, most recent first.
-      def add_to_history(text)
-        trimmed = text.strip
-        return if trimmed.empty? || @history.first == trimmed
-
-        @history.unshift(trimmed)
-        @history.pop if @history.size > HISTORY_LIMIT
-      end
-
-      # --- autocomplete (AC1, pi editor.ts autocomplete block + SelectList) ---
-
-      # The slash token before the cursor, or nil: an optional-whitespace-led
-      # "/" first token with no space before the cursor (pi
-      # isInSlashCommandContext custom-editor.ts:2202-2204 + the provider's
-      # no-space rule tui/autocomplete.ts:340-341 — a space means argument
-      # completion, which the port has none of).
-      def slash_token
-        lead = @input.index(/\S/)
-        return nil if lead.nil? || @input[lead] != "/" || lead >= @cursor
-
-        token = @input[lead...@cursor]
-        token unless token.match?(/\s/)
-      end
-
-      # Re-query the completion source from the current input/cursor (pi
-      # editor.ts:1228-1251 update-on-typing + applyAutocompleteSuggestions
-      # :2432-2442): in slash context, fuzzy-filter the catalog on the
-      # command text (pi CombinedAutocompleteProvider.getSuggestions
-      # tui/autocomplete.ts:336-365 — bare skill names first, then full
-      # "skill:" names); no context or no matches cancels the list.
-      def update_autocomplete
-        token = slash_token
-        items = token && @autocomplete ? filter_suggestions(token[1..]) : nil
-        @suggestions = items&.any? ? items : nil
-        return unless @suggestions
-
-        @selected = best_match_index(items, token[1..])
-      end
-
-      def filter_suggestions(query)
-        bare = Chat.fuzzy_filter(@autocomplete.items, query) { |item| item[:value].delete_prefix("skill:") }
-        bare + Chat.fuzzy_filter(@autocomplete.items - bare, query) { |item| item[:value] }
-      end
-
-      # pi getBestAutocompleteMatchIndex (editor.ts:2207-2232): the exact
-      # match always wins, else the first value with the prefix — else the
-      # default (first) item.
-      def best_match_index(items, prefix)
-        return 0 if prefix.empty?
-
-        first_prefix = nil
-        items.each_with_index do |item, i|
-          return i if item[:value] == prefix
-
-          first_prefix ||= i if item[:value].start_with?(prefix)
-        end
-        first_prefix || 0
-      end
-
-      def cancel_autocomplete
-        @suggestions = nil
-        @selected = 0
-      end
-
-      # pi SelectList.handleInput (select-list.ts:146-155): up/down WRAP.
-      def navigate_suggestions(direction)
-        size = @suggestions.size
-        @selected = direction == -1 ? (@selected.zero? ? size - 1 : @selected - 1) : (@selected == size - 1 ? 0 : @selected + 1)
-      end
-
-      # pi applyCompletion's slash branch (tui/autocomplete.ts:419-436):
-      # the token (before the cursor) is replaced with "/<value> " — the
-      # trailing space included — and the cursor lands after it.
-      def apply_suggestion
-        item = @suggestions[@selected]
-        cancel_autocomplete
-        return unless item
-
-        lead = @input.index(/\S/) || 0
-        tail = @input[@cursor..] || ""
-        @input = "#{@input[0, lead]}/#{item[:value]} #{tail}"
-        @cursor = lead + item[:value].length + 2 # +2 for "/" and the space
       end
 
       # --- transcript scroll state (pi scroll-view.ts follow-end) ---
@@ -1995,36 +1761,9 @@ module Tart
       end
 
       def editor_area_rows(height)
-        return [picker_widget_rows + 2, height - 1].min if @picker # + borders
+        return [@picker.widget_rows + 2, height - 1].min if @picker # + borders
 
-        [MIN_EDITOR_ROWS + autocomplete_rows, height - 1].min
-      end
-
-      # pi's navigateHistory (editor.ts:454-484): -1 is the live draft; up
-      # walks toward older entries (index 0 = most recent), down back toward
-      # the draft. The draft is captured when browsing starts and restored
-      # at -1. Up places the cursor at line start, down at line end
-      # (cursorPlacement "start"/"end"). The port is single-line, so up/down
-      # always navigate (pi: only from the first/last visual line).
-      def history_previous = navigate_history(-1)
-
-      def history_next = navigate_history(1)
-
-      def navigate_history(direction)
-        return if @history.empty?
-
-        new_index = @history_index - direction
-        return if new_index < -1 || new_index >= @history.size
-
-        @history_draft = [@input.dup, @cursor] if @history_index == -1 && new_index >= 0
-        @history_index = new_index
-        if @history_index == -1
-          @input, @cursor = @history_draft || ["", 0]
-          @history_draft = nil
-        else
-          @input = @history[@history_index].dup
-          @cursor = direction == -1 ? 0 : @input.length
-        end
+        [MIN_EDITOR_ROWS + @autocomplete.rows, height - 1].min
       end
 
       # The fullscreen three-area composition (AC1, pi chat-viewport.ts):
@@ -2042,7 +1781,7 @@ module Tart
           children: [
             transcript_widget(transcript_rows),
             dock_spacer_widget,
-            @picker ? picker_widget : editor_widget,
+            @picker ? @picker.widget(viewport_width) : editor_widget,
             footer_widget,
           ],
           constraints: [
@@ -2120,7 +1859,7 @@ module Tart
       # in the rig — cut, itemized; the at-rest `┃` is the reachable
       # subset.
       def overlay_rail_cell(line, glyph, width)
-        head = clip_spans(line.spans, width - 1)
+        head = Text.clip_spans(line.spans, width - 1)
         pad = width - 1 - head.sum { |span| TUI.text_width(span.content) }
         spans = pad.positive? ? [*head, TUI.span(" " * pad)] : head
         TUI.line([*spans, glyph.spans.first])
@@ -2148,7 +1887,7 @@ module Tart
       # I12 placement).
       def editor_widget
         inner = [viewport_width - 1, 1].max
-        content = [TUI.line(clip_spans(input_spans, inner))] + autocomplete_lines(inner)
+        content = [TUI.line(Text.clip_spans(@editor.input_spans, inner))] + @autocomplete.lines(inner)
         TUI.block(
           title: status_title,
           borders: [:top, :bottom],
@@ -2162,12 +1901,6 @@ module Tart
         )
       end
 
-      # pi isBashMode (interactive-mode.ts:3125): the trimmed input starts
-      # with "!" — the editor's border announces the whole-line bash.
-      def bash_mode?
-        @input.start_with?("!")
-      end
-
       # pi getThinkingBorderColor (theme.ts:348) over the session's level
       # || "off" — reasoning-gated like the footer's `model • level`
       # segment (a non-reasoning model carries no level → thinking_off
@@ -2176,7 +1909,7 @@ module Tart
       # session level when set (/thinking), else the settings-resolved
       # one (pi session.thinkingLevel over the settings default).
       def editor_border_color
-        return Theme[:bashMode] if bash_mode?
+        return Theme[:bashMode] if @editor.bash_mode?
 
         level = thinking_level if @footer_data&.fetch(:reasoning, nil)
         token = "thinking_#{level || :off}".to_sym
@@ -2225,7 +1958,7 @@ module Tart
         # fg, so the line-level fg: was silently dropping the color (the
         # default-fg pwd/branch defect).
         TUI.paragraph(text: [
-          TUI.line(clip_spans([TUI.span(pwd, fg: Theme[:dim])], width)),
+          TUI.line(Text.clip_spans([TUI.span(pwd, fg: Theme[:dim])], width)),
           footer_stats(data, width),
         ], wrap: false)
       end
@@ -2285,7 +2018,7 @@ module Tart
         else
           # Too wide: the stats clip (with their colors) and the model keeps
           # a two-cell margin (pi truncates statsLeft with "...").
-          clip_spans(left, [width - TUI.text_width(right) - 2, 0].max) + [TUI.span("… #{right}", fg: Theme[:dim])]
+          Text.clip_spans(left, [width - TUI.text_width(right) - 2, 0].max) + [TUI.span("… #{right}", fg: Theme[:dim])]
         end
         TUI.line(spans)
       end
@@ -2336,132 +2069,6 @@ module Tart
 
         prompt = [@last_usage.input, @last_usage.cache_read, @last_usage.cache_write].compact.sum
         prompt.positive? ? @last_usage.cache_read * 100.0 / prompt : nil
-      end
-
-      # --- input-line editing primitives (each leaves history browsing) ---
-
-      def insert(text)
-        exit_history_browsing
-        @input.insert(@cursor, text)
-        @cursor += text.length
-      end
-
-      def delete_backward
-        exit_history_browsing
-        return if @cursor.zero?
-
-        @input = @input[0, @cursor - 1] + @input[@cursor..]
-        @cursor -= 1
-      end
-
-      def delete_forward
-        exit_history_browsing
-        return if @cursor >= @input.length
-
-        @input = @input[0, @cursor] + @input[(@cursor + 1)..]
-      end
-
-      def move_left
-        exit_history_browsing
-        @cursor -= 1 if @cursor.positive?
-      end
-
-      def move_right
-        exit_history_browsing
-        @cursor += 1 if @cursor < @input.length
-      end
-
-      def move_start
-        exit_history_browsing
-        @cursor = 0
-      end
-
-      def move_end
-        exit_history_browsing
-        @cursor = @input.length
-      end
-
-      def move_word_backward
-        exit_history_browsing
-        @cursor = self.class.find_word_backward(@input, @cursor)
-      end
-
-      def move_word_forward
-        exit_history_browsing
-        @cursor = self.class.find_word_forward(@input, @cursor)
-      end
-
-      # pi's deleteWordBackwards (input.ts:309): move one word backward,
-      # delete what the move crossed.
-      def delete_word_backward
-        return if @cursor.zero?
-
-        exit_history_browsing
-        target = self.class.find_word_backward(@input, @cursor)
-        @input = @input[0, target] + @input[@cursor..]
-        @cursor = target
-      end
-
-      def delete_word_forward
-        return if @cursor >= @input.length
-
-        exit_history_browsing
-        target = self.class.find_word_forward(@input, @cursor)
-        @input = @input[0, @cursor] + @input[target..]
-      end
-
-      def exit_history_browsing
-        @history_index = -1
-        @history_draft = nil
-      end
-
-      # Printable characters insert at the cursor (pi input.ts:268-277);
-      # ctrl/alt-modified keys are never text (the real gem's text? ignores
-      # modifiers, so the guard is load-bearing for alt+b/f).
-      def insert_printable(event)
-        return unless event.text? && !(event.modifiers & %w[ctrl alt]).any?
-
-        insert(event.code)
-      end
-
-      # The input row as spans with pi's fake cursor (tui.ts:205
-      # renderFakeCursor via editor.ts:583-597): the grapheme at the
-      # insertion point renders inverse-video; at end-of-input a highlighted
-      # trailing space. The port's readback-provable analog carries the
-      # reversed modifier (the hardware cursor is unreachable through the
-      # tree-draw seam and not cell-readable). Input beyond one row clips at
-      # the editor's inner width (pre-existing; pi scrolls horizontally).
-      def input_spans
-        at = @input[@cursor]
-        spans = [TUI.span(@input[0, @cursor] || "")]
-        return spans << TUI.span(" ", modifiers: [:reversed]) unless at
-
-        spans << TUI.span(at, modifiers: [:reversed]) << TUI.span(@input[(@cursor + 1)..])
-      end
-
-      # Clips styled spans to +width+ visible columns (the editor's inner
-      # width); the trailing partial span is trimmed cell-wise.
-      def clip_spans(spans, width)
-        out = []
-        budget = width
-        spans.each do |span|
-          break if budget <= 0
-
-          text = span.content
-          if TUI.text_width(text) <= budget
-            out << span
-            budget -= TUI.text_width(text)
-          else
-            head, = Text.fit(text, budget)
-            # The bg rides the rebuild too — the bg panels' fill spans are
-            # the ones that get trimmed here (the scrollbar overlay clips
-            # every row to width−1), and dropping it was the "backgrounds
-            # vanish while scrolling" defect.
-            out << TUI.span(head, fg: span.style&.fg, bg: span.style&.bg, modifiers: span.style&.modifiers.to_a)
-            budget -= TUI.text_width(head)
-          end
-        end
-        out
       end
 
       # The transcript buffer's display lines — completed content plus the
@@ -2551,128 +2158,6 @@ module Tart
         lines << Panel.blank_line if !@reasoning.empty? && !@live.empty?
         lines.concat(markdown_lines(@live, width)) unless @live.empty?
         lines
-      end
-
-      # The editor area's extra rows while the suggestion list is active:
-      # the visible window plus the (i/N) scroll-info line (select-list.ts
-      # render).
-      def autocomplete_rows
-        return 0 unless @suggestions
-
-        [@suggestions.size, AUTOCOMPLETE_MAX + (@suggestions.size > AUTOCOMPLETE_MAX ? 1 : 0)].min
-      end
-
-      # The list's display lines (pi select-list.ts renderItem +
-      # getVisibleRange, two-column with descriptions): the visible window
-      # centered on the selection (startIndex = max(0, min(selected −
-      # maxVisible/2, size − maxVisible))), "→ " marking the selection —
-      # accent-styled whole-line (theme.ts:1061-1068 selectedText) —
-      # unselected labels default with the description muted. Descriptions
-      # only fit when the editor's inner width affords them (width > 40,
-      # select-list.ts:189); the command column clamps to 12-32
-      # (SLASH_COMMAND_SELECT_LIST_LAYOUT, editor.ts:248-251, gap 2).
-      def autocomplete_lines(width)
-        return [] unless @suggestions
-
-        items = @suggestions
-        start = [[@selected - AUTOCOMPLETE_MAX / 2, items.size - AUTOCOMPLETE_MAX].min, 0].max
-        column = autocomplete_column_width(items)
-        column = [column, width - 2 - 4].min # pi: effectivePrimaryColumnWidth (select-list.ts:191)
-        rows = items[start, AUTOCOMPLETE_MAX].map.with_index do |item, i|
-          autocomplete_row(item, start + i == @selected, column, width)
-        end
-        rows << TUI.line("  (#{@selected + 1}/#{items.size})", fg: Theme[:muted]) if items.size > AUTOCOMPLETE_MAX
-        rows
-      end
-
-      # clamp(widest label + gap, 12, 32) over the whole filtered list (pi
-      # select-list.ts getPrimaryColumnWidth, gap 2, slash layout 12/32).
-      def autocomplete_column_width(items)
-        widest = items.map { |item| TUI.text_width(item[:label]) + 2 }.max || 0
-        [[widest, 12].max, 32].min
-      end
-
-      def autocomplete_row(item, selected, column, width)
-        label = Text.clip_text(item[:label], column - 2)
-        spacing = " " * [1, column - TUI.text_width(label)].max
-        desc = autocomplete_description(item[:description], width, label, spacing)
-        return TUI.line("→ #{label}#{spacing}#{desc}", fg: Theme[:accent]) if selected
-
-        TUI.line([TUI.span("  #{label}"), TUI.span("#{spacing}#{desc}", fg: Theme[:muted])])
-      end
-
-      # The description column (select-list.ts:189-210): only when the width
-      # affords it (> 40) and at least MIN_DESCRIPTION_WIDTH (10) columns
-      # remain after prefix + label + spacing − a two-cell safety margin;
-      # hard-clipped (truncateToWidth with an empty tail).
-      def autocomplete_description(desc, width, label, spacing)
-        return "" unless desc && width > 40
-
-        remaining = width - (2 + TUI.text_width(label) + spacing.length) - 2
-        remaining >= 10 ? Text.clip_text(desc, remaining) : ""
-      end
-
-      # --- /resume session picker (item 2, pi SessionSelectorComponent,
-      # reduced): the editor area is REPLACED by the picker while open (pi
-      # showSelector swaps the container and moves focus). Reductions,
-      # itemized: no search input (fuzzy/regex/exact), no all-sessions
-      # scope toggle, no threaded/name sort modes, no rename, no delete,
-      # no path/cwd toggles, no cwd-mismatch prompt, no hint rows — a flat
-      # newest-first list with pi's key shape (up/down navigate, enter
-      # selects — onSelect —, escape cancels — onCancel).
-      def picker_input(event)
-        case event.code
-        when "up" then navigate_picker(-1)
-        when "down" then navigate_picker(1)
-        when "enter"
-          item = @picker[:items][@picker[:selected]]
-          @picker = nil
-          @on_resume&.call(item[:path]) if item
-        when "esc" then @picker = nil
-        end
-      end
-
-      # pi SelectList.handleInput (select-list.ts:146-155): up/down WRAP.
-      def navigate_picker(direction)
-        size = @picker[:items].size
-        return if size.zero?
-
-        selected = @picker[:selected]
-        @picker[:selected] = direction == -1 ? (selected.zero? ? size - 1 : selected - 1) : (selected == size - 1 ? 0 : selected + 1)
-      end
-
-      def picker_widget
-        TUI.block(
-          title: " Resume Session (Current Folder) ", # pi SessionSelectorHeader.render :147
-          borders: [:top, :bottom],
-          border_style: TUI.style(fg: Theme[:border]),
-          title_style: TUI.style(fg: Theme[:dim]),
-          children: [TUI.paragraph(text: picker_lines, wrap: false)]
-        )
-      end
-
-      # The picker's content rows: one line per session (pi renders one
-      # line each with tree structure :459-460), "→ " marking the selection
-      # (accent, pi selectedText — the autocomplete row's shape), labels
-      # hard-clipped to the width.
-      def picker_lines
-        items = @picker[:items]
-        return [TUI.line("  No sessions found", fg: Theme[:muted])] if items.empty?
-
-        start = [[@picker[:selected] - PICKER_MAX / 2, items.size - PICKER_MAX].min, 0].max
-        rows = items[start, PICKER_MAX].map.with_index do |item, i|
-          label = Text.clip_text(item[:label], viewport_width - 3)
-          (start + i) == @picker[:selected] ? TUI.line("→ #{label}", fg: Theme[:accent]) : TUI.line("  #{label}")
-        end
-        rows << TUI.line("  (#{@picker[:selected] + 1}/#{items.size})", fg: Theme[:muted]) if items.size > PICKER_MAX
-        rows
-      end
-
-      # The picker's row budget (the editor-area height calc; +2 borders).
-      def picker_widget_rows
-        items = @picker[:items]
-        count = [items.size, PICKER_MAX].min
-        items.size > PICKER_MAX ? count + 1 : count
       end
 
       # Completed lines move into the transcript buffer (pi: completed

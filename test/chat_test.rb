@@ -1086,7 +1086,7 @@ module Tart
         "---\nname: greet\ndescription: Says hello\n---\nHello body.")
       File.write(File.join(@dir, ".tart", "settings.json"), "{}")
       skills = Skills.load(cwd: @dir, root: @dir, claude_dir: File.join(@dir, "claude-skills")).skills
-      source = Render::Chat::SlashSource.new(commands: {"new" => {description: "x"}}, skills: skills)
+      source = Render::SlashSource.new(commands: {"new" => {description: "x"}}, skills: skills)
       TUI.run(headless: true, viewport: :fullscreen, width: 60, screen_height: 24) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
           settings_root: @dir, autocomplete: source, identity: "tart",
@@ -1658,74 +1658,11 @@ module Tart
       end
     end
 
-    # --- mid-line editing (I06/AC2) ---
-
-    def test_printable_characters_insert_at_the_cursor
-      with_headless_chat do |chat|
-        "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
-        chat.on_event(TUI.key_event("left"))
-        chat.on_event(TUI.key_event("X"))
-        assert_equal "hXi", chat.input, "a printable character inserts at the cursor"
-        chat.on_event(TUI.key_event("left"))
-        chat.on_event(TUI.key_event("left"))
-        chat.on_event(TUI.key_event("!"))
-        assert_equal "!hXi", chat.input, "inserting at the start of the line"
-      end
-    end
-
-    def test_backspace_deletes_before_and_forward_delete_after_the_cursor
-      with_headless_chat do |chat|
-        "hi".each_char { |char| chat.on_event(TUI.key_event(char)) }
-        chat.on_event(TUI.key_event("left"))
-        chat.on_event(TUI.key_event("backspace"))
-        assert_equal "i", chat.input, "backspace deletes before the cursor"
-        chat.on_event(TUI.key_event("delete"))
-        assert_equal "", chat.input, "forward-delete removes the character after the cursor"
-        chat.on_event(TUI.key_event("delete"))
-        assert_equal "", chat.input, "forward-delete at end-of-input is a no-op"
-        "ab".each_char { |char| chat.on_event(TUI.key_event(char)) }
-        chat.on_event(TUI.key_event("home"))
-        chat.on_event(TUI.key_event("delete"))
-        assert_equal "b", chat.input, "forward-delete at line start removes the first character"
-      end
-    end
-
-    def test_home_end_and_ctrl_b_f_move_the_cursor
-      with_headless_chat do |chat|
-        "abcd".each_char { |char| chat.on_event(TUI.key_event(char)) }
-        chat.on_event(TUI.key_event("home"))
-        chat.on_event(TUI.key_event("X"))
-        assert_equal "Xabcd", chat.input, "home jumps to line start"
-        chat.on_event(TUI.key_event("f", modifiers: ["ctrl"])) # over 'a'
-        chat.on_event(TUI.key_event("f", modifiers: ["ctrl"])) # over 'b'
-        chat.on_event(TUI.key_event("Y"))
-        assert_equal "XabYcd", chat.input, "ctrl+f steps right one character"
-        chat.on_event(TUI.key_event("b", modifiers: ["ctrl"]))
-        chat.on_event(TUI.key_event("Z"))
-        assert_equal "XabZYcd", chat.input, "ctrl+b steps left one character"
-        chat.on_event(TUI.key_event("e", modifiers: ["ctrl"]))
-        chat.on_event(TUI.key_event("!"))
-        assert_equal "XabZYcd!", chat.input, "ctrl+e jumps to line end"
-      end
-    end
-
     # --- history (I06/AC3): pi's editor.ts addToHistory/navigateHistory —
-    # most recent first, draft restored, recalled entries editable. ---
-
-    def test_history_recalls_entries_in_order
-      with_headless_chat do |chat|
-        send_message(chat, "A")
-        send_message(chat, "B")
-        chat.on_event(TUI.key_event("up"))
-        assert_equal "B", chat.input, "up recalls the most recent entry"
-        chat.on_event(TUI.key_event("up"))
-        assert_equal "A", chat.input, "up again walks to older entries"
-        chat.on_event(TUI.key_event("down"))
-        assert_equal "B", chat.input, "down returns toward the draft"
-        chat.on_event(TUI.key_event("down"))
-        assert_equal "", chat.input, "down past the newest entry restores the live draft"
-      end
-    end
+    # most recent first, draft restored, recalled entries editable. The
+    # editor-state halves of these moved to test/render/editor_test.rb
+    # (driving Editor directly); the submit-cycle halves stay here — the
+    # echo/agent assertions run through Chat's public surface. ---
 
     def test_recalled_history_entry_is_editable_and_sends_as_edited
       chat_idle_kernel = IdleKernel.new
@@ -1746,41 +1683,6 @@ module Tart
         assert_equal ["", " A", "", "", "", " B", "", "", "", " XA", ""], chat.transcript_lines,
           "the edited recall sends as edited (after the two original echoes: padY wrap + spacer + pad rows)"
       end
-    end
-
-    def test_history_skips_consecutive_duplicates
-      with_headless_chat do |chat|
-        send_message(chat, "A")
-        send_message(chat, "A")
-        chat.on_event(TUI.key_event("up"))
-        assert_equal "A", chat.input, "a duplicate submission enters history once"
-        chat.on_event(TUI.key_event("down"))
-        assert_equal "", chat.input, "down past the newest entry restores the empty draft"
-        chat.on_event(TUI.key_event("up"))
-        chat.on_event(TUI.key_event("up"))
-        assert_equal "A", chat.input, "history holds a single entry — walking past it is a no-op"
-      end
-    end
-
-    # --- word-wise operations (I06/AC3): pi's word-navigation.ts boundary
-    # semantics — skip trailing whitespace, then one word/punctuation run. ---
-
-    def test_find_word_backward_boundaries
-      assert_equal 6, Render::Chat.find_word_backward("hello world", 11),
-        "deletes 'world' but keeps the separator space (pi segment semantics)"
-      assert_equal 0, Render::Chat.find_word_backward("hello ", 6), "trailing whitespace goes with the word"
-      assert_equal 4, Render::Chat.find_word_backward("foo.bar", 7), "ASCII punctuation stays a boundary"
-      assert_equal 3, Render::Chat.find_word_backward("foo.", 4), "a punctuation run goes as one unit"
-      assert_equal 0, Render::Chat.find_word_backward("hi", 0)
-      assert_equal 0, Render::Chat.find_word_backward("", 0)
-    end
-
-    def test_find_word_forward_boundaries
-      assert_equal 5, Render::Chat.find_word_forward("hello world", 0)
-      assert_equal 11, Render::Chat.find_word_forward("hello world", 5), "whitespace skipped to the next word"
-      assert_equal 2, Render::Chat.find_word_forward("hi.", 0), "a word stops at the punctuation"
-      assert_equal 3, Render::Chat.find_word_forward("hi.", 2), "a punctuation run is one unit"
-      assert_equal 2, Render::Chat.find_word_forward("hi", 3), "at end-of-line the cursor stays put"
     end
 
     # app.exit (pi custom-editor.ts:118-125, keybindings.ts:28 — the gem
@@ -2121,60 +2023,9 @@ module Tart
       end
     end
 
-    def test_alt_b_alt_f_jump_words
-      with_headless_chat do |chat|
-        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
-        chat.on_event(TUI.key_event("b", modifiers: ["alt"]))
-        chat.on_event(TUI.key_event("X"))
-        assert_equal "hello Xworld", chat.input, "alt+b jumps one word backward"
-        chat.on_event(TUI.key_event("b", modifiers: ["alt"]))
-        chat.on_event(TUI.key_event("Y"))
-        assert_equal "hello YXworld", chat.input, "alt+b from the last word jumps to its start"
-        chat.on_event(TUI.key_event("f", modifiers: ["alt"]))
-        chat.on_event(TUI.key_event("Z"))
-        assert_equal "hello YXworldZ", chat.input, "alt+f jumps one word forward"
-      end
-    end
-
     # --- autocomplete (AC1, I12): the /-triggered fuzzy suggestion list,
     # with pi's key precedence (the list owns up/down/escape/enter while
     # active — history and interrupt yield). ---
-
-    def test_fuzzy_match_scores_like_pi
-      assert_equal 0, Render::Chat.fuzzy_match("", "new"), "an empty query matches everything"
-      assert Render::Chat.fuzzy_match("ar", "architect"), "a subsequence matches"
-      assert_nil Render::Chat.fuzzy_match("zx", "architect"), "no subsequence = no match"
-      assert Render::Chat.fuzzy_match("new", "new") <= -100, "an exact match scores best (pi's -100 bonus)"
-      assert Render::Chat.fuzzy_match("ab12", "12abc"), "the swapped alnum query retries (+5)"
-    end
-
-    def test_fuzzy_filter_ranks_word_boundary_matches_first
-      items = %w[skills compact].map { |value| {value:} }
-      ranked = Render::Chat.fuzzy_filter(items, "c") { |item| item[:value] }
-      assert_equal "compact", ranked.first[:value], "a word-boundary match outranks a mid-word one"
-    end
-
-    # Stable order (item 4/AC4, pi fuzzy.ts:138): JS sort is stable — ties
-    # keep the pre-sort catalog order; Ruby's sort_by is not, so the
-    # pre-sort index is the tie-break. The owner's case: every
-    # architect-family entry ties identically on "ar" and must land in
-    # catalog order (pi's provider order: commands, then skills).
-    def test_fuzzy_filter_ties_keep_the_pre_sort_catalog_order
-      items = %w[skill:architect-research skill:architect skill:architect-vocabulary new].map { |value| {value:} }
-      ranked = Render::Chat.fuzzy_filter(items, "ar") { |item| item[:value].delete_prefix("skill:") }
-      assert_equal %w[skill:architect-research skill:architect skill:architect-vocabulary], ranked.map { |item| item[:value] },
-        "identical scores keep the pre-sort order (pi's stable sort)"
-    end
-
-    def test_slash_source_lists_builtin_commands_and_skills
-      skill = Skills::Skill.new(name: "greet", description: "Says hi", file_path: "/tmp/x",
-        base_dir: "/tmp", disable_model_invocation: false)
-      source = Render::Chat::SlashSource.new(commands: {"new" => {description: "Start a new session"}}, skills: [skill])
-      assert_equal [
-        {value: "new", label: "new", description: "Start a new session"},
-        {value: "skill:greet", label: "skill:greet", description: "Says hi"}
-      ], source.items
-    end
 
     def test_typing_slash_opens_the_fuzzy_list_below_the_input
       with_headless_chat(autocomplete: slash_source("new", "compact", "architect"), width: 50) do |chat, session|
@@ -2264,7 +2115,7 @@ module Tart
         file_path: "/fixtures/architect/SKILL.md", base_dir: "/fixtures/architect",
         disable_model_invocation: false)
       kernel, chat, session = chat_with_server(
-        autocomplete: Render::Chat::SlashSource.new(commands: Commands::BUILTINS, skills: [skill]))
+        autocomplete: Render::SlashSource.new(commands: Commands::BUILTINS, skills: [skill]))
 
       scenario = Thread.new do
         "/ar".each_char { |char| session.push_event(TUI.key_event(char)) }
@@ -2757,26 +2608,10 @@ module Tart
     end
 
     # --- /resume picker (item 2/AC2, pi SessionSelectorComponent reduced)
-    # and the resume replay (item 3/AC3) ---
-
-    def test_picker_navigates_and_escapes_cancel
-      with_headless_chat(width: 50) do |chat|
-        resumed = []
-        chat.on_resume = ->(path) { resumed << path }
-        chat.open_session_picker([{path: "/a", label: "first"}, {path: "/b", label: "second"}])
-        assert_equal 0, chat.picker_index
-        chat.on_event(TUI.key_event("down"))
-        assert_equal 1, chat.picker_index
-        chat.on_event(TUI.key_event("up"))
-        chat.on_event(TUI.key_event("up"))
-        assert_equal 1, chat.picker_index, "up wraps to the last item (pi select-list wrap)"
-        chat.on_event(TUI.key_event("esc"))
-        assert_nil chat.picker_items, "escape cancels (pi onCancel)"
-        assert_empty resumed
-        chat.on_event(TUI.key_event("enter"))
-        assert_empty resumed, "a cancelled picker never resumes"
-      end
-    end
+    # and the resume replay (item 3/AC3). The picker's state behavior
+    # (navigation wrap, esc-cancel) moved to test/render/picker_test.rb,
+    # driving Picker directly; the wiring (open_session_picker +
+    # on_resume) and the in-place rendering stay here. ---
 
     def test_picker_enter_fires_the_resume_seam
       with_headless_chat do |chat|
@@ -3141,7 +2976,7 @@ module Tart
     # A SlashSource over bare builtin names (description = "<name>
     # description") — the synthetic catalog for the editor's key paths.
     def slash_source(*names)
-      Render::Chat::SlashSource.new(
+      Render::SlashSource.new(
         commands: names.each_with_object({}) { |name, table| table[name] = {description: "#{name} description"} },
         skills: []
       )
