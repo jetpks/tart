@@ -242,30 +242,20 @@ module Tart
     end
 
     # @return [RatatuiRuby::Style::Style] a style value (fg/bg colors +
-    #   modifiers). Colors are symbol names or hex strings ("#rrggbb") —
-    #   whichever the gem's Style accepts (style.rb:100-104; hex parses to
-    #   Color::Rgb in ext style.rs:20-33).
+    #   modifiers). Colors are symbol names, hex strings ("#rrggbb" →
+    #   Color::Rgb, ext style.rs:20-33), or Xterm indexes (Integer, the
+    #   256-color downgrade) — whichever the gem's Style accepts
+    #   (style.rb:100-104).
     def style(fg: nil, bg: nil, modifiers: [])
-      # The reserved :dim fg → the DIM ATTRIBUTE (widget-level twin of
-      # {span}'s mapping — the editor border's title style rides here).
-      if fg == :dim
-        fg = nil
-        modifiers = [*modifiers, :dim]
-      end
       RatatuiRuby::Style::Style.new(fg:, bg:, modifiers:)
     end
 
     # @return [RatatuiRuby::Text::Span] one styled span — the seam's span
     #   vocabulary (fg/bg colors + modifiers, all optional; an unstyled
-    #   span carries no Style value at all). RESERVED fg symbol :dim: the
-    #   DIM ATTRIBUTE (Theme[:dim] — pi's dimTokens render ESC[2m, not a
-    #   color; theme.ts:299), mapped here so every dim call site keeps
-    #   the fg: shape.
+    #   span carries no Style value at all). The retired :dim→modifier
+    #   mapping was the system-theme artifact (rig correction 2026-10-11:
+    #   dark has no dimTokens); {Theme} tokens now carry real colors.
     def span(content, fg: nil, bg: nil, modifiers: [])
-      if fg == :dim
-        fg = nil
-        modifiers = [*modifiers, :dim]
-      end
       styled = (fg || bg || modifiers.any?) ? style(fg:, bg:, modifiers:) : nil
       RatatuiRuby::Text::Span.new(content:, style: styled)
     end
@@ -285,7 +275,7 @@ module Tart
     #   color symbol or nil, +modifiers+ modifier symbols). An empty row is
     #   a blank line.
     def markdown_line(row)
-      line(row.map { |s| span(s.text, fg: s.fg, modifiers: s.modifiers) })
+      line(row.map { |s| span(s.text, fg: s.fg, bg: s.respond_to?(:bg) ? s.bg : nil, modifiers: s.modifiers) })
     end
 
     # @return [Integer] the display width of +string+ in terminal cells

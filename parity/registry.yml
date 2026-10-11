@@ -25,13 +25,3 @@ classes:
   # on the path-free notice lines (I20 s5 baseline evidence).
   - name: truncation-spill-path
     pattern: '/(pi|tart)-bash-[0-9a-f-]+\.log'
-  # The accent token's COLOR-MODE downgrade (style pass only): pi's
-  # theme resolves the terminal's color mode (the rig's tmux sandbox
-  # reports 256-color) and downgrades every token — the accent renders
-  # [38;5;5 (the 16-palette magenta slot in the 256 cube); the port's
-  # 16-color analog renders [38;5;13 (bright magenta). The mode-aware
-  # token table (port the downgrade math) is the follow-up slice; until
-  # then the accent renders the analog on both modes.
-  - name: accent-color-mode-downgrade
-    pattern: '^ (write|read) |pad-pad-|tool-turn-note'
-    style_only: true

@@ -146,9 +146,29 @@ module Tart
       # onboarding). The keybindings behind escape-to-clear, `!` bash and
       # the ctrl+o expand are cut (itemized) — the hint TEXT renders for
       # byte parity, per the identity contract.
-      PI_HINTS_LINE = "escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more".freeze
+      # The compact hint row as (key, description) pairs — pi keyHint's
+      # shape (keybinding-hints.ts:42-44): the key in dim, the description
+      # in muted with the " · " separator riding its run (the -e capture's
+      # byte proof; the system-theme-era whole-line dim was the artifact).
+      PI_HINTS = [
+        ["escape", "interrupt"],
+        ["ctrl+c/ctrl+d", "clear/exit"],
+        ["/", "commands"],
+        ["!", "bash"],
+        ["ctrl+o", "more"],
+      ].freeze
       PI_NOTICE_LINE = "Press ctrl+o to show full startup help and loaded resources.".freeze
       PI_ONBOARDING_LINE = "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.".freeze
+
+      # pi keyHint (keybinding-hints.ts:42-44) over {PI_HINTS}: dim key +
+      # muted description, the separator inside every description run but
+      # the last.
+      def pi_hint_spans
+        PI_HINTS.flat_map.with_index do |(key, description), index|
+          tail = index == PI_HINTS.length - 1 ? " #{description}" : " #{description} · "
+          [TUI.span(key, fg: Theme[:dim]), TUI.span(tail, fg: Theme[:muted])]
+        end
+      end
 
       # pi's outputPad (interactive-mode.ts:516, default 1): one leading
       # space on every content row of the chat surface — the header's Text
@@ -355,7 +375,26 @@ module Tart
       #   readback for kernel-driven tests, where the drawn widget tree is
       #   the only observable).
       def transcript_lines
-        @mutex.synchronize { @transcript.map { |line| line.spans.map(&:content).join } }
+        # Trailing PRESENTATION fill is not text: the bg panels' fill
+        # spans (all-space content, bg-only style — the trailing pad and
+        # the full-width blank rows) drop off the readback; content spans
+        # keep their bytes verbatim (art trailing spaces, markdown
+        # spacing rows). The -e capture remains the style gate.
+        @mutex.synchronize do
+          @transcript.map do |line|
+            spans = line.spans.dup
+            spans.pop while !spans.empty? && panel_fill_span?(spans.last)
+            spans.empty? ? "" : spans.map(&:content).join
+          end
+        end
+      end
+
+      # A trailing bg-panel fill span: all-space content styled bg-only.
+      def panel_fill_span?(span)
+        style = span.style
+        return false unless style && span.content.match?(/\A *\z/)
+
+        style.bg && !style.fg && (style.modifiers || []).empty?
       end
 
       # @return [Array<Hash>, nil] the active suggestion items (test
@@ -871,10 +910,10 @@ module Tart
         # The separating space renders PLAIN (pi: the mark's spans, a
         # plain space, THEN the dim hints span — the -e capture's byte
         # proof: the port dimmed the space).
-        hints = TUI.span(PI_HINTS_LINE, fg: Theme[:dim])
+        hints = pi_hint_spans
         [
           TUI.line([TUI.span(OUTPUT_PAD), *top, TUI.span(" "), TUI.span("v#{Identity::ORACLE_VERSION}", fg: Theme[:dim])]),
-          TUI.line([TUI.span(OUTPUT_PAD), *bottom, TUI.span(" "), hints]),
+          TUI.line([TUI.span(OUTPUT_PAD), *bottom, TUI.span(" "), *hints]),
           TUI.line([TUI.span(OUTPUT_PAD), TUI.span(PI_NOTICE_LINE, fg: Theme[:dim])]),
           blank_line,
           TUI.line([TUI.span(OUTPUT_PAD), TUI.span(PI_ONBOARDING_LINE, fg: Theme[:dim])])
@@ -978,17 +1017,21 @@ module Tart
       # none; the port's container flag is {@chat_started}), then the
       # component's Markdown paddingY=1 (user-message.ts:23) — one blank
       # row above and below the content — every content row through the
-      # {OUTPUT_PAD} rule. Reduced: bg on the text rows only — pi pads a
-      # full-width Markdown block.
+      # {OUTPUT_PAD} rule, the bg riding the FULL row width (pi markdown.ts
+      # :352 applyBackgroundToLine — pad spans + trailing fill + the
+      # paddingY blanks all carry the panel bg).
       def enqueue_user_echo(text)
+        bg = Theme[:user_message_bg]
         rows = Chat.wrap(text, viewport_width - OUTPUT_PAD.length * 2).map do |row|
-          TUI.line([TUI.span(OUTPUT_PAD), TUI.span(row, fg: Theme[:user_message_text], bg: Theme[:user_message_bg])])
+          TUI.line([TUI.span(OUTPUT_PAD, bg: bg),
+                    TUI.span(row, fg: Theme[:user_message_text], bg: bg),
+                    panel_tail(TUI.text_width(row), bg)])
         end
         region = []
         region << blank_line if @chat_started # the container's non-empty gate
-        region << blank_line # paddingY top (user-message.ts:23)
+        region << panel_blank_line(bg) # paddingY top (user-message.ts:23)
         region.concat(rows)
-        region << blank_line # paddingY bottom
+        region << panel_blank_line(bg) # paddingY bottom
         @chat_started = true
         @scrollback << region
       end
@@ -1213,9 +1256,9 @@ module Tart
       # the muted `Took <duration>` line (bash.ts:105-109 — a nil/absent
       # duration, the replay path, renders none; the recorded gap is
       # itemized, never invented).
-      def enqueue_bash_block(command, output, duration)
+      def enqueue_bash_block(command, output, duration, error: false)
         @chat_started = true
-        push_expandable(->(expanded) { bash_block_rows(command, output, duration, expanded:) })
+        push_expandable(->(expanded) { bash_block_rows(command, output, duration, expanded:, error:) })
       end
 
       # The bash tool block (I17 — pi's shell renderer over the tool-turn
@@ -1223,29 +1266,37 @@ module Tart
       # renders whole (no collapse, no hint — bash.ts:67-70 `if
       # (options.expanded) addChild(Text)` vs the VisualLinePreview); the
       # notice + Took compose identically in both states.
-      def bash_block_rows(command, output, duration, expanded:)
-        region = [blank_line, blank_line]
+      def bash_block_rows(command, output, duration, expanded:, error: false)
+        # The Box(1,1) panel (tool-execution.ts:90): the Spacer blank
+        # stays PLAIN, every row after rides the result bg (an isError
+        # result renders toolErrorBg — tool-execution.ts:272-275).
+        bg = error ? Theme[:tool_error_bg] : Theme[:tool_success_bg]
+        region = [blank_line, panel_blank_line(bg)]
+        # pi formatShellCall (renderers/bash.ts:41-44): the header is
+        # toolTitle bold — NOT bashMode (that token is the user-bash !
+        # block's header; the old bashMode pin was the system-theme
+        # artifact).
         region.concat(padded_fg_rows("$ #{command.to_s.empty? ? "..." : command}",
-          fg: Theme[:bashMode], modifiers: [:bold]))
+          fg: Theme[:toolTitle], modifiers: [:bold], bg: bg))
         body, notice = split_truncation_notice(output)
         unless body.empty?
-          region << blank_line
-          rows = padded_fg_rows(body, fg: Theme[:tool_output])
-          region.concat(expanded ? rows : collapse_bash_preview(rows))
+          region << panel_blank_line(bg)
+          rows = padded_fg_rows(body, fg: Theme[:tool_output], bg: bg)
+          region.concat(expanded ? rows : collapse_bash_preview(rows, bg: bg))
         end
         unless notice.empty?
-          region << blank_line
+          region << panel_blank_line(bg)
           # pi bash.ts:88-99 — the truncation notice renders the warning fg
           # (theme.fg("warning", `[...]`)), not the inherited tool_output
           # (the I19 carry-forward, AC6), composed as pi's DISPLAY warnings
           # ({display_truncation_notice}).
-          region.concat(padded_fg_rows(display_truncation_notice(notice), fg: Theme[:warning]))
+          region.concat(padded_fg_rows(display_truncation_notice(notice), fg: Theme[:warning], bg: bg))
         end
         if duration
-          region << blank_line
-          region.concat(padded_fg_rows("Took #{format_duration(duration * 1000.0)}", fg: Theme[:tool_output]))
+          region << panel_blank_line(bg)
+          region.concat(padded_fg_rows("Took #{format_duration(duration * 1000.0)}", fg: Theme[:tool_output], bg: bg))
         end
-        region << blank_line
+        region << panel_blank_line(bg)
         region
       end
 
@@ -1301,10 +1352,10 @@ module Tart
       # a long line spanning the screen counts like pi's); 5 or fewer
       # render whole. Presentation-only: the model sees the full output
       # (the tools' tail truncation is upstream and composes after).
-      def collapse_bash_preview(rows)
+      def collapse_bash_preview(rows, bg: nil)
         return rows if rows.length <= BASH_PREVIEW_LINES
 
-        [expand_hint_row("... (#{rows.length - BASH_PREVIEW_LINES} earlier lines,"),
+        [expand_hint_row("... (#{rows.length - BASH_PREVIEW_LINES} earlier lines,", bg: bg),
           *rows.last(BASH_PREVIEW_LINES)]
       end
 
@@ -1382,10 +1433,33 @@ module Tart
       # Wrapped themed rows through the {OUTPUT_PAD} rule (pi's render-box
       # paddingX, tool-execution.ts:87 — one pad cell, content wrapped to
       # width minus both pads).
-      def padded_fg_rows(text, fg:, modifiers: [])
+      def padded_fg_rows(text, fg:, modifiers: [], bg: nil)
         Chat.wrap(text, viewport_width - OUTPUT_PAD.length * 2).map do |row|
-          TUI.line([TUI.span(OUTPUT_PAD), TUI.span(row, fg:, modifiers:)])
+          spans = [TUI.span(OUTPUT_PAD, bg: bg), TUI.span(row, fg:, modifiers:, bg: bg)]
+          spans << panel_tail(TUI.text_width(row), bg) if bg
+          TUI.line(spans)
         end
+      end
+
+      # The bg panel's trailing fill: bg-styled spaces from the row's
+      # content end to the viewport's right edge (pi markdown.ts:352
+      # applyBackgroundToLine — the bg rides the FULL row width; the -e
+      # capture trims trailing cells, a real terminal doesn't).
+      def panel_tail(content_width, bg)
+        TUI.span(" " * [viewport_width - OUTPUT_PAD.length - content_width, 0].max, bg: bg)
+      end
+
+      # A full-width bg blank row (the Box paddingY rows over the panel bg).
+      def panel_blank_line(bg)
+        TUI.line([TUI.span(" " * viewport_width, bg: bg)])
+      end
+
+      # The tool-block panel bg (tool-execution.ts:272-275): an error
+      # result renders toolErrorBg, the rest toolSuccessBg (the pending
+      # bg never reaches the scrollback — the port's blocks enqueue at
+      # completion).
+      def tool_panel_bg(result)
+        result.is_a?(Hash) && result[:error] ? Theme[:tool_error_bg] : Theme[:tool_success_bg]
       end
 
       # The per-tool block dispatch (pi's per-tool renderCall/renderResult,
@@ -1397,16 +1471,22 @@ module Tart
         args = {} unless args.is_a?(Hash)
         case name
         when BASH_TOOL
-          enqueue_bash_block(args["command"], tool_result_text(result), duration)
+          # pi's bash tool marks a nonzero exit an isError result (the
+          # s4 capture: the failed `ls` block renders toolErrorBg) — the
+          # port's Tools::Bash gates identically (bash.rb:126); carry the
+          # flag so the panel picks the error bg.
+          error = result.is_a?(Hash) && result[:error]
+          enqueue_bash_block(args["command"], tool_result_text(result), duration, error:)
         when WRITE_TOOL
           enqueue_write_block(args, result)
         when READ_TOOL
           enqueue_read_block(args, result)
         else
           # Every tool block opens with a leading blank (pi
-          # tool-execution.ts:85 — the constructor's Spacer).
-          @scrollback << [blank_line]
-          enqueue_scrollback(tool_line(name, result), fg: Theme[:tool_output])
+          # tool-execution.ts:85 — the constructor's Spacer), then the
+          # bg'd contentText panel (the Box shape over tool_line).
+          @chat_started = true
+          @scrollback << [blank_line, *generic_panel_rows(name, result)]
         end
       end
 
@@ -1431,19 +1511,20 @@ module Tart
       # the content preview uncapped (write.ts:117 maxLines = expanded ?
       # lines.length : 10 — the hint dies with the cap).
       def write_block_rows(args, result, expanded:)
-        region = [blank_line, blank_line]
-        region.concat(write_call_rows(args))
-        content_rows = write_content_rows(args, expanded:)
+        bg = tool_panel_bg(result)
+        region = [blank_line, panel_blank_line(bg)]
+        region.concat(write_call_rows(args, bg:))
+        content_rows = write_content_rows(args, expanded:, bg:)
         unless content_rows.empty?
-          region << blank_line
+          region << panel_blank_line(bg)
           region.concat(content_rows)
         end
         error = result.is_a?(Hash) ? result[:error] : nil
         if error
-          region << blank_line
-          region.concat(padded_fg_rows(error.to_s, fg: Theme[:error]))
+          region << panel_blank_line(bg)
+          region.concat(padded_fg_rows(error.to_s, fg: Theme[:error], bg: bg))
         end
-        region << blank_line
+        region << panel_blank_line(bg)
         region
       end
 
@@ -1468,34 +1549,41 @@ module Tart
       # lines.length : 10; trailing-empty lines trimmed). The error text
       # renders in both states.
       def read_block_rows(args, result, expanded:)
-        region = [blank_line, blank_line]
-        region.concat(read_call_rows(args, expanded))
+        bg = tool_panel_bg(result)
+        region = [blank_line, panel_blank_line(bg)]
+        region.concat(read_call_rows(args, expanded, bg:))
         error = result.is_a?(Hash) ? result[:error] : nil
-        rows = error ? padded_fg_rows(error.to_s, fg: Theme[:tool_output]) : (expanded ? read_content_rows(result) : [])
+        rows = if error
+          padded_fg_rows(error.to_s, fg: Theme[:tool_output], bg: bg)
+        elsif expanded
+          read_content_rows(result, bg:)
+        else
+          []
+        end
         unless rows.empty?
-          region << blank_line
+          region << panel_blank_line(bg)
           region.concat(rows)
         end
-        region << blank_line
+        region << panel_blank_line(bg)
         region
       end
 
       # pi read.ts:122-131 formatReadResult's expanded body: the result
       # text (trailing-empty lines trimmed) as toolOutput rows, uncapped.
-      def read_content_rows(result)
+      def read_content_rows(result, bg: nil)
         lines = tool_result_text(result).split("\n", -1)
         lines.pop while !lines.empty? && lines.last.empty?
         return [] if lines.empty?
 
-        padded_fg_rows(lines.join("\n"), fg: Theme[:tool_output])
+        padded_fg_rows(lines.join("\n"), fg: Theme[:tool_output], bg: bg)
       end
 
       # pi write.ts:99-100 — the bold toolTitle `write` header + the
       # renderToolPath display (accent token), wrapped through the
       # call-row family ({wrapped_call_rows}).
-      def write_call_rows(args)
+      def write_call_rows(args, bg: nil)
         wrapped_call_rows([tool_title_span("write"), Markdown::Span.new(text: " "),
-                           Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent])])
+                           Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent])], bg:)
       end
 
       # The styled call-row family (pi's per-tool renderCall Texts inside
@@ -1505,9 +1593,16 @@ module Tart
       # width — pi's Text wraps the header to the viewport (the I18
       # recorded gap, closed: an over-long word moves to its own row, then
       # hard-splits — the s6 capture's shape).
-      def wrapped_call_rows(spans)
+      def wrapped_call_rows(spans, bg: nil)
         Chat.wrap_row(spans, viewport_width - OUTPUT_PAD.length * 2).map do |row|
-          TUI.markdown_line([Markdown::Span.new(text: OUTPUT_PAD), *row])
+          tail = nil
+          if bg
+            row.each { |s| s.bg = bg }
+            width = row.sum { |s| TUI.text_width(s.text) }
+            fill = [viewport_width - OUTPUT_PAD.length - width, 0].max
+            tail = Markdown::Span.new(text: " " * fill, bg: bg)
+          end
+          TUI.markdown_line([Markdown::Span.new(text: OUTPUT_PAD, bg: bg), *row, tail].compact)
         end
       end
 
@@ -1516,15 +1611,15 @@ module Tart
       # (trimTrailingEmptyLines), at most 10 lines, then the expand hint
       # row (keyHint app.tools.expand — the dim key + muted text bytes;
       # the ctrl+o binding is cut, the bytes are the contract).
-      def write_content_rows(args, expanded: false)
+      def write_content_rows(args, expanded: false, bg: nil)
         lines = args["content"].to_s.gsub("\r", "").split("\n", -1)
         lines.pop while !lines.empty? && lines.last.empty?
         return [] if lines.empty?
 
         display = expanded ? lines : lines.first(WRITE_PREVIEW_LINES)
-        rows = padded_fg_rows(display.join("\n"), fg: Theme[:tool_output])
+        rows = padded_fg_rows(display.join("\n"), fg: Theme[:tool_output], bg: bg)
         remaining = lines.length - display.length
-        rows << expand_hint_row("... (#{remaining} more lines, #{lines.length} total,") if remaining.positive?
+        rows << expand_hint_row("... (#{remaining} more lines, #{lines.length} total,", bg: bg) if remaining.positive?
         rows
       end
 
@@ -1533,12 +1628,18 @@ module Tart
       # bash-execution.ts:146 + the collapse variant): muted prefix, the
       # gap (keyHint composes `prefix${keyText}` with NO space in the
       # user-bash shapes), dim key, muted tail.
-      def expand_hint_row(prefix, gap: " ", tail: " to expand)")
-        TUI.line([TUI.span(OUTPUT_PAD),
-                  TUI.span(prefix, fg: Theme[:muted]),
-                  TUI.span(gap),
-                  TUI.span("ctrl+o", fg: Theme[:dim]),
-                  TUI.span(tail, fg: Theme[:muted])])
+      def expand_hint_row(prefix, gap: " ", tail: " to expand)", bg: nil)
+        spans = [TUI.span(OUTPUT_PAD, bg: bg),
+                 TUI.span(prefix, fg: Theme[:muted], bg: bg),
+                 TUI.span(gap, bg: bg),
+                 TUI.span("ctrl+o", fg: Theme[:dim], bg: bg),
+                 TUI.span(tail, fg: Theme[:muted], bg: bg)]
+        if bg
+          width = TUI.text_width(prefix) + TUI.text_width(gap) +
+                  TUI.text_width("ctrl+o") + TUI.text_width(tail)
+          spans << panel_tail(width, bg)
+        end
+        TUI.line(spans)
       end
 
       # pi read.ts:35-42 formatReadCall vs :79-90 formatCompactReadCall —
@@ -1546,7 +1647,7 @@ module Tart
       # expand hint (the [skill] label rides customMessageLabel violet —
       # the port's accent analog — over customMessageText muted), wrapped
       # through the call-row family ({wrapped_call_rows}).
-      def read_call_rows(args, expanded = false)
+      def read_call_rows(args, expanded = false, bg: nil)
         classification = expanded ? nil : compact_read_classification(args)
         if classification
           label_spans = if classification[:kind] == :skill
@@ -1557,11 +1658,11 @@ module Tart
              Markdown::Span.new(text: classification[:label], fg: Theme[:accent])]
           end
           wrapped_call_rows([*label_spans, *line_range_spans(args),
-                             Markdown::Span.new(text: " (ctrl+o to expand)", fg: Theme[:dim])])
+                             Markdown::Span.new(text: " (ctrl+o to expand)", fg: Theme[:dim])], bg:)
         else
           wrapped_call_rows([tool_title_span("read"), Markdown::Span.new(text: " "),
                              Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent]),
-                             *line_range_spans(args)])
+                             *line_range_spans(args)], bg:)
         end
       end
 
@@ -1638,6 +1739,23 @@ module Tart
         preview << "…" if lines.size > TOOL_PREVIEW_LINES
         rest = preview[1..].map { |line| "    #{line}" }
         (["  ⎿ #{name}: #{preview.first}"] + rest).join("\n")
+      end
+
+      # The generic no-renderer tool block (edit/grep/ls/find): the
+      # contentText panel (tool-execution.ts:90-92 — Text over the result
+      # bg) around {tool_line}'s preview, full-width bg rows; the port's
+      # I17 wrap geometry (viewport width, tool_line's own indent) stands —
+      # unmeasured by any scenario, the bg is the pi-source carry.
+      def generic_panel_rows(name, result)
+        bg = tool_panel_bg(result)
+        region = [panel_blank_line(bg)]
+        Chat.wrap(tool_line(name, result), viewport_width).each do |row|
+          fill = [viewport_width - TUI.text_width(row), 0].max
+          region << TUI.line([TUI.span(row, fg: Theme[:tool_output], bg: bg),
+                              TUI.span(" " * fill, bg: bg)])
+        end
+        region << panel_blank_line(bg)
+        region
       end
 
       def viewport_width
@@ -2490,12 +2608,11 @@ module Tart
         TUI.block(
           title: status_title,
           borders: [:top, :bottom],
-          # pi updateEditorBorderColor (interactive-mode.ts:1109-1117): the
-          # border follows the input — bash mode (a leading "!") renders
-          # the bashMode token; otherwise pi colors by thinking level
-          # (getThinkingBorderColor — the port's thinking tokens are cut,
-          # the I11 border token stands; itemized residual).
-          border_style: TUI.style(fg: bash_mode? ? Theme[:bashMode] : Theme[:border]),
+          # pi updateEditorBorderColor (interactive-mode.ts:4514-4522):
+          # the border follows the input — bash mode (a leading "!")
+          # renders the bashMode token; otherwise the session's thinking
+          # level (getThinkingBorderColor — {editor_border_color}).
+          border_style: TUI.style(fg: editor_border_color),
           title_style: TUI.style(fg: Theme[:dim]),
           children: [TUI.paragraph(text: content, wrap: false)]
         )
@@ -2505,6 +2622,19 @@ module Tart
       # with "!" — the editor's border announces the whole-line bash.
       def bash_mode?
         @input.start_with?("!")
+      end
+
+      # pi getThinkingBorderColor (theme.ts:348) over the session's level
+      # || "off" — reasoning-gated like the footer's `model • level`
+      # segment (a non-reasoning model carries no level → thinking_off
+      # #6c767b, the rig mock's settled border; the owner's reasoning
+      # model at level high renders #9776e5).
+      def editor_border_color
+        return Theme[:bashMode] if bash_mode?
+
+        level = @footer_data&.fetch(:thinking_level, nil) if @footer_data&.fetch(:reasoning, nil)
+        token = "thinking_#{level || :off}".to_sym
+        Theme::TOKENS.key?(token) ? Theme[token] : Theme[:thinking_off]
       end
 
       def status_title
