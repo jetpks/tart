@@ -14,6 +14,7 @@ require_relative "picker"
 require_relative "selection"
 require_relative "viewport"
 require_relative "slash_source"
+require_relative "transcript"
 
 module Tart
   module Render
@@ -89,12 +90,6 @@ module Tart
       # paddingX (interactive-mode.ts:1060-1063), the echo's and the
       # assistant's Markdown paddingX (user-message.ts:23,
 
-      # An expandable block riding the scrollback queue: the rows built at
-      # the CURRENT toggle state + the builder (re-invoked with the new
-      # state at the ctrl+o toggle; the drain records the transcript
-      # range). pi's expandable tool children.
-      MarkedRegion = Struct.new(:rows, :builder)
-
       # @param session the TUI session (fullscreen viewport).
       # @param kernel [Core::Loop] the kernel; used to open animation windows
       #   and to submit agent runs as kernel tasks.
@@ -156,14 +151,21 @@ module Tart
         # reduced): nil = closed; open it holds the {Picker} over the
         # launcher-built [{path:, label:}] list (newest first).
         @picker = nil
-        # The ctrl+o global tool-output toggle (pi toolOutputExpanded,
-        # setToolsExpanded — interactive-mode.ts:6810-6826): every
-        # expandable block rebuilds in place; the border status reports.
-        # The expandable registry tracks each block's transcript row range
-        # + row builder (recorded at drain time — the scrollback is a
-        # cross-thread queue, the transcript is flat).
-        @tool_output_expanded = false
-        @expandable_blocks = []
+        # The transcript/scrollback assembly (I25 wave 5): the scrollback
+        # queue, the flat transcript buffer, the ctrl+o expandable
+        # registry (pi toolOutputExpanded/setToolsExpanded —
+        # interactive-mode.ts:6810-6826) and the resume replay, extracted
+        # stateful (the wave-2/4 idiom). Seams: the width reader (the
+        # enqueue family wraps to the viewport width) and the late-bound
+        # completion sinks — the editor-history record on replay and the
+        # footer usage reseed. Unsynchronized: this surface owns the
+        # mutex, and the component is called from exactly the fibers that
+        # touched the state at base.
+        @transcript_state = Transcript.new(
+          width_reader: -> { viewport_width },
+          history_sink: ->(text) { @editor.add_to_history(text) },
+          reseed_sink: ->(message) { @footer.reseed_usage(message) }
+        )
         @border_status = nil
         # The !-prefix bash execution state machine (backlog C, pi
         # handleBashCommand): the coordinator routes into it — submit's
@@ -173,9 +175,9 @@ module Tart
         @user_bash = UserBash.new(
           kernel: kernel,
           busy_reader: -> { busy? },
-          block_sink: ->(command, fields, excluded) { enqueue_user_bash_block(command, **fields, excluded:) },
+          block_sink: ->(command, fields, excluded) { @transcript_state.enqueue_user_bash_block(command, **fields, excluded:) },
           record_sink: ->(message) { @agent&.record_bash_execution(message) },
-          line_sink: ->(text, fg:) { enqueue_scrollback(text, fg:) }
+          line_sink: ->(text, fg:) { @transcript_state.enqueue_scrollback(text, fg:) }
         )
         @last_ctrl_c = nil
         @live = +""
@@ -188,12 +190,6 @@ module Tart
         @busy = false
         @tool = nil
         @frames = 0
-        # Completed lines awaiting the transcript buffer on the next frame
-        # (thread-safe: agent fiber produces, frame loop consumes).
-        @scrollback = Queue.new
-        # The surface-owned scrollback buffer (final display Lines) — the
-        # transcript area draws its visible tail every frame.
-        @transcript = []
         # The footer state machine (I24 wave 4): the branch cache and the
         # usage accounting (pi footer-data-provider.ts + footer.ts), fed
         # the launcher facts per frame from {@footer_data}.
@@ -206,11 +202,6 @@ module Tart
         # /thinking sets it — pi agent.state.thinkingLevel).
         @thinking_level = nil
         @motd_pending = motd # rendered on the first frame, once wired
-        # pi's chat container is a separate component from the header
-        # (interactive-mode.ts:633-639); its leading-spacer gate (children
-        # non-empty, :3930-3931) reads this — any chat region since the
-        # boot/new/resume reset, header excluded.
-        @chat_started = false
       end
 
       # The agent loop this surface drives (wired after construction: the
@@ -263,7 +254,7 @@ module Tart
         # keep their bytes verbatim (art trailing spaces, markdown
         # spacing rows). The -e capture remains the style gate.
         @mutex.synchronize do
-          @transcript.map do |line|
+          @transcript_state.lines.map do |line|
             spans = line.spans.dup
             spans.pop while !spans.empty? && panel_fill_span?(spans.last)
             spans.empty? ? "" : spans.map(&:content).join
@@ -319,7 +310,7 @@ module Tart
         @mutex.synchronize do
           enqueue_motd if @motd_pending
           @motd_pending = false
-          flush_scrollback
+          @transcript_state.flush_scrollback
           @frames += 1
           widget = build_widget
         end
@@ -363,7 +354,11 @@ module Tart
             if message.role == :assistant
               @footer.accumulate_usage(message)
               handled = complete(message.content)
-              enqueue_message(handled)
+              # The reasoning buffer threads in as data and clears after
+              # the render (the flush lived inside enqueue_message at
+              # base — same row order, buffer reset with the completion).
+              @transcript_state.enqueue_message(handled, reasoning: @reasoning)
+              @reasoning = +""
             end
           when :tool_execution_start
             @tool = event[:tool_call].name
@@ -374,7 +369,7 @@ module Tart
             # owns the shell shapes (I17 — the frozen :tool_execution_end
             # contract carries `duration:`), write/read their file-tool
             # shapes (I18), the rest the generic ⎿ line.
-            enqueue_tool_block(call.name, call.arguments, event[:result], event[:duration])
+            @transcript_state.enqueue_tool_block(call.name, call.arguments, event[:result], event[:duration])
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after
             # prepare succeeds): the border shows pi's per-reason label
@@ -388,8 +383,9 @@ module Tart
             # came from :compaction_start — the frozen I12 contract).
             @compaction_reason = nil
             @footer.mark_usage_stale
-            @scrollback << [Panel.blank_line] # the compaction line is a region too (pi :3903-3904)
-            enqueue_scrollback(
+            # the compaction line is a region too (pi :3903-3904)
+            @transcript_state.enqueue_region([Panel.blank_line])
+            @transcript_state.enqueue_scrollback(
               "✻ compacted (#{event[:reason]}, #{event[:tokens_before]} tokens)", fg: Theme[:dim]
             )
           when :agent_end
@@ -400,10 +396,10 @@ module Tart
             @user_bash.flush_pending
             if event[:interrupted] == true
               handled = "interrupted"
-              enqueue_scrollback(handled, fg: Theme[:warning])
+              @transcript_state.enqueue_scrollback(handled, fg: Theme[:warning])
             elsif event[:error]
               handled = "error: #{event[:error].message}"
-              enqueue_scrollback(handled, fg: Theme[:error])
+              @transcript_state.enqueue_scrollback(handled, fg: Theme[:error])
             end
             # A message submitted in the wind-down window (after the agent's
             # final steering check, before agent_end) sits queued with no run
@@ -430,7 +426,7 @@ module Tart
         @mutex.synchronize do
           clear_transcript
           enqueue_motd
-          enqueue_scrollback("✓ New session started", fg: Theme[:accent])
+          @transcript_state.enqueue_scrollback("✓ New session started", fg: Theme[:accent])
         end
       end
 
@@ -447,13 +443,13 @@ module Tart
         @mutex.synchronize do
           clear_transcript
           entries = Agent::Session.load_entries(path)
-          replay_entries(entries)
+          @transcript_state.replay_entries(entries)
           compactions = entries.count { |entry| entry.is_a?(Hash) && entry["type"] == "compaction" }
           if compactions.positive?
             times = compactions == 1 ? "1 time" : "#{compactions} times"
-            enqueue_scrollback("Session compacted #{times}", fg: Theme[:dim])
+            @transcript_state.enqueue_scrollback("Session compacted #{times}", fg: Theme[:dim])
           end
-          enqueue_scrollback("Resumed session", fg: Theme[:accent])
+          @transcript_state.enqueue_scrollback("Resumed session", fg: Theme[:accent])
         end
       end
 
@@ -472,7 +468,7 @@ module Tart
       # Commands::Handler with +output: ->(text) { surface.command_line(text) }+
       # (the I13 /skills NoMethodError).
       def command_line(text)
-        @mutex.synchronize { enqueue_scrollback(text, fg: Theme[:muted]) }
+        @mutex.synchronize { @transcript_state.enqueue_scrollback(text, fg: Theme[:muted]) }
       end
 
       private
@@ -485,32 +481,6 @@ module Tart
         return nil if !text.is_a?(String) || text.empty?
 
         text
-      end
-
-      # A completed assistant message as transcript rows (pi
-      # assistant-message.ts updateContent): the leading blank every
-      # message with visible content opens with (:103-105 — the
-      # between-item rule), the joined reasoning block, the blank after a
-      # thinking run when content follows (:172-174), then the content.
-      # A reasoning-only message gets no trailing blank.
-      def enqueue_message(content)
-        has_reasoning = !@reasoning.empty?
-        has_content = !content.nil?
-        return unless has_reasoning || has_content
-
-        @chat_started = true
-        @scrollback << [Panel.blank_line]
-        # The joined thinking renders as a dim block BEFORE the content
-        # (pi assistant-message.ts:99-175 render order). The live
-        # reasoning buffer is the text source, not Message#thinking —
-        # the loop strips the latter before this event (itemized
-        # deviation from the spec's message.thinking.text letter).
-        flush_reasoning
-        if has_content
-          # Assistant completions render as markdown (AC5).
-          @scrollback << [Panel.blank_line] if has_reasoning
-          enqueue_markdown(content)
-        end
       end
 
       # The startup MOTD block: the header-container shape (pi
@@ -540,362 +510,22 @@ module Tart
           lines.concat(rows)
         end
         lines << Panel.blank_line
-        @scrollback << lines
-      end
-
-      # Verbatim completed text (tool output, status): wrapped to
-      # the transcript width, one line-level fg. Everything routed here is
-      # a chat-container child in pi (tool blocks, chat lines, compaction
-      # and status lines), so it arms the leading-spacer gate.
-      def enqueue_scrollback(text, fg:)
-        return if text.nil? || text.empty?
-
-        @chat_started = true
-        @scrollback << Text.wrap(text, viewport_width).map { |line| TUI.line(line, fg:) }
-      end
-
-      # The submitted prompt's echo (item 4, pi UserMessageComponent,
-      # user-message.ts:40-51): the "text" token's color on the
-      # "userMessageBg" background — pi's echo carries no prompt char
-      # (the port's I05 prompt-char invention; gone). pi's shape: a
-      # leading blank ONLY when the chat container is non-empty
-      # (interactive-mode.ts:3930-3931 — the fresh boot's first echo has
-      # none; the port's container flag is {@chat_started}), then the
-      # component's Markdown paddingY=1 (user-message.ts:23) — one blank
-      # row above and below the content — every content row through the
-      # {OUTPUT_PAD} rule, the bg riding the FULL row width (pi markdown.ts
-      # :352 applyBackgroundToLine — pad spans + trailing fill + the
-      # paddingY blanks all carry the panel bg).
-      def enqueue_user_echo(text)
-        bg = Theme[:user_message_bg]
-        rows = Text.wrap(text, viewport_width - Panel::OUTPUT_PAD.length * 2).map do |row|
-          TUI.line([TUI.span(Panel::OUTPUT_PAD, bg: bg),
-                    TUI.span(row, fg: Theme[:user_message_text], bg: bg),
-                    Panel.panel_tail(TUI.text_width(row), viewport_width, bg)])
-        end
-        region = []
-        region << Panel.blank_line if @chat_started # the container's non-empty gate
-        region << Panel.panel_blank_line(viewport_width, bg) # paddingY top (user-message.ts:23)
-        region.concat(rows)
-        region << Panel.panel_blank_line(viewport_width, bg) # paddingY bottom
-        @chat_started = true
-        @scrollback << region
-      end
-
-      # The submitted prompt's display dispatcher (the skill half of pi's
-      # user-message rendering, interactive-mode.ts:3930-3948): the skill
-      # block parses back out of the expanded text and renders as its OWN
-      # collapsible panel (SkillInvocationMessageComponent, collapsed by
-      # default — the owner's "[skill] architect (ctrl+o to expand)"
-      # container), the trailing user message echoes below it as a normal
-      # echo (pi's unconditional Spacer(1) between). The plain submission
-      # is the echo alone. The MODEL receives and the session records the
-      # full expanded text either way — the split is display-only, as in
-      # pi.
-      def enqueue_user_submission(text)
-        block = Text.parse_skill_block(text)
-        return enqueue_user_echo(text) unless block
-
-        @scrollback << [Panel.blank_line] if @chat_started # the container's non-empty gate (once)
-        @chat_started = true
-        push_expandable(->(expanded) { skill_panel_rows(block, expanded:) })
-        enqueue_user_echo(block.user_message) if block.user_message
-      end
-
-      # The skill-invocation panel (pi skill-invocation-message.ts:
-      # Box(outputPad, 1, customMessageBg), collapsed by default, the
-      # ctrl+o toggle sweeps it via the expandable registry — pi
-      # component.setExpanded(this.toolOutputExpanded)). Collapsed: one
-      # content row — the bold customMessageLabel [skill], the
-      # customMessageText name, the dim " (ctrl+o to expand)" hint
-      # (keyText app.tools.expand). Expanded: the label row, then the
-      # bold-markdown name header + the content as markdown over
-      # customMessageText prose (pi's color override — token colors
-      # still apply, the prose callback doesn't). paddingY 1 both ways;
-      # every row through the {OUTPUT_PAD} rule + the full-width bg.
-      # pi's click-to-toggle MouseRegion is cut — the port's mouse owns
-      # selection (itemized).
-      def skill_panel_rows(block, expanded:)
-        bg = Theme[:custom_message_bg]
-        # pi: theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) —
-        # the trailing space rides the LABEL's run. Every span carries the
-        # panel bg itself — the bg is per-SPAN in the gem's emission, and
-        # a span without one resets it (^[[49m — the transparent-text
-        # defect).
-        label = TUI.span("[skill] ", fg: Theme[:custom_message_label], modifiers: [:bold], bg: bg)
-        unless expanded
-          line = Panel.padded_spans_row(
-            [label, TUI.span(block.name, fg: Theme[:custom_message_text], bg: bg),
-             TUI.span(" (ctrl+o to expand)", fg: Theme[:dim], bg: bg)], viewport_width, bg
-          )
-          return [Panel.panel_blank_line(viewport_width, bg), line, Panel.panel_blank_line(viewport_width, bg)]
-        end
-
-        rows = [Panel.panel_blank_line(viewport_width, bg), Panel.padded_spans_row([label], viewport_width, bg)]
-        rows.concat(markdown_lines("**#{block.name}**\n\n#{block.content}", viewport_width,
-          prose_fg: Theme[:custom_message_text], bg: bg))
-        rows << Panel.panel_blank_line(viewport_width, bg)
-        rows
-      end
-
-      # The resume replay (item 3, pi renderSessionEntries, interactive-
-      # mode.ts :3900-3975): the recorded entries through the live-turn
-      # shapes — user echoes, assistant thinking-then-content markdown,
-      # tool blocks (the assistant's recorded tool_calls joined to their
-      # recorded results), compaction summaries — as the entries carry
-      # them. Recorded gaps (itemized, never invented): thinking is
-      # stripped before record (agent/loop.rb strip_thinking_replay), so no
-      # reasoning block replays; non-string (multimodal) content is
-      # skipped; usage only when the provider reported it.
-      def replay_entries(entries)
-        results = entries.filter_map do |entry|
-          next unless entry.is_a?(Hash) && entry["type"] == "message"
-          message = entry["message"]
-          next unless message.is_a?(Hash) && message["role"] == "tool" && message["tool_call_id"]
-
-          [message["tool_call_id"], message["content"]]
-        end.to_h
-        entries.each { |entry| replay_entry(entry, results) }
-      end
-
-      def replay_entry(entry, results)
-        return unless entry.is_a?(Hash)
-
-        case entry["type"]
-        when "message"
-          message = entry["message"]
-          return unless message.is_a?(Hash)
-
-          case message["role"]
-          when "user" then replay_user(message)
-          when "assistant" then replay_assistant(message, results)
-          when "bashExecution" then replay_user_bash(message)
-          end
-        when "compaction"
-          # pi :3903-3904 — a compaction summary is a spaced region,
-          # markdown-rendered (CompactionSummaryMessageComponent).
-          @scrollback << [Panel.blank_line]
-          enqueue_markdown(entry["summary"]) if entry["summary"].is_a?(String)
-        end
-      end
-
-      def replay_user(message)
-        content = message["content"]
-        return unless content.is_a?(String) && !content.strip.empty?
-
-        enqueue_user_submission(content)
-        @editor.add_to_history(content) # pi renderInitialMessages populateHistory
-      end
-
-      # The replayed !-prefix bash execution (pi addMessageToChat's
-      # bashExecution case :3870-3887): the block rebuilt from the
-      # recorded fields — the recorded output is the executor's
-      # tail-truncated content, the exact display input.
-      def replay_user_bash(message)
-        return unless message.is_a?(Hash)
-
-        enqueue_user_bash_block(
-          message["command"].to_s,
-          content: message["output"].is_a?(String) ? message["output"] : "",
-          exit_code: message["exitCode"],
-          cancelled: message["cancelled"] == true,
-          truncated: message["truncated"] == true,
-          full_output_path: message["fullOutputPath"],
-          excluded: message["excludeFromContext"] == true
-        )
-      end
-
-      def replay_assistant(message, results)
-        content = message["content"]
-        has_content = content.is_a?(String) && !content.strip.empty?
-        reasoning = message["thinking"]
-        has_reasoning = reasoning.is_a?(String) && !reasoning.empty?
-        tool_calls = message["tool_calls"].is_a?(Hash) ? message["tool_calls"] : {}
-        return unless has_content || has_reasoning || tool_calls.any?
-
-        @footer.reseed_usage(message)
-        # pi assistant-message.ts:103-105 — the spacer rides VISIBLE
-        # content only (a tool-call-only assistant entry renders no blank
-        # of its own; its tool block brings one).
-        @scrollback << [Panel.blank_line] if has_content || has_reasoning
-        if has_reasoning
-          @scrollback << reasoning_lines(reasoning, viewport_width)
-          @scrollback << [Panel.blank_line] if has_content # pi :172-174
-        end
-        enqueue_markdown(content) if has_content
-        tool_calls.each_value do |call|
-          next unless call.is_a?(Hash) && call["name"].is_a?(String)
-
-          # The replay dispatches through the same per-tool shapes (I18):
-          # call lines from the recorded arguments, outputs from the
-          # recorded results, NO duration — the recorded entries carry
-          # none (the frozen contract's replay gap, never invented).
-          enqueue_tool_block(call["name"], call["arguments"], results[call["id"]], nil)
-        end
+        @transcript_state.enqueue_region(lines)
       end
 
       # The /new + resume shared reset: the buffer and stream state drop
       # (pi renderCurrentSessionState's container clears, :2210-2216; the
-      # host drops the selection with the transcript, :4096).
+      # host drops the selection with the transcript, :4096). The
+      # transcript state resets through its component (the I24
+      # {@footer.reset_usage} precedent).
       def clear_transcript
-        @transcript = []
-        @scrollback.clear
-        @expandable_blocks.clear
+        @transcript_state.reset
         @viewport.reset
         @selection_state.reset
         @live = +""
         @reasoning = +""
         # pi's footer stats re-derive from the fresh (empty) session.
         @footer.reset_usage
-        # The chat container emptied with the transcript (pi
-        # renderCurrentSessionState, interactive-mode.ts:2210-2216) — the
-        # leading-spacer gate restarts.
-        @chat_started = false
-      end
-
-      # Assistant completions render through the markdown converter (AC5):
-      # styled rows wrapped to the transcript width, every span's fg routed
-      # through the theme (AC3), then converted row → Line at the TUI seam.
-      def enqueue_markdown(text)
-        return if text.nil? || text.empty?
-
-        @scrollback << markdown_lines(text, viewport_width)
-      end
-
-      # Markdown text as themed display lines (the Render::Markdown
-      # converter is read-only — theme colors apply at the span level via
-      # {Theme.md_fg}; rows re-wrapped to the content width — pi's
-      # Markdown wraps to width minus its paddingX on both sides,
-      # markdown.ts:289 — every row through the {OUTPUT_PAD} rule).
-      # Shared by the completion path and the live region (item 3: pi
-      # re-renders the whole streaming message as markdown on every
-      # update — interactive-mode.ts:3519-3535, assistant-message.ts
-      # :107-109).
-      def markdown_lines(text, width, prose_fg: nil, bg: nil)
-        content_width = width - Panel::OUTPUT_PAD.length * 2
-        rows = Render::Markdown.rows(text, width: content_width).flat_map { |row| Text.wrap_row(row, content_width) }
-        rows.map do |row|
-          themed = row.map do |span|
-            fg = Theme.md_fg(span.fg)
-            fg = prose_fg if fg.nil? && prose_fg # the panel's prose-color override
-            Render::Markdown::Span.new(text: span.text, fg:, modifiers: span.modifiers)
-          end
-          bg ? panel_markdown_row(themed, bg) : Panel.padded_row(themed)
-        end
-      end
-
-      # One markdown row through the {OUTPUT_PAD} rule with the panel bg
-      # + tail (the expanded skill panel's content rows —
-      # applyBackgroundToLine over the Markdown component).
-      def panel_markdown_row(spans, bg)
-        width = spans.sum { |span| TUI.text_width(span.text) }
-        content = spans.map { |span| TUI.span(span.text, fg: span.fg, modifiers: span.modifiers, bg: bg) }
-        TUI.line([TUI.span(Panel::OUTPUT_PAD, bg: bg), *content, Panel.panel_tail(width, viewport_width, bg)])
-      end
-
-      # The bash tool block (I17 — pi's shell renderer over the tool-turn
-      # component): the constructor's Spacer (1 blank, tool-execution.ts:85),
-      # the render box's paddingY (1 blank above and below the children,
-      # tool-execution.ts:87 Box(1,1)), then the children — the bold
-      # bashMode `$ <command>` header (bash.ts:36 theme.bold over
-      # formatShellCall; colorKey bashMode — the port carries no
-      # context-exclusion state, the dim variant is unreachable, itemized),
-      # the output lines blank-separated from the header (bash.ts:78-84 —
-      # the Text children's leading "\n") collapsed to the preview's last
-      # rows plus the earlier-lines hint (I19 — {BashBlock.collapse_bash_preview};
-      # the truncation notice rides after, {BashBlock.split_truncation_notice}), and
-      # the muted `Took <duration>` line (bash.ts:105-109 — a nil/absent
-      # duration, the replay path, renders none; the recorded gap is
-      # itemized, never invented).
-      def enqueue_bash_block(command, output, duration, error: false)
-        @chat_started = true
-        push_expandable(->(expanded) { BashBlock.bash_block_rows(command, output, duration, viewport_width, expanded:, error:) })
-      end
-
-      # The expandable-block enqueue: the block rides the scrollback as a
-      # {MarkedRegion} (the drain records its transcript range for the
-      # ctrl+o toggle's in-place rebuild).
-      def push_expandable(builder)
-        @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder)
-      end
-
-      # The !-prefix bash block (pi BashExecutionComponent, backlog C): a
-      # BORERED block — Spacer, DynamicBorder in the colorKey ("dim" for
-      # the !!-excluded, bashMode otherwise), then the content: the bold
-      # `$ command` header, the muted output (tail-truncated to pi's
-      # context limits by the executor; collapsed to the last 20 VISUAL
-      # rows of the last 20 LOGICAL lines — PREVIEW_LINES 20, keep "end",
-      # visual-truncate.ts), the status rows (each its own row,
-      # statusParts.join("\n")): the "... N more lines (ctrl+o to expand)"
-      # hint (N = hidden LOGICAL lines), "(cancelled)" warning,
-      # "(exit N)" error, "Output truncated. Full output: <path>"
-      # warning — then the bottom border. The ctrl+o global toggle is the
-      # next slice (the hint's TEXT renders for byte parity); streaming
-      # loader frames are execution-transient (itemized).
-      def enqueue_user_bash_block(command, content:, exit_code:, cancelled:, truncated:,
-                                  full_output_path:, excluded:)
-        push_expandable(->(expanded) do
-          BashBlock.user_bash_block_rows(command, viewport_width, content:, exit_code:, cancelled:, truncated:,
-                                         full_output_path:, excluded:, expanded:)
-        end)
-      end
-
-      # The per-tool block dispatch (pi's per-tool renderCall/renderResult,
-      # I18): bash owns the shell shapes (I17 — carries the duration),
-      # write/read their file-tool shapes, everything else the generic ⎿
-      # line. Shared by the live and replay paths (I17's shape-sharing
-      # ruling); +duration+ is nil on replay (the recorded gap).
-      def enqueue_tool_block(name, args, result, duration)
-        args = {} unless args.is_a?(Hash)
-        case name
-        when BASH_TOOL
-          # pi's bash tool marks a nonzero exit an isError result (the
-          # s4 capture: the failed `ls` block renders toolErrorBg) — the
-          # port's Tools::Bash gates identically (bash.rb:126); carry the
-          # flag so the panel picks the error bg.
-          error = result.is_a?(Hash) && result[:error]
-          enqueue_bash_block(args["command"], ToolBlock.tool_result_text(result), duration, error:)
-        when WRITE_TOOL
-          enqueue_write_block(args, result)
-        when READ_TOOL
-          enqueue_read_block(args, result)
-        else
-          # Every tool block opens with a leading blank (pi
-          # tool-execution.ts:85 — the constructor's Spacer), then the
-          # bg'd contentText panel (the Box shape over ToolBlock.tool_line).
-          @chat_started = true
-          @scrollback << [Panel.blank_line, *ToolBlock.generic_panel_rows(name, result, viewport_width)]
-        end
-      end
-
-      # The write tool block (I18 — pi write.ts renderers over the
-      # tool-turn component): the constructor's Spacer + render-box
-      # paddingY (tool-execution.ts:85,87 — the bash block's shape), the
-      # bold toolTitle `write` header + the renderToolPath display
-      # (write.ts:99-100), blank, the content as toolOutput rows
-      # (write.ts:108-122), box pad. The SUCCESS result renders NOTHING
-      # (formatWriteResult is undefined unless error, write.ts:128-143);
-      # an error renders its text in the error token after a blank (the
-      # leading "\n", write.ts:143). Cuts, itemized: the syntax
-      # highlighting (highlightCode — the port has no highlighter;
-      # invisible to text files) and the ctrl+o expand binding (backlog
-      # C) — the hint's TEXT renders for byte parity.
-      def enqueue_write_block(args, result)
-        @chat_started = true
-        push_expandable(->(expanded) { FileBlocks.write_block_rows(args, result, viewport_width, expanded:) })
-      end
-
-      # The read tool block (I18 — pi read.ts renderers): the Spacer + box
-      # padding (tool-execution.ts:85,87), then the call line alone —
-      # formatReadCall's bold toolTitle `read` + renderToolPath + the
-      # warning :start-end range (read.ts:35-42), or the compact resource
-      # shape (getCompactReadClassification, read.ts:63-88). The result
-      # renders NOTHING unless error or expanded (read.ts:68-70 — the
-      # expand binding is cut, itemized); an error renders its text as
-      # toolOutput rows (formatReadResult's isError path).
-      def enqueue_read_block(args, result)
-        @chat_started = true
-        push_expandable(->(expanded) { FileBlocks.read_block_rows(args, result, viewport_width, expanded:) })
       end
 
       def viewport_width
@@ -973,7 +603,7 @@ module Tart
         when "o"
           # app.tools.expand (pi keybindings.ts:50, default ctrl+o — the
           # GLOBAL tool-output toggle, setToolsExpanded).
-          ctrl ? set_tool_output_expanded(!@tool_output_expanded) : @editor.insert_printable(event)
+          ctrl ? set_tool_output_expanded(!@transcript_state.tool_output_expanded) : @editor.insert_printable(event)
         # While the list is active up/down navigate the LIST (history
         # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
         when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.history_previous
@@ -1059,7 +689,7 @@ module Tart
         parsed = UserBash.parse(text)
         return @user_bash.run(*parsed) if parsed
 
-        enqueue_user_submission(text)
+        @transcript_state.enqueue_user_submission(text)
         if busy?
           @agent.push_message(text) # steering: consumed at the next turn boundary
         else
@@ -1069,20 +699,16 @@ module Tart
 
       # The completed thinking block (pi assistant-message.ts:99-175 order —
       # thinking before the content): the live reasoning buffer flushed as
-      # dim italic transcript rows, then cleared.
+      # dim italic transcript rows, then cleared. Retained on the
+      # coordinator for the live region; the completion path's flush
+      # happens inside {Transcript#enqueue_message} (the reasoning text
+      # threads in at the :message_end event — I25).
       def flush_reasoning
         text = @reasoning
         @reasoning = +""
         return if text.empty?
 
-        @scrollback << reasoning_lines(text, viewport_width)
-      end
-
-      # Reasoning text as dim italic display lines (pi assistant-message.ts
-      # :140-150: thinkingText fg, italic; markdown-of-reasoning is cut,
-      # plain dim text — itemized reduction).
-      def reasoning_lines(text, width)
-        Text.wrap(text, width - Panel::OUTPUT_PAD.length * 2).map { |line| TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(line, fg: Theme[:thinkingText], modifiers: [:italic])]) }
+        @transcript_state.enqueue_region(Transcript.reasoning_lines(text, viewport_width))
       end
 
       # --- transcript scroll state (pi scroll-view.ts follow-end) ---
@@ -1335,7 +961,7 @@ module Tart
       # and the mouse machinery addresses it (selection points are buffer
       # rows).
       def display_lines
-        @transcript + live_lines(viewport_width)
+        @transcript_state.lines + live_lines(viewport_width)
       end
 
       # The streaming region (item 3, pi interactive-mode.ts:3519-3535 +
@@ -1357,30 +983,10 @@ module Tart
         return [] if @live.empty? && @reasoning.empty?
 
         lines = [Panel.blank_line]
-        lines.concat(reasoning_lines(@reasoning, width)) unless @reasoning.empty?
+        lines.concat(Transcript.reasoning_lines(@reasoning, width)) unless @reasoning.empty?
         lines << Panel.blank_line if !@reasoning.empty? && !@live.empty?
-        lines.concat(markdown_lines(@live, width)) unless @live.empty?
+        lines.concat(Transcript.markdown_lines(@live, width)) unless @live.empty?
         lines
-      end
-
-      # Completed lines move into the transcript buffer (pi: completed
-      # content into scrollback). Entries are final display Lines — or a
-      # {MarkedRegion}: an expandable block, whose transcript range is
-      # recorded at drain time so the ctrl+o toggle can rebuild it in
-      # place (pi setToolsExpanded's child sweep). The inline
-      # insert_before path is retired from the interactive surface — the
-      # buffer is drawn wholesale every frame.
-      def flush_scrollback
-        until @scrollback.empty?
-          item = @scrollback.pop
-          if item.is_a?(MarkedRegion)
-            @expandable_blocks << {start: @transcript.size, size: item.rows.length,
-                                   builder: item.builder}
-            @transcript.concat(item.rows)
-          else
-            @transcript.concat(item)
-          end
-        end
       end
 
       # /thinking's seam (pi selectThinkingLevel :5165-5177): the session
@@ -1415,19 +1021,15 @@ module Tart
 
       # app.tools.expand (pi setToolsExpanded :6810-6826): the GLOBAL
       # toggle — every expandable block rebuilds collapsed↔expanded in
-      # place; the border status reports (pi showStatus). Cuts, itemized:
-      # the header's startup-help flip (the expanded header's full hint
+      # place; the border status reports (pi showStatus). The registry
+      # sweep is the component's state half; the report + draw stay here
+      # (the frozen public op — I25 extraction). Cuts, itemized: the
+      # header's startup-help flip (the expanded header's full hint
       # list + loaded-resources sections are unported) — the block sweep
       # is the feature.
       def set_tool_output_expanded(expanded)
-        return if expanded == @tool_output_expanded
+        return unless @transcript_state.set_tool_output_expanded(expanded)
 
-        @tool_output_expanded = expanded
-        @expandable_blocks.each do |registered|
-          rows = registered[:builder].call(expanded)
-          @transcript[registered[:start], registered[:size]] = rows
-          registered[:size] = rows.length
-        end
         @border_status = "Tool output: #{expanded ? "expanded" : "collapsed"}"
         @kernel.request_draw
       end
