@@ -122,6 +122,35 @@ module Tart
         end
       end
 
+      # The character covering cell +col+ of +text+.
+      def char_index_at_cell(text, col)
+        cell = 0
+        text.each_char.with_index do |ch, i|
+          cell += TUI.text_width(ch)
+          return i if cell > col
+        end
+        text.length - 1
+      end
+
+      # The leading text fitting +width+ cells (whole characters; a wide
+      # character that would straddle the bound moves whole to the
+      # remainder — widths stay additive).
+      def take_cells(text, width)
+        out = +""
+        text.each_char do |ch|
+          break if TUI.text_width(out) + TUI.text_width(ch) > width
+
+          out << ch
+        end
+        out
+      end
+
+      # The +width+-cell substring of +text+ starting at cell +start+.
+      def slice_cells(text, start, width)
+        rest = take_cells(text, start)
+        take_cells(text[rest.length..] || "", width)
+      end
+
       # pi formatTokens (footer.ts:23-30): compact token counts.
       def format_tokens(count)
         if count < 1000 then count.to_s
