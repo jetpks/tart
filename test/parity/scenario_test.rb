@@ -96,6 +96,39 @@ module Tart
         "the footer staging rides the per-app env seam (I16)")
     end
 
+    def test_loads_the_shipped_s5_bash_truncation_scenario
+      scenario = Parity::Scenario.load(File.join(REPO_ROOT, "parity/scenarios/s5_bash_truncation.yml"))
+      assert_equal "s5_bash_truncation", scenario.name
+      assert_equal "run the long seq", scenario.prompt
+      assert_equal 2, scenario.expected_requests
+      assert_equal 2, scenario.responses.size
+      assert_equal "bash", scenario.responses[0][:tool_calls][0][:name]
+      assert_equal({command: "seq 1 2100"}, scenario.responses[0][:tool_calls][0][:arguments],
+        "2100 lines crosses the 2000-line model-facing tail cap")
+      assert_equal "The truncated bash output was captured; fixed final reply for the spike.",
+        scenario.responses[1][:content]
+      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
+        "the footer staging rides the per-app env seam (I16)")
+    end
+
+    def test_loads_the_shipped_s6_long_calls_scenario
+      scenario = Parity::Scenario.load(File.join(REPO_ROOT, "parity/scenarios/s6_long_calls.yml"))
+      assert_equal "s6_long_calls", scenario.name
+      assert_equal "run the long command and write the long-named file", scenario.prompt
+      assert_equal 3, scenario.expected_requests
+      assert_equal 3, scenario.responses.size
+      assert_equal "bash", scenario.responses[0][:tool_calls][0][:name]
+      assert scenario.responses[0][:tool_calls][0][:arguments][:command].length > 120,
+        "the bash call row crosses the 120-col viewport"
+      assert_equal "write", scenario.responses[1][:tool_calls][0][:name]
+      write_args = scenario.responses[1][:tool_calls][0][:arguments]
+      assert write_args[:path].length > 100, "the write call row's staged path crosses 100 chars"
+      assert_equal "parity s6 note", write_args[:content]
+      assert_equal "The long tool calls ran; fixed final reply for the spike.", scenario.responses[2][:content]
+      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
+        "the footer staging rides the per-app env seam (I16)")
+    end
+
     def test_missing_required_field_raises_a_rig_error
       path = File.join(Dir.mktmpdir("pty-tester-scenario-"), "broken.yml")
       File.write(path, "name: broken\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")

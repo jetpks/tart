@@ -17,3 +17,11 @@ classes:
   # anchors only on the stable per-run 'run-<n>/' segment.
   - name: parity-run-path
     pattern: 'run-\d+/'
+  # Truncation spill files: both apps spill full bash output to the OS
+  # temp dir with per-run random segments (pi output-files.ts — tmpdir(),
+  # port output_accumulator.rb — Dir.tmpdir), referenced by the bash
+  # truncation notice's "Full output: <path>". Path noise, not a
+  # rendering difference; the notice text/fg divergence still surfaces
+  # on the path-free notice lines (I20 s5 baseline evidence).
+  - name: truncation-spill-path
+    pattern: '/(pi|tart)-bash-[0-9a-f-]+\.log'
