@@ -356,6 +356,141 @@ module Tart
       end
     end
 
+    # pi bash.ts:14,78-90 + visual-truncate.ts VisualLinePreview (keep
+    # "end"): 12 lines collapse to the muted earlier-lines hint row + the
+    # LAST 5 lines (the s4 shape — "... (7 earlier lines, ctrl+o to
+    # expand)"); the ctrl+o binding itself is cut (backlog C).
+    def test_bash_block_collapses_to_the_last_five_lines_plus_the_earlier_lines_hint
+      output = Array.new(12) { |i| (i + 1).to_s }.join("\n")
+      with_chat(width: 40, screen_height: 30) do |chat, session|
+        tool_end(chat, "bash", output, duration: 0.0, arguments: {"command" => "seq 1 12"})
+        draw(chat, session)
+
+        assert_equal(
+          ["", "", " $ seq 1 12", "", " ... (7 earlier lines, ctrl+o to expand)"] +
+            Array.new(5) { |i| " #{i + 8}" } + ["", " Took 0.0s", ""],
+          chat.transcript_lines,
+          "the hint row rides before the last 5 lines (bash.ts:82-84 VisualLinePreview keep end)"
+        )
+        hint = session.buffer_content.index { |row| row.include?("earlier lines") }
+        assert_equal Theme[:muted], session.cell_fg(1, hint),
+          "the hint prefix renders muted (bash.ts:83 theme.fg muted)"
+        key = session.buffer_content[hint].index("ctrl+o")
+        assert_equal Theme[:dim], session.cell_fg(key, hint),
+          "the ctrl+o key renders dim (keybinding-hints.ts keyHint)"
+      end
+    end
+
+    # Exactly 5 lines render whole — no collapse, no hint (pi
+    # truncateToVisualLines: allVisualLines <= maxVisualLines → no skip).
+    def test_bash_block_renders_whole_at_exactly_five_lines
+      output = Array.new(5) { |i| "line #{i + 1}" }.join("\n")
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", output, duration: 0.0, arguments: {"command" => "seq 1 5"})
+        draw(chat, session)
+
+        assert_equal(["", "", " $ seq 1 5", ""] + Array.new(5) { |i| " line #{i + 1}" } + ["", " Took 0.0s", ""],
+                     chat.transcript_lines, "5 lines render in full, no hint row")
+        refute chat.transcript_lines.any? { |row| row.include?("earlier lines") }, "no hint at the boundary"
+      end
+    end
+
+    # Exactly 6 lines hints ONE earlier line — pi's singular-agnostic
+    # bytes "(1 earlier lines," (bash.ts:83, no pluralization branch).
+    def test_bash_block_hints_one_earlier_line_at_exactly_six_lines
+      output = Array.new(6) { |i| "line #{i + 1}" }.join("\n")
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", output, duration: 0.0, arguments: {"command" => "seq 1 6"})
+        draw(chat, session)
+
+        assert_equal(["", "", " $ seq 1 6", "", " ... (1 earlier lines, ctrl+o to expand)"] +
+                     Array.new(5) { |i| " line #{i + 2}" } + ["", " Took 0.0s", ""],
+                     chat.transcript_lines, "the 6th line over the boundary hints 1 earlier line")
+      end
+    end
+
+    # The preview counts VISUAL rows, not logical lines (visual-truncate.ts
+    # truncateToVisualLines over the wrapped Text render): one long line
+    # wrapping across the screen consumes multiple preview rows.
+    def test_bash_block_collapse_counts_wrapped_visual_rows
+      long_line = "x" * 100 # content width 38 → 3 wrapped rows
+      output = [long_line, "a", "b", "c"].join("\n") # 6 visual rows
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", output, duration: 0.0, arguments: {"command" => "echo"})
+        draw(chat, session)
+
+        rows = chat.transcript_lines
+        assert_equal " ... (1 earlier lines, ctrl+o to expand)", rows[4],
+          "6 visual rows (3 wrapped + 3 short) hide exactly one"
+        assert_equal [" a", " b", " c"], rows[7, 3], "the short tail rows are kept"
+        assert_equal 2, rows.count { |row| row.include?("x" * 24) },
+          "exactly two wrapped x-rows survive (the last wrapped rows, keep end)"
+      end
+    end
+
+    # Trailing blank lines die at the trim before the preview (pi bash.ts:63
+    # getTextOutput().trim() — VisualLinePreview itself trims nothing), so
+    # they never pad the kept tail nor inflate the hidden count.
+    def test_bash_block_trailing_blank_lines_trim_before_the_collapse
+      output = (Array.new(8) { |i| "line #{i + 1}" }.join("\n") + "\n\n\n")
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", output, duration: 0.0, arguments: {"command" => "seq"})
+        draw(chat, session)
+
+        assert_equal [" ... (3 earlier lines, ctrl+o to expand)"] +
+                     Array.new(5) { |i| " line #{i + 4}" },
+          chat.transcript_lines[4, 6],
+          "8 real lines collapse after the trim; the trailing blanks count nothing"
+      end
+    end
+
+    # pi bash.ts:65-71 — the model-facing truncation footer splits OFF the
+    # preview: the body collapses, the notice rows follow (composition
+    # per pi's renderResult; the port keeps the notice's tool_output
+    # rendering — recorded deviation).
+    def test_bash_block_truncation_notice_follows_the_collapsed_block
+      output = Array.new(8) { |i| "line #{i + 1}" }.join("\n") +
+               "\n\n[Showing lines 5-8 of 8. Full output: /tmp/full.txt]"
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", output, arguments: {"command" => "big"})
+        draw(chat, session)
+
+        assert_equal(
+          ["", "", " $ big", "", " ... (3 earlier lines, ctrl+o to expand)"] +
+            Array.new(5) { |i| " line #{i + 4}" } +
+            ["", " [Showing lines 5-8 of 8. Full output:", " /tmp/full.txt]", ""],
+          chat.transcript_lines,
+          "the notice is not swallowed into the kept five — it renders after the collapsed body"
+        )
+      end
+    end
+
+    # The replay path shares enqueue_bash_block (I17's shape-sharing
+    # ruling): the recorded 12-line output collapses through the same
+    # rows, no Took (the recorded duration gap).
+    def test_resume_session_replays_the_collapsed_bash_preview
+      dir = File.join(@dir, "sessions")
+      FileUtils.mkpath(dir)
+      recorded = File.join(dir, "bash_collapse_replay_test-session.jsonl")
+      lines = Array.new(12) { |i| (i + 1).to_s }.join("\\n")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"bash-collapse","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"seq it"}}
+        {"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":"","tool_calls":{"call_1":{"id":"call_1","name":"bash","arguments":{"command":"seq 1 12"}}},"finish_reason":"tool_calls","input_tokens":10,"output_tokens":5}}
+        {"type":"message","id":"e3","parentId":"e2","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"tool","content":"#{lines}","tool_call_id":"call_1"}}
+      JSONL
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+
+        hint = chat.transcript_lines.index { |row| row.include?("earlier lines") }
+        assert_equal [" ... (7 earlier lines, ctrl+o to expand)", " 8", " 9", " 10", " 11", " 12"],
+          chat.transcript_lines[hint, 6],
+          "the replayed block collapses through the same enqueue_bash_block rows"
+        refute chat.transcript_lines.any? { |row| row.include?("Took") }, "no invented duration on replay"
+      end
+    end
+
     # ---- the write/read tool blocks (I18 — pi write.ts/read.ts
     # renderers over the tool-turn component). ----
 
