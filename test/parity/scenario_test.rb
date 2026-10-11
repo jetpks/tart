@@ -2,6 +2,8 @@
 
 require_relative "../test_helper"
 require_relative "../../lib/tart/parity"
+require "net/http"
+require "socket"
 
 module Tart
   # Scenario loading: the shipped data files and the failure path.
@@ -82,6 +84,20 @@ module Tart
         "the footer staging rides the per-app env seam (I16)")
     end
 
+    def test_loads_the_shipped_s4_bash_variants_scenario
+      scenario = Parity::Scenario.load(File.join(REPO_ROOT, "parity/scenarios/s4_bash_variants.yml"))
+      assert_equal "s4_bash_variants", scenario.name
+      assert_equal "run the two bash commands", scenario.prompt
+      assert_equal 3, scenario.expected_requests
+      assert_equal "bash", scenario.responses[0][:tool_calls][0][:name]
+      assert_equal({command: "seq 1 12"}, scenario.responses[0][:tool_calls][0][:arguments])
+      assert_equal "bash", scenario.responses[1][:tool_calls][0][:name]
+      assert_equal({command: "ls /definitely-not-here-s4"}, scenario.responses[1][:tool_calls][0][:arguments])
+      assert_equal "The bash tools ran; fixed final reply for the spike.", scenario.responses[2][:content]
+      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
+        "the footer staging rides the per-app env seam (I16)")
+    end
+
     def test_missing_required_field_raises_a_rig_error
       path = File.join(Dir.mktmpdir("pty-tester-scenario-"), "broken.yml")
       File.write(path, "name: broken\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
@@ -91,6 +107,36 @@ module Tart
 
     def test_absent_scenario_file_raises_a_rig_error
       assert_raises(Parity::Error) { Parity::Scenario.load("/nonexistent/scenario.yml") }
+    end
+
+    # AC4 (I18 rig robustness): a connection that sends no request line
+    # consumes no scripted response — no @script shift, no request-log
+    # entry, no response — so the next real request gets the next spec.
+    def test_an_empty_tcp_connection_consumes_no_scripted_response
+      with_server([{type: :message, content: "one"}, {type: :message, content: "two"}]) do |server|
+        TCPSocket.new("127.0.0.1", server.port).close
+
+        assert_equal "one", fetch_content(server)
+        assert_equal "two", fetch_content(server)
+        logs = server.captured_request_logs
+        assert_equal 2, logs.size
+        assert logs.all? { |entry| entry[:method] == "POST" && entry[:path] == "/v1/chat/completions" }
+      end
+    end
+
+    private
+
+    def with_server(specs)
+      server = MockLLMServer.new.script(specs).start
+      yield server
+    ensure
+      server&.stop
+    end
+
+    def fetch_content(server)
+      uri = URI("http://127.0.0.1:#{server.port}/v1/chat/completions")
+      response = Net::HTTP.post(uri, {model: "m", stream: false}.to_json, "content-type" => "application/json")
+      JSON.parse(response.body).fetch("choices")[0].fetch("message").fetch("content")
     end
   end
 end

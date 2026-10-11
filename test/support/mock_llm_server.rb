@@ -113,6 +113,12 @@ class MockLLMServer
 
   def serve(io)
     request_line = io.gets
+    # A connection that sends no request line (empty TCP connect, prober,
+    # port scan) consumes nothing: no script shift, no log entry, no response
+    # — the next real request still gets the next spec (I17 rig defect:
+    # method=None entries shifted every later response by one).
+    return if request_line.nil? || request_line.strip.empty?
+
     headers = {}
     while (line = io.gets) && line != "\r\n"
       name, value = line.split(":", 2)
