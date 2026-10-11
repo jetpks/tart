@@ -1,8 +1,9 @@
 # frozen_string_literal: true
 
-require "open3"
-
 require_relative "text"
+require_relative "motd"
+require_relative "footer"
+require_relative "user_bash"
 require_relative "panel"
 require_relative "bash_block"
 require_relative "file_blocks"
@@ -83,45 +84,6 @@ module Tart
         overflow: "Context overflow detected, Auto-compacting..."
       }.freeze
 
-      # The owner's ascii-art collection (tart-mode's mark) — one random
-      # piece per MOTD render (boot and /new). pi-mode renders pi's actual
-      # half-block mark instead ({pi_mark}).
-      LOGOS_DIR = File.expand_path("logos", __dir__)
-
-      # The MOTD hints line — the PORT's real keys only (pi's `!` bash
-      # mode, escape-to-clear, ctrl+c-twice and the thinking/model cycles
-      # have no port binding; cut, itemized).
-      HINTS_LINE = "ctrl+c interrupt/quit · ctrl+d exit (empty) · / commands · pgup/pgdn scroll".freeze
-
-      # pi-mode's built-in header text (pi interactive-mode.ts:1045-1053 —
-      # compactInstructions joined with muted " · ", compactOnboarding,
-      # onboarding). The keybindings behind escape-to-clear, `!` bash and
-      # the ctrl+o expand are cut (itemized) — the hint TEXT renders for
-      # byte parity, per the identity contract.
-      # The compact hint row as (key, description) pairs — pi keyHint's
-      # shape (keybinding-hints.ts:42-44): the key in dim, the description
-      # in muted with the " · " separator riding its run (the -e capture's
-      # byte proof; the system-theme-era whole-line dim was the artifact).
-      PI_HINTS = [
-        ["escape", "interrupt"],
-        ["ctrl+c/ctrl+d", "clear/exit"],
-        ["/", "commands"],
-        ["!", "bash"],
-        ["ctrl+o", "more"],
-      ].freeze
-      PI_NOTICE_LINE = "Press ctrl+o to show full startup help and loaded resources.".freeze
-      PI_ONBOARDING_LINE = "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.".freeze
-
-      # pi keyHint (keybinding-hints.ts:42-44) over {PI_HINTS}: dim key +
-      # muted description, the separator inside every description run but
-      # the last.
-      def pi_hint_spans
-        PI_HINTS.flat_map.with_index do |(key, description), index|
-          tail = index == PI_HINTS.length - 1 ? " #{description}" : " #{description} · "
-          [TUI.span(key, fg: Theme[:dim]), TUI.span(tail, fg: Theme[:muted])]
-        end
-      end
-
       # pi's outputPad (interactive-mode.ts:516, default 1): one leading
       # space on every content row of the chat surface — the header's Text
       # paddingX (interactive-mode.ts:1060-1063), the echo's and the
@@ -132,22 +94,6 @@ module Tart
       # state at the ctrl+o toggle; the drain records the transcript
       # range). pi's expandable tool children.
       MarkedRegion = Struct.new(:rows, :builder)
-
-      # One random art piece's lines (empty collection → no logo lines).
-      def motd_logo_lines
-        file = Dir[File.join(LOGOS_DIR, "*.txt")].sample
-        file ? File.readlines(file, chomp: true) : []
-      end
-
-      # The git branch reader (pi footer-data-provider.ts:52-70, reduced):
-      # one +git symbolic-ref+ per turn, nil when not on a branch (detached
-      # HEAD or no repo — pi labels detached "detached"; the port omits the
-      # segment, recorded). Injected so tests never shell out.
-      DEFAULT_BRANCH_READER = lambda do |cwd|
-        out, _err, status = Open3.capture3("git", "--no-optional-locks", "symbolic-ref",
-          "--quiet", "--short", "HEAD", chdir: cwd)
-        status.success? && !out.empty? ? out.strip : nil
-      end
 
       # @param session the TUI session (fullscreen viewport).
       # @param kernel [Core::Loop] the kernel; used to open animation windows
@@ -182,13 +128,12 @@ module Tart
       # @param settings_root [String] the user config dir the MOTD's
       #   [Context] section reports (injectable so tests never touch
       #   ~/.tart).
-      def initialize(session:, kernel:, footer_data: nil, branch_reader: DEFAULT_BRANCH_READER, autocomplete: nil,
+      def initialize(session:, kernel:, footer_data: nil, branch_reader: Footer::DEFAULT_BRANCH_READER, autocomplete: nil,
         motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
         prompts: [], extensions: [])
         @session = session
         @kernel = kernel
         @footer_data = footer_data
-        @branch_reader = branch_reader
         @agent = nil
         @mutex = Mutex.new
         # The input-line editor (pi's Input — the editor state and
@@ -220,20 +165,19 @@ module Tart
         @tool_output_expanded = false
         @expandable_blocks = []
         @border_status = nil
-        # The !-prefix bash execution (backlog C, pi handleBashCommand):
-        # the in-flight task (single-flight — pi's isBashRunning gate),
-        # the escape-cancel handshake state, and the last ctrl+c timestamp
-        # (pi's lastSigintTime — the double-press exit window,
-        # handleCtrlC :6840).
-        @user_bash_task = nil
-        @user_bash_cancel_flag = false
-        @user_bash_slot = {}
-        @user_bash_command = nil
-        @user_bash_excluded = false
+        # The !-prefix bash execution state machine (backlog C, pi
+        # handleBashCommand): the coordinator routes into it — submit's
+        # parse, escape's cancel, agent_end's deferred-record flush. The
+        # last ctrl+c timestamp stays here (pi's lastSigintTime — the
+        # double-press exit window, handleCtrlC :6840).
+        @user_bash = UserBash.new(
+          kernel: kernel,
+          busy_reader: -> { busy? },
+          block_sink: ->(command, fields, excluded) { enqueue_user_bash_block(command, **fields, excluded:) },
+          record_sink: ->(message) { @agent&.record_bash_execution(message) },
+          line_sink: ->(text, fg:) { enqueue_scrollback(text, fg:) }
+        )
         @last_ctrl_c = nil
-        # The bashExecution records deferred while a turn runs (pi's
-        # _pendingBashMessages, flushed on agent_end).
-        @pending_bash_records = []
         @live = +""
         # The in-flight message's reasoning (pi's live thinking block): the
         # joined chunk.thinking deltas, rendered dim while it grows and
@@ -250,15 +194,10 @@ module Tart
         # The surface-owned scrollback buffer (final display Lines) — the
         # transcript area draws its visible tail every frame.
         @transcript = []
-        # Footer usage state: session-cumulative token totals accumulated at
-        # each assistant completion, the latest assistant usage (the context
-        # numerator), and the staleness flag pi's post-compaction "?" comes
-        # from (footer.ts getSessionStats / contextUsage).
-        @usage_totals = {input: 0, output: 0, cache_read: 0, cache_write: 0}
-        @last_usage = nil
-        @usage_stale = false
-        @branch = nil
-        @branch_fetched = false
+        # The footer state machine (I24 wave 4): the branch cache and the
+        # usage accounting (pi footer-data-provider.ts + footer.ts), fed
+        # the launcher facts per frame from {@footer_data}.
+        @footer = Footer.new(branch_reader:)
         @settings_root = settings_root
         @identity = identity
         @prompts = prompts
@@ -410,8 +349,7 @@ module Tart
           when :agent_start
             @busy = true
             @border_status = nil # pi's status indicators clear on agent events
-            @branch = nil # per-turn branch invalidation (pi's provider cache, reduced)
-            @branch_fetched = false
+            @footer.invalidate_branch # per-turn branch invalidation (pi's provider cache, reduced)
           when :message_start
             @live = +""
             @reasoning = +""
@@ -423,7 +361,7 @@ module Tart
           when :message_end
             message = event[:message]
             if message.role == :assistant
-              accumulate_usage(message)
+              @footer.accumulate_usage(message)
               handled = complete(message.content)
               enqueue_message(handled)
             end
@@ -449,7 +387,7 @@ module Tart
             # post-hoc compaction line (the compaction-start border status
             # came from :compaction_start — the frozen I12 contract).
             @compaction_reason = nil
-            @usage_stale = true
+            @footer.mark_usage_stale
             @scrollback << [Panel.blank_line] # the compaction line is a region too (pi :3903-3904)
             enqueue_scrollback(
               "✻ compacted (#{event[:reason]}, #{event[:tokens_before]} tokens)", fg: Theme[:dim]
@@ -459,7 +397,7 @@ module Tart
             @compaction_reason = nil
             # The deferred bashExecution records flush at agent end (pi's
             # _pendingBashMessages flush) — never mid-tool-sequence.
-            flush_pending_bash_records
+            @user_bash.flush_pending
             if event[:interrupted] == true
               handled = "interrupted"
               enqueue_scrollback(handled, fg: Theme[:warning])
@@ -585,140 +523,24 @@ module Tart
       # itemized). pi-mode renders pi's actual built-in header bytes.
       def enqueue_motd
         lines = [Panel.blank_line]
-        lines.concat(@identity == Identity::PI ? pi_header_lines : tart_header_lines(viewport_width))
+        lines.concat(@identity == Identity::PI ? Motd.pi_header_lines : Motd.tart_header_lines(viewport_width))
         # The loaded-resource sections ride BOTH identities (pi
         # showLoadedResources renders for any theme/identity — the owner's
         # missing [Context]/[Skills]/[Prompts]/[Extensions] block; each
         # section opens with its blank, the enqueue's trailing blank is
         # the header container's closing Spacer). Wrapped at the content
-        # width, as the sections always have.
-        motd_sections(viewport_width - Panel::OUTPUT_PAD.length * 2).each do |header, rows|
+        # width, as the sections always have. The section inputs gather
+        # from this surface's constructor state (Motd is stateless —
+        # everything threads).
+        Motd.sections(viewport_width - Panel::OUTPUT_PAD.length * 2,
+          context: Motd.context_sources(@settings_root, @footer_data&.fetch(:cwd, nil) || Dir.pwd),
+          skills: Motd.motd_skill_names(@autocomplete.source),
+          prompts: @prompts, extensions: @extensions).each do |header, rows|
           lines << Panel.blank_line << TUI.line("#{Panel::OUTPUT_PAD}#{header}", fg: Theme[:md_heading])
           lines.concat(rows)
         end
         lines << Panel.blank_line
         @scrollback << lines
-      end
-
-      # tart-mode's header: the owner's art collection, the tart version
-      # line, the port's hints line — every content row through the
-      # {OUTPUT_PAD} rule. The resource sections render below for both
-      # identities ({enqueue_motd}).
-      def tart_header_lines(width)
-        content_width = width - Panel::OUTPUT_PAD.length * 2
-        lines = motd_logo_lines.map { |line| TUI.line("#{Panel::OUTPUT_PAD}#{line}") }
-        lines << TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span("tart"), TUI.span(" v#{Tart::VERSION}", fg: Theme[:dim])])
-        lines.concat(Text.wrap(HINTS_LINE, content_width).map { |row| TUI.line("#{Panel::OUTPUT_PAD}#{row}", fg: Theme[:dim]) })
-        lines
-      end
-
-      # pi-mode's built-in header (interactive-mode.ts:1028-1063 +
-      # pi-logo.ts): the 2-line half-block mark with the version on the
-      # mark's first line and the hints on its second, the ctrl+o notice,
-      # a blank (the header text's "\\n\\n"), the onboarding line. The
-      # mark's brand colors are fixed (pi-logo.ts:9); Apple Terminal gets
-      # the wordmark fallback (supportsPiLogo — it misrenders half
-      # blocks). The expand machinery behind the notice is cut, itemized.
-      def pi_header_lines
-        top, bottom = pi_mark
-        # The separating space renders PLAIN (pi: the mark's spans, a
-        # plain space, THEN the dim hints span — the -e capture's byte
-        # proof: the port dimmed the space).
-        hints = pi_hint_spans
-        [
-          TUI.line([TUI.span(Panel::OUTPUT_PAD), *top, TUI.span(" "), TUI.span("v#{Identity::ORACLE_VERSION}", fg: Theme[:dim])]),
-          TUI.line([TUI.span(Panel::OUTPUT_PAD), *bottom, TUI.span(" "), *hints]),
-          TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(PI_NOTICE_LINE, fg: Theme[:dim])]),
-          Panel.blank_line,
-          TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(PI_ONBOARDING_LINE, fg: Theme[:dim])])
-        ]
-      end
-
-      # pi piLogoLines (pi-logo.ts:26-30): 4 cells wide, 2 lines tall —
-      # the top line coral-on-blue, then coral, then empty; the bottom
-      # blue, empty, yellow. Returns [first-line spans, second-line
-      # spans]; the wordmark fallback's second line is empty (the hints
-      # ride alone).
-      def pi_mark
-        if apple_terminal?
-          [[TUI.span("P", fg: Theme[:logoCoral]), TUI.span("i", fg: Theme[:logoYellow])], []]
-        else
-          top = [
-            TUI.span("▀", fg: Theme[:logoCoral], bg: Theme[:logoBlue]),
-            TUI.span("▀█", fg: Theme[:logoCoral]),
-            TUI.span(" ")
-          ]
-          bottom = [TUI.span("█▀", fg: Theme[:logoBlue]), TUI.span(" "), TUI.span("█", fg: Theme[:logoYellow])]
-          [top, bottom]
-        end
-      end
-
-      # pi isAppleTerminalSession (pi-tui terminal.ts:44-45): darwin +
-      # TERM_PROGRAM.
-      def apple_terminal?
-        RUBY_PLATFORM.include?("darwin") && ENV["TERM_PROGRAM"] == "Apple_Terminal"
-      end
-
-      # The loaded-resource sections (pi showLoadedResources): [Context] —
-      # the config sources the port actually loads, existing files only,
-      # registration order (pi's contextCompactList, sort: false);
-      # [Skills] — the loaded skill names, sorted; [Prompts] — the loaded
-      # prompt templates as /name, sorted (pi promptCompactList :1896);
-      # [Extensions] — the loaded MCP server names, sorted. One wrapped
-      # dim compact list each (pi formatCompactList :1791-1797). Sections
-      # with no entries are omitted, as in pi.
-      def motd_sections(width)
-        sections = []
-        context = context_sources.select { |path| File.file?(path) }
-        unless context.empty?
-          sections << ["[Context]", dim_compact_list(context, width)]
-        end
-        skills = motd_skill_names # sorted (pi formatCompactList's localeCompare)
-        unless skills.empty?
-          sections << ["[Skills]", dim_compact_list(skills, width)]
-        end
-        prompts = @prompts.map { |template| "/#{template.name}" }.sort
-        unless prompts.empty?
-          sections << ["[Prompts]", dim_compact_list(prompts, width)]
-        end
-        extensions = @extensions.sort
-        unless extensions.empty?
-          sections << ["[Extensions]", dim_compact_list(extensions, width)]
-        end
-        sections
-      end
-
-      # The config files the port loads for +cwd+ (Settings.load's user +
-      # project pair and the MCP config; settings.rb:12-14,
-      # mcp/config.rb:16). Paths injectable through +settings_root+ so
-      # tests never touch ~/.tart.
-      def context_sources
-        mcp = ENV["TART_MCP_CONFIG"] || File.join(@settings_root, "mcp.json")
-        cwd = @footer_data&.fetch(:cwd, nil) || Dir.pwd
-        [
-          File.join(@settings_root, Settings::ROOT_KEY),
-          File.join(cwd, Settings::CONFIG_DIR, Settings::ROOT_KEY),
-          mcp
-        ]
-      end
-
-      # The MOTD's [Skills] names: the wired completion source's skill
-      # entries (SlashSource carries exactly the launcher's loaded skills).
-      def motd_skill_names
-        return [] unless @autocomplete.source
-
-        @autocomplete.source.items.filter_map { |item|
-          item[:value].delete_prefix("skill:") if item[:value].start_with?("skill:")
-        }.sort
-      end
-
-      # pi formatCompactList (:1791-1797): trimmed entries joined ", ",
-      # two-space indent, dim — word-wrapped to the content width, every
-      # row through the {OUTPUT_PAD} rule. (The sort, when wanted, happens
-      # at the call site: pi's [Context] list passes sort: false —
-      # registration order.)
-      def dim_compact_list(entries, width)
-        Text.wrap("  #{entries.join(", ")}", width).map { |row| TUI.line("#{Panel::OUTPUT_PAD}#{row}", fg: Theme[:dim]) }
       end
 
       # Verbatim completed text (tool output, status): wrapped to
@@ -891,7 +713,7 @@ module Tart
         tool_calls = message["tool_calls"].is_a?(Hash) ? message["tool_calls"] : {}
         return unless has_content || has_reasoning || tool_calls.any?
 
-        reseed_usage(message)
+        @footer.reseed_usage(message)
         # pi assistant-message.ts:103-105 — the spacer rides VISIBLE
         # content only (a tool-call-only assistant entry renders no blank
         # of its own; its tool block brings one).
@@ -912,22 +734,6 @@ module Tart
         end
       end
 
-      # Footer usage reseeds from the replayed assistant entry's recorded
-      # token counts (Message#to_h merges Tokens#to_h — input_tokens,
-      # output_tokens, cache_read_tokens, cache_write_tokens). Entries
-      # carry usage only when the provider reported it; interrupted turns
-      # may carry none (gap, itemized) — all-nil entries are skipped so
-      # the boot state stays intact.
-      def reseed_usage(message)
-        tokens = RubyLLM::Tokens.new(
-          input: message["input_tokens"], output: message["output_tokens"],
-          cache_read: message["cache_read_tokens"], cache_write: message["cache_write_tokens"]
-        )
-        return if [tokens.input, tokens.output, tokens.cache_read, tokens.cache_write].all?(&:nil?)
-
-        accumulate_usage(tokens)
-      end
-
       # The /new + resume shared reset: the buffer and stream state drop
       # (pi renderCurrentSessionState's container clears, :2210-2216; the
       # host drops the selection with the transcript, :4096).
@@ -940,9 +746,7 @@ module Tart
         @live = +""
         @reasoning = +""
         # pi's footer stats re-derive from the fresh (empty) session.
-        @usage_totals = {input: 0, output: 0, cache_read: 0, cache_write: 0}
-        @last_usage = nil
-        @usage_stale = false
+        @footer.reset_usage
         # The chat container emptied with the transcript (pi
         # renderCurrentSessionState, interactive-mode.ts:2210-2216) — the
         # leading-spacer gate restarts.
@@ -987,23 +791,6 @@ module Tart
         width = spans.sum { |span| TUI.text_width(span.text) }
         content = spans.map { |span| TUI.span(span.text, fg: span.fg, modifiers: span.modifiers, bg: bg) }
         TUI.line([TUI.span(Panel::OUTPUT_PAD, bg: bg), *content, Panel.panel_tail(width, viewport_width, bg)])
-      end
-
-      # Session-cumulative usage totals + the latest assistant usage (the
-      # context numerator; pi's getSessionStats over session entries,
-      # reduced to what the event surface carries: assistant messages).
-      # Takes an assistant message (reads its +tokens+) or a bare
-      # RubyLLM::Tokens (the replay's reseed from recorded counts).
-      def accumulate_usage(message)
-        tokens = message.respond_to?(:tokens) ? message.tokens : message
-        return if tokens.nil?
-
-        @usage_totals[:input] += tokens.input if tokens.input
-        @usage_totals[:output] += tokens.output if tokens.output
-        @usage_totals[:cache_read] += tokens.cache_read if tokens.cache_read
-        @usage_totals[:cache_write] += tokens.cache_write if tokens.cache_write
-        @last_usage = tokens
-        @usage_stale = false
       end
 
       # The bash tool block (I17 — pi's shell renderer over the tool-turn
@@ -1162,8 +949,8 @@ module Tart
             @autocomplete.cancel
           elsif busy?
             @kernel.interrupt_work!
-          elsif @user_bash_task
-            cancel_user_bash
+          elsif @user_bash.running?
+            @user_bash.cancel
           elsif @editor.bash_mode?
             @editor.clear
           end
@@ -1261,8 +1048,7 @@ module Tart
         @editor.add_to_history(text)
         @editor.clear
         @editor.exit_history_browsing
-        @branch = nil # per-turn branch invalidation
-        @branch_fetched = false
+        @footer.invalidate_branch # per-turn branch invalidation
         if @commands && text.start_with?("/")
           text = @commands.expand_skill(text)
           return if !busy? && @commands.dispatch(text)
@@ -1270,8 +1056,8 @@ module Tart
         # The !-prefix bash intercepts BEFORE the user echo (pi handleSubmit
         # :3347-3360 — the BashExecutionComponent is the display, no user
         # echo; the bare prefix falls through as plain text).
-        parsed = user_bash_command(text)
-        return user_bash(*parsed) if parsed
+        parsed = UserBash.parse(text)
+        return @user_bash.run(*parsed) if parsed
 
         enqueue_user_submission(text)
         if busy?
@@ -1279,133 +1065,6 @@ module Tart
         else
           @kernel.async { @agent.run(text) }
         end
-      end
-
-      # pi handleSubmit :3347-3356 — "!" runs whole-line bash, "!!" runs it
-      # excluded from the model context; the bare prefix (no command) is
-      # plain text. Returns [command, excluded] or nil.
-      def user_bash_command(text)
-        return unless text.start_with?("!")
-
-        excluded = text.start_with?("!!")
-        command = text[(excluded ? 2 : 1)..].to_s.strip
-        return if command.empty?
-
-        [command, excluded]
-      end
-
-      # The user-bash execution (pi handleBashCommand :6987): one at a time
-      # (pi's isBashRunning gate — the warning is pi's showWarning text).
-      # The tool run BRIDGES to a worker thread (Agent::Bridge — the tool's
-      # pop-loop blocks its thread; the reactor must keep drawing), and the
-      # block renders on completion; the RECORD defers to agent_end while
-      # a turn runs (pi's _pendingBashMessages — the entry must not
-      # interleave a tool sequence in the record). Streaming chunks are
-      # execution-transient in pi's Loader frames — the port renders the
-      # completed block (itemized).
-      def user_bash(command, excluded)
-        if @user_bash_task
-          enqueue_scrollback("A bash command is already running. Press Esc to cancel it first.",
-            fg: Theme[:warning])
-          return
-        end
-        tool = Tools::Bash.new(cwd: Dir.pwd)
-        # The escape-cancel handshake: the flag flips the worker's
-        # cancellation checkpoint (the tool aborts at its next 50 ms
-        # check — the group kill + partial-output outcome are the tool's
-        # own {Tools::Bash#run_user} rescue), the task stop kills the
-        # reactor-side wait, and the handler renders from the slot the
-        # worker filled (read after the bridge's bounded join).
-        @user_bash_command = command
-        @user_bash_excluded = excluded
-        @user_bash_cancel_flag = false
-        @user_bash_slot = {}
-        @user_bash_task = @kernel.async do
-          terminal = Agent::Bridge.new
-            .on_cancel { @user_bash_cancel_flag = true }
-            .run(lambda do |sink|
-              RubyLLM::Support::Cancellation.watch(
-                -> { raise RubyLLM::CancelledError if @user_bash_cancel_flag }
-              ) do
-                outcome = tool.run_user(command)
-                @user_bash_slot[:outcome] = outcome
-                sink.call({})
-              end
-            end) { |_item| }
-          finish_user_bash(terminal)
-        end
-      end
-
-      # The worker's terminal: the outcome rendered + recorded; a worker
-      # error surfaces as an error line (the ENOENT class — no block).
-      def finish_user_bash(terminal)
-        @user_bash_task = nil
-        if (outcome = @user_bash_slot[:outcome])
-          enqueue_user_bash_block(@user_bash_command, **user_bash_fields(outcome),
-            excluded: @user_bash_excluded)
-          record_user_bash(user_bash_record(@user_bash_command, outcome, excluded: @user_bash_excluded))
-        elsif terminal&.dig(:type) == :error
-          enqueue_scrollback("bash: #{terminal[:error].message}", fg: Theme[:error])
-        end
-        @kernel.request_draw
-      end
-
-      # The record defers while a turn runs (pi's _pendingBashMessages);
-      # idle executions record immediately.
-      def record_user_bash(message)
-        if busy?
-          @pending_bash_records << message
-        else
-          @agent&.record_bash_execution(message)
-        end
-      end
-
-      # The escape-cancel (pi abortBash): flip the worker's checkpoint
-      # flag, stop the reactor-side wait (the bridge joins the worker
-      # bounded — its cancelled outcome, partial output included, lands
-      # in the slot), then render from the slot after a bounded yield
-      # loop (this handler runs in the frame-loop fiber — sleep yields).
-      def cancel_user_bash
-        @user_bash_cancel_flag = true
-        @user_bash_task.stop
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
-        sleep 0.05 while @user_bash_slot.empty? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        outcome = @user_bash_slot[:outcome]
-        @user_bash_task = nil
-        enqueue_user_bash_block(@user_bash_command,
-          **(outcome ? user_bash_fields(outcome) : {content: "", exit_code: nil, cancelled: true,
-                                                    truncated: false, full_output_path: nil}),
-          excluded: @user_bash_excluded)
-        record_user_bash(user_bash_record(@user_bash_command,
-          outcome || Tools::Bash::BashOutcome.new(content: "", exit_code: nil, cancelled: true,
-                                                  truncation: nil, full_output_path: nil),
-          excluded: @user_bash_excluded))
-        @kernel.request_draw
-      end
-
-      # The block's primitive fields off the executor's outcome (the live
-      # and replay compositions share them — pi's setComplete arguments,
-      # bash-execution.ts:108-121).
-      def user_bash_fields(outcome)
-        {content: outcome.content, exit_code: outcome.exit_code, cancelled: outcome.cancelled,
-         truncated: outcome.truncation&.truncated == true,
-         full_output_path: outcome.truncation&.truncated == true ? outcome.full_output_path : nil}
-      end
-
-      def user_bash_record(command, outcome, excluded:)
-        fields = user_bash_fields(outcome)
-        Agent::Session.bash_execution_message(
-          command:, output: fields[:content], exit_code: fields[:exit_code],
-          cancelled: fields[:cancelled], truncated: outcome.truncation&.truncated == true,
-          full_output_path: outcome.full_output_path,
-          exclude_from_context: excluded
-        )
-      end
-
-      # The agent_end flush (pi's agent-end _pendingBashMessages flush).
-      def flush_pending_bash_records
-        @pending_bash_records.each { |message| @agent&.record_bash_execution(message) }
-        @pending_bash_records.clear
       end
 
       # The completed thinking block (pi assistant-message.ts:99-175 order —
@@ -1541,7 +1200,7 @@ module Tart
             transcript_widget(transcript_rows),
             dock_spacer_widget,
             @picker ? @picker.widget(viewport_width) : editor_widget,
-            footer_widget,
+            @footer.widget(footer_data, viewport_width),
           ],
           constraints: [
             TUI.constraint_min(transcript_rows),
@@ -1661,133 +1320,14 @@ module Tart
         "#{SPINNER[@frames % SPINNER.size]} #{detail}"
       end
 
-      # The footer (AC4, pi footer.ts): line 1 the ~-contracted cwd with the
-      # git branch; line 2 the token stats left and the model (plus the
-      # thinking level — footer.ts:226-244) right-aligned. pi's whole
-      # footer renders dim (:280-288 — the parts dimmed independently so
-      # the colored context segment survives): every span is dim except
-      # the context segment when it crosses the warning/error thresholds.
-      def footer_widget
+      # The footer's per-frame data view: the launcher facts with the
+      # runtime thinking level overlaid when set ({thinking_level} — pi
+      # footer.ts:226-244 reads the live session level over the
+      # settings-resolved one). nil footer_data renders from what the
+      # surface knows alone, as at base.
+      def footer_data
         data = @footer_data || {}
-        width = viewport_width
-        pwd = Text.format_cwd(data[:cwd] || Dir.pwd)
-        pwd = "#{pwd} (#{read_branch(data[:cwd])})" if read_branch(data[:cwd])
-        # The pwd span carries the dim token ITSELF (pi footer.ts:282 —
-        # theme.fg("dim", pwd)); TUI.line's array form ignores the line
-        # fg, so the line-level fg: was silently dropping the color (the
-        # default-fg pwd/branch defect).
-        TUI.paragraph(text: [
-          TUI.line(Text.clip_spans([TUI.span(pwd, fg: Theme[:dim])], width)),
-          footer_stats(data, width),
-        ], wrap: false)
-      end
-
-      # The branch, cached until the next turn invalidates it (pi's provider
-      # cache, reduced to per-turn invalidation — recorded). The fetched
-      # flag makes a nil result (no repo / detached HEAD) cached too.
-      def read_branch(cwd)
-        return nil if @branch_reader.nil? || cwd.nil?
-
-        unless @branch_fetched
-          @branch = @branch_reader.call(cwd)
-          @branch_fetched = true
-        end
-        @branch
-      end
-
-      # The stats line as spans (footer.ts:113-153): ↑input ↓output
-      # R(ead) W(rite) CH% when present, the context segment, then the
-      # model right-aligned (min 2 spaces padding, stats truncated with
-      # "..." when they would crowd it out). The thinking level rides the
-      # right side as +model • <level>+ ONLY when the model is
-      # reasoning-capable (pi footer.ts:233-244 reads
-      # state.model?.reasoning; otherwise the model alone), and the
-      # provider label prefixes the segment (pi :246-258 — the
-      # launcher-resolved model metadata; pi's own >1-available-provider
-      # gate is unimplementable without a catalog, itemized). pi's
-      # "thinking off" state is unreachable through the port's level
-      # resolution, itemized.
-      def footer_stats(data, width)
-        totals = @usage_totals
-        parts = []
-        parts << "↑#{Text.format_tokens(totals[:input])}" if totals[:input].positive?
-        parts << "↓#{Text.format_tokens(totals[:output])}" if totals[:output].positive?
-        parts << "R#{Text.format_tokens(totals[:cache_read])}" if totals[:cache_read].positive?
-        parts << "W#{Text.format_tokens(totals[:cache_write])}" if totals[:cache_write].positive?
-        parts << "CH#{format("%.1f%%", cache_hit_rate)}" if cache_hit_rate
-
-        # The model segment (pi footer.ts:233-244): +model • <level>+
-        # when reasoning-capable — level "off" renders the spelled-out
-        # "thinking off" (pi's literal). The provider prefix is pi's
-        # >1-available-provider gate (:246-258) — the port resolves one
-        # static provider, so it NEVER renders (the owner's live
-        # "(openai) " finding). The level is the runtime session level
-        # (/thinking), else the settings-resolved one.
-        model = data[:model] || "no-model"
-        right = if data[:reasoning]
-          thinking_level == "off" ? "#{model} • thinking off" : "#{model} • #{thinking_level}"
-        else
-          model
-        end
-        left = parts.map { |part| TUI.span("#{part} ", fg: Theme[:dim]) }
-        left << TUI.span(context_segment(data), fg: context_fg)
-        pad = width - left.sum { |span| TUI.text_width(span.content) } - TUI.text_width(right)
-        spans = if pad >= 2
-          left + [TUI.span(" " * pad + right, fg: Theme[:dim])]
-        else
-          # Too wide: the stats clip (with their colors) and the model keeps
-          # a two-cell margin (pi truncates statsLeft with "...").
-          Text.clip_spans(left, [width - TUI.text_width(right) - 2, 0].max) + [TUI.span("… #{right}", fg: Theme[:dim])]
-        end
-        TUI.line(spans)
-      end
-
-      # The context numerator (pi getContextUsage, agent-session.ts
-      # :4237-4271): provider-reported context tokens of the latest
-      # assistant usage — 0 at boot (pi's estimate 0 → the 0.0% boot
-      # state), nil after a compaction until the next LLM response (pi's
-      # post-compaction "?").
-      def context_used
-        return nil if @usage_stale
-        return 0 if @last_usage.nil?
-
-        Compaction.calculate_context_tokens(@last_usage)
-      end
-
-      # The context segment (footer.ts:134-143): "0.0%/window (auto)" at
-      # boot, "pct%/window (auto)" after usage, "?/window (auto)" after a
-      # compaction (pi's post-compaction "?"). Nil window renders "?"
-      # alone.
-      def context_segment(data)
-        window = data[:context_window]
-        auto = data[:auto_compact] ? " (auto)" : ""
-        return "?" if window.nil?
-
-        used = context_used
-        return "?/#{Text.format_tokens(window)}#{auto}" if used.nil?
-
-        "#{(used * 100.0 / window).round(1)}%/#{Text.format_tokens(window)}#{auto}"
-      end
-
-      def context_fg
-        used = context_used
-        window = @footer_data&.fetch(:context_window, nil)
-        return Theme[:dim] if used.nil? || !window.is_a?(Integer) || !window.positive?
-
-        percent = used * 100.0 / window
-        if percent > 90 then Theme[:error] # footer.ts:194-213
-        elsif percent > 70 then Theme[:warning]
-        else Theme[:dim]
-        end
-      end
-
-      # pi's latestCacheHitRate (footer.ts:98-103): the latest assistant
-      # usage's cacheRead share of the prompt tokens.
-      def cache_hit_rate
-        return nil if @last_usage.nil? || @usage_totals[:cache_read].zero? && @usage_totals[:cache_write].zero?
-
-        prompt = [@last_usage.input, @last_usage.cache_read, @last_usage.cache_write].compact.sum
-        prompt.positive? ? @last_usage.cache_read * 100.0 / prompt : nil
+        @thinking_level ? data.merge(thinking_level: @thinking_level) : data
       end
 
       # The transcript buffer's display lines — completed content plus the
