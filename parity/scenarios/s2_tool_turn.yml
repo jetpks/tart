@@ -1,6 +1,9 @@
 # S2 — bash tool turn (I01 spike): the mock scripts a bash tool call
 # (echo pty-tester in the app's sandbox) plus a fixed final reply.
 # Two mock requests per app (tool round-trip + follow-up).
+#
+# Footer staging (I16, same seam as s1): TART_MODEL_PROVIDER=mock so the
+# footer right segment renders `(mock) mock-1` in both apps.
 name: s2_tool_turn
 prompt: "run the echo"
 expected_requests: 2
@@ -14,3 +17,6 @@ responses:
           command: "echo pty-tester"
   - type: stream
     content: "The bash tool ran; fixed final reply for the spike."
+env:
+  tart:
+    TART_MODEL_PROVIDER: mock

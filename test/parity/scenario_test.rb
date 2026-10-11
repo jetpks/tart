@@ -61,6 +61,27 @@ module Tart
       assert_equal({command: "echo pty-tester"}, scenario.responses[0][:tool_calls][0][:arguments])
     end
 
+    def test_s2_stages_the_footer_provider_env
+      scenario = Parity::Scenario.load(File.join(REPO_ROOT, "parity/scenarios/s2_tool_turn.yml"))
+      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
+        "the footer staging rides the per-app env seam (I16)")
+    end
+
+    def test_loads_the_shipped_s3_tool_turn_files_scenario
+      scenario = Parity::Scenario.load(File.join(REPO_ROOT, "parity/scenarios/s3_tool_turn_files.yml"))
+      assert_equal "s3_tool_turn_files", scenario.name
+      assert_equal "write then read the file", scenario.prompt
+      assert_equal 3, scenario.expected_requests
+      assert_equal "write", scenario.responses[0][:tool_calls][0][:name]
+      assert_equal({path: "s3-tool-turn-note.txt", content: "parity s3 sandbox note"},
+        scenario.responses[0][:tool_calls][0][:arguments])
+      assert_equal "read", scenario.responses[1][:tool_calls][0][:name]
+      assert_equal({path: "s3-tool-turn-note.txt"}, scenario.responses[1][:tool_calls][0][:arguments])
+      assert_equal "The file tools ran; fixed final reply for the spike.", scenario.responses[2][:content]
+      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
+        "the footer staging rides the per-app env seam (I16)")
+    end
+
     def test_missing_required_field_raises_a_rig_error
       path = File.join(Dir.mktmpdir("pty-tester-scenario-"), "broken.yml")
       File.write(path, "name: broken\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
