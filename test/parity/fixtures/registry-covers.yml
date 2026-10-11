@@ -1,0 +1,7 @@
+# Covers EVERY difference line of covered-a.capture vs covered-b.capture
+# (synthetic fixtures for AC2, direction 1: exit 0).
+classes:
+  - name: test-logo-art
+    pattern: '\A\s*[█▒]+\z'
+  - name: test-sandbox-path
+    pattern: '/run-[ab]-sandbox-[0-9]+'
