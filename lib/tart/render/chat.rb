@@ -38,6 +38,20 @@ module Tart
       # line — footer.ts:169-171).
       FOOTER_ROWS = 2
 
+      # pi chat-viewport.ts:22-45 — the dock's widgets-above container
+      # renders a default Spacer(1) when no extension widgets exist
+      # (interactive-mode.ts:966-968 renderWidgetContainer,
+      # spacerWhenEmpty: true): a blank dock row between the transcript
+      # and the editor. The port's fixed analog (no extension
+      # widgets/pending/status containers — itemized cuts, as ever):
+      # transcript + spacer(1) + editor + footer.
+      DOCK_SPACER_ROWS = 1
+
+      # The auto scrollbar's transient hide delay (pi scroll-view.ts:55
+      # scrollbarHideDelayMs, default 1000 — AC2). Injectable so tests
+      # never sleep real seconds.
+      SCROLLBAR_HIDE_DELAY_MS = 1000
+
       # Smallest editor area: top border, one input row, bottom border (pi
       # chat-viewport.ts:33 editor minSize 3).
       MIN_EDITOR_ROWS = 3
@@ -218,6 +232,13 @@ module Tart
         # to the end (the default — the tail is what's visible).
         @scroll_offset = 0
         @follow = true
+        # The auto scrollbar's transient state (pi scroll-view.ts:74-123):
+        # the activity timestamp a user scroll marks (transientScrollbarVisible
+        # — fresh while younger than the hide delay) and the epoch that
+        # retires stale one-shot hide timers (pi clearTimeout). Reactor-
+        # thread-only state, like the scroll state.
+        @scrollbar_activity_at = nil
+        @scrollbar_timer_epoch = 0
         # Mouse selection state (item 10, pi tui-alt-screen.ts:83-107):
         # anchor/focus points, granularity (:character/:word/:line), the
         # initial word/line range a drag extends, and the multi-click
@@ -283,6 +304,11 @@ module Tart
 
       # The launcher-wired footer facts (see #initialize).
       attr_writer :footer_data
+
+      # The auto scrollbar's hide delay in ms (pi scrollbarHideDelayMs,
+      # scroll-view.ts:55) — a test seam: tests inject a short delay
+      # instead of sleeping real seconds.
+      attr_writer :scrollbar_hide_delay_ms
 
       # @return [Boolean] whether an agent run is in flight.
       def busy?
@@ -1139,7 +1165,10 @@ module Tart
         end
         unless notice.empty?
           region << blank_line
-          region.concat(padded_fg_rows(notice, fg: Theme[:tool_output]))
+          # pi bash.ts:88-99 — the model-facing truncation notice renders
+          # the warning fg (theme.fg("warning", `[...]`)), not the
+          # inherited tool_output (the I19 carry-forward, AC6).
+          region.concat(padded_fg_rows(notice, fg: Theme[:warning]))
         end
         if duration
           region << blank_line
@@ -1642,19 +1671,53 @@ module Tart
       # back down = re-arm; a wheel down while following clamps and stays
       # armed — pi's next === maxScrollTop rule). While following,
       # +@scroll_offset+ tracks the last rendered end, so the wheel moves
-      # relative to it.
+      # relative to it. A scroll that MOVED marks scrollbar activity (pi
+      # scrollBy: `if (moved !== 0) markScrollbarActivity()` — a clamped
+      # no-op marks nothing).
       def scroll_by(lines)
+        max_offset = [display_lines.size - transcript_area_rows, 0].max
+        start = @follow ? max_offset : @scroll_offset # pi: followingEnd ? maxScrollTop : scrollTop
+        previous = @scroll_offset
+        @scroll_offset = [[start + lines, max_offset].min, 0].max
         @follow = false
-        @scroll_offset = [@scroll_offset + lines, 0].max
+        mark_scrollbar_activity if @scroll_offset != previous
+      end
+
+      # The auto rail's transient show (pi ScrollView.markScrollbarActivity,
+      # scroll-view.ts:97-110): a moved user scroll marks the activity
+      # timestamp and arms a one-shot hide timer on the reactor; a re-mark
+      # bumps the epoch so the stale timer no-ops (pi clearTimeout +
+      # re-set). The timer clears the timestamp and requests exactly one
+      # redraw — the hide frame (kernel.request_draw). Movement already
+      # implies overflow (a fitting view's max_offset is 0 — nothing can
+      # move), matching pi's contentHeight > viewportHeight guard.
+      def mark_scrollbar_activity
+        @scrollbar_activity_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        epoch = (@scrollbar_timer_epoch += 1)
+        @kernel.async do
+          sleep(scrollbar_hide_delay_ms / 1000.0)
+          next if @scrollbar_timer_epoch != epoch
+
+          @scrollbar_activity_at = nil
+          @kernel.request_draw
+        end
+      end
+
+      def scrollbar_hide_delay_ms
+        @scrollbar_hide_delay_ms || SCROLLBAR_HIDE_DELAY_MS
       end
 
       # The transcript area's row budget — the page size and the mouse
       # mapping's viewport bound (pi chat-viewport geometry, shared with
-      # {build_widget}).
-      def transcript_area_rows
-        area = @session.viewport_area
-        height = area ? area.height : 24
-        [height - editor_area_rows(height) - FOOTER_ROWS, 1].max
+      # {build_widget}): the viewport minus the dock — spacer 1 + editor +
+      # footer (pi chat-viewport.ts:22-45, the widgets-above default
+      # Spacer(1); AC2).
+      def transcript_area_rows(height = nil)
+        unless height
+          area = @session.viewport_area
+          height = area ? area.height : 24
+        end
+        [height - editor_area_rows(height) - FOOTER_ROWS - dock_spacer_rows(height), 1].max
       end
 
       # --- mouse: wheel scroll + transcript selection (items 6/10, pi
@@ -1797,8 +1860,10 @@ module Tart
         return nil if lines.empty?
 
         row = (@scroll_offset + y).clamp(0, lines.size - 1)
-        transcript_width = lines.size > rows ? viewport_width - 1 : viewport_width
-        Point.new(row, x.clamp(0, transcript_width - 1))
+        # pi clamps to the scrollview box — full width for "auto" (the
+        # rail overlays the last column, no reserved gutter to exclude;
+        # scroll-view.ts:80-82 getContentWidth).
+        Point.new(row, x.clamp(0, viewport_width - 1))
       end
 
       # The word selection at +point+ (pi getWordSelection :1167-1212): the
@@ -1925,50 +1990,94 @@ module Tart
         area = @session.viewport_area
         height = area ? area.height : 24
         editor_rows = editor_area_rows(height)
-        transcript_rows = [height - editor_rows - FOOTER_ROWS, 1].max
+        transcript_rows = transcript_area_rows(height)
+        spacer_rows = dock_spacer_rows(height)
         TUI.layout(
           children: [
             transcript_widget(transcript_rows),
+            dock_spacer_widget,
             @picker ? picker_widget : editor_widget,
             footer_widget,
           ],
           constraints: [
             TUI.constraint_min(transcript_rows),
+            TUI.constraint_length(spacer_rows),
             TUI.constraint_length(editor_rows),
             TUI.constraint_length(FOOTER_ROWS),
           ]
         )
       end
 
+      # The dock spacer's rendered rows (pi widgetsAbove shrink 1, minSize 0
+      # — chat-viewport.ts:29): one blank dock row when the screen affords
+      # it; under pressure (a cramped screen whose editor area grew — the
+      # suggestion list) it is the row that yields, keeping the
+      # transcript's min 1 and the editor's full height.
+      def dock_spacer_rows(height)
+        [[height - editor_area_rows(height) - FOOTER_ROWS - 1, 0].max, DOCK_SPACER_ROWS].min
+      end
+
+      # The dock's widgets-above default (pi interactive-mode.ts:966-968
+      # renderWidgetContainer spacerWhenEmpty: true — a Spacer(1) when no
+      # extension widgets exist): a blank row between the transcript and
+      # the editor (AC2).
+      def dock_spacer_widget
+        TUI.paragraph(text: [blank_line], wrap: false)
+      end
+
       # The transcript area: the scroll buffer's viewport — pi ScrollView
       # follow-end semantics (scroll-view.ts:127-135): while following, the
       # visible tail tracks the content end; a scrolled-up offset stays put
       # as new output arrives; any landing at the end re-follows
-      # (followingEnd = followEnd && next === maxScrollTop). A right-gutter
-      # scrollbar renders when the content overflows (pi "auto" —
-      # settings-defaults.ts:63; hidden when the view fits).
+      # (followingEnd = followEnd && next === maxScrollTop). The follow-end
+      # adjustment NEVER marks scrollbar activity (pi updateLayout :180-192
+      # — only the user-scroll seams mark). Content wraps the FULL width
+      # for "auto" (scroll-view.ts:80-82 getContentWidth — only "always"
+      # reserves a column); the rail overlays the last column while fresh
+      # and the settled screen shows none (AC2).
       def transcript_widget(rows)
         width = viewport_width
         lines = display_lines
         max_offset = [lines.size - rows, 0].max
         @scroll_offset = @follow ? max_offset : @scroll_offset.clamp(0, max_offset)
         @follow = true if @scroll_offset == max_offset
+        # pi updateLayout force-hide (scroll-view.ts:200): content fits →
+        # the transient rail hides immediately.
+        @scrollbar_activity_at = nil if lines.size <= rows
         window = (lines[@scroll_offset, rows] || []).map.with_index do |line, i|
           highlight_row(line, @scroll_offset + i)
         end
-        return TUI.paragraph(text: window, wrap: false) if lines.size <= rows
+        return TUI.paragraph(text: window, wrap: false) unless scrollbar_visible?(lines, rows)
 
-        TUI.layout(
-          direction: :horizontal,
-          children: [
-            TUI.paragraph(text: window, wrap: false),
-            # pi paints onto the last column (replaceScrollbarCell); the
-            # port carves a dedicated 1-cell column instead (mapping
-            # judgment — same visible result, content clips one cell early).
-            TUI.paragraph(text: scrollbar_glyphs(lines.size, rows), wrap: false),
-          ],
-          constraints: [TUI.constraint_min(1), TUI.constraint_length(1)]
-        )
+        glyphs = scrollbar_glyphs(lines.size, rows)
+        TUI.paragraph(text: window.map.with_index { |line, i| overlay_rail_cell(line, glyphs[i], width) }, wrap: false)
+      end
+
+      # pi scroll-view.ts isScrollbarVisible (:74-78): the auto rail paints
+      # only while the content overflows AND scroll activity is fresh
+      # (transientScrollbarVisible, younger than scrollbarHideDelayMs) — a
+      # settled screen never shows it (AC2).
+      def scrollbar_visible?(lines, rows)
+        stamp = @scrollbar_activity_at
+        return false if stamp.nil? || lines.size <= rows
+
+        Process.clock_gettime(Process::CLOCK_MONOTONIC) - stamp < scrollbar_hide_delay_ms / 1000.0
+      end
+
+      # One rail row (pi paintScrollbar layout.ts:307-330 via
+      # replaceScrollbarCell): the glyph REPLACES the last column's cell —
+      # content clips at width−1, plain padding spaces carry it to the
+      # rail column, the glyph keeps its theme fg (grafted from
+      # {scrollbar_glyphs}' own span — scrollbarTrack/scrollbarThumb).
+      # pi's hover-driven active thumb `█` (setScrollbarActive,
+      # tui-alt-screen.ts:1057-1065) has no port seam and is unreachable
+      # in the rig — cut, itemized; the at-rest `┃` is the reachable
+      # subset.
+      def overlay_rail_cell(line, glyph, width)
+        head = clip_spans(line.spans, width - 1)
+        pad = width - 1 - head.sum { |span| TUI.text_width(span.content) }
+        spans = pad.positive? ? [*head, TUI.span(" " * pad)] : head
+        TUI.line([*spans, glyph.spans.first])
       end
 
       # The right-gutter scrollbar (pi layout.ts:307-330 paintScrollbar:
