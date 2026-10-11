@@ -246,13 +246,26 @@ module Tart
     #   whichever the gem's Style accepts (style.rb:100-104; hex parses to
     #   Color::Rgb in ext style.rs:20-33).
     def style(fg: nil, bg: nil, modifiers: [])
+      # The reserved :dim fg → the DIM ATTRIBUTE (widget-level twin of
+      # {span}'s mapping — the editor border's title style rides here).
+      if fg == :dim
+        fg = nil
+        modifiers = [*modifiers, :dim]
+      end
       RatatuiRuby::Style::Style.new(fg:, bg:, modifiers:)
     end
 
     # @return [RatatuiRuby::Text::Span] one styled span — the seam's span
     #   vocabulary (fg/bg colors + modifiers, all optional; an unstyled
-    #   span carries no Style value at all).
+    #   span carries no Style value at all). RESERVED fg symbol :dim: the
+    #   DIM ATTRIBUTE (Theme[:dim] — pi's dimTokens render ESC[2m, not a
+    #   color; theme.ts:299), mapped here so every dim call site keeps
+    #   the fg: shape.
     def span(content, fg: nil, bg: nil, modifiers: [])
+      if fg == :dim
+        fg = nil
+        modifiers = [*modifiers, :dim]
+      end
       styled = (fg || bg || modifiers.any?) ? style(fg:, bg:, modifiers:) : nil
       RatatuiRuby::Text::Span.new(content:, style: styled)
     end

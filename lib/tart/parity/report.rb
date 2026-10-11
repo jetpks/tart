@@ -40,6 +40,14 @@ module Tart
           if (diff = run["diff"])
             out << "\n### per-class diff counts\n\n"
             diff.fetch("classes").each { |klass, count| out << "- #{count}x #{klass}\n" }
+            if (style = diff["style_candidates"])
+              out << "\n### style differences (SGR runs on text-identical lines)\n\n"
+              if style.empty?
+                out << "- none — every text-identical line carries identical SGR runs\n"
+              else
+                out << "```\n" << style.join("\n") << "\n```\n"
+              end
+            end
             out << "\n### classified unified diff\n\n```diff\n"
             out << diff.fetch("unified").join("\n") << "\n```\n\n### attribution\n\n```diff\n"
             out << diff.fetch("attribution").join("\n") << "\n```\n"

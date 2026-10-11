@@ -96,6 +96,8 @@ module Tart
         # the failure, it never crashes on a missing artifact.
         capture_path = File.join(stage, "#{app}.capture")
         File.write(capture_path, session_exists?(session) ? capture(session) : "")
+        styled_path = File.join(stage, "#{app}.capture.styled")
+        File.write(styled_path, session_exists?(session) ? capture_styled(session) : "")
 
         requests = mock.captured_request_logs
         request_log = File.join(stage, "#{app}-requests.jsonl")
@@ -106,7 +108,7 @@ module Tart
         result = {
           "app" => app, "session" => session, "completed" => completed,
           "requests" => requests.size, "expected_requests" => @scenario.expected_requests,
-          "capture" => capture_path, "request_log" => request_log,
+          "capture" => capture_path, "styled_capture" => styled_path, "request_log" => request_log,
           "boot_settle_ms" => boot[:ms], "boot_timed_out" => boot[:timed_out],
           "reply_settle_ms" => reply[:ms], "reply_timed_out" => reply[:timed_out],
         }
@@ -185,6 +187,14 @@ module Tart
         # A dead pane/session is a legitimate mid-run state (we surface it in
         # the summary); keep its tmux stderr out of the rig's own output.
         Open3.capture2("tmux", "capture-pane", "-p", "-t", session, err: IO::NULL)[0].to_s
+      end
+
+      # The STYLED capture (-e): the SGR sequences ride the output — the
+      # color/attribute dimension the plain capture strips (tmux
+      # normalizes both apps' escapes through its own writer, so a
+      # difference is the APP's, not the terminal's).
+      def capture_styled(session)
+        Open3.capture2("tmux", "capture-pane", "-e", "-p", "-t", session, err: IO::NULL)[0].to_s
       end
 
       def settle(session, label)
@@ -276,6 +286,7 @@ module Tart
         pi = apps["pi"]
         tart = apps["tart"]
         diff = pi && tart ? Differ.diff(File.read(pi["capture"]), File.read(tart["capture"]), registry) : nil
+        styles = diff && pi && tart ? style_result(diff, pi, tart, registry) : nil
         {
           "run" => n,
           "stage" => stage,
@@ -285,8 +296,26 @@ module Tart
             "candidates" => diff.candidates.map { |c| tagged_line(c) },
             "unified" => diff.unified,
             "attribution" => diff.classifications.map { |c| "#{tagged_line(c)} -> #{c.klass || 'unknown-candidate'}" },
-          },
+          }.merge(styles || {}),
         }
+      end
+
+      # The style pass over the -e captures: the SGR runs on the lines the
+      # structural diff called :same must be byte-identical; a mismatch is
+      # a style candidate, classified by the registry against the stripped
+      # line. Unknown style candidates block exit 0 like text ones.
+      def style_result(diff, pi, tart, registry)
+        pairs = diff.style_candidates(File.read(pi["styled_capture"]).lines(chomp: true),
+                                      File.read(tart["styled_capture"]).lines(chomp: true), registry)
+        unknown = pairs.reject { |(_candidate, klass)| klass }
+        {
+          "style_candidates" => pairs.map { |candidate, klass| style_line(candidate, klass) },
+          "style_unknown" => unknown.map { |candidate, _klass| "[style]#{style_line(candidate, nil)}" },
+        }
+      end
+
+      def style_line(candidate, klass)
+        "~ #{candidate.line.inspect} pi=#{candidate.pi_styles} tart=#{candidate.tart_styles} -> #{klass || 'unknown-candidate'}"
       end
 
       def tagged_line(classified)
@@ -300,11 +329,13 @@ module Tart
         end
 
         candidates = run_results.flat_map { |r| r["diff"] ? r["diff"]["candidates"] : [] }
-        code = @failure ? 2 : (candidates.empty? ? 0 : 1)
+        style_unknown = run_results.flat_map { |r| r["diff"] ? r["diff"]["style_unknown"] : [] }
+        code = @failure ? 2 : (candidates.empty? && style_unknown.empty? ? 0 : 1)
         {
           "scenario" => @scenario.name,
           "runs" => run_results,
           "candidates" => candidates,
+          "style_candidates" => style_unknown,
           "rig_failure" => @failure,
           "exit_code" => code,
         }

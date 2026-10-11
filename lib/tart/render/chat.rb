@@ -868,10 +868,13 @@ module Tart
       # blocks). The expand machinery behind the notice is cut, itemized.
       def pi_header_lines
         top, bottom = pi_mark
-        hints = TUI.span(bottom.empty? ? PI_HINTS_LINE : " #{PI_HINTS_LINE}", fg: Theme[:dim])
+        # The separating space renders PLAIN (pi: the mark's spans, a
+        # plain space, THEN the dim hints span — the -e capture's byte
+        # proof: the port dimmed the space).
+        hints = TUI.span(PI_HINTS_LINE, fg: Theme[:dim])
         [
-          TUI.line([TUI.span(OUTPUT_PAD), *top, TUI.span(" v#{Identity::ORACLE_VERSION}", fg: Theme[:dim])]),
-          TUI.line([TUI.span(OUTPUT_PAD), *bottom, hints]),
+          TUI.line([TUI.span(OUTPUT_PAD), *top, TUI.span(" "), TUI.span("v#{Identity::ORACLE_VERSION}", fg: Theme[:dim])]),
+          TUI.line([TUI.span(OUTPUT_PAD), *bottom, TUI.span(" "), hints]),
           TUI.line([TUI.span(OUTPUT_PAD), TUI.span(PI_NOTICE_LINE, fg: Theme[:dim])]),
           blank_line,
           TUI.line([TUI.span(OUTPUT_PAD), TUI.span(PI_ONBOARDING_LINE, fg: Theme[:dim])])

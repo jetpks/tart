@@ -13,18 +13,18 @@ module Tart
     # verified live); non-content tokens keep their 16-color analogs
     # (itemized reduction).
     EXPECTED = {
-      text: "#dee0e1",                # dark.json:6 "text" okhsl(234 3% 89%) — body prose, truecolor
-      dim: :gray,                     # "dim" okhsl(229 8% 56%) (dark.json:24) — the mid-gray analog, I14 item 9
-      muted: :gray,                   # "muted" okhsl(229 6% 67%) — footer/autocomplete (non-content)
-      border: :gray,                  # "borderMuted" okhsl(229 8% 53%)
+      text: nil,                      # dark.json:6 "text" — the TERMINAL DEFAULT (pi's default-token resolution, theme.ts:226-229)
+      dim: :dim,                      # "dim" — RESERVED: the ESC[2m attribute (pi dimTokens, theme.ts:299)
+      muted: :dim,                    # "muted" — ALSO a dimToken (the -e capture: the hint rows render [2m)
+      border: :dim,                   # "borderMuted" — pi's borders render the DIM attribute (the -e capture)
       warning: :yellow,               # "warning" yellow
       error: :red,                    # "error" red
       accent: :light_magenta,         # "accent" violet (dark.json vars)
-      user_message_text: "#dee0e1",   # dark.json:32 — userMessageText = the "text" token
-      user_message_bg: "#213b49",     # dark.json:13/:33 — blueBg okhsl(233 41% 24%)
-      tool_output: "#9da5a9",         # dark.json:35 "toolOutput" = muted okhsl(229 6% 67%)
-      bashMode: "#5eb286",            # dark.json:71 okhsl(159 64% 65%) — the bash header (I17)
-      toolTitle: "#dee0e1",           # dark.json:40 toolTitle = the text token — the tool-call headers (I18)
+      user_message_text: nil,         # dark.json:32 — = text → the terminal default
+      user_message_bg: nil,           # dark.json:13/:33 — blueBg → the terminal default (the capture's plain emission)
+      tool_output: :dim,              # "toolOutput" — renders the DIM attribute (the -e capture: pi's output rows are [2m)
+      bashMode: nil,                  # "bashMode" — the header is bold + DEFAULT fg (the -e capture: [1m[0m only)
+      toolTitle: nil,                 # dark.json:40 toolTitle = text → the terminal default (the I18 headers render bold-default)
       md_heading: :yellow,            # dark.json:42
       md_link: :light_blue,           # dark.json:43 blue
       md_link_url: :gray,             # dark.json:44 muted
@@ -49,7 +49,7 @@ module Tart
 
     def test_lookup_returns_the_token_color
       assert_equal :red, Theme[:error]
-      assert_equal "#dee0e1", Theme[:text], "body prose carries the text token's true color (dark.json:6)"
+      assert_nil Theme[:text], "body prose carries the TERMINAL DEFAULT (pi's default-token resolution; the -e capture's plain emission)"
       assert_raises(KeyError) { Theme[:not_a_token] }
     end
 
@@ -71,8 +71,11 @@ module Tart
     # tokens carry TRUE values (I15 item 4); the non-content analogs stand.
     def test_surface_roles_resolve_through_the_theme
       assert_equal Theme[:user_message_text], Theme[:text], "pi userMessageText = text on the blue bg (dark.json:32-33)"
-      refute_equal Theme[:tool_output], Theme[:muted], "tool output is truecolor; the autocomplete muted analog stands"
-      assert_equal Theme[:dim], :gray, "the footer-dim analog (I14 item 9: pi's whole footer is dim, okhsl 56%)"
+      # toolOutput and muted render the same DIM attribute (the -e capture).
+      # RESERVED: pi renders the dim tokens as the ESC[2m attribute (theme.ts:299
+      # dimTokens — the -e capture proves it); the port's :gray guess was the
+      # pre-instrument analog.
+      assert_equal :dim, Theme[:dim], "the dim token is the dim ATTRIBUTE (pi's dimTokens)"
       assert_equal Theme[:warning], :yellow
       assert_equal Theme[:error], :red
       assert_equal Theme[:text], Theme[:toolTitle], "pi toolTitle = text (dark.json:40) — the I18 tool headers"

@@ -19,35 +19,43 @@ module Tart
     # pi token (theme-tokens.ts / dark.json) → the color the port renders.
     # nil = the terminal default.
     TOKENS = {
-      # dark.json:6 "text" okhsl(234 3% 89%) — body prose (truecolor; pi's
-      # own converter: #dee0e1).
-      text: "#dee0e1",  # okhsl(234 3% 89%) → #dee0e1 (dark.json:6, dark.json vars "text")
-      # "dim" okhsl(229 8% 56%) (dark.json:24, I14 item 9) — a blue-tinted
-      # mid gray. Closest ANSI analog: :gray, the same mid-gray the table
-      # already renders for the 53% (borderMuted) and 67% (muted) band —
-      # 56% sits between them. The blue tint is unrepresentable in the
-      # gem's 16-color vocabulary: :blue (the 33% family member) and
-      # :light_blue (65%, thinkingText) are farther in lightness and would
-      # either darken the footer or collapse it into the reasoning color.
-      dim: :gray,
-      muted: :gray,             # "muted" okhsl(229 6% 67%) — footer/autocomplete/command lines (non-content: 16-color analog)
-      border: :gray,            # "borderMuted" okhsl(229 8% 53%) — the port's one border style
+      # dark.json:6 "text" — the PROSE family resolves to the TERMINAL
+      # DEFAULT (theme.ts:226-229: a ""/reference value lands in
+      # defaultForegroundTokens → resolved to the terminal's real fg at
+      # render — the -e capture's plain emission; the port's #dee0e1 pin
+      # captured the var, missing the resolution). nil = the default.
+      text: nil,
+      # "dim" (dark.json:24, I14 item 9) — RESERVED: pi renders the dim
+      # tokens as the ESC[2m DIM ATTRIBUTE, not a color (theme.ts:299/337
+      # — dimTokens → dim: true, reset 22;39); the instrument's -e capture
+      # proves it (the port's :gray guess was the pre-instrument analog).
+      # TUI.span/style map fg: :dim → modifiers [:dim], no fg.
+      dim: :dim,
+      # "muted" — ALSO a dimToken in pi (the -e capture: the hint rows\n      # render [2m whole — muted and dim are the same attribute).
+      muted: :dim,
+      # "borderMuted" — pi's borders render the DIM attribute (the -e
+      # capture: the editor borders are [2m).
+      border: :dim,
       warning: :yellow,         # "warning" yellow — interrupts, context >70% (Chat::FG[:interrupted])
       error: :red,              # "error" red — errors, context >90% (Chat::FG[:error])
       accent: :light_magenta,   # "accent" violet — the port's violet analog (markdown.rb mdCode)
-      # dark.json:32-33: userMessageText = "text" on userMessageBg = "blueBg"
-      # okhsl(233 41% 24%) → #213b49 (pi's own converter).
-      user_message_text: "#dee0e1",   # = the "text" token (dark.json:32)
-      user_message_bg: "#213b49",     # okhsl(233 41% 24%) → #213b49 (dark.json:13 "blueBg", :33)
-      tool_output: "#9da5a9",   # "toolOutput" = muted okhsl(229 6% 67%) → #9da5a9 (dark.json:35, vars :5)
+      # dark.json:32-33: userMessageText = "text", userMessageBg = "blueBg"
+      # — the ECHO resolves to the terminal default (the capture's plain
+      # emission — user-message.ts:49-50's callbacks render defaults).
+      user_message_text: nil,
+      user_message_bg: nil,
+      # "toolOutput" renders the DIM ATTRIBUTE (the -e capture: pi"s output/Took rows are [2m, not the #9da5a9 pin).
+      tool_output: :dim,
       # dark.json:71 "bashMode" okhsl(159 64% 65%) → #5eb286 (pi's own
       # converter) — the bash tool block's `$ <command>` header (I17);
       # pi's system-theme "green" (system-theme.ts:112) is the 16-color
       # fallback, not the dark value the port renders.
-      bashMode: "#5eb286",
-      # dark.json:40 "toolTitle" = the "text" token → #dee0e1 (the I18
-      # tool-call headers: the bold `write`/`read`).
-      toolTitle: "#dee0e1",
+      # "bashMode" — the header is BOLD + DEFAULT fg (the capture: pi"s $ row is [1m[0m only).
+      bashMode: nil,
+      # dark.json:40 "toolTitle" = the "text" token → the terminal
+      # default (the resolution, above — the I18 tool headers render
+      # bold-with-default-fg).
+      toolTitle: nil,
       md_heading: :yellow,      # dark.json:42
       md_link: :light_blue,     # dark.json:43 "mdLink" blue → :light_blue (markdown.rb)
       md_link_url: :gray,       # dark.json:44 muted

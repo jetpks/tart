@@ -15,8 +15,11 @@ module Tart
     #   classes:
     #     - name: staged-sandbox-path
     #       pattern: 'sandbox/(pi|tart)-run-\d+'
+    #     - name: cursor-row-style          # style_only: matches ONLY the
+    #       pattern: '^$'                   # style pass (never the text diff)
+    #       style_only: true
     class Registry
-      Rule = Struct.new(:name, :pattern) # @return [Regexp]
+      Rule = Struct.new(:name, :pattern, :style_only)
 
       def self.load(path)
         raise Error, "#{path}: no such registry file" unless File.readable?(path)
@@ -31,7 +34,7 @@ module Tart
           raise Error, "#{path}: each class needs 'name' and 'pattern'" unless entry.is_a?(Hash) && entry["name"] && entry["pattern"]
 
           begin
-            Rule.new(entry.fetch("name"), Regexp.new(entry.fetch("pattern")))
+            Rule.new(entry.fetch("name"), Regexp.new(entry.fetch("pattern")), entry["style_only"] == true)
           rescue RegexpError => e
             raise Error, "#{path}: bad pattern for #{entry['name']}: #{e.message}"
           end
@@ -46,8 +49,15 @@ module Tart
       end
 
       # First match wins. Returns the class name or nil (unknown-candidate).
-      def classify(line)
-        rule = @rules.find { |r| r.pattern.match?(line) }
+      # The TEXT pass skips style_only classes; the SGR pass (+style_only_context:+)
+      # consults everything — patterns too broad to sanction a TEXT line
+      # (an empty line's cursor-row SGR shape) but right for a style one.
+      def classify(line, style_only_context: false)
+        rule = @rules.find do |r|
+          next false if !style_only_context && r.style_only
+
+          r.pattern.match?(line)
+        end
         rule&.name
       end
 

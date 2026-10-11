@@ -199,9 +199,10 @@ module Tart
         stream(chat, "streaming")
         draw(chat, session)
         # The status renders in the editor's top border (after the corner
-        # glyph) — scan cells, not lead cells.
-        assert all_cells(session).any? { |symbol, fg| Render::Chat::SPINNER.include?(symbol) && fg == Theme[:dim] },
-          "the status line is dim (#{Theme[:dim].inspect})"
+        # glyph) — scan cells, not lead cells. Dim = the ATTRIBUTE (pi's
+        # dimTokens render ESC[2m, not a color).
+        assert dim_cell?(session, ->(symbol, _x, _y) { Render::Chat::SPINNER.include?(symbol) }),
+          "the status line renders the dim attribute"
 
         finish_message(chat, "assistant answer") # transcript: assistant, terminal default
         tool_end(chat, "grep", "tool output")    # transcript: tool, muted
@@ -211,16 +212,16 @@ module Tart
         draw(chat, session)
 
         leads = lead_cells(session)
-        assert_includes leads, ["a", Theme[:text]],
-          "assistant prose renders the text token's true color (pi: text, dark.json:6)"
-        assert_includes leads, ["⎿", Theme[:tool_output]],
-          "tool output is the muted token's true value (pi: toolOutput)"
-        assert_includes leads, ["h", Theme[:user_message_text]],
-          "the user echo renders the text token (pi: userMessageText) with NO prompt char"
+        assert_includes leads, ["a", nil],
+          "assistant prose renders the TERMINAL DEFAULT (pi's default-token resolution; the -e capture's plain emission)"
+        assert_includes leads, ["⎿", nil],
+          "the generic tool line renders the default fg"
+        assert_includes leads, ["h", nil],
+          "the user echo renders the default fg/bg (pi: userMessageText resolves to the terminal fg)"
         # The input row's lead cell (column 0 — pi's full-width editor)
         # keeps the terminal default, visually apart from the colored echo.
         assert_nil session.cell_fg(0, input_row(session)),
-          "the input line keeps the terminal default — visually apart from the colored echo"
+          "the input line keeps the terminal default"
       end
     end
 
@@ -232,9 +233,9 @@ module Tart
         draw(chat, session)
         y = buffer_row(chat, "hi")
         x = session.buffer_content[y].index("h")
-        assert_equal Theme[:user_message_text], session.cell_fg(x, y)
-        assert_equal Theme[:user_message_bg], session.cell_bg(x, y),
-          "the echo rides the blueBg truecolor background (dark.json:13)"
+        assert_nil session.cell_fg(x, y)
+        assert_nil session.cell_bg(x, y),
+          "the echo renders the terminal default fg/bg (userMessageText/userMessageBg resolve to the terminal's — the -e capture's plain emission)"
       end
     end
 
@@ -280,15 +281,15 @@ module Tart
         rows = session.buffer_content
         header = rows.index { |row| row.include?("$ echo pty-tester") }
         x = rows[header].index("$")
-        assert_equal Theme[:bashMode], session.cell_fg(x, header),
-          "the header renders the bashMode token (dark.json:71)"
+        assert_nil session.cell_fg(x, header),
+          "the header renders the DEFAULT fg (the -e capture: pi's $ row is [1m[0m — bold only)"
         assert_includes session.cell_modifiers(x, header), :bold, "the header is bold (bash.ts:36 theme.bold)"
         out = rows.index { |row| row.start_with?(" pty-tester") }
-        assert_equal Theme[:tool_output], session.cell_fg(rows[out].index("p"), out),
-          "the output line renders pi's muted token's true value (toolOutput = muted, dark.json:41)"
+        assert session.cell_modifiers(rows[out].index("p"), out).include?(:dim),
+          "the output line renders the DIM attribute (the -e capture: pi's tool output is [2m)"
         took = rows.index { |row| row.include?("Took 0.0s") }
-        assert_equal Theme[:tool_output], session.cell_fg(rows[took].index("T"), took),
-          "the Took line renders muted (bash.ts:106)"
+        assert session.cell_modifiers(rows[took].index("T"), took).include?(:dim),
+          "the Took line renders the dim attribute (bash.ts:106)"
       end
     end
 
@@ -373,11 +374,11 @@ module Tart
           "the hint row rides before the last 5 lines (bash.ts:82-84 VisualLinePreview keep end)"
         )
         hint = session.buffer_content.index { |row| row.include?("earlier lines") }
-        assert_equal Theme[:muted], session.cell_fg(1, hint),
-          "the hint prefix renders muted (bash.ts:83 theme.fg muted)"
+        assert session.cell_modifiers(1, hint).include?(:dim),
+          "the hint prefix renders the dim attribute (muted = dimTokens; the -e capture)"
         key = session.buffer_content[hint].index("ctrl+o")
-        assert_equal Theme[:dim], session.cell_fg(key, hint),
-          "the ctrl+o key renders dim (keybinding-hints.ts keyHint)"
+        assert session.cell_modifiers(key, hint).include?(:dim),
+          "the ctrl+o key renders the dim attribute (keybinding-hints.ts keyHint)"
       end
     end
 
@@ -558,15 +559,15 @@ module Tart
           "the capture's rows 11-16: spacer, box pad, header, blank, content, box pad — NO result row on success"
         rows = session.buffer_content
         header = rows.index { |row| row.include?("write s3-tool-turn-note.txt") }
-        assert_equal Theme[:toolTitle], session.cell_fg(rows[header].index("w"), header),
-          "the header renders the toolTitle token (dark.json:40 toolTitle = text)"
+        assert_nil session.cell_fg(rows[header].index("w"), header),
+          "the header renders the default fg (toolTitle = text = the terminal default)"
         assert_includes session.cell_modifiers(rows[header].index("w"), header), :bold,
           "the header is bold (write.ts:99 theme.bold)"
         assert_equal Theme[:accent], session.cell_fg(rows[header].index("s3-tool-turn-note.txt"), header),
           "the path renders the accent token (renderToolPath)"
         content = rows.index { |row| row.include?("parity s3 sandbox note") }
-        assert_equal Theme[:tool_output], session.cell_fg(rows[content].index("p"), content),
-          "the content preview renders the toolOutput truecolor (write.ts:119)"
+        assert session.cell_modifiers(rows[content].index("p"), content).include?(:dim),
+          "the content preview renders the dim attribute (toolOutput — the -e capture)"
       end
     end
 
@@ -1050,7 +1051,8 @@ module Tart
 
         skills_y = session.buffer_content.index { |row| row.include?("[Skills]") }
         body_x = session.buffer_content[skills_y + 1].index("greet")
-        assert_equal Theme[:dim], session.cell_fg(body_x, skills_y + 1), "the skills list renders dim (pi formatCompactList)"
+        assert session.cell_modifiers(body_x, skills_y + 1).include?(:dim),
+          "the skills list renders the dim attribute (pi formatCompactList)"
       end
     end
 
@@ -1090,7 +1092,7 @@ module Tart
         assert_equal Theme[:logoCoral], session.cell_fg(1, 1), "the top pixel renders coral (pi-logo.ts)"
         assert_equal Theme[:logoBlue], session.cell_bg(1, 1), "the top pixel's blue under-half"
         assert_equal Theme[:logoYellow], session.cell_fg(4, 2), "the bottom mark's yellow pixel"
-        assert_equal Theme[:dim], session.cell_fg(6, 1), "the version renders dim"
+        assert session.cell_modifiers(6, 1).include?(:dim), "the version renders the dim attribute"
       end
     end
 
@@ -1370,7 +1372,8 @@ module Tart
         draw(chat, session)
         row = footer_stats_row(session)
         model_x = (0...40).find { |x| session.buffer_content[row][x] == "m" }
-        assert_equal Theme[:dim], session.cell_fg(model_x, row), "the model renders dim (pi footer.ts:280-288)"
+        assert session.cell_modifiers(model_x, row).include?(:dim),
+          "the model renders the dim attribute (pi footer.ts:280-288 — the whole footer is dim)"
       end
     end
 
@@ -1626,8 +1629,8 @@ module Tart
 
         buffer = session.buffer_content
         border_row = buffer.index { |row| row.include?("─") }
-        assert_equal Theme[:dim], session.cell_fg(0, border_row),
-          "the !! block's border renders the dim key (excludeFromContext)"
+        assert session.cell_modifiers(0, border_row).include?(:dim),
+          "the !! block's border renders the dim attribute (excludeFromContext)"
       end
     end
 
@@ -1951,7 +1954,8 @@ module Tart
         assert_match(/\A→ new\s+new description\z/, rows[0], "the selection marker on the first item")
         assert_match(/\A  compact\s+compact description\z/, rows[1], "descriptions render beside the labels")
         assert_equal :light_magenta, session.cell_fg(1, input_y + 1), "the selected row is accent (pi theme.ts:1063-1064)"
-        assert_equal :gray, session.cell_fg(14, input_y + 2), "the description column is muted (pi theme.ts:1065)"
+        assert session.cell_modifiers(14, input_y + 2).include?(:dim),
+          "the description column renders the dim attribute (muted = dimTokens; the -e capture)"
       end
     end
 
@@ -2844,6 +2848,16 @@ module Tart
           next if symbol == " "
 
           [symbol, session.cell_fg(x, y)]
+        end
+      end
+    end
+
+    # The dim attribute's cell readback (pi's dimTokens render ESC[2m —
+    # Theme[:dim] maps to the modifier, the fg stays nil).
+    def dim_cell?(session, match)
+      session.buffer_content.each_with_index.any? do |row, y|
+        row.chars.each_with_index.any? do |symbol, x|
+          match.call(symbol, x, y) && session.cell_modifiers(x, y).include?(:dim)
         end
       end
     end
