@@ -1251,6 +1251,89 @@ module Tart
       end
     end
 
+    # The skill invocation renders as its OWN collapsible panel (pi
+    # skill-invocation-message.ts + interactive-mode.ts:3936-3948) —
+    # collapsed "[skill] greet (ctrl+o to expand)" on the
+    # customMessageBg container, the trailing user message echoing below
+    # as a normal echo — the submission echo does NOT carry the expanded
+    # block (the owner's blow-up finding).
+    def test_skill_invocation_renders_the_collapsed_panel_and_the_prompt_below
+      with_headless_chat(width: 60) do |chat, session|
+        with_commands_handler(chat)
+        runs = with_recording_agent(chat)
+        send_message(chat, "/skill:greet hello world")
+        drain_runs(chat)
+        draw(chat, session)
+
+        lines = chat.transcript_lines
+        assert_includes lines.join, "[skill] greet (ctrl+o to expand)", "the collapsed panel renders"
+        refute_includes lines.join, "<skill", "the expanded block never renders as the echo"
+        assert_includes lines.join, "hello world", "the trailing prompt echoes below the panel"
+
+        y_abs = session.buffer_content.index { |buffer_row| buffer_row.include?("[skill]") }
+        buffer_row = session.buffer_content[y_abs]
+        assert_equal Theme[:custom_message_label], session.cell_fg(buffer_row.index("["), y_abs)
+        assert_includes session.cell_modifiers(buffer_row.index("["), y_abs), :bold
+        assert_equal Theme[:custom_message_text], session.cell_fg(buffer_row.index("greet"), y_abs)
+        assert_equal Theme[:dim], session.cell_fg(buffer_row.index("(ctrl+o"), y_abs)
+        assert_equal Theme[:custom_message_bg], session.cell_bg(0, y_abs),
+          "the panel rides the customMessageBg container"
+        prompt_y = session.buffer_content.index { |buffer_row| buffer_row.include?("hello world") }
+        assert_equal Theme[:user_message_bg], session.cell_bg(0, prompt_y),
+          "the prompt below echoes as a normal user message"
+      end
+    end
+
+    # ctrl+o expands the skill panel in place (pi
+    # component.setExpanded(this.toolOutputExpanded) in the global
+    # toggle's sweep) — the bold name header + the content as
+    # customMessageText prose — and collapses again.
+    def test_ctrl_o_expands_the_skill_panel
+      with_headless_chat(width: 60) do |chat, session|
+        with_commands_handler(chat)
+        with_recording_agent(chat)
+        send_message(chat, "/skill:greet")
+        drain_runs(chat)
+        draw(chat, session)
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_includes lines.join, "greet", "the bold markdown name header renders expanded"
+        assert_includes lines.join, "Hello body.", "the skill content renders expanded"
+        refute_includes lines.join, "(ctrl+o to expand)", "the hint dies expanded"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join, "(ctrl+o to expand)", "the second press collapses again"
+      end
+    end
+
+    # The replay renders the recorded skill submission through the same
+    # panel (pi renderSessionEntries' user case parses the skill block).
+    def test_replayed_skill_submission_renders_the_panel
+      with_headless_chat do |chat, session|
+        chat.resume_session(skill_session_file)
+        draw(chat, session)
+
+        assert_includes chat.transcript_lines.join, "[skill] greet (ctrl+o to expand)",
+          "the recorded skill submission renders as the panel"
+        assert_includes chat.transcript_lines.join, "the follow-up", "the recorded prompt echoes below"
+      end
+    end
+
+    # A recorded session file carrying one skill-block submission (the
+    # recorder's message shape — the expansion + args as ONE user text).
+    def skill_session_file
+      path = File.join(@dir, "session_skill_test.jsonl")
+      File.write(path, [
+        JSON.generate({type: "session", version: 1, id: "abc123", timestamp: "t", cwd: @dir}),
+        JSON.generate({type: "message", message: {role: "user", content:
+          "<skill name=\"greet\" location=\"/tmp/greet/SKILL.md\">\nHello body.\n</skill>\n\nthe follow-up"}})
+      ].join("\n") << "\n")
+      path
+    end
+
     def test_unknown_skill_and_unknown_command_pass_through_as_plain_text
       with_headless_chat do |chat|
         with_commands_handler(chat)
@@ -1942,6 +2025,29 @@ module Tart
         draw(chat, session)
         assert_equal [" ... (3 earlier lines, ctrl+o to expand)", " line 4"],
           chat.transcript_lines[4, 2], "the second press collapses again"
+      end
+    end
+
+    # The toggle works MID-STREAM (pi tui-alt-screen: the app.tools.expand
+    # action is not idle-gated): a tool block in the buffer + a live
+    # region growing, ctrl+o rebuilds the block in place.
+    def test_ctrl_o_works_while_a_message_is_streaming
+      output = Array.new(8) { |i| "line #{i + 1}" }.join("\n")
+      with_chat(width: 40) do |chat, session|
+        tool_end(chat, "bash", output, duration: 0.0, arguments: {"command" => "seq"})
+        draw(chat, session)
+        chat.on_agent_event({type: :agent_start})
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("streaming away")})
+        draw(chat, session)
+        assert chat.busy?, "the turn is in flight"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join, " line 1",
+          "the block rebuilds mid-stream"
+        assert chat.transcript_lines.none? { |row| row.include?("earlier lines") },
+          "the collapsed hint is gone mid-stream"
       end
     end
 

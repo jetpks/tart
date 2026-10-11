@@ -60,7 +60,12 @@ module Tart
         ),
         load_from_dir(File.join(cwd, ".tart", "skills"), "project")
       )
-      Result.new(skills: merged[:skills], diagnostics: merged[:diagnostics])
+      # The catalog is NAME-SORTED: the oracle's observed autocomplete
+      # order (2026-10-11 live probe — /ar selects architect, not
+      # architect-research; readdir order would select the latter, the
+      # synced dir's nested skills first). Every consumer rides this
+      # order: the fuzzy tie-break, /skills, the system-prompt listing.
+      Result.new(skills: merged[:skills].sort_by(&:name), diagnostics: merged[:diagnostics])
     end
 
     # pi addSkills (:432-456): realpath dedup first (silent), then name

@@ -44,8 +44,19 @@ module Tart
       write_skill(project_dir, "deploy", "description: Deploys the app")
 
       loaded = load_skills
-      assert_equal %w[greet deploy], loaded.skills.map(&:name)
+      # user-before-project decides the collision winner; the CATALOG
+      # itself is name-sorted (the oracle's autocomplete order — /ar
+      # selects architect, 2026-10-11 live probe).
+      assert_equal %w[deploy greet], loaded.skills.map(&:name)
       assert_empty loaded.diagnostics
+    end
+
+    def test_catalog_is_name_sorted
+      write_skill(user_dir, "zeta", "description: z")
+      write_skill(user_dir, "alpha", "description: a")
+      write_skill(project_dir, "mid", "description: m")
+
+      assert_equal %w[alpha mid zeta], load_skills.skills.map(&:name)
     end
 
     def test_skill_md_root_does_not_recurse_and_subdirs_recurse

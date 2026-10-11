@@ -49,6 +49,12 @@ module Tart
       # applyBackgroundToLine).
       user_message_text: "#dee0e1",
       user_message_bg: "#213b49",
+      # dark.json:34-36: customMessageBg = okhsl(295 42% 24%),
+      # customMessageText = muted var, customMessageLabel = violet var —
+      # the skill-invocation panel (skill-invocation-message.ts Box(1,1)).
+      custom_message_bg: "#3a3055",
+      custom_message_text: "#9da5a9",
+      custom_message_label: "#a798d7",
       # dark.json:41 toolOutput = muted var
       tool_output: "#9da5a9",
       # dark.json:40 toolTitle = text — the tool call headers (bold).

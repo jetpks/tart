@@ -25,6 +25,9 @@ module Tart
       accent: "#a798d7",          # dark.json:16 violet var
       user_message_text: "#dee0e1", # dark.json:32 = text
       user_message_bg: "#213b49",   # dark.json:33 blueBg okhsl(233 41% 24%)
+      custom_message_bg: "#3a3055", # dark.json:34 okhsl(295 42% 24%) — the skill panel
+      custom_message_text: "#9da5a9", # dark.json:35 muted var
+      custom_message_label: "#a798d7", # dark.json:36 violet var
       tool_output: "#9da5a9",     # dark.json:41 muted var
       toolTitle: "#dee0e1",       # dark.json:40 = text
       bashMode: "#5eb286",        # dark.json:77 okhsl(159 64% 65%)

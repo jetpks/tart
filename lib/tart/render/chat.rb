@@ -184,6 +184,22 @@ module Tart
       # range). pi's expandable tool children.
       MarkedRegion = Struct.new(:rows, :builder)
 
+      # A parsed skill block (pi parseSkillBlock, agent-session.ts:177-187
+      # — the display-side parse of the submitted text back into the
+      # skill's name/location/content + the user message that followed):
+      # the panel renders the skill, the echo renders the message.
+      SkillBlock = Struct.new(:name, :location, :content, :user_message, keyword_init: true)
+
+      # pi parseSkillBlock (:177-187), verbatim shape. nil when the text
+      # carries no skill block (a plain submission).
+      def self.parse_skill_block(text)
+        match = text.match(/\A<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?\z/)
+        return nil unless match
+
+        user_message = match[4]&.strip
+        SkillBlock.new(name: match[1], location: match[2], content: match[3], user_message: user_message&.empty? ? nil : user_message)
+      end
+
       # One random art piece's lines (empty collection → no logo lines).
       def motd_logo_lines
         file = Dir[File.join(LOGOS_DIR, "*.txt")].sample
@@ -1069,6 +1085,67 @@ module Tart
         @scrollback << region
       end
 
+      # The submitted prompt's display dispatcher (the skill half of pi's
+      # user-message rendering, interactive-mode.ts:3930-3948): the skill
+      # block parses back out of the expanded text and renders as its OWN
+      # collapsible panel (SkillInvocationMessageComponent, collapsed by
+      # default — the owner's "[skill] architect (ctrl+o to expand)"
+      # container), the trailing user message echoes below it as a normal
+      # echo (pi's unconditional Spacer(1) between). The plain submission
+      # is the echo alone. The MODEL receives and the session records the
+      # full expanded text either way — the split is display-only, as in
+      # pi.
+      def enqueue_user_submission(text)
+        block = self.class.parse_skill_block(text)
+        return enqueue_user_echo(text) unless block
+
+        @scrollback << [blank_line] if @chat_started # the container's non-empty gate (once)
+        @chat_started = true
+        push_expandable(->(expanded) { skill_panel_rows(block, expanded:) })
+        enqueue_user_echo(block.user_message) if block.user_message
+      end
+
+      # The skill-invocation panel (pi skill-invocation-message.ts:
+      # Box(outputPad, 1, customMessageBg), collapsed by default, the
+      # ctrl+o toggle sweeps it via the expandable registry — pi
+      # component.setExpanded(this.toolOutputExpanded)). Collapsed: one
+      # content row — the bold customMessageLabel [skill], the
+      # customMessageText name, the dim " (ctrl+o to expand)" hint
+      # (keyText app.tools.expand). Expanded: the label row, then the
+      # bold-markdown name header + the content as markdown over
+      # customMessageText prose (pi's color override — token colors
+      # still apply, the prose callback doesn't). paddingY 1 both ways;
+      # every row through the {OUTPUT_PAD} rule + the full-width bg.
+      # pi's click-to-toggle MouseRegion is cut — the port's mouse owns
+      # selection (itemized).
+      def skill_panel_rows(block, expanded:)
+        bg = Theme[:custom_message_bg]
+        # pi: theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) —
+        # the trailing space rides the LABEL's run.
+        label = TUI.span("[skill] ", fg: Theme[:custom_message_label], modifiers: [:bold])
+        unless expanded
+          line = padded_spans_row(
+            [label, TUI.span(block.name, fg: Theme[:custom_message_text]),
+             TUI.span(" (ctrl+o to expand)", fg: Theme[:dim])], bg
+          )
+          return [panel_blank_line(bg), line, panel_blank_line(bg)]
+        end
+
+        rows = [panel_blank_line(bg), padded_spans_row([label], bg)]
+        rows.concat(markdown_lines("**#{block.name}**\n\n#{block.content}", viewport_width,
+          prose_fg: Theme[:custom_message_text], bg: bg))
+        rows << panel_blank_line(bg)
+        rows
+      end
+
+      # One row of pre-built spans through the {OUTPUT_PAD} rule with the
+      # panel bg + tail (the multi-span analog of {padded_fg_rows}'s
+      # single-span row).
+      def padded_spans_row(spans, bg)
+        width = spans.sum { |span| TUI.text_width(span.content) }
+        TUI.line([TUI.span(OUTPUT_PAD, bg: bg), *spans, panel_tail(width, bg)])
+      end
+
       # The resume replay (item 3, pi renderSessionEntries, interactive-
       # mode.ts :3900-3975): the recorded entries through the live-turn
       # shapes — user echoes, assistant thinking-then-content markdown,
@@ -1114,7 +1191,7 @@ module Tart
         content = message["content"]
         return unless content.is_a?(String) && !content.strip.empty?
 
-        enqueue_user_echo(content)
+        enqueue_user_submission(content)
         add_to_history(content) # pi renderInitialMessages populateHistory
       end
 
@@ -1222,13 +1299,26 @@ module Tart
       # re-renders the whole streaming message as markdown on every
       # update — interactive-mode.ts:3519-3535, assistant-message.ts
       # :107-109).
-      def markdown_lines(text, width)
+      def markdown_lines(text, width, prose_fg: nil, bg: nil)
         content_width = width - OUTPUT_PAD.length * 2
         rows = Render::Markdown.rows(text, width: content_width).flat_map { |row| Chat.wrap_row(row, content_width) }
         rows.map do |row|
-          themed = row.map { |span| Render::Markdown::Span.new(text: span.text, fg: Theme.md_fg(span.fg), modifiers: span.modifiers) }
-          padded_row(themed)
+          themed = row.map do |span|
+            fg = Theme.md_fg(span.fg)
+            fg = prose_fg if fg.nil? && prose_fg # the panel's prose-color override
+            Render::Markdown::Span.new(text: span.text, fg:, modifiers: span.modifiers)
+          end
+          bg ? panel_markdown_row(themed, bg) : padded_row(themed)
         end
+      end
+
+      # One markdown row through the {OUTPUT_PAD} rule with the panel bg
+      # + tail (the expanded skill panel's content rows —
+      # applyBackgroundToLine over the Markdown component).
+      def panel_markdown_row(spans, bg)
+        width = spans.sum { |span| TUI.text_width(span.text) }
+        content = spans.map { |span| TUI.span(span.text, fg: span.fg, modifiers: span.modifiers, bg: bg) }
+        TUI.line([TUI.span(OUTPUT_PAD, bg: bg), *content, panel_tail(width, bg)])
       end
 
       # One content row with the {OUTPUT_PAD} leading the spans (pi's
@@ -1951,7 +2041,7 @@ module Tart
         parsed = user_bash_command(text)
         return user_bash(*parsed) if parsed
 
-        enqueue_user_echo(text)
+        enqueue_user_submission(text)
         if busy?
           @agent.push_message(text) # steering: consumed at the next turn boundary
         else

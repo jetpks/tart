@@ -54,7 +54,9 @@ module Tart
           templates << template
         end
       end
-      Result.new(templates:, diagnostics:)
+      # Name-sorted like the skills catalog (the oracle's prompt list is
+      # alphabetical — the [Prompts] display and the autocomplete order).
+      Result.new(templates: templates.sort_by(&:name), diagnostics:)
     end
 
     # pi loadTemplatesFromDir (:158-196): non-recursive top-level .md
