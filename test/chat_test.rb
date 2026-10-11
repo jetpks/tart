@@ -445,9 +445,10 @@ module Tart
     end
 
     # pi bash.ts:65-71 — the model-facing truncation footer splits OFF the
-    # preview: the body collapses, the notice rows follow (composition
-    # per pi's renderResult; the port keeps the notice's tool_output
-    # rendering — recorded deviation).
+    # preview: the body collapses, the notice rows follow. The DISPLAYED
+    # notice is pi's warnings composition (renderers/bash.ts:88-99 —
+    # `[Full output: <path>. Truncated: showing N of M lines]`, joined on
+    # one line, path FIRST), recomposed from the model footer's shape.
     def test_bash_block_truncation_notice_follows_the_collapsed_block
       output = Array.new(8) { |i| "line #{i + 1}" }.join("\n") +
                "\n\n[Showing lines 5-8 of 8. Full output: /tmp/full.txt]"
@@ -458,10 +459,41 @@ module Tart
         assert_equal(
           ["", "", " $ big", "", " ... (3 earlier lines, ctrl+o to expand)"] +
             Array.new(5) { |i| " line #{i + 4}" } +
-            ["", " [Showing lines 5-8 of 8. Full output:", " /tmp/full.txt]", ""],
+            ["", " [Full output: /tmp/full.txt.", " Truncated: showing 4 of 8 lines]", ""],
           chat.transcript_lines,
           "the notice is not swallowed into the kept five — it renders after the collapsed body"
         )
+      end
+    end
+
+    # The bytes variant composes pi's else-branch warnings
+    # (renderers/bash.ts:94-96): `Truncated: N lines shown (<limit> limit)`
+    # — outputLines again, the limit carried from the footer.
+    def test_bash_truncation_notice_bytes_variant_composes_the_shown_count
+      output = Array.new(8) { |i| "line #{i + 1}" }.join("\n") +
+               "\n\n[Showing lines 5-8 of 8 (50.0KB limit). Full output: /tmp/full.txt]"
+      with_chat(width: 80) do |chat, session|
+        tool_end(chat, "bash", output, arguments: {"command" => "big"})
+        draw(chat, session)
+
+        assert chat.transcript_lines.include?(" [Full output: /tmp/full.txt. Truncated: 4 lines shown (50.0KB limit)]"),
+          "the bytes variant composes pi's `lines shown` warnings — got #{chat.transcript_lines.compact.reject(&:empty?).last.inspect}"
+      end
+    end
+
+    # The partial-line footer ("Showing last … of line N") carries no
+    # output-line count — the display renders it as-is (itemized
+    # residual: pi composes `N lines shown` from the structured details
+    # the port's render layer cannot see).
+    def test_bash_truncation_notice_partial_line_footer_renders_as_is
+      footer = "[Showing last 50.0KB of line 8 (line is 50.1KB). Full output: /tmp/full.txt]"
+      output = Array.new(8) { |i| "line #{i + 1}" }.join("\n") + "\n\n#{footer}"
+      with_chat(width: 120) do |chat, session|
+        tool_end(chat, "bash", output, arguments: {"command" => "big"})
+        draw(chat, session)
+
+        assert chat.transcript_lines.include?(" #{footer}"),
+          "the partial-line footer renders as-is — got #{chat.transcript_lines.compact.reject(&:empty?).last.inspect}"
       end
     end
 
@@ -648,17 +680,22 @@ module Tart
     # [skill] shape, both with the dim expand hint. pi's own-package docs
     # class is cut (no pi package root in the port — itemized).
     def test_read_block_compact_resource_shapes
+      # pi's Text wraps the header to the viewport (40 cols): the hint's
+      # tail word moves to its own row (the wrapped_call_rows shape).
       with_chat(width: 40) do |chat, session|
         tool_end(chat, "read", "guide", arguments: {"path" => "AGENTS.md"})
         draw(chat, session)
-        assert_includes chat.transcript_lines, " read resource AGENTS.md (ctrl+o to expand)",
-          "AGENTS.md collapses to the compact resource shape (read.ts:79-90)"
+        y = chat.transcript_lines.index { |row| row.include?("read resource") }
+        assert_equal [" read resource AGENTS.md (ctrl+o to", " expand)"],
+          chat.transcript_lines[y, 2],
+          "AGENTS.md collapses to the compact resource shape (read.ts:79-90), wrapped"
       end
       with_chat(width: 40) do |chat, session|
         tool_end(chat, "read", "guide", arguments: {"path" => "skills/parith/SKILL.md"})
         draw(chat, session)
-        assert_includes chat.transcript_lines, " [skill] parith (ctrl+o to expand)",
-          "SKILL.md collapses to the [skill] shape (read.ts:81-83)"
+        y = chat.transcript_lines.index { |row| row.include?("[skill]") }
+        assert chat.transcript_lines[y].start_with?(" [skill] parith (ctrl+o to expand)"),
+          "SKILL.md collapses to the [skill] shape (read.ts:81-83) — fits unwrapped"
       end
     end
 

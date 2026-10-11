@@ -1165,10 +1165,11 @@ module Tart
         end
         unless notice.empty?
           region << blank_line
-          # pi bash.ts:88-99 — the model-facing truncation notice renders
-          # the warning fg (theme.fg("warning", `[...]`)), not the
-          # inherited tool_output (the I19 carry-forward, AC6).
-          region.concat(padded_fg_rows(notice, fg: Theme[:warning]))
+          # pi bash.ts:88-99 — the truncation notice renders the warning fg
+          # (theme.fg("warning", `[...]`)), not the inherited tool_output
+          # (the I19 carry-forward, AC6), composed as pi's DISPLAY warnings
+          # ({display_truncation_notice}).
+          region.concat(padded_fg_rows(display_truncation_notice(notice), fg: Theme[:warning]))
         end
         if duration
           region << blank_line
@@ -1176,6 +1177,28 @@ module Tart
         end
         region << blank_line
         @scrollback << region
+      end
+
+      # pi renderers/bash.ts:88-99 — the DISPLAYED notice is composed from
+      # the tool's truncation details: `[Full output: <path>. Truncated: …]`
+      # — the warnings joined on ONE line, path FIRST. The model-facing
+      # footer the render layer receives (bash.ts:348-352, port
+      # format_output) composes differently ("[Showing lines …]"), so the
+      # display parses the footer's shape (the {split_truncation_notice}
+      # guard) and recomposes pi's warnings. The lines and bytes variants
+      # recover every field the warnings carry; the partial-line footer
+      # ("Showing last …") carries no output-line count — it renders
+      # as-is (itemized residual).
+      def display_truncation_notice(footer)
+        lines = footer.match(/\A\[Showing lines (\d+)-(\d+) of (\d+)\. Full output: (.+)\]\z/)
+        bytes = footer.match(/\A\[Showing lines (\d+)-(\d+) of (\d+) \(([^)]+) limit\)\. Full output: (.+)\]\z/)
+        if lines
+          "[Full output: #{lines[4]}. Truncated: showing #{lines[2].to_i - lines[1].to_i + 1} of #{lines[3]} lines]"
+        elsif bytes
+          "[Full output: #{bytes[5]}. Truncated: #{bytes[2].to_i - bytes[1].to_i + 1} lines shown (#{bytes[4]} limit)]"
+        else
+          footer
+        end
       end
 
       # pi bash.ts:63-71 — the preview trims the output, and the model-
@@ -1289,13 +1312,24 @@ module Tart
       end
 
       # pi write.ts:99-100 — the bold toolTitle `write` header + the
-      # renderToolPath display (accent token). Mixed spans, so the row
-      # bypasses {padded_fg_rows} for a hand-built span line (recorded
-      # gap: pi's Text wraps the header to the viewport; a call line
-      # wider than the width overflows here).
+      # renderToolPath display (accent token), wrapped through the
+      # call-row family ({wrapped_call_rows}).
       def write_call_rows(args)
-        [TUI.line([TUI.span(OUTPUT_PAD), tool_title_span("write"), TUI.span(" "),
-                   TUI.span(tool_path_display(args), fg: Theme[:accent])])]
+        wrapped_call_rows([tool_title_span("write"), Markdown::Span.new(text: " "),
+                           Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent])])
+      end
+
+      # The styled call-row family (pi's per-tool renderCall Texts inside
+      # the tool-execution box): the box pad rides EVERY wrapped row
+      # ({padded_fg_rows}' rule — pi's box paddingX, tool-execution.ts:87),
+      # the mixed spans wrap through {Chat.wrap_row} at the padded content
+      # width — pi's Text wraps the header to the viewport (the I18
+      # recorded gap, closed: an over-long word moves to its own row, then
+      # hard-splits — the s6 capture's shape).
+      def wrapped_call_rows(spans)
+        Chat.wrap_row(spans, viewport_width - OUTPUT_PAD.length * 2).map do |row|
+          TUI.markdown_line([Markdown::Span.new(text: OUTPUT_PAD), *row])
+        end
       end
 
       # pi write.ts:108-122 — the content preview: \r stripped
@@ -1330,30 +1364,33 @@ module Tart
       # pi read.ts:35-42 formatReadCall vs :79-90 formatCompactReadCall —
       # the plain call line, or the compact resource shape with the dim
       # expand hint (the [skill] label rides customMessageLabel violet —
-      # the port's accent analog — over customMessageText muted).
+      # the port's accent analog — over customMessageText muted), wrapped
+      # through the call-row family ({wrapped_call_rows}).
       def read_call_rows(args)
         classification = compact_read_classification(args)
         if classification
           label_spans = if classification[:kind] == :skill
-            [TUI.span("[skill] ", fg: Theme[:accent], modifiers: [:bold]),
-             TUI.span(classification[:label], fg: Theme[:muted])]
+            [Markdown::Span.new(text: "[skill] ", fg: Theme[:accent], modifiers: [:bold]),
+             Markdown::Span.new(text: classification[:label], fg: Theme[:muted])]
           else
-            [tool_title_span("read resource"), TUI.span(" "),
-             TUI.span(classification[:label], fg: Theme[:accent])]
+            [tool_title_span("read resource"), Markdown::Span.new(text: " "),
+             Markdown::Span.new(text: classification[:label], fg: Theme[:accent])]
           end
-          [TUI.line([TUI.span(OUTPUT_PAD), *label_spans, *line_range_spans(args),
-                     TUI.span(" (ctrl+o to expand)", fg: Theme[:dim])])]
+          wrapped_call_rows([*label_spans, *line_range_spans(args),
+                             Markdown::Span.new(text: " (ctrl+o to expand)", fg: Theme[:dim])])
         else
-          [TUI.line([TUI.span(OUTPUT_PAD), tool_title_span("read"), TUI.span(" "),
-                     TUI.span(tool_path_display(args), fg: Theme[:accent]), *line_range_spans(args)])]
+          wrapped_call_rows([tool_title_span("read"), Markdown::Span.new(text: " "),
+                             Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent]),
+                             *line_range_spans(args)])
         end
       end
 
       # pi write.ts:99 theme.fg("toolTitle", theme.bold(...)) — the tool
       # call header token (dark.json:40 toolTitle = text, the truecolor
-      # prose value).
+      # prose value). The call rows speak the wrap vocabulary
+      # ({Chat.wrap_row} re-groups {Render::Markdown::Span}s).
       def tool_title_span(title)
-        TUI.span(title, fg: Theme[:toolTitle], modifiers: [:bold])
+        Markdown::Span.new(text: title, fg: Theme[:toolTitle], modifiers: [:bold])
       end
 
       # pi render-utils.ts:102-110 renderToolPath over :10-18 shortenPath
@@ -1379,7 +1416,7 @@ module Tart
 
         start_line = offset || 1
         end_line = limit ? start_line + limit - 1 : ""
-        [TUI.span(":#{start_line}-#{end_line}", fg: Theme[:warning])]
+        [Markdown::Span.new(text: ":#{start_line}-#{end_line}", fg: Theme[:warning])]
       end
 
       # pi read.ts:63-88 getCompactReadClassification — the compact shape
