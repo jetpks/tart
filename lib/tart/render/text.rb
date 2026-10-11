@@ -74,6 +74,31 @@ module Tart
         out.join
       end
 
+      # Clips styled spans to +width+ visible columns (the editor's inner
+      # width); the trailing partial span is trimmed cell-wise.
+      def clip_spans(spans, width)
+        out = []
+        budget = width
+        spans.each do |span|
+          break if budget <= 0
+
+          text = span.content
+          if TUI.text_width(text) <= budget
+            out << span
+            budget -= TUI.text_width(text)
+          else
+            head, = fit(text, budget)
+            # The bg rides the rebuild too — the bg panels' fill spans are
+            # the ones that get trimmed here (the scrollbar overlay clips
+            # every row to width−1), and dropping it was the "backgrounds
+            # vanish while scrolling" defect.
+            out << TUI.span(head, fg: span.style&.fg, bg: span.style&.bg, modifiers: span.style&.modifiers.to_a)
+            budget -= TUI.text_width(head)
+          end
+        end
+        out
+      end
+
       # Longest prefix of +line+ fitting +width+, preferring a word break.
       # Returns [head, chars_consumed].
       def fit(line, width)

@@ -206,7 +206,7 @@ module Tart
           # Autocomplete sources (AC1): the builtin slash commands + the
           # loaded skills + the prompt templates (the same catalog the
           # Commands::Handler routes).
-          autocomplete: Render::Chat::SlashSource.new(commands: Commands::BUILTINS, skills: skills.skills,
+          autocomplete: Render::SlashSource.new(commands: Commands::BUILTINS, skills: skills.skills,
             prompts: prompts.templates),
           motd: resume_path.nil?,
           identity:, prompts: prompts.templates, extensions: mcp_servers.keys
