@@ -4,6 +4,7 @@ require_relative "../test_helper"
 require_relative "../../lib/tart/parity"
 require_relative "../support/mock_llm_server"
 require "net/http"
+require "socket"
 
 module Tart
   # The parity-rig extensions of MockLLMServer (I02): per-request wire
@@ -36,6 +37,21 @@ module Tart
         server.rearm!
         assert_equal "one", fetch_content(server)
         assert_equal "two", fetch_content(server)
+      end
+    end
+
+    # AC4 (I18 rig robustness): a connection that sends no request line
+    # consumes no scripted response — no @script shift, no request-log
+    # entry, no response — so the next real request gets the next spec.
+    def test_an_empty_tcp_connection_consumes_no_scripted_response
+      with_server([{type: :message, content: "one"}, {type: :message, content: "two"}]) do |server|
+        TCPSocket.new("127.0.0.1", server.port).close
+
+        assert_equal "one", fetch_content(server)
+        assert_equal "two", fetch_content(server)
+        logs = server.captured_request_logs
+        assert_equal 2, logs.size
+        assert logs.all? { |entry| entry[:method] == "POST" && entry[:path] == "/v1/chat/completions" }
       end
     end
 

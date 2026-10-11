@@ -2,8 +2,6 @@
 
 require_relative "../test_helper"
 require_relative "../../lib/tart/parity"
-require "net/http"
-require "socket"
 
 module Tart
   # Scenario loading: the shipped data files and the failure path.
@@ -109,34 +107,5 @@ module Tart
       assert_raises(Parity::Error) { Parity::Scenario.load("/nonexistent/scenario.yml") }
     end
 
-    # AC4 (I18 rig robustness): a connection that sends no request line
-    # consumes no scripted response — no @script shift, no request-log
-    # entry, no response — so the next real request gets the next spec.
-    def test_an_empty_tcp_connection_consumes_no_scripted_response
-      with_server([{type: :message, content: "one"}, {type: :message, content: "two"}]) do |server|
-        TCPSocket.new("127.0.0.1", server.port).close
-
-        assert_equal "one", fetch_content(server)
-        assert_equal "two", fetch_content(server)
-        logs = server.captured_request_logs
-        assert_equal 2, logs.size
-        assert logs.all? { |entry| entry[:method] == "POST" && entry[:path] == "/v1/chat/completions" }
-      end
-    end
-
-    private
-
-    def with_server(specs)
-      server = MockLLMServer.new.script(specs).start
-      yield server
-    ensure
-      server&.stop
-    end
-
-    def fetch_content(server)
-      uri = URI("http://127.0.0.1:#{server.port}/v1/chat/completions")
-      response = Net::HTTP.post(uri, {model: "m", stream: false}.to_json, "content-type" => "application/json")
-      JSON.parse(response.body).fetch("choices")[0].fetch("message").fetch("content")
-    end
   end
 end
