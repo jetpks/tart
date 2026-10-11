@@ -1,0 +1,6 @@
+# Registry GAPS by construction: the prompt lines (`> hello` /
+# `> hello again`) match no class, so the gapped pair must produce
+# unknown-candidate lines and exit 1 (AC2, direction 2).
+classes:
+  - name: test-sandbox-path
+    pattern: '/run-[ab]-sandbox-[0-9]+'

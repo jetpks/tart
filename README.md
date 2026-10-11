@@ -198,6 +198,55 @@ Word operations stop at whitespace, punctuation, and word boundaries (pi's
 `word-navigation.ts` semantics — on `hello world|`, Ctrl+W deletes `world`
 and keeps the separator space).
 
+## Parity rig: pty-tester
+
+`bin/pty-tester` is the scripted side-by-side parity instrument (BRIEF §1–§3,
+built in I02 from the I01 spike): it runs **pi** (installed oracle) and
+**tart** under identical scripted conditions — same mock LLM, same prompt,
+same 120x40 tmux geometry — captures each app's settled screen, and diffs the
+two captures with attribution.
+
+```sh
+bin/pty-tester run parity/scenarios/s1_text_turn.yml   # full rig: pi + tart, diff, report
+bin/pty-tester run parity/scenarios/s2_tool_turn.yml --runs 3 --app pi
+bin/pty-tester diff a.capture b.capture --registry parity/registry.yml
+```
+
+`run` stages everything under the out dir (default `tmp/parity/<timestamp>`):
+per-run mock server, staged HOME and agent dir per app, fresh sandbox per app,
+the settled captures, `report.md` (human-readable classified unified diff)
+and `summary.json` (per-app completion, mock request counts vs expected,
+per-class diff counts, candidate lines, exit code).
+
+**Exit semantics (frozen):** `0` — every difference line matched a registry
+class (parity); `1` — at least one `unknown-candidate` line exists (parity not
+yet achieved; the candidates ARE the work list); `2` — rig failure (staging,
+boot, settle timeout, request-count mismatch, teardown survivor).
+
+**The diff is sharp by design.** There are NO sanctioned MOTD/logo/version/
+glyph classes. Today's known divergences (MOTD art, `❯` glyph, `⎿` tool
+transcript, footer model string) surface as `unknown-candidate` lines — that
+is correct behavior, not noise. The seed registry
+(`parity/registry.yml`) contains only per-run path/sandbox normalization.
+
+**Pinning a new class** (when the owner rules a difference out of scope): add
+a `classes:` entry to `parity/registry.yml` with a name and a regex
+`pattern` — first match wins; keep the class as narrow as the finding.
+Classes are data, never code, so a pin is reviewable in a one-line diff. The
+exact-parity direction is one-way: candidates shrink, classes only ever get
+more precise, and a class must never be widened to hide a rendering
+regression — reproduce, fix in tart, keep the candidate list honest.
+
+Isolation/teardown: every pane runs with a staged `HOME` (pi also gets a
+staged `PI_CODING_AGENT_DIR`), pane commands are exec-wrapped so the pane pid
+IS the app process, and teardown kills -9 the app and all descendants before
+dropping the session (tmux kill-session alone does not kill tart — I01).
+After any run: no surviving app process, no leftover `pty-tester-*` tmux
+session, worktree clean.
+
+Live integration test (drives real pi + tart, tens of seconds):
+`PTY_TESTER_LIVE=1 bundle exec rake test`.
+
 ## Development
 
 ```sh
