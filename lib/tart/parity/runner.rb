@@ -135,6 +135,14 @@ module Tart
           },
         }
         File.write(File.join(agent_dir, "models.json"), JSON.pretty_generate(config))
+        # The parity TARGET is the owner's daily-driver pi (~/.pi/agent/
+        # settings.json: "theme": "dark") — a fresh staged HOME otherwise
+        # boots the SYSTEM theme (theme.ts:683 `themeName ?? SYSTEM_THEME_NAME`),
+        # and under tmux (no OSC palette report) that degenerates to the
+        # indexed-16 fallback: accent 38;5;5, neutrals as the [2m dim
+        # attribute. Every style measured against that config was an
+        # artifact — dark renders truecolor 38;2;r;g;b tokens instead.
+        File.write(File.join(agent_dir, "settings.json"), JSON.pretty_generate({theme: "dark"}))
         agent_dir
       end
 
