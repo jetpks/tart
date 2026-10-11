@@ -131,25 +131,34 @@ module Tart
 
     # --- footer model metadata (I16): staged env/settings over the model ---
 
-    def test_model_provider_label_and_reasoning_resolve_staged_over_model
-      model = RubyLLM::Model.default("mock-1", "openai") # an assumed model: provider slug, no reasoning
-      assert_equal "openai", Settings.model_provider_label({}, model)
+    # The provider label is RETIRED: pi prefixes the model only when its
+    # available-model snapshot spans >1 provider (footer.ts:246-258) —
+    # the port's static snapshot is one, the prefix never fires.
+    def test_reasoning_resolves_staged_over_model
+      model = RubyLLM::Model.default("mock-1", "openai") # an assumed model: no reasoning
       refute Settings.model_reasoning_capable({}, model)
 
-      assert_equal "mock", Settings.model_provider_label({"modelProvider" => "mock"}, model)
       assert Settings.model_reasoning_capable({"modelReasoning" => true}, model)
       refute Settings.model_reasoning_capable({"modelReasoning" => false}, model)
       assert Settings.model_reasoning_capable({"modelReasoning" => "true"}, model), "the env layer stages strings"
     end
 
-    def test_model_provider_label_and_reasoning_read_the_registry_model
-      # A registry entry (real model) carries its provider slug and — when
-      # the entry lists reasoning — the reasoning capability (pi reads
-      # state.model.provider / state.model.reasoning, footer.ts:226-258).
+    # An assumed model falls back to the known-models table (the owner's
+    # daily-driver glm — pi's footer shows its level, so the port's must).
+    def test_assumed_model_reasoning_reads_the_known_table
+      model = RubyLLM::Model.default("accounts/fireworks/models/glm-5p3-flash", "openai")
+      assert Settings.model_reasoning_capable({}, model), "the daily-driver model is reasoning-capable"
+
+      unknown = RubyLLM::Model.default("totally-unknown", "openai")
+      refute Settings.model_reasoning_capable({}, unknown)
+    end
+
+    def test_reasoning_reads_the_registry_model
+      # A registry entry (real model) — when the entry lists reasoning —
+      # carries the reasoning capability (pi reads state.model?.reasoning,
+      # footer.ts:233-244).
       model = RubyLLM.models.find("gpt-5.6")
-      assert_equal "openai", Settings.model_provider_label({}, model)
       assert_equal model.supports?(:reasoning), Settings.model_reasoning_capable({}, model)
-      assert_nil Settings.model_provider_label({}, nil), "no model → no label"
       refute Settings.model_reasoning_capable({}, nil)
     end
 

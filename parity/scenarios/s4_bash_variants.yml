@@ -37,6 +37,3 @@ responses:
           command: "ls /definitely-not-here-s4"
   - type: stream
     content: "The bash tools ran; fixed final reply for the spike."
-env:
-  tart:
-    TART_MODEL_PROVIDER: mock

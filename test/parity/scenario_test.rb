@@ -14,8 +14,6 @@ module Tart
       assert_equal "hello", scenario.prompt
       assert_equal 1, scenario.expected_requests
       assert_equal [{type: :stream, content: "The mock reply is fixed and short for the spike."}], scenario.responses
-      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
-        "the footer staging rides the per-app env seam (I16)")
     end
 
     def test_loads_the_shipped_s1_tart_scenario_with_the_identity_staged
@@ -61,12 +59,6 @@ module Tart
       assert_equal({command: "echo pty-tester"}, scenario.responses[0][:tool_calls][0][:arguments])
     end
 
-    def test_s2_stages_the_footer_provider_env
-      scenario = Parity::Scenario.load(File.join(REPO_ROOT, "parity/scenarios/s2_tool_turn.yml"))
-      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
-        "the footer staging rides the per-app env seam (I16)")
-    end
-
     def test_loads_the_shipped_s3_tool_turn_files_scenario
       scenario = Parity::Scenario.load(File.join(REPO_ROOT, "parity/scenarios/s3_tool_turn_files.yml"))
       assert_equal "s3_tool_turn_files", scenario.name
@@ -78,8 +70,6 @@ module Tart
       assert_equal "read", scenario.responses[1][:tool_calls][0][:name]
       assert_equal({path: "s3-tool-turn-note.txt"}, scenario.responses[1][:tool_calls][0][:arguments])
       assert_equal "The file tools ran; fixed final reply for the spike.", scenario.responses[2][:content]
-      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
-        "the footer staging rides the per-app env seam (I16)")
     end
 
     def test_loads_the_shipped_s4_bash_variants_scenario
@@ -92,8 +82,6 @@ module Tart
       assert_equal "bash", scenario.responses[1][:tool_calls][0][:name]
       assert_equal({command: "ls /definitely-not-here-s4"}, scenario.responses[1][:tool_calls][0][:arguments])
       assert_equal "The bash tools ran; fixed final reply for the spike.", scenario.responses[2][:content]
-      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
-        "the footer staging rides the per-app env seam (I16)")
     end
 
     def test_loads_the_shipped_s5_bash_truncation_scenario
@@ -107,8 +95,6 @@ module Tart
         "2100 lines crosses the 2000-line model-facing tail cap")
       assert_equal "The truncated bash output was captured; fixed final reply for the spike.",
         scenario.responses[1][:content]
-      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
-        "the footer staging rides the per-app env seam (I16)")
     end
 
     def test_loads_the_shipped_s6_long_calls_scenario
@@ -125,8 +111,6 @@ module Tart
       assert write_args[:path].length > 100, "the write call row's staged path crosses 100 chars"
       assert_equal "parity s6 note", write_args[:content]
       assert_equal "The long tool calls ran; fixed final reply for the spike.", scenario.responses[2][:content]
-      assert_equal({"tart" => {"TART_MODEL_PROVIDER" => "mock"}}, scenario.env,
-        "the footer staging rides the per-app env seam (I16)")
     end
 
     def test_missing_required_field_raises_a_rig_error

@@ -8,6 +8,10 @@ module Tart
   class ParityRegistryTest < Test
     REPO_ROOT = File.expand_path("#{__dir__}/../..")
     SEED = File.join(REPO_ROOT, "parity/registry.yml")
+    # The one owner-ruled non-path pin: the footer model segment's
+    # provider prefix (pi's >1-provider gate over a snapshot the port
+    # cannot reproduce — footer.ts:246-258).
+    SANCTIONED_NON_PATH = ["footer-provider-prefix"].freeze
 
     def test_seed_registry_loads_and_classifies_staged_paths
       registry = Parity::Registry.load(SEED)
@@ -28,6 +32,8 @@ module Tart
       registry = Parity::Registry.load(SEED)
       refute_empty registry.rules
       registry.rules.each do |rule|
+        next if SANCTIONED_NON_PATH.include?(rule.name)
+
         assert_match(/path|sandbox/, rule.name, "seed registry must stay path/sandbox-only: #{rule.name}")
       end
     end

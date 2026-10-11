@@ -68,10 +68,11 @@ module Tart
           <workdir>/.tart/settings.json (project, merged over user).
           Keys (camelCase): defaultModel, defaultProvider, apiBase, apiKey,
           contextWindow, thinkingLevel (off/minimal/low/medium/high/xhigh/
-          max, default medium), compaction {enabled, reserveTokens,
-          keepRecentTokens}, defaultTools (plain names replace the default
-          loadout; +name adds, -name removes). Environment overrides
-          settings for model/provider/apiBase/apiKey (TART_* above).
+          max, default medium; /thinking overrides it for the session),
+          compaction {enabled, reserveTokens, keepRecentTokens},
+          defaultTools (plain names replace the default loadout; +name
+          adds, -name removes). Environment overrides settings for
+          model/provider/apiBase/apiKey (TART_* above).
 
         Skills:
           Skills load from ~/.tart/skills (user) and <workdir>/.tart/skills
@@ -81,14 +82,24 @@ module Tart
           message; loaded skills are listed with /skills.
 
         Commands:
-          /new /compact /resume /skills /settings /help /quit — /new starts
-          a fresh session, /compact compacts the context now, /resume opens
-          the session picker (arrows navigate, enter resumes, escape
-          cancels), /quit exits (when idle). Slash text matching no command
-          goes to the model.
-          Autocomplete: type / to get a fuzzy list of commands and skills;
-          up/down pick, tab (or enter) apply, escape dismisses. PageUp/
-          PageDown scroll the transcript when the list is hidden.
+          /new /compact /resume /skills /settings /thinking /help /quit —
+          /new starts a fresh session, /compact compacts the context now,
+          /resume opens the session picker (arrows navigate, enter
+          resumes, escape cancels), /thinking sets or cycles (bare) the
+          thinking level, /quit exits (when idle). Slash text matching no
+          command goes to the model.
+          Autocomplete: type / to get a fuzzy list of commands, skills,
+          and prompt templates; up/down pick, tab (or enter) apply,
+          escape dismisses. PageUp/PageDown scroll the transcript when
+          the list is hidden.
+
+        Prompt templates:
+          Prompt templates load from ~/.tart/prompts and
+          <workdir>/.tart/prompts: a top-level .md file (optional YAML
+          frontmatter: description, argument-hint) invoked as /<name>
+          [args] — its body joins your message with the args substituted
+          ($1..$N, $@/$ARGUMENTS, ${N:-default}, ${@:N} slices); loaded
+          templates are listed in the startup [Prompts] section.
 
         MCP servers:
           MCP stdio servers are loaded from ~/.tart/mcp.json (shape:
@@ -175,6 +186,8 @@ module Tart
       # "identity" (Tart::Identity is the one resolution point).
       identity = resolve_identity(options, settings)
       skills = Skills.load(cwd: workdir)
+      prompts = Prompts.load(cwd: workdir)
+      mcp_servers = Mcp::Config.load(mcp_config_path)
       require_api_key(settings)
 
       # The resume path is known before the surface is built: a resumed
@@ -191,12 +204,14 @@ module Tart
         surface = Render::Chat.new(
           session:, kernel:,
           # Autocomplete sources (AC1): the builtin slash commands + the
-          # loaded skills (the same catalog the Commands::Handler routes).
-          autocomplete: Render::Chat::SlashSource.new(commands: Commands::BUILTINS, skills: skills.skills),
+          # loaded skills + the prompt templates (the same catalog the
+          # Commands::Handler routes).
+          autocomplete: Render::Chat::SlashSource.new(commands: Commands::BUILTINS, skills: skills.skills,
+            prompts: prompts.templates),
           motd: resume_path.nil?,
-          identity:
+          identity:, prompts: prompts.templates, extensions: mcp_servers.keys
         )
-        tools = build_tools(workdir, settings)
+        tools = build_tools(workdir, settings, mcp_servers:)
         prompt = system_prompt(workdir, skills.skills)
 
         # /new's reset seam: a fresh session is a new recorder (new session
@@ -237,6 +252,8 @@ module Tart
           spawn: ->(&block) { kernel.async(&block) },
           agent: -> { surface.agent },
           reset: lambda { start_session.call(nil); surface.new_session },
+          thinking: ->(arg) { arg == :cycle ? surface.cycle_thinking_level : surface.set_thinking_level(arg) },
+          prompts: prompts.templates,
           resume: lambda do
             sessions = Agent::Session.list(cwd: workdir)
             if sessions.empty?
@@ -252,6 +269,7 @@ module Tart
         start_session.call(nil) unless resume_path
         report_diagnostics(result.diagnostics, surface:)
         skills.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
+        prompts.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
 
         kernel.renderer = surface.renderer
         kernel.on_event = ->(event, source) { surface.on_event(event, source) }
@@ -305,10 +323,13 @@ module Tart
     # model, stageable via TART_MODEL_PROVIDER / TART_MODEL_REASONING
     # (Settings); the thinking level rides the settings-resolved value.
     def footer_data(workdir, settings, chat:)
+      # No provider label: pi prefixes the provider only when MORE THAN
+      # one provider is available (footer.ts:246-258) — the port resolves
+      # a single static provider, so the segment is the bare model (the
+      # owner's live "(openai) " finding).
       {
         cwd: workdir,
         model: Settings.resolve_setting("defaultModel", settings),
-        provider: Settings.model_provider_label(settings, chat.model),
         reasoning: Settings.model_reasoning_capable(settings, chat.model),
         context_window: Settings.resolve_context_window(settings:, model: chat.model),
         auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
@@ -348,8 +369,7 @@ module Tart
       )
     end
 
-    def build_tools(workdir, settings)
-      mcp_servers = Mcp::Config.load(mcp_config_path)
+    def build_tools(workdir, settings, mcp_servers: Mcp::Config.load(mcp_config_path))
       Tools::Registry.build(selected: Settings.selected_tools(settings), cwd: workdir, mcp_servers:)
     rescue Mcp::Config::ConfigError => e
       abort "tart: #{e.message}"

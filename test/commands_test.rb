@@ -56,8 +56,42 @@ module Tart
 
     # --- the frozen builtin set ---
 
-    def test_builtin_set_is_exactly_the_seven_frozen_commands
-      assert_equal %w[new compact resume skills settings help quit], Commands::BUILTINS.keys
+    def test_builtin_set_is_exactly_the_frozen_commands
+      assert_equal %w[new compact resume skills settings thinking help quit], Commands::BUILTINS.keys
+    end
+
+    # --- /thinking (pi handleThinkingCommand :5145) ---
+
+    # An arg sets the exact level through the thinking callable; unknown
+    # levels error with pi's showError text and never call through.
+    def test_thinking_dispatch_sets_and_validates
+      levels = []
+      handler = Commands::Handler.new(
+        skills: @skills, settings: {}, output: ->(text) { @calls[:output] << text },
+        spawn: ->(&block) { block.call }, agent: -> { @agent }, reset: -> {},
+        thinking: ->(arg) { levels << arg }, quit: -> {}
+      )
+
+      assert handler.dispatch("/thinking high")
+      assert_equal ["high"], levels, "the exact level sets"
+      assert handler.dispatch("/thinking nope")
+      assert_equal ["high"], levels, "an unknown level never calls through"
+      assert @calls[:output].last.include?("Unknown thinking level \"nope\". Available levels: off, minimal"),
+        "the error carries pi's showError text"
+    end
+
+    # The bare command cycles (pi's app.thinking.cycle — the port has no
+    # selector UI, itemized).
+    def test_thinking_dispatch_bare_cycles
+      levels = []
+      handler = Commands::Handler.new(
+        skills: @skills, settings: {}, output: ->(text) { @calls[:output] << text },
+        spawn: ->(&block) { block.call }, agent: -> { @agent }, reset: -> {},
+        thinking: ->(arg) { levels << arg }, quit: -> {}
+      )
+
+      assert handler.dispatch("/thinking")
+      assert_equal [:cycle], levels, "the bare command cycles"
     end
 
     # /resume (item 2, pi slash-commands.ts:41 + interactive-mode.ts

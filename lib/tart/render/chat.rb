@@ -232,11 +232,19 @@ module Tart
       #   MOTD renders — pi's header bytes vs the owner's art + tart
       #   header. Structural items (padding, spacers, footer format) are
       #   identity-independent.
+      # @param prompts [Array<Prompts::Template>] the loaded prompt
+      #   templates — the MOTD's [Prompts] section (injectable so tests
+      #   never touch the filesystem; the empty default renders no
+      #   section, as in pi).
+      # @param extensions [Array<String>] the loaded MCP server names —
+      #   the MOTD's [Extensions] section (the port's loaded
+      #   external-resource analog; empty renders none).
       # @param settings_root [String] the user config dir the MOTD's
       #   [Context] section reports (injectable so tests never touch
       #   ~/.tart).
       def initialize(session:, kernel:, footer_data: nil, branch_reader: DEFAULT_BRANCH_READER, autocomplete: nil,
-        motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root)
+        motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
+        prompts: [], extensions: [])
         @session = session
         @kernel = kernel
         @footer_data = footer_data
@@ -328,6 +336,11 @@ module Tart
         @branch_fetched = false
         @settings_root = settings_root
         @identity = identity
+        @prompts = prompts
+        @extensions = extensions
+        # The runtime thinking level (nil = the settings default shows;
+        # /thinking sets it — pi agent.state.thinkingLevel).
+        @thinking_level = nil
         @motd_pending = motd # rendered on the first frame, once wired
         # pi's chat container is a separate component from the header
         # (interactive-mode.ts:633-639); its leading-spacer gate (children
@@ -807,22 +820,25 @@ module Tart
       end
 
       # The real completion source (bin/tart-wired): the builtin slash
-      # commands plus /skill:<name> entries — pi's command list
-      # (CombinedAutocompleteProvider; skills registered as "skill:<name>"
-      # at coding-agent interactive-mode.ts:809-818, plain descriptions —
+      # commands plus /skill:<name> entries plus the prompt templates —
+      # pi's command list (CombinedAutocompleteProvider; skills registered
+      # as "skill:<name>" at coding-agent interactive-mode.ts:809-818,
+      # templates as bare names :787-791, plain descriptions —
       # pi's [sourceTag] prefixes are extension/path-source metadata the
       # port has no equivalent of, recorded). Items-only: the surface owns
       # the fuzzy filter (mapping judgment — the port's provider seam is
       # static, no async).
       class SlashSource
-        def initialize(commands:, skills:)
+        def initialize(commands:, skills:, prompts: [])
           @commands = commands
           @skills = skills
+          @prompts = prompts
         end
 
         def items
           @commands.map { |name, meta| {value: name, label: name, description: meta[:description]} } +
-            @skills.map { |skill| {value: "skill:#{skill.name}", label: "skill:#{skill.name}", description: skill.description} }
+            @skills.map { |skill| {value: "skill:#{skill.name}", label: "skill:#{skill.name}", description: skill.description} } +
+            @prompts.map { |template| {value: template.name, label: template.name, description: template.description} }
         end
       end
 
@@ -879,22 +895,29 @@ module Tart
       def enqueue_motd
         lines = [blank_line]
         lines.concat(@identity == Identity::PI ? pi_header_lines : tart_header_lines(viewport_width))
+        # The loaded-resource sections ride BOTH identities (pi
+        # showLoadedResources renders for any theme/identity — the owner's
+        # missing [Context]/[Skills]/[Prompts]/[Extensions] block; each
+        # section opens with its blank, the enqueue's trailing blank is
+        # the header container's closing Spacer). Wrapped at the content
+        # width, as the sections always have.
+        motd_sections(viewport_width - OUTPUT_PAD.length * 2).each do |header, rows|
+          lines << blank_line << TUI.line("#{OUTPUT_PAD}#{header}", fg: Theme[:md_heading])
+          lines.concat(rows)
+        end
         lines << blank_line
         @scrollback << lines
       end
 
       # tart-mode's header: the owner's art collection, the tart version
-      # line, the port's hints line, the resource sections — every content
-      # row through the {OUTPUT_PAD} rule.
+      # line, the port's hints line — every content row through the
+      # {OUTPUT_PAD} rule. The resource sections render below for both
+      # identities ({enqueue_motd}).
       def tart_header_lines(width)
         content_width = width - OUTPUT_PAD.length * 2
         lines = motd_logo_lines.map { |line| TUI.line("#{OUTPUT_PAD}#{line}") }
         lines << TUI.line([TUI.span(OUTPUT_PAD), TUI.span("tart"), TUI.span(" v#{Tart::VERSION}", fg: Theme[:dim])])
         lines.concat(Chat.wrap(HINTS_LINE, content_width).map { |row| TUI.line("#{OUTPUT_PAD}#{row}", fg: Theme[:dim]) })
-        motd_sections(content_width).each do |header, rows|
-          lines << blank_line << TUI.line("#{OUTPUT_PAD}#{header}", fg: Theme[:md_heading])
-          lines.concat(rows)
-        end
         lines
       end
 
@@ -948,9 +971,11 @@ module Tart
       # The loaded-resource sections (pi showLoadedResources): [Context] —
       # the config sources the port actually loads, existing files only,
       # registration order (pi's contextCompactList, sort: false);
-      # [Skills] — the loaded skill names, sorted, dim, one wrapped
-      # compact list (pi formatCompactList :1791-1797). Sections with no
-      # entries are omitted, as in pi.
+      # [Skills] — the loaded skill names, sorted; [Prompts] — the loaded
+      # prompt templates as /name, sorted (pi promptCompactList :1896);
+      # [Extensions] — the loaded MCP server names, sorted. One wrapped
+      # dim compact list each (pi formatCompactList :1791-1797). Sections
+      # with no entries are omitted, as in pi.
       def motd_sections(width)
         sections = []
         context = context_sources.select { |path| File.file?(path) }
@@ -960,6 +985,14 @@ module Tart
         skills = motd_skill_names # sorted (pi formatCompactList's localeCompare)
         unless skills.empty?
           sections << ["[Skills]", dim_compact_list(skills, width)]
+        end
+        prompts = @prompts.map { |template| "/#{template.name}" }.sort
+        unless prompts.empty?
+          sections << ["[Prompts]", dim_compact_list(prompts, width)]
+        end
+        extensions = @extensions.sort
+        unless extensions.empty?
+          sections << ["[Extensions]", dim_compact_list(extensions, width)]
         end
         sections
       end
@@ -2628,13 +2661,21 @@ module Tart
       # || "off" — reasoning-gated like the footer's `model • level`
       # segment (a non-reasoning model carries no level → thinking_off
       # #6c767b, the rig mock's settled border; the owner's reasoning
-      # model at level high renders #9776e5).
+      # model at level high renders #9776e5). The level is the RUNTIME
+      # session level when set (/thinking), else the settings-resolved
+      # one (pi session.thinkingLevel over the settings default).
       def editor_border_color
         return Theme[:bashMode] if bash_mode?
 
-        level = @footer_data&.fetch(:thinking_level, nil) if @footer_data&.fetch(:reasoning, nil)
+        level = thinking_level if @footer_data&.fetch(:reasoning, nil)
         token = "thinking_#{level || :off}".to_sym
         Theme::TOKENS.key?(token) ? Theme[token] : Theme[:thinking_off]
+      end
+
+      # The session's thinking level (pi agent.state.thinkingLevel): nil
+      # = not set this session — the settings-resolved default shows.
+      def thinking_level
+        @thinking_level || @footer_data&.fetch(:thinking_level, nil)
       end
 
       def status_title
@@ -2668,8 +2709,12 @@ module Tart
         width = viewport_width
         pwd = Chat.format_cwd(data[:cwd] || Dir.pwd)
         pwd = "#{pwd} (#{read_branch(data[:cwd])})" if read_branch(data[:cwd])
+        # The pwd span carries the dim token ITSELF (pi footer.ts:282 —
+        # theme.fg("dim", pwd)); TUI.line's array form ignores the line
+        # fg, so the line-level fg: was silently dropping the color (the
+        # default-fg pwd/branch defect).
         TUI.paragraph(text: [
-          TUI.line(clip_spans([TUI.span(pwd)], width), fg: Theme[:dim]),
+          TUI.line(clip_spans([TUI.span(pwd, fg: Theme[:dim])], width)),
           footer_stats(data, width),
         ], wrap: false)
       end
@@ -2708,9 +2753,19 @@ module Tart
         parts << "W#{Chat.format_tokens(totals[:cache_write])}" if totals[:cache_write].positive?
         parts << "CH#{format("%.1f%%", cache_hit_rate)}" if cache_hit_rate
 
+        # The model segment (pi footer.ts:233-244): +model • <level>+
+        # when reasoning-capable — level "off" renders the spelled-out
+        # "thinking off" (pi's literal). The provider prefix is pi's
+        # >1-available-provider gate (:246-258) — the port resolves one
+        # static provider, so it NEVER renders (the owner's live
+        # "(openai) " finding). The level is the runtime session level
+        # (/thinking), else the settings-resolved one.
         model = data[:model] || "no-model"
-        right = data[:reasoning] ? "#{model} • #{data[:thinking_level]}" : model
-        right = "(#{data[:provider]}) #{right}" if data[:provider]
+        right = if data[:reasoning]
+          thinking_level == "off" ? "#{model} • thinking off" : "#{model} • #{thinking_level}"
+        else
+          model
+        end
         left = parts.map { |part| TUI.span("#{part} ", fg: Theme[:dim]) }
         left << TUI.span(context_segment(data), fg: context_fg)
         pad = width - left.sum { |span| TUI.text_width(span.content) } - TUI.text_width(right)
@@ -2887,7 +2942,11 @@ module Tart
             budget -= TUI.text_width(text)
           else
             head, = self.class.fit(text, budget)
-            out << TUI.span(head, fg: span.style&.fg, modifiers: span.style&.modifiers.to_a)
+            # The bg rides the rebuild too — the bg panels' fill spans are
+            # the ones that get trimmed here (the scrollbar overlay clips
+            # every row to width−1), and dropping it was the "backgrounds
+            # vanish while scrolling" defect.
+            out << TUI.span(head, fg: span.style&.fg, bg: span.style&.bg, modifiers: span.style&.modifiers.to_a)
             budget -= TUI.text_width(head)
           end
         end
@@ -2965,10 +3024,22 @@ module Tart
       # pi re-renders the whole streaming message each update, no
       # incremental cleverness. The transcript area's tail clip bounds it
       # (deltas append; the window slides).
+      #
+      # The region renders the assistant message's SETTLED shape from the
+      # first delta (pi updateContent runs while streaming — the leading
+      # Spacer(1) :103-105 and the between-runs Spacer :172-174 are
+      # component children, not post-hoc inserts): leading blank, the
+      # reasoning rows, a blank when content follows the reasoning, the
+      # content. The blank appearing only at completion was the 2nd-pass
+      # shift (the row insert moved streaming content down a line).
       def live_lines(width)
         return [] if @live.empty? && @reasoning.empty?
 
-        reasoning_lines(@reasoning, width) + (@live.empty? ? [] : markdown_lines(@live, width))
+        lines = [blank_line]
+        lines.concat(reasoning_lines(@reasoning, width)) unless @reasoning.empty?
+        lines << blank_line if !@reasoning.empty? && !@live.empty?
+        lines.concat(markdown_lines(@live, width)) unless @live.empty?
+        lines
       end
 
       # The editor area's extra rows while the suggestion list is active:
@@ -3112,6 +3183,36 @@ module Tart
           end
         end
       end
+
+      # /thinking's seam (pi selectThinkingLevel :5165-5177): the session
+      # level changes, the border reports "Thinking level: <level>"
+      # (pi showStatus) until the next agent event clears it. The level
+      # drives the footer's `model • <level>` segment and the editor
+      # border color ({editor_border_color}) — pi footer.invalidate +
+      # updateEditorBorderColor. (Public — the dispatcher's callable.)
+      def set_thinking_level(level)
+        @mutex.synchronize do
+          @thinking_level = level
+          @border_status = "Thinking level: #{level}"
+        end
+        @kernel.request_draw
+      end
+
+      # pi cycleThinkingLevel (agent-session.ts:2641-2653): the next
+      # level in THINKING_LEVEL_OPTIONS order, wrapping — the port's
+      # analog for the bare /thinking command (pi opens its selector
+      # there; the port has no selector UI, the cycle is the keybinding's
+      # behavior — itemized deviation). (Public — the dispatcher's
+      # callable.)
+      def cycle_thinking_level
+        current = @mutex.synchronize { thinking_level || Settings::DEFAULTS.fetch("thinkingLevel") }
+        levels = Settings::THINKING_LEVELS
+        next_level = levels[(levels.index(current) + 1) % levels.size]
+        set_thinking_level(next_level)
+        next_level
+      end
+
+      public :set_thinking_level, :cycle_thinking_level
 
       # app.tools.expand (pi setToolsExpanded :6810-6826): the GLOBAL
       # toggle — every expandable block rebuilds collapsed↔expanded in

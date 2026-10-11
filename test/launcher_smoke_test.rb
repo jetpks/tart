@@ -78,11 +78,13 @@ module Tart
       assert_equal "/somewhere", data[:cwd]
       assert_equal "medium", data[:thinking_level]
       assert data.key?(:model) && data.key?(:context_window) && data.key?(:auto_compact)
-      # The model metadata (I16, pi footer.ts:226-258): the assumed model
-      # falls back to the provider slug it was built with; not
-      # reasoning-capable.
-      assert_equal "openai", data[:provider]
-      refute data[:reasoning], "an assumed model carries no reasoning capability"
+      # The model metadata (pi footer.ts:226-258): the provider prefix is
+      # pi's >1-available-provider gate — the port never renders it, so
+      # footer_data carries no provider at all. The assumed glm resolves
+      # reasoning-capable through the known-models table (the owner's
+      # daily driver — pi's footer shows its level).
+      refute data.key?(:provider), "no provider label — pi's single-provider fallthrough"
+      assert data[:reasoning], "the assumed glm is reasoning-capable (the known-models table)"
 
       data = Executable.footer_data("/somewhere", settings.merge("thinkingLevel" => "off"), chat: chat)
       assert_equal "off", data[:thinking_level]

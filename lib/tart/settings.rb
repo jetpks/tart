@@ -44,8 +44,7 @@ module Tart
       "thinkingLevel" => "medium",
       "compaction" => {"enabled" => true, "reserveTokens" => 16_384, "keepRecentTokens" => 20_000},
       # Footer model-metadata staging (rarely set; nil = resolve from the
-      # model, see {model_provider_label}/{model_reasoning_capable}).
-      "modelProvider" => nil,
+      # model, see {model_reasoning_capable}).
       "modelReasoning" => nil
     }.freeze
 
@@ -64,12 +63,19 @@ module Tart
       "defaultProvider" => "TART_PROVIDER",
       "apiBase" => "TART_API_BASE",
       "apiKey" => "TART_API_KEY",
-      "modelProvider" => "TART_MODEL_PROVIDER",
       "modelReasoning" => "TART_MODEL_REASONING"
     }.freeze
 
     MODEL_CONTEXT_WINDOWS = {
       "accounts/fireworks/models/glm-5p3-flash" => 1_048_573
+    }.freeze
+
+    # The known reasoning-capable models (same assumed-model class as
+    # {MODEL_CONTEXT_WINDOWS}: ids RubyLLM's registry has no entry for,
+    # but the owner's daily-driver catalog declares reasoning — pi's
+    # footer shows the level for them, so the port must too).
+    MODEL_REASONING = {
+      "accounts/fireworks/models/glm-5p3-flash" => true
     }.freeze
 
     Diagnostic = Struct.new(:type, :message, :path, keyword_init: true)
@@ -130,23 +136,24 @@ module Tart
       THINKING_LEVELS.include?(level) ? level : DEFAULTS.fetch("thinkingLevel")
     end
 
-    # The footer's model metadata (pi footer.ts:246-258 reads
-    # state.model.provider / state.model.reasoning off the registry's
-    # model entry; the port's registry is RubyLLM's — a found entry
-    # answers .provider and .supports?(:reasoning), an assumed model
-    # falls back to the provider slug it was built with and is not
-    # reasoning-capable). Stageable for rigs/mocks: the modelProvider /
-    # modelReasoning settings (TART_MODEL_PROVIDER / TART_MODEL_REASONING
-    # env) override the model.
-    def model_provider_label(settings, model)
-      resolve_setting("modelProvider", settings) || (model.provider if model.respond_to?(:provider))
-    end
-
+    # The footer's model-metadata fact (pi footer.ts:233-244 reads
+    # state.model?.reasoning off the registry's model entry; the port's
+    # registry is RubyLLM's — a found entry answers .supports?(:reasoning)).
+    # The provider LABEL is never rendered: pi prefixes the model only
+    # when its available-model snapshot spans >1 provider (footer.ts:246
+    # -258) — the port's static snapshot is one provider, so the prefix
+    # never fires. Stageable for rigs/mocks: the modelReasoning setting
+    # (TART_MODEL_REASONING env) overrides everything; an assumed model
+    # (no registry entry) falls back to the known-models table — the
+    # owner's daily-driver glm declares reasoning in pi's book, and the
+    # footer/border parity dies without it.
     def model_reasoning_capable(settings, model)
       staged = resolve_setting("modelReasoning", settings)
       return staged == true || staged == "true" unless staged.nil?
 
-      model.respond_to?(:supports?) ? model.supports?(:reasoning) : false
+      MODEL_REASONING.fetch(model&.id) do
+        model.respond_to?(:supports?) ? model.supports?(:reasoning) : false
+      end
     end
 
     # The compaction settings as Agent::Loop kwargs (camelCase JSON keys →

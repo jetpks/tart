@@ -40,6 +40,3 @@ responses:
           command: "seq 1 2100"
   - type: stream
     content: "The truncated bash output was captured; fixed final reply for the spike."
-env:
-  tart:
-    TART_MODEL_PROVIDER: mock

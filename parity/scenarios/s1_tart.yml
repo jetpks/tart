@@ -11,4 +11,3 @@ responses:
 env:
   tart:
     TART_IDENTITY: tart
-    TART_MODEL_PROVIDER: mock

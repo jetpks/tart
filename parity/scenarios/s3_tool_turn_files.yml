@@ -6,7 +6,6 @@
 # tool paths relative to their cwd — the tmux pane's staged sandbox — so the
 # sandbox-relative write/read completes identically in pi and the port.
 #
-# Footer staging (I16, same seam as s1/s2): TART_MODEL_PROVIDER=mock.
 name: s3_tool_turn_files
 prompt: "write then read the file"
 expected_requests: 3
@@ -28,6 +27,3 @@ responses:
           path: "s3-tool-turn-note.txt"
   - type: stream
     content: "The file tools ran; fixed final reply for the spike."
-env:
-  tart:
-    TART_MODEL_PROVIDER: mock

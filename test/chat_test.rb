@@ -18,6 +18,7 @@ module Tart
   class ChatTest < Test
     def setup
       @dir = Dir.mktmpdir("tart-chat-")
+      @commands_output = []
     end
 
     def teardown
@@ -96,6 +97,69 @@ module Tart
         x = session.buffer_content[y].index("p")
         assert_equal Theme[:thinkingText], session.cell_fg(x, y)
         assert_includes session.cell_modifiers(x, y), :italic
+      end
+    end
+
+    # The live region renders the assistant message's SETTLED shape from
+    # the first delta (pi updateContent runs while streaming — the leading
+    # Spacer is a component child, not a completion-time insert): the
+    # completed message occupies the row it streamed on, no 2nd-pass blank
+    # shift.
+    def test_completion_does_not_shift_the_streaming_content
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        send_message(chat, "hi")
+        draw(chat, session)
+        stream(chat, "hello")
+        draw(chat, session)
+        live_row = session.buffer_content.index { |row| row.include?("hello") }
+        assert_equal "", session.buffer_content[live_row - 1].rstrip,
+          "the leading blank rides the live region from the first delta"
+
+        finish_message(chat, "hello")
+        draw(chat, session)
+        settled_row = session.buffer_content.index { |row| row.include?("hello") }
+        assert_equal live_row, settled_row, "the completed message keeps its streamed row"
+      end
+    end
+
+    # The between-runs blank (pi assistant-message.ts:172-174 — the Spacer
+    # when content follows thinking) materializes when the content STARTS,
+    # not at completion.
+    def test_live_region_inserts_the_reasoning_content_blank_when_content_starts
+      with_chat(width: 18, screen_height: 12) do |chat, session|
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
+        draw(chat, session)
+        reasoning_row = session.buffer_content.index { |row| row.include?("pondering") }
+        assert_equal "", session.buffer_content[reasoning_row - 1].rstrip, "the leading blank precedes the reasoning"
+
+        chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("answer")})
+        draw(chat, session)
+        content_row = session.buffer_content.index { |row| row.include?("answer") }
+        assert_equal "", session.buffer_content[content_row - 1].rstrip,
+          "a blank separates the thinking run from the content while streaming"
+      end
+    end
+
+    # The panel backgrounds survive the scrollbar overlay (the owner's
+    # scrolling finding): the overlay clips every row to width−1, and the
+    # trimmed fill spans must keep their bg (the full-width paddingY
+    # blanks were the visible casualties).
+    def test_panel_backgrounds_survive_the_scrollbar_overlay
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        send_message(chat, "hi")
+        10.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session) # settle: the buffer flushes, follow pins to the end
+        chat.scrollbar_hide_delay_ms = 10_000 # fresh for the duration of the test — no real sleeps
+        3.times { chat.on_event(TUI.key_event("page_up")) } # scroll to the top; the echo is on screen
+        draw(chat, session)
+        assert_equal "│", session.cell_symbol(19, 3), "the rail is visible (the overlay is what clipped the bg away)"
+
+        echo_top = session.buffer_content.index { |row| row.include?("hi") }
+        assert_equal Theme[:user_message_bg], session.cell_bg(0, echo_top),
+          "the echo's content row keeps the panel bg under the overlay"
+        assert_equal Theme[:user_message_bg], session.cell_bg(0, echo_top - 1),
+          "the echo's paddingY blank row keeps the panel bg (the full-width bg span clips)"
       end
     end
 
@@ -1073,8 +1137,10 @@ module Tart
     # pi-mode's MOTD (I16 AC2): the oracle's built-in header bytes — the
     # half-block mark with the tracked oracle version on its first line,
     # the hints on its second, the ctrl+o notice, then the onboarding
-    # line (pi interactive-mode.ts:1028-1063) — and NO resource sections
-    # (pi's collapsed header shows none). No tart art/version/hints.
+    # line (pi interactive-mode.ts:1028-1063). The loaded-resource
+    # sections render below when resources exist (pi showLoadedResources
+    # — the owner's missing [Context]/[Skills]/[Prompts]/[Extensions]
+    # block); none loaded here → none render. No tart art/version/hints.
     def test_motd_renders_pi_header_bytes_in_pi_mode
       TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 24) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
@@ -1092,7 +1158,7 @@ module Tart
         assert_equal "", lines[4], "the header text's blank row"
         assert_equal " #{Render::Chat::PI_ONBOARDING_LINE}", lines[5], "the onboarding line"
         assert_equal "", lines[6], "the header container closes with its Spacer(1)"
-        assert_empty lines[7..], "no [Context]/[Skills] in pi's collapsed header"
+        assert_empty lines[7..], "no resources loaded → no sections (pi gates each on entries)"
 
         mark = session.buffer_content[1]
         assert_equal Theme[:logoCoral], session.cell_fg(1, 1), "the top pixel renders coral (pi-logo.ts)"
@@ -1104,6 +1170,31 @@ module Tart
           "the hint keys render the dim token (keyHint — keybinding-hints.ts:43)"
         assert_equal Theme[:muted], session.cell_fg(hints_row.index("interrupt"), 2),
           "the hint descriptions render the muted token (keyHint's description run)"
+      end
+    end
+
+    # The loaded-resource sections ride BOTH identities (pi
+    # showLoadedResources renders for any): [Prompts] lists the loaded
+    # templates as /name (pi promptCompactList :1896), [Extensions] the
+    # MCP server names — sorted, dim, blank-separated like [Skills].
+    def test_motd_renders_prompt_and_extension_sections
+      template = Prompts::Template.new(name: "council", description: "d", content: "body", file_path: "/x/council.md")
+      TUI.run(headless: true, viewport: :fullscreen, width: 60, screen_height: 24) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
+          settings_root: @dir, footer_data: {cwd: @dir},
+          prompts: [template], extensions: ["memory", "notify"])
+        draw(chat, session)
+        lines = chat.transcript_lines
+
+        prompts_i = lines.index { |line| line.include?("[Prompts]") }
+        extensions_i = lines.index { |line| line.include?("[Extensions]") }
+        refute_nil prompts_i, "the [Prompts] section renders"
+        refute_nil extensions_i, "the [Extensions] section renders"
+        assert_includes lines[extensions_i - 1], "", "sections stay blank-separated"
+        assert lines[extensions_i - 1].strip.empty?, "a blank precedes each section header"
+        assert_includes lines[prompts_i + 1].strip, "/council", "the template renders as /name"
+        assert_equal ["memory", "notify"], lines[extensions_i + 1].strip.split(", "),
+          "the extension names render sorted, comma-joined"
       end
     end
 
@@ -1362,16 +1453,73 @@ module Tart
       end
     end
 
-    # The provider label (I16, pi footer.ts:246-258): the launcher-
-    # resolved provider label prefixes the model segment; no label → the
-    # bare model (pi's single-provider fallthrough).
-    def test_footer_renders_the_provider_label
+    # The provider label NEVER renders (pi footer.ts:246-258 — the
+    # prefix is gated on >1 available provider; the port resolves one
+    # static provider — the owner's live "(openai) " finding).
+    def test_footer_never_renders_the_provider_label
       with_chat(width: 40, screen_height: 12,
         footer_data: {cwd: @dir, model: "m", context_window: 1000, provider: "mock"}) do |chat, session|
         draw(chat, session)
-        assert_includes footer_text(session), "(mock) m", "the provider label prefixes the model"
-        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("(mock) m"),
-          "the labeled model right-aligns"
+        refute_includes footer_text(session), "(mock)", "no provider prefix at any gate"
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("m"),
+          "the bare model right-aligns"
+      end
+    end
+
+    # pi footer.ts:238 — level "off" renders the spelled-out
+    # "thinking off", not the bare token.
+    def test_footer_renders_thinking_off_spelled_out
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "off", reasoning: true}) do |chat, session|
+        draw(chat, session)
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("m • thinking off"),
+          'the off level renders as "thinking off"'
+      end
+    end
+
+    # /thinking's runtime seam (pi selectThinkingLevel :5165-5177 —
+    # footer.invalidate + updateEditorBorderColor + showStatus): the
+    # session level drives the footer segment AND the editor border
+    # color, live; the border status reports.
+    def test_thinking_command_updates_the_footer_and_border_live
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true}) do |chat, session|
+        handler = Commands::Handler.new(
+          skills: [], settings: {}, output: ->(text) { @commands_output << text },
+          spawn: ->(&block) { block.call }, agent: -> { nil }, reset: -> {},
+          thinking: ->(arg) { arg == :cycle ? chat.cycle_thinking_level : chat.set_thinking_level(arg) },
+          quit: -> {}
+        )
+
+        handler.dispatch("/thinking high")
+        draw(chat, session)
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("m • high"),
+          "the footer shows the runtime level"
+        border_row = session.buffer_content.rindex { |row| row.include?("─") }
+        assert_equal Theme[:thinking_high], session.cell_fg(0, border_row),
+          "the editor border follows the level (getThinkingBorderColor — the bottom border row is all glyph cells)"
+
+        handler.dispatch("/thinking")
+        draw(chat, session)
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("m • xhigh"),
+          "the bare command cycles to the next level"
+
+        handler.dispatch("/thinking nope")
+        assert @commands_output.last.include?("Unknown thinking level"), "unknown levels error, the level holds"
+      end
+    end
+
+    # The footer's pwd line renders the dim token (pi footer.ts:282 —
+    # theme.fg("dim", pwd); the line-level fg was silently dropped by the
+    # span-array path — the default-fg pwd/branch defect).
+    def test_footer_pwd_renders_the_dim_token
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: "/tmp", model: "m", context_window: 1000}, branch_reader: ->(_cwd) { "main" }) do |chat, session|
+        draw(chat, session)
+        pwd_row = session.buffer_content.index { |row| row.include?("(") && row.include?("main") }
+        text = session.buffer_content[pwd_row]
+        assert_equal Theme[:dim], session.cell_fg(text.index("/"), pwd_row), "the pwd renders dim"
+        assert_equal Theme[:dim], session.cell_fg(text.index("main"), pwd_row), "the branch renders dim"
       end
     end
 

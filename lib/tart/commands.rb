@@ -25,16 +25,19 @@ module Tart
     #
     # The frozen builtin set is exactly these seven (each pi cut is bound
     # to a feature the port lacks — itemized in the lane's deviation
-    # table): pi's other 18 published builtins (model, tree, thinking,
+    # table): pi's other 17 published builtins (model, tree,
     # scoped-models, export, import, share, bug, copy, name, session,
     # changelog, hotkeys, fork, clone, trust, login, logout, reload) plus
-    # its hidden debug commands are cut.
+    # its hidden debug commands are cut. /thinking (pi slash-commands.ts
+    # :23, "Set thinking level", argumentHint <level>) IS in — the level
+    # drives the footer segment and the editor border color.
     BUILTINS = {
       "new" => {description: "Start a new session"},
       "compact" => {description: "Manually compact the session context", args: true},
       "resume" => {description: "Resume a different session"},
       "skills" => {description: "List loaded skills"},
       "settings" => {description: "Show resolved settings"},
+      "thinking" => {description: "Set thinking level", args: true},
       "help" => {description: "Show the builtin commands"},
       "quit" => {description: "Quit tart"}
     }.freeze
@@ -85,9 +88,15 @@ module Tart
     # @param reset [Proc] starts a fresh session (/new).
     # @param resume [Proc, nil] opens the session picker (/resume); nil
     #   (test doubles) makes /resume a no-op.
+    # @param thinking [Proc] sets the session's thinking level —
+    #   +call(:cycle)+ cycles, +call(level)+ sets (the surface's seam;
+    #   /thinking, pi selectThinkingLevel).
+    # @param prompts [Array<Prompts::Template>] the loaded templates
+    #   (/name expansion; empty = templates never match).
     # @param quit [Proc] exits the app (/quit).
     class Handler
-      def initialize(skills:, settings:, output:, spawn:, agent:, reset:, resume: nil, quit:)
+      def initialize(skills:, settings:, output:, spawn:, agent:, reset:, resume: nil, thinking: nil,
+        quit:, prompts: [])
         @skills = skills
         @settings = settings
         @output = output
@@ -95,12 +104,16 @@ module Tart
         @agent = agent
         @reset = reset
         @resume = resume
+        @thinking = thinking
         @quit = quit
+        @prompts = prompts
       end
 
-      # Expands /skill:<name> text (pure pass-through otherwise).
+      # Expands /skill:<name> then /<template> text (pi agent-session.ts
+      # :2005-2007 — skills first, then prompt templates; pure
+      # pass-through otherwise).
       def expand_skill(text)
-        Commands.expand_skill(text, @skills)
+        Prompts.expand(Commands.expand_skill(text, @skills), @prompts)
       end
 
       # Dispatches a builtin (pi's submit-top if-chain); false when the
@@ -116,12 +129,28 @@ module Tart
         when "resume" then @resume&.call
         when "skills" then list_skills
         when "settings" then show_settings
+        when "thinking" then dispatch_thinking(text)
         when "help" then show_help
         end
         true
       end
 
       private
+
+      # pi handleThinkingCommand (:5145-5163): an arg sets the exact
+      # level; the bare command opens pi's selector — the port has no
+      # selector UI, so it cycles (the app.thinking.cycle behavior,
+      # itemized). An unknown level is pi's showError text.
+      def dispatch_thinking(text)
+        arg = text.split(/\s+/, 2)[1].to_s.strip
+        if arg.empty?
+          @thinking&.call(:cycle)
+        elsif Settings::THINKING_LEVELS.include?(arg)
+          @thinking&.call(arg)
+        else
+          @output.call(%(Unknown thinking level "#{arg}". Available levels: #{Settings::THINKING_LEVELS.join(", ")}.))
+        end
+      end
 
       # pi handleCompactCommand (interactive-mode.ts:7080): compact now.
       # pi aborts a running turn first (session.compact → this.abort(),
