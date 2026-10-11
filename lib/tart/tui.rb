@@ -82,6 +82,12 @@ module Tart
         RatatuiRuby.get_cell_at(x, y).fg
       end
 
+      # Background color of the cell at (+x+, +y+) — the bg readback for the
+      # body-color spans (same readback vocabulary as {cell_fg}).
+      def cell_bg(x, y)
+        RatatuiRuby.get_cell_at(x, y).bg
+      end
+
       # Modifiers of the cell at (+x+, +y+) — modifier-style assertions on
       # the headless test terminal (e.g. the input line's fake cursor reads
       # back as [:reversed]).
@@ -235,16 +241,19 @@ module Tart
       RatatuiRuby::Widgets::Paragraph.new(text:, wrap:)
     end
 
-    # @return [RatatuiRuby::Style::Style] a style value (fg color + modifiers).
-    def style(fg: nil, modifiers: [])
-      RatatuiRuby::Style::Style.new(fg:, modifiers:)
+    # @return [RatatuiRuby::Style::Style] a style value (fg/bg colors +
+    #   modifiers). Colors are symbol names or hex strings ("#rrggbb") —
+    #   whichever the gem's Style accepts (style.rb:100-104; hex parses to
+    #   Color::Rgb in ext style.rs:20-33).
+    def style(fg: nil, bg: nil, modifiers: [])
+      RatatuiRuby::Style::Style.new(fg:, bg:, modifiers:)
     end
 
     # @return [RatatuiRuby::Text::Span] one styled span — the seam's span
-    #   vocabulary (fg color name + modifiers, both optional; an unstyled
+    #   vocabulary (fg/bg colors + modifiers, all optional; an unstyled
     #   span carries no Style value at all).
-    def span(content, fg: nil, modifiers: [])
-      styled = (fg || modifiers.any?) ? style(fg:, modifiers:) : nil
+    def span(content, fg: nil, bg: nil, modifiers: [])
+      styled = (fg || bg || modifiers.any?) ? style(fg:, bg:, modifiers:) : nil
       RatatuiRuby::Text::Span.new(content:, style: styled)
     end
 
@@ -316,6 +325,13 @@ module Tart
     #   raw mode arrives as an in-band Key event, never as SIGINT).
     def ctrl_c?(event)
       event.key? && event.ctrl? && event.code == "c"
+    end
+
+    # @return [Boolean] whether +event+ is the bare escape key (pi's
+    #   app.interrupt binding, keybindings.ts:26 — the editor's onEscape
+    #   path, custom-editor.ts:103-111).
+    def escape?(event)
+      event.key? && event.code == "escape" && !(event.modifiers & %w[ctrl alt]).any?
     end
   end
 end

@@ -23,15 +23,16 @@ module Tart
     # an unknown skill passes through as plain text (:2155); the expanded
     # block is what the model receives and what the session records.
     #
-    # The frozen builtin set is exactly these six (each pi cut is bound to
-    # a feature the port lacks — itemized in the lane's deviation table):
-    # pi's other 19 published builtins (model, tree, thinking, scoped-
-    # models, export, import, share, bug, copy, name, session, changelog,
-    # hotkeys, fork, clone, trust, login, logout, resume, reload) plus its
-    # hidden debug commands are cut.
+    # The frozen builtin set is exactly these seven (each pi cut is bound
+    # to a feature the port lacks — itemized in the lane's deviation
+    # table): pi's other 18 published builtins (model, tree, thinking,
+    # scoped-models, export, import, share, bug, copy, name, session,
+    # changelog, hotkeys, fork, clone, trust, login, logout, reload) plus
+    # its hidden debug commands are cut.
     BUILTINS = {
       "new" => {description: "Start a new session"},
       "compact" => {description: "Manually compact the session context", args: true},
+      "resume" => {description: "Resume a different session"},
       "skills" => {description: "List loaded skills"},
       "settings" => {description: "Show resolved settings"},
       "help" => {description: "Show the builtin commands"},
@@ -82,15 +83,18 @@ module Tart
     #   commands run on the reactor fiber, like agent.run).
     # @param agent [Proc] the current {Agent::Loop} (/compact's target).
     # @param reset [Proc] starts a fresh session (/new).
+    # @param resume [Proc, nil] opens the session picker (/resume); nil
+    #   (test doubles) makes /resume a no-op.
     # @param quit [Proc] exits the app (/quit).
     class Handler
-      def initialize(skills:, settings:, output:, spawn:, agent:, reset:, quit:)
+      def initialize(skills:, settings:, output:, spawn:, agent:, reset:, resume: nil, quit:)
         @skills = skills
         @settings = settings
         @output = output
         @spawn = spawn
         @agent = agent
         @reset = reset
+        @resume = resume
         @quit = quit
       end
 
@@ -109,6 +113,7 @@ module Tart
         when "quit" then @quit.call
         when "new" then @reset.call
         when "compact" then @spawn.call { dispatch_compact }
+        when "resume" then @resume&.call
         when "skills" then list_skills
         when "settings" then show_settings
         when "help" then show_help

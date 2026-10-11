@@ -86,15 +86,41 @@ module Tart
     end
 
     # bin/tart launches the agent on load, so it cannot be required — eval
-    # its source minus the final run line to reach the filter module (the
+    # its source minus the final run line to reach the module (the
     # launcher boot itself is covered by the child-process smoke above).
-    def launcher_filter
+    def launcher
       src = File.read(File.join(REPO_ROOT, "bin", "tart"))
         .sub(/^Tart::Executable\.run\(ARGV\)\n\z/, "")
       # Anchor the filename so bin/tart's require_relative resolves (it is
       # already loaded in-process and no-ops).
       eval(src, TOPLEVEL_BINDING, File.join(REPO_ROOT, "bin", "tart")) # rubocop:disable Security/Eval
+      Executable
+    end
+
+    def launcher_filter
+      launcher
       Executable::QuietIOBufferWarning
+    end
+
+    # The exit resume hint (item 1/AC1, pi formatResumeCommand
+    # interactive-mode.ts:339-355 + the :4324 print): exact shape (dim
+    # label, plain command) when the session was persisted; nothing when
+    # not (pi's isPersisted gate; the isTTY gate is itemized — the port's
+    # interactive exit only ever runs on a terminal).
+    def test_resume_hint_shape_and_not_persisted_branch
+      launcher
+      recorder = Object.new.tap do |r|
+        r.define_singleton_method(:persisted?) { true }
+        r.define_singleton_method(:id) { "abc123" }
+      end
+      assert_equal "\e[2mTo resume this session:\e[0m tart --resume abc123", Executable.resume_hint(recorder)
+
+      unpersisted = Object.new.tap do |r|
+        r.define_singleton_method(:persisted?) { false }
+        r.define_singleton_method(:id) { "abc123" }
+      end
+      assert_nil Executable.resume_hint(unpersisted), "nothing when the session was never persisted"
+      assert_nil Executable.resume_hint(nil), "no recorder (boot failure) — nothing"
     end
 
     def smoke_env(home, server)

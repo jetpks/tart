@@ -180,6 +180,23 @@ module Tart
         @stop_mutex.synchronize { @stop }
       end
 
+      # Cancels the in-flight work (the work task, else the {#async} tasks)
+      # WITHOUT the Ctrl+C quit fallback — the editor's escape-interrupt path
+      # (pi app.interrupt, keybindings.ts:26 → onEscape aborts a streaming
+      # run, interactive-mode.ts:3070-3090): an idle loop stays alive. Same
+      # Task#stop mechanism as the Ctrl+C path — no second interrupt path.
+      # @return [Boolean] whether any live work was cancelled.
+      def interrupt_work!
+        work = @work_task
+        if work&.alive?
+          work.stop
+          true
+        elsif @tasks.any?(&:alive?)
+          @tasks.each(&:stop)
+          true
+        end
+      end
+
       # @return [Boolean] whether a Ctrl+C interrupt was seen this run.
       #   Thread-safe (I02 carry-in).
       def interrupted?
@@ -207,14 +224,7 @@ module Tart
       # interrupt stops the loop.
       def interrupt!
         @stop_mutex.synchronize { @interrupted = true }
-        work = @work_task
-        if work&.alive?
-          work.stop
-        elsif @tasks.any?(&:alive?)
-          @tasks.each(&:stop)
-        else
-          stop!
-        end
+        interrupt_work! || stop!
       end
 
       # Runs the work subtree; any exit path eventually stops the loop.

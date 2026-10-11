@@ -56,8 +56,30 @@ module Tart
 
     # --- the frozen builtin set ---
 
-    def test_builtin_set_is_exactly_the_six_frozen_commands
-      assert_equal %w[new compact skills settings help quit], Commands::BUILTINS.keys
+    def test_builtin_set_is_exactly_the_seven_frozen_commands
+      assert_equal %w[new compact resume skills settings help quit], Commands::BUILTINS.keys
+    end
+
+    # /resume (item 2, pi slash-commands.ts:41 + interactive-mode.ts
+    # :3335-3338): dispatch opens the picker through the resume callable —
+    # never falls through to the model.
+    def test_resume_dispatch_opens_the_picker
+      @handler = Commands::Handler.new(
+        skills: @skills, settings: {}, output: ->(text) { @calls[:output] << text },
+        spawn: ->(&block) { block.call }, agent: -> { @agent }, reset: -> {},
+        resume: -> { @calls[:resume] = true }, quit: -> {}
+      )
+      assert @handler.dispatch("/resume")
+      assert @calls[:resume], "the resume callable fired"
+
+      @calls[:resume] = nil
+      @handler.dispatch("/resume all")
+      assert_nil @calls[:resume], "pi matches /resume exactly (interactive-mode.ts:3335)"
+    end
+
+    def test_resume_without_the_seam_is_a_noop
+      assert @handler.dispatch("/resume"), "dispatched (not a model passthrough)"
+      assert_empty @calls[:output]
     end
 
     # --- match shapes (pi: /new /quit exact, /compact takes args) ---

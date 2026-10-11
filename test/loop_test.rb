@@ -130,6 +130,39 @@ module Tart
       assert_operator state[:steps], :<, 50, "work must stop well before the loop tears down"
     end
 
+    # interrupt_work! (item 5/AC6, the escape path): cancels live work
+    # through the same Task#stop mechanism WITHOUT the ctrl+c quit
+    # fallback — an idle loop stays alive (pi onEscape aborts a streaming
+    # run, interactive-mode.ts:3070-3090; app.interrupt = escape,
+    # keybindings.ts:26).
+    def test_interrupt_work_cancels_tasks_without_stopping_the_loop
+      session = ScriptedSession.new
+      state = {cancelled: false, still_running: nil}
+      spawned = Queue.new
+      event_loop = Core::Loop.new(session:)
+      event_loop.on_event = lambda do |_event, _source|
+        if spawned.empty?
+          spawned << event_loop.async do
+            loop { sleep 0.01 }
+          rescue Async::Cancel
+            state[:cancelled] = true
+            raise
+          end
+        else
+          event_loop.interrupt_work!
+          state[:still_running] = !event_loop.stop_requested?
+          event_loop.stop!
+        end
+      end
+      session.push_native(KeyEvent.new("a", []))
+      session.push_native(KeyEvent.new("b", []))
+
+      event_loop.run
+
+      assert state[:cancelled], "the async'd agent-run task is cancelled (Task#stop — the ctrl+c mechanism)"
+      assert state[:still_running], "the loop outlives the interrupt — escape never quits (no stop! fallback)"
+    end
+
     def test_static_loop_is_not_fixed_rate
       session = ScriptedSession.new(poll_timeout: 0.005)
       event_loop = Core::Loop.new(session:)

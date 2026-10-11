@@ -209,16 +209,53 @@ module Tart
         draw(chat, session)
 
         leads = lead_cells(session)
-        assert_includes leads, ["a", nil],
-          "assistant text carries the terminal default fg (pi: userMessageText/text)"
+        assert_includes leads, ["a", Theme[:text]],
+          "assistant prose renders the text token's true color (pi: text, dark.json:6)"
         assert_includes leads, ["⎿", Theme[:tool_output]],
-          "tool output is muted (pi: toolOutput)"
-        assert_includes leads, ["❯", Theme[:user_message_text]],
-          "the user echo carries the blue distinction (pi: userMessageBg)"
+          "tool output is the muted token's true value (pi: toolOutput)"
+        assert_includes leads, ["h", Theme[:user_message_text]],
+          "the user echo renders the text token (pi: userMessageText) with NO prompt char"
         # The input row's lead cell (column 0 — pi's full-width editor)
         # keeps the terminal default, visually apart from the colored echo.
         assert_nil session.cell_fg(0, input_row(session)),
           "the input line keeps the terminal default — visually apart from the colored echo"
+      end
+    end
+
+    # The user echo's background (item 4, pi user-message.ts:40-51): the
+    # echo rows carry the userMessageBg truecolor background.
+    def test_user_echo_renders_the_userMessageBg_background
+      with_chat(width: 40) do |chat, session|
+        send_message(chat, "hi")
+        draw(chat, session)
+        y = buffer_row(chat, "hi")
+        x = session.buffer_content[y].index("h")
+        assert_equal Theme[:user_message_text], session.cell_fg(x, y)
+        assert_equal Theme[:user_message_bg], session.cell_bg(x, y),
+          "the echo rides the blueBg truecolor background (dark.json:13)"
+      end
+    end
+
+    # Region padding (item 5/AC5, PHASE 0 rule set: user echo only when
+    # the container is non-empty (interactive-mode.ts:3930-3931), tool
+    # blocks unconditional (tool-execution.ts:85), compaction summaries
+    # (:3903-3904), assistant messages with visible content
+    # (assistant-message.ts:103-105) — raw readback keeps the blanks).
+    def test_leading_blank_separates_every_scrollback_region
+      with_chat(width: 40) do |chat, session|
+        send_message(chat, "hi")                             # echo: container empty → no blank
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk("pondering")})
+        chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("answer")})
+        chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "answer")})
+        tool_end(chat, "bash", "done\nmore")                 # tool block
+        send_message(chat, "again")                          # echo: container non-empty → blank
+        finish_message(chat, "second")                       # assistant
+        draw(chat, session) # the frame's flush moves every region into the buffer
+
+        assert_equal ["hi", "", "pondering", "", "answer", "", "  ⎿ bash: done", "    more", "", "again", "", "second"],
+          chat.transcript_lines,
+          "every region opens with the leading blank (the first echo on an empty container does not)"
       end
     end
 
@@ -262,7 +299,7 @@ module Tart
         draw(chat, session)
 
         buffer = session.buffer_content
-        assert_includes buffer[0, transcript_height(session, chat)].join, "❯ hello", "transcript on top"
+        assert_includes buffer[0, transcript_height(session, chat)].join, "hello", "transcript on top"
         assert_includes buffer[transcript_height(session, chat), 3].join, "─", "the edit box below it"
         assert_equal "─", buffer[transcript_height(session, chat) + 2][0],
           "the editor's bottom border, full-width from column 0 (pi editor.ts)"
@@ -291,7 +328,7 @@ module Tart
         buffer = session.buffer_content
         assert_equal 16, buffer.size, "the redraw repaints the full screen at the new size"
         assert_equal 60, buffer.first.length
-        assert_includes buffer[0, transcript_height(session, chat)].join, "❯ hello",
+        assert_includes buffer[0, transcript_height(session, chat)].join, "hello",
           "the transcript survives the resize"
         assert_includes buffer[transcript_height(session, chat), 3].join, "─",
           "the edit box recomposes at the new geometry"
@@ -316,7 +353,7 @@ module Tart
 
       request = captured.first
       assert_equal "hi", request["messages"].select { |m| m["role"] == "user" }.last["content"]
-      assert_equal ["❯ hi"], chat.transcript_lines,
+      assert_equal ["hi"], chat.transcript_lines,
         "the submitted prompt is echoed into the transcript"
     end
 
@@ -617,7 +654,7 @@ module Tart
         bold = cells.find { |cell| cell[2] == "b" }
         assert_equal [:bold], bold[4], "strong renders the bold modifier (markdown.ts:683-687)"
         plain = cells.find { |cell| cell[2] == "p" }
-        assert_equal [nil, []], plain[3, 2], "plain prose keeps the terminal default"
+        assert_equal [Theme[:text], []], plain[3, 2], "plain prose renders the text token (pi: text, dark.json:6)"
         assert_equal 4, chat.transcript_lines.size,
           "the leading blank (pi between-item rule), the heading, its spacing row, and the paragraph occupy four transcript rows"
       end
@@ -659,7 +696,7 @@ module Tart
       kernel.run
       scenario.join
 
-      assert_equal ["❯ hi", "", "Title", "", "plain body"], chat.transcript_lines,
+      assert_equal ["hi", "", "Title", "", "plain body"], chat.transcript_lines,
         "the assistant reply renders as markdown rows in the transcript (leading blank, then the spacing row between blocks)"
     end
 
@@ -810,7 +847,7 @@ module Tart
         chat.on_event(TUI.key_event("enter"))
         assert_equal "", chat.input, "enter submits and clears the input line"
         draw(chat, session) # the frame's flush moves the echo into the buffer
-        assert_equal ["❯ hi ther"], chat.transcript_lines,
+        assert_equal ["hi ther"], chat.transcript_lines,
           "the submitted prompt is echoed into the transcript"
         assert_equal 1, chat_idle_kernel.submitted.size, "an idle submit starts an agent run"
       end
@@ -931,7 +968,7 @@ module Tart
         assert_equal "!A", chat.input, "a recalled entry is editable at the cursor"
         chat.on_event(TUI.key_event("enter"))
         draw(chat, session) # the frame's flush moves the echo into the buffer
-        assert_equal ["❯ A", "❯ B", "❯ !A"], chat.transcript_lines,
+        assert_equal ["A", "", "B", "", "!A"], chat.transcript_lines,
           "the edited recall sends as edited (after the two original echoes)"
       end
     end
@@ -1130,7 +1167,7 @@ module Tart
         chat.on_event(TUI.key_event("enter"))
         assert_equal "", chat.input
         draw(chat, session)
-        assert_equal ["❯ /architect"], transcript_lines(session, chat),
+        assert_equal ["/architect"], transcript_lines(session, chat),
           "enter applies AND submits (pi editor.ts:790-816 — a /-prefix completion falls through to submit, trimmed)"
       end
     end
@@ -1507,6 +1544,199 @@ module Tart
 
       assert_includes chat.transcript_lines.join, "answer",
         "the turn completed — escape with an active list never interrupts the run"
+    end
+
+    # Escape interrupts a streaming run (item 5/AC6, pi app.interrupt —
+    # keybindings.ts:26, custom-editor.ts:103-110 → onEscape aborts the
+    # generation, interactive-mode.ts:3070-3090): through the kernel's
+    # existing interrupt path (Task#stop — the ctrl+c mechanism).
+    def test_escape_interrupts_a_streaming_run_through_the_kernel_path
+      @server = MockLLMServer.new.start
+      @server.script([{type: :slow_stream, content: "x" * 40}])
+      kernel, chat, session = chat_with_server
+
+      scenario = Thread.new do
+        type(session, "long stream")
+        wait_until { chat.busy? }
+        session.push_event(TUI.key_event("escape"))
+        wait_until { !chat.busy? }
+        wait_until { chat.transcript_lines.join.include?("interrupted") }
+        @agent_interrupted = chat.agent.interrupted?
+        type(session, "still there") # the loop must still be alive to submit
+        wait_until { captured.any? { |req| req["messages"].select { |m| m["role"] == "user" }.last["content"] == "still there" } }
+        kernel.stop!
+      end
+      kernel.run
+      scenario.join
+
+      assert @agent_interrupted, "the agent saw the cancel (the ctrl+c interrupt path)"
+      assert_includes chat.transcript_lines.join, "interrupted"
+    end
+
+    def test_idle_escape_is_a_noop_kernel_driven
+      @server = MockLLMServer.new.start
+      kernel, chat, session = chat_with_server
+
+      scenario = Thread.new do
+        session.push_event(TUI.key_event("escape"))
+        type(session, "still there") # the loop must still be alive to submit
+        wait_until { !captured.empty? }
+        kernel.stop!
+      end
+      kernel.run
+      scenario.join
+
+      request = captured.first
+      assert_equal "still there", request["messages"].select { |m| m["role"] == "user" }.last["content"],
+        "idle escape neither quit the loop nor disturbed the editor"
+      assert_equal ["still there"], chat.transcript_lines, "only the echo — no interrupt residue"
+    end
+
+    # --- /resume picker (item 2/AC2, pi SessionSelectorComponent reduced)
+    # and the resume replay (item 3/AC3) ---
+
+    def test_picker_navigates_and_escapes_cancel
+      with_headless_chat(width: 50) do |chat|
+        resumed = []
+        chat.on_resume = ->(path) { resumed << path }
+        chat.open_session_picker([{path: "/a", label: "first"}, {path: "/b", label: "second"}])
+        assert_equal 0, chat.picker_index
+        chat.on_event(TUI.key_event("down"))
+        assert_equal 1, chat.picker_index
+        chat.on_event(TUI.key_event("up"))
+        chat.on_event(TUI.key_event("up"))
+        assert_equal 1, chat.picker_index, "up wraps to the last item (pi select-list wrap)"
+        chat.on_event(TUI.key_event("escape"))
+        assert_nil chat.picker_items, "escape cancels (pi onCancel)"
+        assert_empty resumed
+        chat.on_event(TUI.key_event("enter"))
+        assert_empty resumed, "a cancelled picker never resumes"
+      end
+    end
+
+    def test_picker_enter_fires_the_resume_seam
+      with_headless_chat do |chat|
+        resumed = []
+        chat.on_resume = ->(path) { resumed << path }
+        chat.open_session_picker([{path: "/a", label: "first"}, {path: "/b", label: "second"}])
+        chat.on_event(TUI.key_event("down"))
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal ["/b"], resumed, "enter resumes the selection (pi onSelect)"
+        assert_nil chat.picker_items, "the picker closes on resume"
+      end
+    end
+
+    def test_picker_renders_the_session_list_in_place_of_the_editor
+      with_chat(width: 50, screen_height: 14) do |chat, session|
+        chat.open_session_picker([{path: "/a", label: "first session"}, {path: "/b", label: "second session"}])
+        draw(chat, session)
+        buffer = session.buffer_content.join
+        assert_includes buffer, "Resume Session (Current Folder)", "pi's selector title (session-selector.ts:147)"
+        assert_match(/→ first session/, buffer, "the selection marker on the newest session")
+        assert_includes buffer, "second session"
+      end
+    end
+
+    # The replay (item 3/AC3): a recorded fixture session (real recorder
+    # shapes — Message#to_h entries, see the report's fixture dump)
+    # replays through the live-turn shapes + "Resumed session"; no MOTD.
+    def test_resume_session_replays_the_recorded_entries
+      recorded = recorded_session_fixture
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+        lines = chat.transcript_lines
+        joined = lines.join("\n")
+        assert_includes joined, "what is in notes.txt?", "the user echo replays"
+        assert_includes joined, "Let me look.", "the assistant markdown replays"
+        assert_includes joined, "⎿ read: hello", "the tool block replays (call name + recorded result)"
+        assert_includes joined, "The file contains: hello", "the follow-up replays"
+        assert_includes joined, "Resumed session", "the status line renders (interactive-mode.ts:5756)"
+        refute_includes joined, "tart v#{Tart::VERSION}", "NO fresh MOTD on resume (itemized cut)"
+        # The echo replay carries the bg span shape.
+        y = buffer_row(chat, "what is in notes.txt?")
+        assert_equal Theme[:user_message_text], line_fg(session, y, "what")
+        assert_equal Theme[:user_message_bg], session.cell_bg(session.buffer_content[y].index("what"), y)
+      end
+    end
+
+    def test_resume_session_reports_the_compaction_count
+      recorded = recorded_session_fixture
+      File.open(recorded, "a") do |file|
+        file.write(JSON.generate(
+          type: "compaction", id: "c1", parentId: "x", timestamp: Agent::Session.now_iso,
+          summary: "earlier context", firstKeptEntryId: "x", tokensBefore: 100, details: {}
+        ))
+        file.write("\n")
+      end
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join, "Session compacted 1 time",
+          "the compaction count renders (interactive-mode.ts:4226-4232)"
+      end
+    end
+
+    # /resume end-to-end through the kernel + command wiring (AC2): the
+    # dispatched builtin opens the picker, enter fires the resume seam,
+    # and the replayed transcript + status land — the same surface shape
+    # the CLI --resume path renders (bin/tart wires both through one
+    # lambda).
+    def test_slash_resume_through_the_kernel_dispatch
+      @server = MockLLMServer.new.start
+      kernel, chat, session = chat_with_server
+      chat.commands = Commands::Handler.new(
+        skills: [], settings: {},
+        output: ->(text) { chat.command_line(text) },
+        spawn: ->(&block) { kernel.async(&block) },
+        agent: -> { chat.agent },
+        reset: -> { chat.new_session },
+        resume: lambda do
+          chat.open_session_picker([{path: recorded_session_fixture, label: "fixture session"}])
+        end,
+        quit: -> { kernel.stop! }
+      )
+      resumed = Queue.new
+      chat.on_resume = ->(path) { resumed << path; chat.resume_session(path) }
+
+      scenario = Thread.new do
+        type(session, "/resume")
+        wait_until { chat.picker_items }
+        session.push_event(TUI.key_event("enter"))
+        wait_until { !resumed.empty? }
+        wait_until { chat.transcript_lines.join.include?("Resumed session") }
+        kernel.stop!
+      end
+      kernel.run
+      scenario.join
+
+      assert_equal recorded_session_fixture, resumed.pop
+      joined = chat.transcript_lines.join("\n")
+      assert_includes joined, "what is in notes.txt?", "the replay landed through the dispatch"
+      assert_includes joined, "Resumed session"
+    end
+
+    # A recorded fixture session (the report's dump shapes): user turn,
+    # assistant with a tool call, the tool result, the follow-up assistant.
+    def recorded_session_fixture
+      dir = File.join(@dir, "sessions")
+      FileUtils.mkpath(dir)
+      path = File.join(dir, "fixture_test-session.jsonl")
+      File.write(path, <<~JSONL)
+        {"type":"session","version":3,"id":"test-session","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"what is in notes.txt?"}}
+        {"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":"Let me look.","tool_calls":{"call_1":{"id":"call_1","name":"read","arguments":{"path":"notes.txt"}}},"finish_reason":"tool_calls","input_tokens":10,"output_tokens":5}}
+        {"type":"message","id":"e3","parentId":"e2","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"tool","content":"hello","tool_call_id":"call_1"}}
+        {"type":"message","id":"e4","parentId":"e3","timestamp":"2026-01-01T00:00:04.000Z","message":{"role":"assistant","content":"The file contains: hello","tool_calls":{},"finish_reason":"stop","input_tokens":10,"output_tokens":5}}
+      JSONL
+      path
+    end
+
+    # The fg of the first cell carrying +glyph+ on buffer row +y+ (the
+    # ScriptedSession keeps no cells; this runs on the real test terminal).
+    def line_fg(session, y, glyph)
+      x = session.buffer_content[y].index(glyph)
+      session.cell_fg(x, y)
     end
 
     private

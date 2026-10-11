@@ -53,6 +53,9 @@ module Tart
       # is settings-backed — cut, itemized deviation: fixed at the default).
       AUTOCOMPLETE_MAX = 5
 
+      # Session-picker window (pi session-selector.ts:302 maxVisible 10).
+      PICKER_MAX = 10
+
       # Wheel scroll (item 6, pi tui-alt-screen.ts): lines per event — the
       # library default (:271, `options.wheelScrollLines ?? 1`; the app-level
       # "auto" accelerator and its fullscreen-wheel-scroll-lines settings
@@ -181,6 +184,10 @@ module Tart
         @last_click = nil
         # The running compaction's reason (the border-status label's key).
         @compaction_reason = nil
+        # The /resume session picker (item 2, pi SessionSelectorComponent
+        # reduced): nil = closed; open it holds {items:, selected:} with
+        # items the launcher-built [{path:, label:}] list (newest first).
+        @picker = nil
         @live = +""
         # The in-flight message's reasoning (pi's live thinking block): the
         # joined chunk.thinking deltas, rendered dim while it grows and
@@ -219,6 +226,12 @@ module Tart
       # default; e.g. tests) sends every text to the agent — pre-I10 shape.
       attr_accessor :commands
 
+      # The resume seam (bin/tart-wired): the session picker's enter key
+      # calls +call(path)+ with the selected session file; the launcher
+      # swaps in the fresh agent (start_session) and replays the transcript
+      # ({resume_session}).
+      attr_accessor :on_resume
+
       # The launcher-wired footer facts (see #initialize).
       attr_writer :footer_data
 
@@ -246,6 +259,17 @@ module Tart
       # @return [Integer] the active list's selection index (test readback).
       def suggestions_index
         @mutex.synchronize { @selected }
+      end
+
+      # @return [Array<Hash>, nil] the open session picker's items (test
+      #   readback; nil = closed).
+      def picker_items
+        @mutex.synchronize { @picker&.fetch(:items) }
+      end
+
+      # @return [Integer] the picker's selection index (test readback).
+      def picker_index
+        @mutex.synchronize { @picker ? @picker[:selected] : 0 }
       end
 
       # @return [Integer] the transcript viewport's top-line offset (test
@@ -317,6 +341,9 @@ module Tart
           when :tool_execution_end
             @tool = nil
             handled = tool_line(event[:tool_call].name, event[:result])
+            # Every tool block opens with a leading blank (pi
+            # tool-execution.ts:85 — the constructor's Spacer).
+            @scrollback << [blank_line]
             enqueue_scrollback(handled, fg: Theme[:tool_output])
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after
@@ -331,6 +358,7 @@ module Tart
             # came from :compaction_start — the frozen I12 contract).
             @compaction_reason = nil
             @usage_stale = true
+            @scrollback << [blank_line] # the compaction line is a region too (pi :3903-3904)
             enqueue_scrollback(
               "✻ compacted (#{event[:reason]}, #{event[:tokens_before]} tokens)", fg: Theme[:dim]
             )
@@ -367,23 +395,42 @@ module Tart
       # fresh agent (start_session + surface.new_session).
       def new_session
         @mutex.synchronize do
-          @transcript = []
-          @scrollback.clear
-          @scroll_offset = 0
-          @follow = true
-          # The host drops the selection when it replaces the transcript
-          # (pi interactive-mode.ts:4096 resetTextSelection).
-          @selection = nil
-          @last_click = nil
-          @live = +""
-          @reasoning = +""
-          # pi's footer stats re-derive from the fresh (empty) session.
-          @usage_totals = {input: 0, output: 0, cache_read: 0, cache_write: 0}
-          @last_usage = nil
-          @usage_stale = false
+          clear_transcript
           enqueue_motd
           enqueue_scrollback("✓ New session started", fg: Theme[:accent])
         end
+      end
+
+      # The resume surface (item 3, pi handleResumeSession → switchSession
+      # → renderCurrentSessionState + showStatus, interactive-mode.ts
+      # :5741-5780, :2210-2218): the transcript clears — NO MOTD re-render
+      # (pi's chat container gets the session's entries only; the port's
+      # header/MOTD would be a fresh-boot shape — itemized cut) — the
+      # recorded entries replay through the live-turn shapes, then the
+      # compaction count (:4226-4232) and "Resumed session". bin/tart wires
+      # both CLI --resume and the picker's enter through this one method
+      # after swapping in the fresh agent.
+      def resume_session(path)
+        @mutex.synchronize do
+          clear_transcript
+          entries = Agent::Session.load_entries(path)
+          replay_entries(entries)
+          compactions = entries.count { |entry| entry.is_a?(Hash) && entry["type"] == "compaction" }
+          if compactions.positive?
+            times = compactions == 1 ? "1 time" : "#{compactions} times"
+            enqueue_scrollback("Session compacted #{times}", fg: Theme[:dim])
+          end
+          enqueue_scrollback("Resumed session", fg: Theme[:accent])
+        end
+      end
+
+      # The /resume picker (item 2, pi showSessionSelector →
+      # SessionSelectorComponent, interactive-mode.ts:3335-3338, :5708-5735,
+      # reduced — see the picker methods at the bottom): +items+ is the
+      # launcher-built [{path:, label:}] list, newest first; keys route
+      # through {picker_input} while open, enter fires {on_resume}.
+      def open_session_picker(items)
+        @mutex.synchronize { @picker = {items:, selected: 0} }
       end
 
       # Slash-command output (pi's chat-line status UX): a muted line in
@@ -737,12 +784,137 @@ module Tart
         Chat.wrap("  #{entries.join(", ")}", width).map { |row| TUI.line(row, fg: Theme[:dim]) }
       end
 
-      # Verbatim completed text (user echo, tool output, status): wrapped to
+      # Verbatim completed text (tool output, status): wrapped to
       # the transcript width, one line-level fg.
       def enqueue_scrollback(text, fg:)
         return if text.nil? || text.empty?
 
         @scrollback << Chat.wrap(text, viewport_width).map { |line| TUI.line(line, fg:) }
+      end
+
+      # The submitted prompt's echo (item 4, pi UserMessageComponent,
+      # user-message.ts:40-51): the "text" token's color on the
+      # "userMessageBg" background — pi's echo carries no prompt char
+      # (the port's I05 prompt-char invention; gone). A leading blank
+      # separates the echo from the previous region — but not on an empty
+      # container (pi interactive-mode.ts:3930-3931 gates the spacer on
+      # children.length > 0; the port's container is @transcript plus its
+      # pending scrollback). Reduced: plain wrapped text with bg on the
+      # text rows only — pi pads a full-width Markdown block.
+      def enqueue_user_echo(text)
+        rows = Chat.wrap(text, viewport_width).map do |row|
+          TUI.line([TUI.span(row, fg: Theme[:user_message_text], bg: Theme[:user_message_bg])])
+        end
+        rows = [blank_line] + rows unless @transcript.empty? && @scrollback.empty?
+        @scrollback << rows
+      end
+
+      # The resume replay (item 3, pi renderSessionEntries, interactive-
+      # mode.ts :3900-3975): the recorded entries through the live-turn
+      # shapes — user echoes, assistant thinking-then-content markdown,
+      # tool blocks (the assistant's recorded tool_calls joined to their
+      # recorded results), compaction summaries — as the entries carry
+      # them. Recorded gaps (itemized, never invented): thinking is
+      # stripped before record (agent/loop.rb strip_thinking_replay), so no
+      # reasoning block replays; non-string (multimodal) content is
+      # skipped; usage only when the provider reported it.
+      def replay_entries(entries)
+        results = entries.filter_map do |entry|
+          next unless entry.is_a?(Hash) && entry["type"] == "message"
+          message = entry["message"]
+          next unless message.is_a?(Hash) && message["role"] == "tool" && message["tool_call_id"]
+
+          [message["tool_call_id"], message["content"]]
+        end.to_h
+        entries.each { |entry| replay_entry(entry, results) }
+      end
+
+      def replay_entry(entry, results)
+        return unless entry.is_a?(Hash)
+
+        case entry["type"]
+        when "message"
+          message = entry["message"]
+          return unless message.is_a?(Hash)
+
+          case message["role"]
+          when "user" then replay_user(message)
+          when "assistant" then replay_assistant(message, results)
+          end
+        when "compaction"
+          # pi :3903-3904 — a compaction summary is a spaced region,
+          # markdown-rendered (CompactionSummaryMessageComponent).
+          @scrollback << [blank_line]
+          enqueue_markdown(entry["summary"]) if entry["summary"].is_a?(String)
+        end
+      end
+
+      def replay_user(message)
+        content = message["content"]
+        return unless content.is_a?(String) && !content.strip.empty?
+
+        enqueue_user_echo(content)
+        add_to_history(content) # pi renderInitialMessages populateHistory
+      end
+
+      def replay_assistant(message, results)
+        content = message["content"]
+        has_content = content.is_a?(String) && !content.strip.empty?
+        reasoning = message["thinking"]
+        has_reasoning = reasoning.is_a?(String) && !reasoning.empty?
+        tool_calls = message["tool_calls"].is_a?(Hash) ? message["tool_calls"] : {}
+        return unless has_content || has_reasoning || tool_calls.any?
+
+        reseed_usage(message)
+        # pi assistant-message.ts:103-105 — the spacer rides VISIBLE
+        # content only (a tool-call-only assistant entry renders no blank
+        # of its own; its tool block brings one).
+        @scrollback << [blank_line] if has_content || has_reasoning
+        if has_reasoning
+          @scrollback << reasoning_lines(reasoning, viewport_width)
+          @scrollback << [blank_line] if has_content # pi :172-174
+        end
+        enqueue_markdown(content) if has_content
+        tool_calls.each_value do |call|
+          next unless call.is_a?(Hash) && call["name"].is_a?(String)
+
+          @scrollback << [blank_line] # every tool block opens with a blank (pi tool-execution.ts:85)
+          enqueue_scrollback(tool_line(call["name"], results[call["id"]]), fg: Theme[:tool_output])
+        end
+      end
+
+      # Footer usage reseeds from the replayed assistant entry's recorded
+      # token counts (Message#to_h merges Tokens#to_h — input_tokens,
+      # output_tokens, cache_read_tokens, cache_write_tokens). Entries
+      # carry usage only when the provider reported it; interrupted turns
+      # may carry none (gap, itemized) — all-nil entries are skipped so
+      # the boot state stays intact.
+      def reseed_usage(message)
+        tokens = RubyLLM::Tokens.new(
+          input: message["input_tokens"], output: message["output_tokens"],
+          cache_read: message["cache_read_tokens"], cache_write: message["cache_write_tokens"]
+        )
+        return if [tokens.input, tokens.output, tokens.cache_read, tokens.cache_write].all?(&:nil?)
+
+        accumulate_usage(tokens)
+      end
+
+      # The /new + resume shared reset: the buffer and stream state drop
+      # (pi renderCurrentSessionState's container clears, :2210-2216; the
+      # host drops the selection with the transcript, :4096).
+      def clear_transcript
+        @transcript = []
+        @scrollback.clear
+        @scroll_offset = 0
+        @follow = true
+        @selection = nil
+        @last_click = nil
+        @live = +""
+        @reasoning = +""
+        # pi's footer stats re-derive from the fresh (empty) session.
+        @usage_totals = {input: 0, output: 0, cache_read: 0, cache_write: 0}
+        @last_usage = nil
+        @usage_stale = false
       end
 
       # Assistant completions render through the markdown converter (AC5):
@@ -771,8 +943,10 @@ module Tart
       # Session-cumulative usage totals + the latest assistant usage (the
       # context numerator; pi's getSessionStats over session entries,
       # reduced to what the event surface carries: assistant messages).
+      # Takes an assistant message (reads its +tokens+) or a bare
+      # RubyLLM::Tokens (the replay's reseed from recorded counts).
       def accumulate_usage(message)
-        tokens = message.tokens if message.respond_to?(:tokens)
+        tokens = message.respond_to?(:tokens) ? message.tokens : message
         return if tokens.nil?
 
         @usage_totals[:input] += tokens.input if tokens.input
@@ -816,18 +990,31 @@ module Tart
           return
         end
 
+        # The picker owns every key while open (pi: the selector takes
+        # focus — showSelector { focus: selector }).
+        return picker_input(event) if @picker
+
         ctrl = event.modifiers.include?("ctrl")
         alt = event.modifiers.include?("alt")
         printable = event.text? && !(event.modifiers & %w[ctrl alt]).any?
         case event.code
         # Enter applies the selection and submits it (pi editor.ts:790-816
         # tui.select.confirm: a "/"-prefix completion falls through to
-        # submit). Escape cancels the list WITHOUT interrupting (pi
-        # custom-editor.ts:103-111 — interrupt only when no list is shown).
+        # submit). Escape is the editor's onEscape (item 5, pi
+        # custom-editor.ts:103-111: the list consumes it first for
+        # cancellation; else interactive-mode.ts:3070-3090 — a streaming
+        # run aborts through the kernel's interrupt path (the ctrl+c
+        # mechanism, Task#stop — no second path), idle escape is a no-op;
+        # pi's double-escape /tree//fork is cut — no session branching).
         when "enter"
           apply_suggestion if @suggestions
           submit
-        when "escape" then cancel_autocomplete if @suggestions
+        when "escape"
+          if @suggestions
+            cancel_autocomplete
+          elsif busy?
+            @kernel.interrupt_work!
+          end
         # While the list is active up/down navigate the LIST (history
         # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
         when "up" then @suggestions ? navigate_suggestions(-1) : history_previous
@@ -899,7 +1086,7 @@ module Tart
         exit_history_browsing
         @branch = nil # per-turn branch invalidation
         @branch_fetched = false
-        enqueue_scrollback("❯ #{text}", fg: Theme[:user_message_text])
+        enqueue_user_echo(text)
         if @commands && text.start_with?("/")
           text = @commands.expand_skill(text)
           return if !busy? && @commands.dispatch(text)
@@ -1273,6 +1460,8 @@ module Tart
       end
 
       def editor_area_rows(height)
+        return [picker_widget_rows + 2, height - 1].min if @picker # + borders
+
         [MIN_EDITOR_ROWS + autocomplete_rows, height - 1].min
       end
 
@@ -1316,7 +1505,7 @@ module Tart
         TUI.layout(
           children: [
             transcript_widget(transcript_rows),
-            editor_widget,
+            @picker ? picker_widget : editor_widget,
             footer_widget,
           ],
           constraints: [
@@ -1772,6 +1961,69 @@ module Tart
 
         remaining = width - (2 + TUI.text_width(label) + spacing.length) - 2
         remaining >= 10 ? Chat.clip_text(desc, remaining) : ""
+      end
+
+      # --- /resume session picker (item 2, pi SessionSelectorComponent,
+      # reduced): the editor area is REPLACED by the picker while open (pi
+      # showSelector swaps the container and moves focus). Reductions,
+      # itemized: no search input (fuzzy/regex/exact), no all-sessions
+      # scope toggle, no threaded/name sort modes, no rename, no delete,
+      # no path/cwd toggles, no cwd-mismatch prompt, no hint rows — a flat
+      # newest-first list with pi's key shape (up/down navigate, enter
+      # selects — onSelect —, escape cancels — onCancel).
+      def picker_input(event)
+        case event.code
+        when "up" then navigate_picker(-1)
+        when "down" then navigate_picker(1)
+        when "enter"
+          item = @picker[:items][@picker[:selected]]
+          @picker = nil
+          @on_resume&.call(item[:path]) if item
+        when "escape" then @picker = nil
+        end
+      end
+
+      # pi SelectList.handleInput (select-list.ts:146-155): up/down WRAP.
+      def navigate_picker(direction)
+        size = @picker[:items].size
+        return if size.zero?
+
+        selected = @picker[:selected]
+        @picker[:selected] = direction == -1 ? (selected.zero? ? size - 1 : selected - 1) : (selected == size - 1 ? 0 : selected + 1)
+      end
+
+      def picker_widget
+        TUI.block(
+          title: " Resume Session (Current Folder) ", # pi SessionSelectorHeader.render :147
+          borders: [:top, :bottom],
+          border_style: TUI.style(fg: Theme[:border]),
+          title_style: TUI.style(fg: Theme[:dim]),
+          children: [TUI.paragraph(text: picker_lines, wrap: false)]
+        )
+      end
+
+      # The picker's content rows: one line per session (pi renders one
+      # line each with tree structure :459-460), "→ " marking the selection
+      # (accent, pi selectedText — the autocomplete row's shape), labels
+      # hard-clipped to the width.
+      def picker_lines
+        items = @picker[:items]
+        return [TUI.line("  No sessions found", fg: Theme[:muted])] if items.empty?
+
+        start = [[@picker[:selected] - PICKER_MAX / 2, items.size - PICKER_MAX].min, 0].max
+        rows = items[start, PICKER_MAX].map.with_index do |item, i|
+          label = Chat.clip_text(item[:label], viewport_width - 3)
+          (start + i) == @picker[:selected] ? TUI.line("→ #{label}", fg: Theme[:accent]) : TUI.line("  #{label}")
+        end
+        rows << TUI.line("  (#{@picker[:selected] + 1}/#{items.size})", fg: Theme[:muted]) if items.size > PICKER_MAX
+        rows
+      end
+
+      # The picker's row budget (the editor-area height calc; +2 borders).
+      def picker_widget_rows
+        items = @picker[:items]
+        count = [items.size, PICKER_MAX].min
+        items.size > PICKER_MAX ? count + 1 : count
       end
 
       # Completed lines move into the transcript buffer (pi: completed
