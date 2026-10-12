@@ -115,7 +115,16 @@ module Tart
       # open when no turn runs.
       def switch_model(model_id, provider:, context_window: nil)
         @chat.with_model(model_id, provider:, protocol: :chat_completions, assume_model_exists: true)
-        @context_window = context_window if context_window
+        # pi has no cached window to go stale: setModel swaps the Model
+        # object (agent-session.ts:2484) and every check reads
+        # model.contextWindow live (:2965). The port's cache re-resolves
+        # instead: the declared window, else the switched chat's model (the
+        # gem's registry resolution — under the boot path's
+        # assume_model_exists a mock lands on Model.default with no
+        # context_window, nil = threshold disabled, pi's `contextWindow ??
+        # 0`). The explicit-override chain (TART_CONTEXT_WINDOW) still
+        # stands in resolved_context_window.
+        @context_window = context_window || @chat.model&.context_window
         self
       end
 
@@ -233,7 +242,7 @@ module Tart
             # pi _handlePostAgentRun checks compaction after EVERY
             # completed turn, queued steering or not (agent-session.ts:
             # 1861-1885); the run then continues with the queued messages.
-            run_threshold_compaction
+            run_threshold_compaction(message)
             pending = steering_messages
             if pending.empty?
               emit(type: :turn_end, message:)
@@ -266,28 +275,25 @@ module Tart
         true
       end
 
-      # pi _checkCompaction Case 3 (agent-session.ts:3079-3083): after a
-      # completed turn, provider-reported usage vs the model's context
-      # window and the reserve.
-      def run_threshold_compaction
-        return unless threshold_exceeded?
+      # pi _checkCompaction Case 3 (agent-session.ts:3050-3090): after a
+      # completed turn, the direct usage of that turn's final assistant
+      # message vs the model's context window and the reserve; zero/absent
+      # usage falls back to the estimate (Compaction.trigger_tokens).
+      def run_threshold_compaction(message)
+        return unless threshold_exceeded?(message)
 
         run_compaction(reason: :threshold)
       end
 
-      def threshold_exceeded?
+      def threshold_exceeded?(message)
         window = resolved_context_window
         return false unless window.is_a?(Integer) && window.positive?
 
-        estimate = Compaction.estimate_context_tokens(@chat.messages)
-        # pi's stale pre-compaction usage guard (agent-session.ts:3063-3075):
-        # kept pre-compaction messages carry usage reflecting the old
-        # (larger) context and would falsely re-trigger right after a
-        # compaction — only a post-compaction usage message may fire it.
-        usage_message = estimate[:last_usage_index] && @chat.messages[estimate[:last_usage_index]]
-        return false if usage_message && @pre_compaction_messages.key?(usage_message)
+        tokens = Compaction.trigger_tokens(@chat.messages, message,
+          pre_compaction_messages: @pre_compaction_messages)
+        return false if tokens.nil?
 
-        Compaction.should_compact?(estimate[:tokens], window, @compaction_settings)
+        Compaction.should_compact?(tokens, window, @compaction_settings)
       end
 
       # Explicit kwarg → TART_CONTEXT_WINDOW → chat.model.context_
@@ -318,13 +324,17 @@ module Tart
         # reasons) — the surface's "Compacting context..." border status
         # keys off it; the completed-compaction event below clears it.
         emit(type: :compaction_start, reason:)
-        summary = summarize(preparation)
-        return false unless summary
+        summarized = summarize(preparation)
+        return false unless summarized
 
         lists = Compaction.compute_file_lists(
           Compaction.extract_file_ops(preparation.messages_to_summarize)
         )
-        summary += Compaction.format_file_operations(lists[:read_files], lists[:modified_files])
+        summary = summarized.content + Compaction.format_file_operations(lists[:read_files], lists[:modified_files])
+        # pi CompactionResult.usage — the summarization call's own usage
+        # (compaction.ts:1085, populated) — data only: the render is the
+        # compaction-panel fast-follow's.
+        preparation.usage = summarized.tokens
 
         keep_from = preparation.first_kept_index
         system_messages = @chat.messages.select { |message| message.role == :system }
@@ -332,6 +342,10 @@ module Tart
         summary_message = @chat.add_message(role: :user, content: compaction_summary_content(summary))
         @chat.messages = [*system_messages, summary_message, *kept]
 
+        # pi CompactionResult.estimatedTokensAfter (agent-session.ts:2850):
+        # the pure estimateMessagesTokens over the post-compaction history
+        # (:366-371 — chars/4, never usage-backed). Data only.
+        preparation.estimated_tokens_after = Compaction.full_estimate(@chat.messages)[:tokens]
         @recorder&.append_compaction(
           summary:,
           first_kept_entry_id: @entry_ids[kept.first],
@@ -356,7 +370,9 @@ module Tart
       # min(floor(0.8 * reserve_tokens), model max) (:683-686); the gem's
       # model.max_output_tokens is the model max (model.rb:36). Run through
       # the Bridge like every blocking LLM call so a kernel interrupt
-      # cancels it. nil (compaction aborted) when the call fails.
+      # cancels it. nil (compaction aborted) when the call fails. The full
+      # reply Message is returned — its usage is pi's CompactionResult.usage
+      # (compaction.ts:1085).
       def summarize(preparation)
         prompt = Compaction.summarization_prompt(preparation.messages_to_summarize,
           previous_summary: preparation.previous_summary)
@@ -370,7 +386,7 @@ module Tart
         }) { |_item| }
         return nil if terminal.is_a?(Hash) && terminal[:type] == :error
 
-        result.content
+        result
       end
 
       def build_summary_chat

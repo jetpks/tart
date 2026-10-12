@@ -92,7 +92,9 @@ module TuiSplitRig
 
     def run_once(n, registry)
       stage = File.join(@out_dir, "run-#{n}")
-      mock = MockLLMServer.new.script(@scenario.responses).start
+      mock = MockLLMServer.new.script(@scenario.responses)
+      mock.suppress_usage! if @scenario.suppress_usage
+      mock.start
       apps = {}
       begin
         (@app == "both" ? %w[pi tart] : [@app]).each do |app|

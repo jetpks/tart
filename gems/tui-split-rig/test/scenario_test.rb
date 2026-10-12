@@ -211,5 +211,25 @@ module TuiSplitRig
         "settings.json stays context_window-gated (s1–s6 don't stage it)"
     end
 
+    # The usage-suppression knob (I29, the Case-3 instrument): a boolean
+    # scenario field, false when absent, a rig error when mistyped.
+    def test_suppress_usage_defaults_to_false_and_loads_from_the_shipped_s8
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      refute Scenario.load(path).suppress_usage
+
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s8_zero_usage_compaction.yml"))
+      assert scenario.suppress_usage
+      assert_equal 10, scenario.context_window
+    end
+
+    def test_non_boolean_suppress_usage_is_a_rig_error
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nsuppress_usage: yes-please\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/suppress_usage must be a boolean/, error.message)
+    end
+
   end
 end

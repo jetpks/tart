@@ -19,6 +19,10 @@ module TuiSplitRig
   #                              # TART_CONTEXT_WINDOW) and zero both apps'
   #                              # compaction knobs — the threshold-trigger
   #                              # lever (s7). Unset: the 32768 defaults.
+  #   suppress_usage: true       # optional: serve every response WITHOUT the
+  #                              # usage payload — both apps' triggers must
+  #                              # fall back to the estimate (the Case-3
+  #                              # zero-usage path, s8). Default: false.
   #   env:                       # optional per-app env overrides (the
   #     tart:                    # runner layers them over its staged
   #       TART_IDENTITY: tart    # env — the branding/staging seam)
@@ -29,7 +33,7 @@ module TuiSplitRig
   class Scenario
     APPS = %w[pi tart].freeze
 
-    attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window
+    attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -61,6 +65,7 @@ module TuiSplitRig
       end
       @env = parse_env(data)
       @context_window = parse_context_window(data)
+      @suppress_usage = parse_suppress_usage(data)
     end
 
     # The optional scenario context window (s7's compaction lever): a
@@ -70,6 +75,17 @@ module TuiSplitRig
       return nil if raw.nil?
 
       raise Error, "#{@path}: context_window must be a positive integer" unless raw.is_a?(Integer) && raw.positive?
+
+      raw
+    end
+
+    # The optional usage-suppression knob (the Case-3 instrument): a
+    # boolean or absent.
+    def parse_suppress_usage(data)
+      raw = data["suppress_usage"]
+      return false if raw.nil?
+
+      raise Error, "#{@path}: suppress_usage must be a boolean" unless raw == true || raw == false
 
       raw
     end

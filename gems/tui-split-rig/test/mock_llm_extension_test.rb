@@ -55,10 +55,39 @@ module TuiSplitRig
       end
     end
 
+    # The usage-suppression knob (I29, the Case-3 instrument): responses
+    # carry no usage payload at all, driving both apps' compaction
+    # triggers to the estimate fallback.
+    def test_suppress_usage_omits_the_usage_object_from_message_responses
+      with_server([{type: :message, content: "hi"}], suppress: true) do |server|
+        body = JSON.parse(post(server, "/v1/chat/completions", {model: "m", stream: false}.to_json, {}).body)
+        assert_equal "hi", body.fetch("choices")[0].fetch("message").fetch("content")
+        refute body.key?("usage"), "no usage object under the knob"
+      end
+    end
+
+    def test_suppress_usage_omits_the_usage_chunk_from_stream_responses
+      with_server([{type: :stream, content: "hi"}], suppress: true) do |server|
+        body = post(server, "/v1/chat/completions", {model: "m", stream: true}.to_json,
+          "accept" => "text/event-stream").body
+        assert_includes body, "hi"
+        refute_includes body, "usage", "no usage chunk under the knob"
+      end
+    end
+
+    def test_without_the_knob_responses_still_carry_usage
+      with_server([{type: :message, content: "hi"}]) do |server|
+        body = JSON.parse(post(server, "/v1/chat/completions", {model: "m", stream: false}.to_json, {}).body)
+        assert_equal 15, body.fetch("usage").fetch("total_tokens")
+      end
+    end
+
     private
 
-    def with_server(specs)
-      server = MockLLMServer.new.script(specs).start
+    def with_server(specs, suppress: false)
+      server = MockLLMServer.new.script(specs)
+      server.suppress_usage! if suppress
+      server = server.start
       yield server
     ensure
       server&.stop

@@ -58,6 +58,50 @@ module Tart
       assert_equal 2, Compaction.estimate_tokens(llm_message(:user, "x" * 5))
     end
 
+    # pi _checkCompaction Case 3's selection (agent-session.ts:3050-3090),
+    # the three paths: the direct usage first; the zero/absent-usage
+    # fallback to the estimate; the stale pre-compaction guard INSIDE the
+    # fallback only.
+    def test_trigger_tokens_reads_the_just_completed_messages_direct_usage_first
+      used = RubyLLM::Message.new(role: :assistant, content: "done",
+        tokens: RubyLLM::Tokens.new(input: 120, output: 10))
+      messages = [llm_message(:user, "x" * 40), used]
+
+      # The direct usage wins even when the same message sits in the stale
+      # set — it is the just-completed turn's own usage, fresh by
+      # construction (pi skips the timestamp guard on the direct branch).
+      assert_equal 130, Compaction.trigger_tokens(messages, used,
+        pre_compaction_messages: identity_set(used))
+    end
+
+    def test_trigger_tokens_zero_direct_usage_falls_back_to_the_estimate
+      used = RubyLLM::Message.new(role: :assistant, content: "a",
+        tokens: RubyLLM::Tokens.new(input: 100, output: 20))
+      fresh = RubyLLM::Message.new(role: :assistant, content: "y" * 8)
+      messages = [llm_message(:user, "x" * 40), used, fresh]
+
+      # The just-completed message carries no usage (pi's error stop-reason
+      # or all-zero usage; the port: tokens nil/all-nil) — the estimate:
+      # usage 120 + trailing ("y" * 8) => 2.
+      assert_equal 122, Compaction.trigger_tokens(messages, fresh,
+        pre_compaction_messages: identity_set)
+      assert_equal 122, Compaction.trigger_tokens(messages, fresh)
+    end
+
+    def test_trigger_tokens_stale_guard_trips_inside_the_fallback
+      used = RubyLLM::Message.new(role: :assistant, content: "a",
+        tokens: RubyLLM::Tokens.new(input: 100, output: 20))
+      fresh = RubyLLM::Message.new(role: :assistant, content: "y" * 8)
+      messages = [llm_message(:user, "x" * 40), used, fresh]
+
+      # The last usage message is a KEPT pre-compaction message — its usage
+      # reflects the old (larger) context and would falsely re-trigger
+      # right after a compaction: nil (pi's `return false`,
+      # agent-session.ts:3063-3075).
+      assert_nil Compaction.trigger_tokens(messages, fresh,
+        pre_compaction_messages: identity_set(used))
+    end
+
     def test_should_compact_boundaries
       settings = Compaction::Settings.resolve(nil)
       assert Compaction.should_compact?(16_386, 32_769, settings) # > window - reserve
@@ -187,6 +231,14 @@ module Tart
 
     def llm_message(role, content)
       RubyLLM::Message.new(role:, content:)
+    end
+
+    # The loop's identity-keyed pre-compaction message set
+    # (@pre_compaction_messages's shape).
+    def identity_set(*messages)
+      set = {}.compare_by_identity
+      messages.each { |message| set[message] = true }
+      set
     end
 
     # An assistant message making one tool call (tool results follow it in

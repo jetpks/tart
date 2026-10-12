@@ -1,0 +1,24 @@
+# S8 — compaction turn under ZERO usage (I29, the Case-3 instrument):
+# s7's scenario with the rig's usage-suppression knob — every response is
+# served without the usage payload, so neither app can read the
+# just-completed turn's direct usage and BOTH must fire the threshold
+# trigger on the chars/4 estimate over the messages (pi Case 3's
+# zero-usage branch, agent-session.ts:3058-3083; tart
+# Compaction.trigger_tokens). The second scripted response is the
+# summarization call — a per-app request count of 2 IS the compaction
+# proof (a non-compacting app stops at 1 and the run exits 2, rig
+# failure).
+#
+# Baseline EXPECTED to exit 1 (s7's divergence stands): pi renders the
+# compaction as a customMessageBg panel, the port a dim "✻ compacted"
+# scrollback line — the compaction-panel fast-follow's work list.
+name: s8_zero_usage_compaction
+prompt: "hello compact"
+expected_requests: 2
+context_window: 10
+suppress_usage: true
+responses:
+  - type: stream
+    content: "first turn reply for the compaction scenario."
+  - type: message
+    content: "## Goal\n\nProbe the compaction summary render.\n\n## Progress\n\n### Done\n- [x] first turn completed"
