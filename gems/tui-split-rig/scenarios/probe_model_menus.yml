@@ -1,0 +1,15 @@
+# The model-menu probe's driver (I27 — NOT a parity gate): the probe
+# (bin/model-menu-probe) sends its own keystrokes (/model, /thinking), so
+# the scenario only arms the mock LLM script. The one response a turn can
+# consume is tart's /model fallback: the port has no /model builtin at the
+# pre-model-lane base (commands.rb BUILTINS), so the text falls through to
+# a normal submission — pi opens its selector and makes no request. The
+# second response is slack for the same fallback on /thinking.
+name: probe_model_menus
+prompt: "unused"
+expected_requests: 1
+responses:
+  - type: stream
+    content: "The fallback reply for a text submission."
+  - type: stream
+    content: "Slack fallback reply; the probe consumes at most two turns."

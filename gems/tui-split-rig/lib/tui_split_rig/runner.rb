@@ -21,7 +21,10 @@ module TuiSplitRig
   # command is exec-wrapped (verified live: pane_pid IS the app process —
   # the exec chain replaces the pane's default fish shell), so teardown
   # kills -9 the pane pid and all descendants, waits for exit, kills the
-  # session, and asserts no survivor and no leftover tui-split-rig-* session.
+  # session, and asserts no survivor and no leftover session OF ITS OWN
+  # (I27: sessions carry a per-Runner token, and the leftover check greps
+  # only that token — concurrent rig processes on the shared tmux server
+  # must not flake each other's end-of-run check or kill each other's panes).
   class Runner
     GEOMETRY = %w[-x 120 -y 40].freeze
     POLL_INTERVAL = 0.25
@@ -45,9 +48,13 @@ module TuiSplitRig
       @out_dir = File.expand_path(out || default_out_dir)
       @failure = nil
       @bundle_bin = resolve_bundle_bin
+      # Concurrent-run scoping (I27): every session this runner creates is
+      # named tui-split-rig-<token>-…, and the leftover check greps only
+      # that token — another process's live sessions are invisible to it.
+      @token = format("%04x%04x", rand(65_536), rand(65_536))
     end
 
-    attr_reader :out_dir
+    attr_reader :out_dir, :token
 
     def run!
       FileUtils.mkdir_p(@out_dir)
@@ -66,13 +73,19 @@ module TuiSplitRig
       sandbox = File.join(stage, "sandbox", app)
       [home, sandbox].each { |dir| FileUtils.mkdir_p(dir) }
       agent_dir = app == "pi" ? stage_pi_agent(stage, mock.port) : nil
-      stage_tart_home(home) if app == "tart"
+      stage_tart_home(home, mock.port) if app == "tart"
 
-      session = "tui-split-rig-#{app}-#{@scenario.name}-r#{n}-#{format('%04x', rand(65_536))}"
+      session = session_name(app, n)
       command = app == "pi" ? pi_command(home, agent_dir) : tart_command(sandbox, home, mock.port)
       tmux("kill-session", "-t", session) if session_exists?(session)
       tmux("new-session", "-d", *GEOMETRY, "-c", sandbox, "-s", session, command)
       {session:, home:, sandbox:}
+    end
+
+    # The token-scoped tmux session name (I27): unique per runner, app,
+    # scenario and run; the leftover check greps for exactly this shape.
+    def session_name(app, n)
+      "tui-split-rig-#{@token}-#{app}-#{@scenario.name}-r#{n}-#{format('%04x', rand(65_536))}"
     end
 
     private
@@ -170,11 +183,31 @@ module TuiSplitRig
     # global settings (settings.rb global root — HOME/.tart/settings.json)
     # carrying the same zeroed compaction knobs. The context window itself
     # rides the TART_CONTEXT_WINDOW env in tart_command.
-    def stage_tart_home(home)
-      return unless @scenario.context_window
-
+    #
+    # The model-menu staging (I27): HOME/.tart/models.json — pi's staged
+    # models.json shape (providers → {baseUrl, apiKey, api, models}) with
+    # TWO mock models, so the /model menu has something to select. Inert
+    # for tart at the pre-model-lane base (no reader); the model lane's
+    # reader contract must match this shape.
+    def stage_tart_home(home, port)
       dir = File.join(home, ".tart")
       FileUtils.mkdir_p(dir)
+      models = {
+        providers: {
+          mock: {
+            baseUrl: "http://127.0.0.1:#{port}/v1",
+            apiKey: "mock-key",
+            api: "openai-completions",
+            models: [
+              {id: "mock-1", name: "Mock 1", reasoning: false, contextWindow: (@scenario.context_window || 32_768), maxTokens: 512},
+              {id: "mock-2", name: "Mock 2", reasoning: true, contextWindow: (@scenario.context_window || 32_768), maxTokens: 512},
+            ],
+          },
+        },
+      }
+      File.write(File.join(dir, "models.json"), JSON.pretty_generate(models))
+      return unless @scenario.context_window
+
       File.write(File.join(dir, "settings.json"), JSON.pretty_generate(
         "compaction" => {"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0}
       ))
@@ -283,7 +316,7 @@ module TuiSplitRig
     # methods are public for the same reason (the load pin asserts their
     # staged files).
     public :capture, :capture_styled, :settle, :teardown, :boot_session,
-      :stage_pi_agent, :stage_tart_home
+      :stage_pi_agent, :stage_tart_home, :session_name
 
     def pane_pid_tree(session)
       out = Open3.capture2("tmux", "list-panes", "-t", session, "-F", PANE_PID_FORMAT)[0].to_s
@@ -324,9 +357,12 @@ module TuiSplitRig
       system("tmux", *args) or raise Error, "tmux #{args.join(' ')} failed"
     end
 
+    # Scoped to THIS runner's token (I27): a concurrent rig process's live
+    # sessions share the server but not the token, so parallel lanes don't
+    # flake each other's end-of-run leftover check.
     def assert_clean_sessions!
-      left = Open3.capture2("tmux", "ls", err: IO::NULL)[0].to_s.lines.grep(/tui-split-rig-/)
-      @failure = "leftover tui-split-rig-* tmux sessions: #{left.join(', ')}" unless left.empty?
+      left = Open3.capture2("tmux", "ls", err: IO::NULL)[0].to_s.lines.grep(/tui-split-rig-#{@token}-/)
+      @failure = "leftover tui-split-rig-#{@token}-* tmux sessions: #{left.join(', ')}" unless left.empty?
     end
 
     # -- assembly ---------------------------------------------------------
