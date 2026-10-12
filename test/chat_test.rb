@@ -1729,6 +1729,129 @@ module Tart
       end
     end
 
+    # --- the I27-verdict residuals (I28 AC4) ---
+
+    # A mock-provider catalog (the model keyed under a NON-native
+    # endpoint key) + an env boot whose TART_PROVIDER is the native wire
+    # slug: the ✓/· markers must cross-resolve the wire provider onto
+    # the catalog key (the boot pair {openai, mock-1} vs the entry
+    # {mock, mock-1}).
+    def mock_native_catalog
+      Models::Config.new(
+        providers: {
+          "mock" => {name: "Mock", base_url: nil, api_key: nil, api: nil,
+                     models: [{provider: "mock", id: "mock-1", name: "Mock 1", reasoning: true,
+                               context_window: 33_000, max_tokens: nil}]}
+        },
+        default: nil, error: nil
+      )
+    end
+
+    def test_model_menu_markers_match_the_runtime_model_across_the_wire_provider
+      with_chat(width: 40, screen_height: 16, models: mock_native_catalog,
+        footer_data: {cwd: @dir, model: "mock-1", default_provider: "openai"}) do |chat, session|
+        chat.open_model_menu
+        draw(chat, session)
+
+        selection = chat.menu_selection
+        assert_equal "mock-1", selection&.fetch(:id), "sorted to the top row (current first)"
+        assert selection[:current], "the ✓ marker cross-resolves the boot pair's wire provider"
+        assert selection[:default], "the · default badge cross-resolves too"
+        rows = TUI.widget_lines(chat.renderer.call).join("\n")
+        assert_includes rows, "✓ mock-1 [mock]"
+        assert_includes rows, "· default"
+      end
+    end
+
+    # pi getAvailableThinkingLevels (agent-session.ts:2657 →
+    # getSupportedThinkingLevels, models.ts:1224): a non-reasoning model
+    # offers [off] alone — the menu gates, the ✓ clamps onto the gate's
+    # floor (pi setModel's _clampThinkingLevel), and the /thinking arg
+    # error lists the GATED set (handleThinkingCommand :5153-5155).
+    def test_thinking_menu_gates_to_off_for_a_non_reasoning_runtime_model
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: false}) do |chat, session|
+        chat.open_thinking_menu
+        draw(chat, session)
+
+        menu = chat.instance_variable_get(:@menu)
+        assert_equal %w[off], menu.instance_variable_get(:@items).map { |item| item[:value] },
+          "the gated set is [off] alone"
+        assert_equal "off", chat.menu_selection&.fetch(:value), "the gate's floor preselects"
+        rows = TUI.widget_lines(chat.renderer.call).join("\n")
+        assert_includes rows, "✓ off", "the ✓ clamps onto the gated set"
+        refute_includes rows, "minimal", "no ungated levels render"
+      end
+    end
+
+    def test_thinking_menu_lists_all_levels_for_a_reasoning_runtime_model
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true}) do |chat, session|
+        chat.open_thinking_menu
+
+        menu = chat.instance_variable_get(:@menu)
+        assert_equal Settings::THINKING_LEVELS, menu.instance_variable_get(:@items).map { |item| item[:value] },
+          "the full ladder (no thinkingLevelMap in the port's schema — itemized)"
+      end
+    end
+
+    # The /thinking arg gate lives on the surface (pi handleThinkingCommand
+    # is interactive-mode code; the frozen Commands::Handler renders the
+    # full ladder) — routed through chat submit's dispatch seam.
+    def thinking_chat(footer_data)
+      with_chat(width: 40, screen_height: 16, footer_data:) do |chat, session|
+        chat.commands = Commands::Handler.new(
+          skills: [], settings: {}, output: ->(text) { @commands_output << text },
+          spawn: ->(&block) { block.call }, agent: -> { nil }, reset: -> {},
+          thinking: ->(level) { chat.set_thinking_level(level) },
+          thinking_menu: -> { chat.open_thinking_menu }, quit: -> {}
+        )
+        draw(chat, session)
+        yield chat, session
+      end
+    end
+
+    def test_thinking_command_rejects_ungated_levels_with_the_gated_set
+      thinking_chat({cwd: @dir, model: "m", context_window: 1000, thinking_level: "off", reasoning: false}) do |chat, session|
+        send_message(chat, "/thinking high")
+        draw(chat, session)
+
+        assert_includes chat.transcript_lines.join, 'Unknown thinking level "high". Available levels: off.',
+          "the error lists the GATED set (pi handleThinkingCommand :5153-5155)"
+        assert_nil chat.instance_variable_get(:@thinking_level), "the level holds (no status rode)"
+        assert_nil chat.instance_variable_get(:@border_status), "no selection status rendered"
+      end
+    end
+
+    def test_thinking_command_accepts_gated_levels_and_switching_re_gates
+      with_chat(width: 40, screen_height: 16, models: mock_native_catalog,
+        footer_data: {cwd: @dir, model: "mock-1", default_provider: "openai",
+                      context_window: 33_000, thinking_level: "off", reasoning: true}) do |chat, session|
+        chat.switch_model(provider: "mock", id: "mock-1", name: "Mock 1", reasoning: false,
+          context_window: 33_000, max_tokens: nil)
+        draw(chat, session)
+
+        chat.open_thinking_menu
+        menu = chat.instance_variable_get(:@menu)
+        assert_equal %w[off], menu.instance_variable_get(:@items).map { |item| item[:value] },
+          "the runtime switch re-gates (the entry's reasoning flag rides the footer view)"
+      end
+    end
+
+    # pi cycleThinkingLevel (:2645-2646): no thinking support → undefined
+    # (the shift+tab cycle is a no-op).
+    def test_shift_tab_cycle_is_a_noop_for_a_non_reasoning_runtime_model
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, reasoning: false}) do |chat, session|
+        chat.on_event(TUI.key_event("tab", modifiers: ["shift"]))
+        draw(chat, session)
+
+        assert_nil chat.instance_variable_get(:@thinking_level), "cycled nothing"
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("m"),
+          "the footer's model segment stays the bare model"
+      end
+    end
+
     # The /model dispatch wiring through the bin-shaped handler: bare →
     # the menu, exact → the direct switch, unknown → the menu pre-seeded
     # (pi handleModelCommand).
@@ -2754,6 +2877,175 @@ module Tart
       end
     end
 
+    # --- whole-screen selection (I28, AC1/AC2 — pi getSelectionPoint's
+    # non-scrollview branch :1145-1152 + getSelectionSourceLine :1165:
+    # every rendered row selects; the port composes the dock rows from
+    # the same builders that render them, itemized) ---
+    #
+    # Geometry at width 40 / screen_height 12: transcript rows 0-5, the
+    # dock spacer 6, the editor block 7 (top border) / 8 (input) /
+    # 9 (bottom border), the footer 10-11.
+
+    def test_mouse_drag_selects_and_highlights_over_a_footer_row
+      with_chat(width: 40, screen_height: 12, footer_data: {cwd: @dir, model: "m", context_window: 1000}) do |chat, session|
+        draw(chat, session)
+        pwd = Render::Text.format_cwd(@dir)
+
+        chat.on_event(TUI.mouse_event(kind: "down", x: 1, y: 10, button: "left"))
+        chat.on_event(TUI.mouse_event(kind: "drag", x: 5, y: 10, button: "left"))
+        draw(chat, session)
+        (1..5).each do |x|
+          assert_equal [:reversed], session.cell_modifiers(x, 10), "footer cell #{x} is inverse-highlighted"
+        end
+        assert_empty session.cell_modifiers(6, 10), "the cell after the focus is unhighlighted"
+
+        copied = capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "up", x: 5, y: 10, button: "left"))
+        end
+        assert_equal pwd[1..5], copied_text(copied), "copy-on-release over the footer row (OSC 52)"
+      end
+    end
+
+    def test_mouse_drag_selects_and_highlights_over_the_input_row
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        "hello world".chars.each { |char| chat.on_event(TUI.key_event(char)) }
+        draw(chat, session)
+        y = input_row(session)
+
+        chat.on_event(TUI.mouse_event(kind: "down", x: 0, y:, button: "left"))
+        chat.on_event(TUI.mouse_event(kind: "drag", x: 4, y:, button: "left"))
+        draw(chat, session)
+        (0..4).each do |x|
+          assert_equal [:reversed], session.cell_modifiers(x, y), "input cell #{x} is inverse-highlighted"
+        end
+
+        copied = capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "up", x: 4, y:, button: "left"))
+        end
+        assert_equal "hello", copied_text(copied), "copy-on-release over the input row"
+
+        2.times do
+          chat.on_event(TUI.mouse_event(kind: "down", x: 6, y:, button: "left"))
+        end
+        draw(chat, session)
+        (6..10).each do |x|
+          assert_equal [:reversed], session.cell_modifiers(x, y), "word cell #{x} is highlighted"
+        end
+      end
+    end
+
+    def test_selection_text_over_the_editor_border_row_answers_the_composed_border
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        draw(chat, session)
+
+        chat.on_event(TUI.mouse_event(kind: "down", x: 0, y: 7, button: "left"))
+        chat.on_event(TUI.mouse_event(kind: "drag", x: 9, y: 7, button: "left"))
+        copied = capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "up", x: 9, y: 7, button: "left"))
+        end
+        # The gem Block renders the titleless top border as dashes to width
+        # (byte-verified) — the drag's slice is its first ten cells.
+        assert_equal "─" * 10, copied_text(copied),
+          "the border row's reader answers the composed border (previousScreen analog)"
+      end
+    end
+
+    def test_double_and_triple_click_work_over_a_footer_row
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: File.join(Dir.home, "wordy-dir", "child"), model: "m", context_window: 1000}) do |chat, session|
+        draw(chat, session)
+        # Under home → the ~-contracted pwd row (format_cwd); no branch.
+        pwd = "~/wordy-dir/child"
+        word_start = pwd.index("wordy")
+
+        2.times do
+          chat.on_event(TUI.mouse_event(kind: "down", x: word_start + 2, y: 10, button: "left"))
+        end
+        draw(chat, session)
+        # The word run joins across "/" and "-" (paths and kebab stay
+        # whole) — from the "/" after the ~ boundary to the row's end.
+        (1...(word_start + "wordy-dir/child".length)).each do |x|
+          assert_equal [:reversed], session.cell_modifiers(x, 10), "word cell #{x} is highlighted"
+        end
+        copied = capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "up", x: word_start + 2, y: 10, button: "left"))
+        end
+        assert_equal "/wordy-dir/child", copied_text(copied),
+          "the word selection keeps paths and kebab-case whole over a footer row"
+      end
+    end
+
+    def test_triple_click_selects_the_whole_footer_row
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: File.join(Dir.home, "wordy-dir", "child"), model: "m", context_window: 1000}) do |chat, session|
+        draw(chat, session)
+        word_start = "~/wordy-dir/child".index("wordy")
+
+        3.times do
+          chat.on_event(TUI.mouse_event(kind: "down", x: word_start + 2, y: 10, button: "left"))
+        end
+        copied = capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "up", x: word_start + 2, y: 10, button: "left"))
+        end
+        assert_equal "~/wordy-dir/child", copied_text(copied),
+          "the triple-click line selection spans the footer row"
+      end
+    end
+
+    # --- app.message.copy (I28 AC3, pi keybindings.ts:63 ctrl+x →
+    # handleCopyCommand {flashConfirmation: true, preferSelection: true}) ---
+
+    def test_ctrl_x_copies_the_active_selection_else_the_last_assistant
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        finish_message(chat, "assistant says hi")
+        draw(chat, session)
+
+        copied = capture_stdout { chat.on_event(TUI.key_event("x", modifiers: ["ctrl"])) }
+        assert_equal "assistant says hi", copied_text(copied), "no selection → the last assistant message"
+
+        y = buffer_row(chat, "assistant says hi")
+        capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "down", x: 1, y:, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "drag", x: 9, y:, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "up", x: 9, y:, button: "left"))
+        end
+        copied = capture_stdout { chat.on_event(TUI.key_event("x", modifiers: ["ctrl"])) }
+        assert_equal "assistant", copied_text(copied), "the active selection wins"
+      end
+    end
+
+    def test_ctrl_x_without_a_copy_source_shows_the_error_line
+      with_chat(width: 40) do |chat, session|
+        draw(chat, session)
+        capture_stdout { chat.on_event(TUI.key_event("x", modifiers: ["ctrl"])) }
+        draw(chat, session)
+
+        assert_includes chat.transcript_lines, "Error: No agent messages to copy yet.",
+          "pi's showError (interactive-mode.ts:6651-6653)"
+      end
+    end
+
+    # pi's flash (alt-screen-flash.ts): a reversed " Copied! " composited
+    # at the finished screen's top-right for DEFAULT_DURATION_MS 1000,
+    # then one redraw.
+    def test_ctrl_x_flashes_the_confirmation_for_its_dwell
+      with_chat(width: 40, screen_height: 12) do |chat, session, kernel|
+        chat.flash_seconds = 0
+        finish_message(chat, "hi")
+        draw(chat, session)
+        capture_stdout { chat.on_event(TUI.key_event("x", modifiers: ["ctrl"])) }
+        draw(chat, session)
+
+        row0 = session.buffer_content[0]
+        assert_includes row0, "Copied!", "the flash composites at the screen's top-right"
+        assert_equal [:reversed], session.cell_modifiers(row0.rindex("Copied!"), 0)
+
+        kernel.fire_timers
+        draw(chat, session)
+        refute session.buffer_content[0].include?("Copied!"), "cleared after the dwell"
+      end
+    end
+
     # The buffer row currently displaying the transcript line containing
     # +text+ (the tests keep the view following, so the mapping is direct).
     def buffer_row(chat, text)
@@ -2771,9 +3063,10 @@ module Tart
     end
 
     # The OSC 52 payload's text (pi tui-alt-screen.ts:1483 — base64 under
-    # a bell terminator, buffer "c").
+    # a bell terminator, buffer "c"), re-encoded for comparison (unpack1
+    # yields ASCII-8BIT; non-ASCII payloads need the source encoding).
     def copied_text(stdout)
-      stdout[/\e\]52;c;(.*?)\a/, 1].unpack1("m")
+      stdout[/\e\]52;c;(.*?)\a/, 1]&.unpack1("m")&.force_encoding(Encoding::UTF_8)
     end
 
     # --- compaction-start border status (AC3, I12): the frozen event

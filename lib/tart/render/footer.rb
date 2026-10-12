@@ -47,16 +47,24 @@ module Tart
       # the colored context segment survives): every span is dim except
       # the context segment when it crosses the warning/error thresholds.
       def widget(data, width)
+        TUI.paragraph(text: lines(data, width), wrap: false)
+      end
+
+      # The footer's two display lines (the widget's rows): the pwd/branch
+      # line and the stats line. Public — the Chat's whole-screen selection
+      # composes the footer rows from it ({Chat#selection_line} reads and
+      # highlights the Line objects, not the finished paragraph).
+      def lines(data, width)
         pwd = Text.format_cwd(data[:cwd] || Dir.pwd)
         pwd = "#{pwd} (#{read_branch(data[:cwd])})" if read_branch(data[:cwd])
         # The pwd span carries the dim token ITSELF (pi footer.ts:282 —
         # theme.fg("dim", pwd)); TUI.line's array form ignores the line
         # fg, so the line-level fg: was silently dropping the color (the
         # default-fg pwd/branch defect).
-        TUI.paragraph(text: [
+        [
           TUI.line(Text.clip_spans([TUI.span(pwd, fg: Theme[:dim])], width)),
           stats(data, width),
-        ], wrap: false)
+        ]
       end
 
       # Session-cumulative usage totals + the latest assistant usage (the

@@ -13,8 +13,13 @@ module Tart
     # copy-on-select seam (pi :1332-1366, default on — :269, via
     # TUI.osc52_copy inside the release op). Points address
     # transcript-buffer rows (pi SelectionPoint reduced — the selection
-    # is anchored to buffer lines, so it survives scrolling); the
-    # buffer's content lines reach the machine through the
+    # is anchored to buffer lines, so it survives scrolling; whole-screen
+    # selection (I28) extends the space: rows below the transcript area
+    # arrive as NEGATIVE synthetic rows (terminal row − screen height,
+    # the coordinator's {Chat#content_point}) and the injected reader
+    # answers them from the composed dock — the machine itself stays
+    # area-agnostic. The buffer's content lines reach the machine
+    # through the
     # construction-injected reader over the Chat coordinator's live
     # transcript, the pointer points are threaded per call from it (the
     # content_point composition needs the viewport state + geometry).
@@ -78,6 +83,30 @@ module Tart
         return unless @selection
 
         update_focus(point) if point
+      end
+
+      # The selected text (pi getActiveSelectionText :1414-1437): each
+      # covered row's cell slice, trailing whitespace trimmed, joined
+      # with newlines. nil when nothing (or only whitespace) is selected.
+      # Public — pi's app.message.copy reads it for the preferSelection
+      # branch (interactive-mode.ts:6641-6648); the rows are the
+      # coordinator's whole-screen point space ({Point#row}): transcript
+      # buffer rows at 0+, the dock's synthetic rows below (negative —
+      # the coordinator's reader answers them).
+      def selection_text
+        start, focus = bounds
+        return nil unless start
+
+        text = (start.row..focus.row).map do |row|
+          source = line(row)
+          width = TUI.text_width(source)
+          from = start.row == row ? start.col : 0
+          to = focus.row == row ? (focus.boundary ? focus.col : focus.col + 1) : width
+          from = from.clamp(0, width)
+          to = to.clamp(from, width)
+          Text.slice_cells(source, from, to - from).rstrip
+        end.join("\n")
+        text.empty? ? nil : text
       end
 
       # Release: a press without a move (anchor == focus) collapses to no
@@ -153,26 +182,6 @@ module Tart
         return nil if a == b
 
         before?(a, b) ? [a, b] : [b, a]
-      end
-
-      # The selected text (pi getActiveSelectionText :1414-1437): each
-      # covered buffer row's cell slice, trailing whitespace trimmed,
-      # joined with newlines. nil when nothing (or only whitespace) is
-      # selected.
-      def selection_text
-        start, focus = bounds
-        return nil unless start
-
-        text = (start.row..focus.row).map do |row|
-          source = line(row)
-          width = TUI.text_width(source)
-          from = start.row == row ? start.col : 0
-          to = focus.row == row ? (focus.boundary ? focus.col : focus.col + 1) : width
-          from = from.clamp(0, width)
-          to = to.clamp(from, width)
-          Text.slice_cells(source, from, to - from).rstrip
-        end.join("\n")
-        text.empty? ? nil : text
       end
 
       # The selection's cell range on +row+ (pi getSelectionColumns
