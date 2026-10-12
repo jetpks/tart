@@ -362,17 +362,6 @@ module Tart
         @scrollback << region
       end
 
-      # The skill-invocation panel (pi skill-invocation-message.ts:
-      # Box(outputPad, 1, customMessageBg), collapsed by default, the
-      # ctrl+o toggle sweeps it via the expandable registry — pi
-      # component.setExpanded(this.toolOutputExpanded)). Collapsed: one
-      # content row — the bold customMessageLabel [skill], the
-      # customMessageText name, the dim " (ctrl+o to expand)" hint
-      # (keyText app.tools.expand). Expanded: the label row, then the
-      # bold-markdown name header + the content as markdown over
-      # customMessageText prose (pi's color override — token colors
-      # still apply, the prose callback doesn't). paddingY 1 both ways;
-      # every row through the {OUTPUT_PAD} rule + the full-width bg.
       # The compaction panel rows (pi compaction-summary-message.ts — the
       # skill panel's Box(outputPad, 1, customMessageBg) shape with the
       # label on its own row): the padY top, the bold customMessageLabel

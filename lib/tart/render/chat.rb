@@ -147,6 +147,11 @@ module Tart
         @selection_state = Selection.new(line_reader: ->(row) { selection_line(row) })
         # The running compaction's reason (the border-status label's key).
         @compaction_reason = nil
+        # The header-container rows the boot MOTD enqueued (the compaction
+        # rebuild restores them — pi's headerContainer survives the
+        # compaction_end chatContainer clear). nil = no header on screen
+        # (motd: false, or the /resume screen) — the rebuild restores none.
+        @header_rows = nil
         # The /resume session picker (item 2, pi SessionSelectorComponent
         # reduced): nil = closed; open it holds the {Picker} over the
         # launcher-built [{path:, label:}] list (newest first).
@@ -423,6 +428,11 @@ module Tart
             # (the frozen I12 contract); its clearing here stays.
             @compaction_reason = nil
             wipe_transcript
+            # The header container survives pi's chatContainer clear
+            # (interactive-mode.ts:633-639 — sibling containers; the s7
+            # capture: art + help + onboarding ride again, no resource
+            # listings). The boot's captured shape, exact rows.
+            @transcript_state.enqueue_region(@header_rows) if @header_rows
             entries = event[:entries].is_a?(Array) ? event[:entries] : []
             @transcript_state.replay_entries(entries, update_footer: false, populate_history: false)
             @transcript_state.enqueue_compaction_panel(event[:summary], event[:tokens_before])
@@ -540,8 +550,15 @@ module Tart
       # package-update notices are cut — the port loads none of them,
       # itemized). pi-mode renders pi's actual built-in header bytes.
       def enqueue_motd
-        lines = [Panel.blank_line]
-        lines.concat(@identity == Identity::PI ? Motd.pi_header_lines : Motd.tart_header_lines(viewport_width))
+        # The header-container shape (Spacer(1), the header, Spacer(1)) —
+        # captured so the compaction rebuild can restore the exact rows
+        # (pi's headerContainer is a separate container the compaction_end
+        # clear never touches; re-rendering would resurrect the port-only
+        # resource listings and tart-mode's random art would swap).
+        header = [Panel.blank_line]
+        header.concat(@identity == Identity::PI ? Motd.pi_header_lines : Motd.tart_header_lines(viewport_width))
+        @header_rows = [*header, Panel.blank_line]
+        lines = header.dup
         # The loaded-resource sections ride BOTH identities (pi
         # showLoadedResources renders for any theme/identity — the owner's
         # missing [Context]/[Skills]/[Prompts]/[Extensions] block; each
@@ -568,6 +585,9 @@ module Tart
       # {@footer.reset_usage} precedent).
       def clear_transcript
         wipe_transcript
+        # The capture dies with the screen it rode (the /resume screen
+        # re-renders no MOTD — the itemized cut; /new re-captures below).
+        @header_rows = nil
         @last_assistant_text = nil # the fresh session has no messages to copy
         # pi's footer stats re-derive from the fresh (empty) session.
         @footer.reset_usage

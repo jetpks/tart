@@ -3163,18 +3163,21 @@ module Tart
       end
     end
 
-    # The live rebuild (AC2, pi compaction_end's result arm): the
-    # transcript clears — the MOTD wiped and NOT re-rendered — the kept
-    # entries re-render chronologically through the replay machinery,
-    # the panel appends LAST; the footer invalidates (the "?") without
-    # resetting the usage totals; the border status clears.
+    # The live rebuild (AC1, pi compaction_end's result arm): the CHAT
+    # container clears — the kept entries re-render chronologically
+    # through the replay machinery, the panel appends LAST — while the
+    # HEADER container survives (interactive-mode.ts:633-639, sibling
+    # containers; the s7 capture: art + help ride again, and the
+    # port-only resource listings die with the wipe, not resurrected).
+    # The footer invalidates (the "?") without resetting the usage
+    # totals; the border status clears.
     def test_compaction_rebuilds_kept_entries_then_the_panel
       FileUtils.mkpath(File.join(@dir, ".tart"))
       File.write(File.join(@dir, ".tart", "settings.json"), "{}") # the [Context] section's input
       with_chat(width: 60, screen_height: 24, motd: true,
         footer_data: {cwd: @dir, model: "m", context_window: 1000, auto_compact: true}) do |chat, session|
         draw(chat, session)
-        assert_includes chat.transcript_lines.join, "[Context]", "the MOTD renders before the compaction"
+        assert_includes chat.transcript_lines.join, "[Context]", "the boot MOTD renders before the compaction"
         finish_message(chat, "kept reply")
         assistant_done(chat, TokensDouble.new(10, 5, 0, 0))
         send_message(chat, "hello")
@@ -3190,8 +3193,13 @@ module Tart
         lines = chat.transcript_lines
         joined = lines.join("\n")
         refute_includes joined, "✻ compacted", "the dim line is replaced by the rebuild"
-        refute_includes joined, "[Context]", "the MOTD is wiped and NOT re-rendered"
-        refute_includes joined, "tart v#{Tart::VERSION}", "no fresh MOTD block (pi's settled screen has none)"
+        assert_includes joined, Render::Motd::PI_NOTICE_LINE,
+          "the header survives the rebuild (pi's headerContainer, the chatContainer clear's untouched sibling)"
+        assert_includes joined, Render::Motd::PI_ONBOARDING_LINE, "the onboarding row survives with it"
+        refute_includes joined, "[Context]", "the port-only resource listings are NOT resurrected"
+        header_y = lines.index { |line| line.include?(Render::Motd::PI_NOTICE_LINE) }
+        assert_operator header_y, :<, lines.rindex { |line| line.include?("kept reply") },
+          "the header rides ABOVE the kept entries (pi's container order)"
         assert_includes joined, " hello", "the kept user entry re-renders through the replay machinery"
         assert_includes joined, "kept reply", "the kept assistant entry re-renders"
         panel_y = lines.index { |line| line.include?("Compacted from 100 tokens") }
