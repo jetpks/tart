@@ -11,7 +11,7 @@ module TuiSplitRig
     # The one owner-ruled non-path pin: the footer model segment's
     # provider prefix (pi's >1-provider gate over a snapshot the port
     # cannot reproduce — footer.ts:246-258).
-    SANCTIONED_NON_PATH = ["footer-provider-prefix"].freeze
+    SANCTIONED_NON_PATH = ["footer-provider-prefix", "compaction-token-estimate"].freeze
 
     def test_seed_registry_loads_and_classifies_staged_paths
       registry = Registry.load(SEED)
