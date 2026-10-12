@@ -151,7 +151,7 @@ module Tart
         10.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session) # settle: the buffer flushes, follow pins to the end
         chat.scrollbar_hide_delay_ms = 10_000 # fresh for the duration of the test — no real sleeps
-        3.times { chat.on_event(TUI.key_event("page_up")) } # scroll to the top; the echo is on screen
+        wheel_to_top(chat) # scroll to the top; the echo is on screen
         draw(chat, session)
         assert_equal "│", session.cell_symbol(19, 3), "the rail is visible (the overlay is what clipped the bg away)"
 
@@ -2940,26 +2940,46 @@ module Tart
     end
 
     # --- transcript scrolling (AC2, I12): pi ScrollView follow-end + the
-    # auto scrollbar (pageUp/pageDown per keybindings.ts:114-115 — the gem
-    # spells the codes page_up/page_down). ---
+    # auto scrollbar. The user-scroll seam is the WHEEL since I35 — the
+    # page keys page the editor now (I35 OPTION A, pi pageScroll; the
+    # I12 page-key mapping retired). ---
 
-    def test_page_up_pans_the_transcript_and_the_tail_refollows
+    # The wheel seam scrolled one VIEWPORT back (6 rows at these tests'
+    # 12-row screen — the same window the I12 page key used to land on;
+    # the page keys page the editor since I35). One line per event (pi
+    # lines-per-event default 1).
+    def wheel_page_back(chat)
+      6.times { chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0)) }
+    end
+
+    # The wheel seam scrolled to the very top — generous on purpose: the
+    # wheel clamps at 0 and a clamped no-op neither moves nor re-marks
+    # (pi scrollBy: moved === 0).
+    def wheel_to_top(chat)
+      40.times { chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0)) }
+    end
+
+    def wheel_to_end(chat)
+      40.times { chat.on_event(TUI.mouse_event(kind: "scroll_down", x: 0, y: 0)) }
+    end
+
+    def test_scrolling_up_pans_the_transcript_and_the_tail_refollows
       with_chat(width: 20, screen_height: 12) do |chat, session|
         20.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session)
         assert_equal " line19", transcript_view(session, chat).last, "following: the tail is visible"
 
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
         visible = transcript_view(session, chat)
-        refute_includes visible, "line19", "a page up detaches from the end"
-        assert_equal 28, chat.scroll_offset, "one page = the transcript viewport rows (6 off 34)"
-        assert_includes visible, " line14", "the window sits a page back into the transcript"
+        refute_includes visible, "line19", "a scroll away from the end detaches"
+        assert_equal 28, chat.scroll_offset, "scrolled to the top (34 buffer lines off a 6-row viewport)"
+        assert_includes visible, " line14", "the window sits a viewport back into the transcript"
 
-        chat.on_event(TUI.key_event("page_down"))
+        28.times { chat.on_event(TUI.mouse_event(kind: "scroll_down", x: 0, y: 0)) }
         draw(chat, session)
         assert_equal " line19", transcript_view(session, chat).last,
-          "a page down from the page-up position lands at the end and re-follows"
+          "scrolling back to the end re-follows"
       end
     end
 
@@ -2967,7 +2987,7 @@ module Tart
       with_chat(width: 20, screen_height: 12) do |chat, session|
         20.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session)
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
 
         finish_message(chat, "late")
@@ -2976,22 +2996,22 @@ module Tart
           "the detached view stays put while output streams"
         refute_includes transcript_view(session, chat), "late"
 
-        chat.on_event(TUI.key_event("page_down"))
+        chat.on_event(TUI.mouse_event(kind: "scroll_down", x: 0, y: 0))
         draw(chat, session)
-        refute_includes transcript_view(session, chat), "late", "a paged view pans one page, not to the end"
-        chat.on_event(TUI.key_event("page_down"))
+        refute_includes transcript_view(session, chat), "late", "a scroll down pans one line, not to the end"
+        wheel_to_end(chat)
         draw(chat, session)
         assert_equal " late", transcript_view(session, chat).last,
           "landing at the end re-follows the new output"
       end
     end
 
-    def test_page_scrolling_is_the_lists_prisoner_and_needs_no_overflow
+    def test_wheel_scrolling_needs_no_overflow
       with_chat(width: 20, screen_height: 12) do |chat, session|
         chat.on_agent_event({type: :agent_start})
-        "ar".each_char { |char| chat.on_event(TUI.key_event(char)) } # no slash: no list, page keys free
-        chat.on_event(TUI.key_event("page_up"))
-        assert_equal 0, chat.scroll_offset, "paging with nothing to scroll is a no-op"
+        "ar".each_char { |char| chat.on_event(TUI.key_event(char)) } # no slash: no list
+        chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0))
+        assert_equal 0, chat.scroll_offset, "wheeling with nothing to scroll is a no-op"
       end
     end
 
@@ -3021,7 +3041,7 @@ module Tart
         20.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session) # settle: the buffer flushes, follow pins to the end
         chat.scrollbar_hide_delay_ms = 10_000 # fresh for the duration of the test — no real sleeps
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
         assert_equal "┃", session.cell_symbol(19, 4), "the thumb paints the last column while activity is fresh (offset 28 of 34 → thumb rows 3-4)"
         assert_equal Theme[:scrollbarThumb], session.cell_fg(19, 4), "the thumb routes through the theme (pi's blue-tinted token)"
@@ -3037,11 +3057,10 @@ module Tart
       end
     end
 
-    # Mark sites (AC2): the user-scroll seams (pi scrollTo/scrollBy/
-    # scrollToStart/scrollToEnd analogs — page keys and the wheel) mark
-    # activity; the render-time follow-end adjustment never does (pi
-    # updateLayout :180-192), and a clamped no-op scroll marks nothing
-    # (pi scrollBy: moved === 0).
+    # Mark sites (AC2): the user-scroll seam (the wheel — the page keys
+    # page the editor since I35) marks activity; the render-time
+    # follow-end adjustment never does (pi updateLayout :180-192), and a
+    # clamped no-op scroll marks nothing (pi scrollBy: moved === 0).
     def test_user_scroll_marks_scrollbar_activity_follow_end_does_not
       with_chat(width: 20, screen_height: 12) do |chat, session, kernel|
         20.times { |i| finish_message(chat, "line#{i}") }
@@ -3052,9 +3071,9 @@ module Tart
         assert_equal " ", session.cell_symbol(19, 5),
           "the follow-end adjustment never marks activity (pi updateLayout)"
 
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
-        assert_equal "┃", session.cell_symbol(19, 4), "the page-key seam marks"
+        assert_equal "┃", session.cell_symbol(19, 4), "the wheel seam marks"
         assert_equal "│", session.cell_symbol(19, 5), "the thumb is not pinned at the bottom — the view is detached"
         chat.scrollbar_hide_delay_ms = 0 # the timer reads the delay at fire time
         kernel.fire_timers
@@ -3088,7 +3107,7 @@ module Tart
         assert_equal " line19", rows[5], "content ends at content — no carved column pads overflow rows"
         assert_equal "", rows[4], "the settled window's rows carry no padding"
 
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
         rows = TUI.widget_lines(chat.renderer.call)
         assert_equal "│", rows[0][-1], "the track paints the last column while visible"
@@ -3098,6 +3117,179 @@ module Tart
 
     # --- mouse: wheel scroll + transcript selection (I14 items 6/10,
     # driven through the synthetic-seam event shapes) ---
+
+    # --- I35 OPTION A (AC5): the page keys page the EDITOR's visual
+    # rows (pi pageScroll, editor.ts:1961-1973) — the transcript pans
+    # only through the wheel (the re-pointed family above); the I12
+    # page-key mapping is retired with Viewport#scroll_page. ---
+
+    def test_page_up_down_page_the_editor_and_the_transcript_does_not_move
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        9.times do |n|
+          chat.on_event(TUI.key_event("e"))
+          chat.on_event(TUI.key_event("enter", modifiers: ["shift"])) unless n == 8
+        end
+        draw(chat, session)
+        editor = chat.instance_variable_get(:@editor)
+        assert_equal 9, editor.lines.length, "the setup: 9 visual rows in the editor"
+        following = chat.scroll_offset
+
+        chat.on_event(TUI.key_event("page_up"))
+        draw(chat, session)
+        assert_equal following, chat.scroll_offset, "the transcript does not move on page_up"
+        assert_equal [3, 1], [editor.cursor_line, editor.cursor_col],
+          "the editor pages up 5 visual rows (max(5, floor(12*0.3))) with the sticky move"
+
+        chat.on_event(TUI.key_event("page_down"))
+        draw(chat, session)
+        assert_equal following, chat.scroll_offset, "the transcript does not move on page_down"
+        assert_equal [8, 1], [editor.cursor_line, editor.cursor_col], "the editor pages back down, clamped"
+      end
+    end
+
+    def test_viewport_has_no_scroll_page_and_the_wheel_still_pans
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        refute Render::Viewport.method_defined?(:scroll_page), "the retired I12 mapping is gone"
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        max = chat.scroll_offset
+        chat.on_event(TUI.key_event("page_up")) # pages the editor, not the transcript
+        draw(chat, session)
+        assert_equal max, chat.scroll_offset
+        chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0))
+        draw(chat, session)
+        assert_equal max - 1, chat.scroll_offset, "the wheel still pans the transcript"
+      end
+    end
+
+    # --- test list (5): the box grows with the wrapped rows, caps at
+    # the maxVisible window, keeps the cursor row visible, and composes
+    # the ↑/↓ borders (pi createScrollBorder). ---
+
+    def test_the_editor_box_grows_with_wrapped_rows_and_the_transcript_cedes
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        assert_equal 6, transcript_height(session, chat)
+
+        "aaaa bbbb cccc dddd eeee".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        draw(chat, session)
+        # Layout: transcript 0-4 (a row ceded), spacer 5, editor 6-9
+        # (border, 2 rows, border), footer 10-11.
+        assert_equal " line19", session.buffer_content[4].rstrip, "the transcript ceded a row to the wrapped editor"
+        # Layout: transcript 0-4, spacer 5, editor 6-9 (border, 2 rows, border), footer 10-11.
+        assert_equal "─" * 20, session.buffer_content[6].rstrip, "no hidden rows: a plain top border"
+        assert_equal "aaaa bbbb cccc", session.buffer_content[7].rstrip, "content row 1"
+        assert_equal "dddd eeee", session.buffer_content[8].rstrip, "content row 2 — the box grew"
+        assert_equal " ", session.cell_symbol(9, 8), "the cursor's trailing space sits past the row end"
+        assert session.cell_modifiers(9, 8).include?(:reversed), "the fake cursor marks the wrapped row"
+        assert_equal "─" * 20, session.buffer_content[9].rstrip, "no hidden rows: a plain bottom border"
+      end
+    end
+
+    def test_the_window_caps_the_box_and_the_borders_compose
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        "abcdefghi".each_char do |char|
+          chat.on_event(TUI.key_event(char))
+          chat.on_event(TUI.key_event("enter", modifiers: ["shift"])) unless char == "i"
+        end
+        draw(chat, session)
+        editor = chat.instance_variable_get(:@editor)
+        assert_equal 9, editor.lines.length
+        # maxVisible = max(5, floor(12*0.3)) = 5 → the box caps at 7 rows;
+        # the cursor row (8) pins the window at scroll 4. Layout: 2
+        # transcript rows, the spacer, editor 3-9 (border + 5 rows +
+        # border), the footer.
+        assert_equal 5, editor.rendered_rows
+        assert_equal 4, editor.scroll_offset
+        assert_equal "───── ↑ 4 more ─────", session.buffer_content[3].rstrip, "the ↑ border composes (createScrollBorder)"
+        assert_equal "─" * 20, session.buffer_content[9].rstrip, "nothing hidden below: a plain bottom border"
+        assert session.cell_modifiers(1, 8).include?(:reversed), "the cursor row stays visible under the cap"
+
+        chat.on_event(TUI.key_event("page_up"))
+        draw(chat, session)
+        assert_equal 3, editor.scroll_offset, "the editor paged up one window (the cursor row pins the top)"
+        assert_equal "───── ↓ 1 more ─────", session.buffer_content[9].rstrip, "the ↓ border composes"
+      end
+    end
+
+    # --- test list (7) through the dispatch: the newline keys route to
+    # addNewLine BEFORE the submit path (pi editor.ts:889-919). ---
+
+    def test_newline_keys_insert_newlines_without_submitting
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        "  a".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter", modifiers: ["shift"]))
+        assert_equal "  a\n", chat.input, "shift+enter inserts a newline (tui.input.newLine)"
+        chat.on_event(TUI.key_event("enter", modifiers: ["alt"]))
+        assert_equal "  a\n\n", chat.input, "alt+enter is pi's terminal fallback"
+        chat.on_event(TUI.key_event("j", modifiers: ["ctrl"]))
+        assert_equal "  a\n\n\n", chat.input, "ctrl+j inserts a newline (keybindings.ts:143)"
+        "b  ".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal "", chat.input, "plain enter submits"
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_includes lines, " a", "the echo carried the joined text (leading-trimmed)"
+        assert_includes lines, " b", "...and the trailing spaces are gone (pi submitValue trims)"
+        chat.on_event(TUI.key_event("up")) # empty editor: straight into history
+        assert_equal "a\n\n\nb", chat.input,
+          "submit sent the JOINED TRIMMED text — the interior blanks survive the trim (pi submitValue)"
+      end
+    end
+
+    def test_the_backslash_enter_idiom_inserts_a_newline
+      with_headless_chat do |chat|
+        "hello\\".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal "hello\n", chat.input, "the backslash-enter workaround (pi editor.ts:906-917)"
+        refute_includes chat.input, "\\", "the backslash was deleted, not kept"
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal "", chat.input, "a second enter submits (trimmed join)"
+      end
+    end
+
+    def test_multi_line_paste_normalizes_through_the_dispatch
+      with_headless_chat do |chat|
+        chat.on_event(TUI.paste_event("x\r\ny\tz\x01"))
+        assert_equal "x\ny    z", chat.input, "pi normalizeText + the non-printable filter"
+        editor = chat.instance_variable_get(:@editor)
+        assert_equal ["x", "y    z"], editor.lines
+      end
+    end
+
+    def test_multi_line_history_recall_edits_and_submits_as_text
+      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: false)
+        send_message(chat, "A1")
+        "B1".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter", modifiers: ["shift"]))
+        "B2".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+        chat.on_event(TUI.key_event("up")) # empty editor: straight into history
+        assert_equal ["B1", "B2"], chat.instance_variable_get(:@editor).lines,
+          "the multi-line entry recalls all rows"
+        chat.on_event(TUI.key_event("end"))
+        chat.on_event(TUI.key_event("X"))
+        assert_equal "B1X\nB2", chat.input, "the recalled entry edits at the cursor"
+        chat.on_event(TUI.key_event("enter"))
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join("\n"), "B1X", "the edited multi-line entry submits as text"
+      end
+    end
+
+    def test_slash_context_stays_line_zero_only_through_the_dispatch
+      with_headless_chat(autocomplete: slash_source("help")) do |chat|
+        "/he".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        assert chat.suggestions, "the list opens in slash context on line 0"
+        chat.on_event(TUI.key_event("enter", modifiers: ["shift"]))
+        assert_nil chat.suggestions, "the newline cancelled the list (pi addNewLine)"
+        "l".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        assert_nil chat.suggestions, "no list off line 0 (pi isSlashMenuAllowed)"
+      end
+    end
 
     def test_wheel_scrolls_one_line_per_event_and_alt_wheel_five
       with_chat(width: 20, screen_height: 12) do |chat, session|
