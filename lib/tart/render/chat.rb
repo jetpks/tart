@@ -215,9 +215,9 @@ module Tart
         @live = +""
         # The in-flight message's reasoning (pi's live thinking block): the
         # joined chunk.thinking deltas, rendered dim while it grows and
-        # flushed as the completed thinking block at :message_end (the loop
-        # strips Message#thinking before the surface sees the event —
-        # loop.rb strip_thinking_replay).
+        # flushed as the completed thinking block at :message_end (replay
+        # normalization happens at the request seam — Agent::Loop's
+        # before_request hook; the message itself keeps its thinking).
         @reasoning = +""
         @busy = false
         @tool = nil
@@ -1429,9 +1429,10 @@ module Tart
       # The footer's per-frame data view: the launcher facts with the
       # runtime overlays — the thinking level ({thinking_level}, pi
       # footer.ts:226-244) and the switched model's id, context window,
-      # and reasoning capability (I27, the footer model segment's
-      # refresh after a /model switch). nil footer_data renders from
-      # what the surface knows alone, as at base.
+      # reasoning capability, and thinkingLevelMap (I27 + I36, the footer
+      # model segment's + the level ladder's refresh after a /model
+      # switch). nil footer_data renders from what the surface knows
+      # alone, as at base.
       def footer_data
         data = @footer_data || {}
         data = data.merge(thinking_level: @thinking_level) if @thinking_level
@@ -1439,6 +1440,7 @@ module Tart
 
         data = data.merge(model: @runtime_model[:id])
         data = data.merge(context_window: @runtime_model[:context_window]) if @runtime_model[:context_window]
+        data = data.merge(thinking_level_map: @runtime_model[:thinking_level_map]) if @runtime_model.key?(:thinking_level_map)
         @runtime_model[:reasoning].nil? ? data : data.merge(reasoning: @runtime_model[:reasoning])
       end
 
@@ -1493,26 +1495,33 @@ module Tart
       end
 
       # pi getAvailableThinkingLevels (:2657-2662 →
-      # getSupportedThinkingLevels, models.ts:1224-1231): a non-reasoning
-      # model offers [off] alone; a reasoning model the full ladder. The
-      # runtime switch re-gates (the reasoning flag rides the per-frame
-      # footer view). The port's catalog schema carries no
-      # thinkingLevelMap — xhigh/max never filter (itemized).
+      # getSupportedThinkingLevels, models.ts:1224-1233): a non-reasoning
+      # model offers [off] alone; a reasoning model the ladder filtered
+      # through the runtime model's thinkingLevelMap (null marks a level
+      # unsupported, xhigh/max need a present entry; no map = pi's
+      # map-less rule off..high). The runtime switch re-gates (the map
+      # rides the per-frame footer view). Retires the I27 deviation
+      # ("xhigh/max never filter" — the catalog schema carries the map
+      # since I36).
       def available_thinking_levels
-        reasoning_capable? ? Settings::THINKING_LEVELS : %w[off]
+        Models.supported_thinking_levels(map: footer_data[:thinking_level_map], reasoning: reasoning_capable?)
       end
 
       # pi cycleThinkingLevel (agent-session.ts:2641-2653): the next
       # level in THINKING_LEVEL_OPTIONS order, wrapping — app.thinking.cycle
       # (shift+tab), kept in-session when bare /thinking became the menu
-      # (I27); no thinking support is a no-op (:2645-2646). (Public — the
-      # keybinding's callable.)
+      # (I27); no thinking support is a no-op (:2645-2646). A stored
+      # level outside the gated set (a switch re-laddered under it)
+      # cycles to the FIRST rung — pi's `indexOf → -1` makes
+      # `(−1 + 1) % size` land on index 0 (agent-session.ts:2641-2653).
+      # (Public — the keybinding's callable.)
       def cycle_thinking_level
         return unless reasoning_capable?
 
         current = @mutex.synchronize { thinking_level || Settings::DEFAULTS.fetch("thinkingLevel") }
         levels = available_thinking_levels
-        next_level = levels[(levels.index(current) + 1) % levels.size]
+        index = levels.index(current) || -1
+        next_level = levels[(index + 1) % levels.size]
         set_thinking_level(next_level)
         next_level
       end
@@ -1594,22 +1603,25 @@ module Tart
       # footer's re-ladder and the editor border's (the overlays flow
       # through {footer_data}), the status (pi showStatus — the transcript
       # tail row, I33); persist:true reports "Default thinking level" and
-      # writes the settings default (ctrl+s).
+      # writes the settings default (ctrl+s). The level rides the AGENT
+      # seam too ({Agent::Loop#set_thinking_level}) — the next request
+      # carries it (pi sets session state the stream options read).
       def apply_thinking_selection(level, persist:)
         @mutex.synchronize do
           @thinking_level = level
           @transcript_state.enqueue_status("#{persist ? "Default thinking level" : "Thinking level"}: #{level}")
         end
+        @agent&.set_thinking_level(level)
         Settings.save(@settings_root, "thinkingLevel" => level) if persist
         @kernel.request_draw
       end
 
       # The switch seam (pi selectModel → session.setModel { persist }):
       # swap the runtime chat model (the loop re-resolves the context
-      # window — Loop#switch_model), refresh the footer model segment +
-      # the editor border re-ladder (the runtime overlays flow into
-      # {footer_data}), report (pi showStatus — the transcript tail row,
-      # I33), and persist the default when asked.
+      # window AND the reasoning facts — Loop#switch_model), refresh the
+      # footer model segment + the editor border re-ladder (the runtime
+      # overlays flow into {footer_data}), report (pi showStatus — the
+      # transcript tail row, I33), and persist the default when asked.
       def apply_model_selection(entry, persist:)
         status = persist ? "Default model: #{entry[:provider]}/#{entry[:id]}" : "Model: #{entry[:id]}"
         @mutex.synchronize do
@@ -1618,9 +1630,14 @@ module Tart
         end
         # The wire provider is the models.json key mapped onto the port's
         # carried seam (Models.wire_provider — the loop's with_model
-        # needs a native slug); the window re-resolves in the loop seam.
+        # needs a native slug); the window + the composed reasoning facts
+        # re-resolve in the loop seam (the entry's flag/map, the known
+        # tables when the entry declares none — Settings.thinking_facts).
+        facts = Settings.thinking_facts(entry, model_id: entry[:id])
         @agent&.switch_model(entry[:id], provider: Models.wire_provider(entry[:provider]),
-          context_window: entry[:context_window])
+          context_window: entry[:context_window],
+          model_reasoning: facts[:reasoning],
+          thinking_level_map: facts[:thinking_level_map])
         Settings.save(@settings_root, "defaultProvider" => entry[:provider], "defaultModel" => entry[:id]) if persist
         @kernel.request_draw
       end
@@ -1635,12 +1652,13 @@ module Tart
       end
 
       # The boot entry from the launcher facts (footer_data): the
-      # resolved model/provider/window/reasoning.
+      # resolved model/provider/window/reasoning/level-map.
       def boot_model_entry
         data = @footer_data || {}
         model = data.fetch(:model, nil) || "no-model"
         {provider: data.fetch(:default_provider, "openai"), id: model, name: model,
-         reasoning: data[:reasoning], context_window: data[:context_window]}
+         reasoning: data[:reasoning], context_window: data[:context_window],
+         thinking_level_map: data[:thinking_level_map]}
       end
 
       # The ✓ current marker's ref: the runtime switch, else the boot

@@ -67,7 +67,7 @@ module Tart
       assert_equal "glm/glm-5.3", config.default
       entry = config.model_entries.first
       assert_equal ({provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
-                     context_window: 200_000, max_tokens: 8192}), entry
+                     context_window: 200_000, max_tokens: 8192, thinking_level_map: nil}), entry
       assert_equal "https://example.test/v1", config.provider("glm").fetch(:base_url)
       assert_equal "k-catalog", config.provider("glm").fetch(:api_key)
     end
@@ -196,6 +196,122 @@ module Tart
     def test_boot_resolves_settings_alone_when_no_catalog
       boot = Models.resolve_boot_model(Models.load(root: @root), settings, env: {})
       assert_equal ({provider: "settings-provider", id: "settings-model"}), boot
+    end
+
+    # --- thinkingLevelMap (I36): parse, validate, resolve —
+    # pi model-config.ts:38/:54 (the catalog field), model-schema.ts:14-15
+    # (Partial Record<level, String|null>), models.ts:1224-1254
+    # (supported/clamp), openai-completions.ts:745-755 + :969-976 (effort) ---
+
+    def test_thinking_level_map_parses_symbolized_with_null_values
+      write_models(<<~JSON)
+        {"providers": {"glm": {"models": [{"id": "m", "reasoning": true,
+          "thinkingLevelMap": {"off": null, "low": "low", "madeup": "x"}}]}}}
+      JSON
+
+      entry = load_models.model_entries.first
+      assert_equal ({off: nil, low: "low", madeup: "x"}), entry[:thinking_level_map],
+        "symbolized keys, null kept, unknown level keys tolerated (pi's Partial-Record default)"
+    end
+
+    def test_thinking_level_map_absent_is_nil
+      write_models('{"providers": {"glm": {"models": [{"id": "m"}]}}}')
+      assert_nil load_models.model_entries.first[:thinking_level_map]
+    end
+
+    def test_thinking_level_map_schema_violations_surface_an_error
+      write_models('{"providers": {"glm": {"models": [{"id": "m", "thinkingLevelMap": "high"}]}}}')
+      config = load_models
+      assert config.error
+      assert_match(/thinkingLevelMap: expected an object/, config.error)
+
+      write_models('{"providers": {"glm": {"models": [{"id": "m", "thinkingLevelMap": {"low": 5}}]}}}')
+      config = load_models
+      assert config.error
+      assert_match(/thinkingLevelMap\.low: expected a string or null/, config.error)
+    end
+
+    def test_thinking_level_map_valid_shapes_load_clean
+      write_models(<<~JSON)
+        {"providers": {"glm": {"models": [{"id": "m", "thinkingLevelMap":
+          {"off": null, "low": "low", "future_level": null}}]}}}
+      JSON
+      assert_nil load_models.error, "unknown level keys are tolerated (pi's Partial-Record default)"
+    end
+
+    # The owner's override map (every level a String; off floors to "low"
+    # directly) — Settings::THINKING_LEVEL_MAPS' glm row.
+    def owner_map
+      {off: "low", minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max"}
+    end
+
+    # The live fireworks catalog map ({off:null, ...} — the grounding's
+    # glm-5p3-flash shape).
+    def catalog_map
+      {off: nil, minimal: nil, low: "low", medium: nil, high: "high", xhigh: nil, max: "max"}
+    end
+
+    def test_resolve_reasoning_effort_owner_override
+      assert_equal "low", Models.resolve_reasoning_effort("off", map: owner_map, reasoning: true),
+        "the String off map value floors off directly"
+      assert_equal "low", Models.resolve_reasoning_effort("minimal", map: owner_map, reasoning: true)
+      assert_equal "medium", Models.resolve_reasoning_effort("medium", map: owner_map, reasoning: true)
+      assert_equal "max", Models.resolve_reasoning_effort("max", map: owner_map, reasoning: true)
+    end
+
+    def test_resolve_reasoning_effort_live_catalog_map
+      assert_equal "low", Models.resolve_reasoning_effort("off", map: catalog_map, reasoning: true),
+        "the null-off floor clamps upward: off → low"
+      assert_equal "low", Models.resolve_reasoning_effort("minimal", map: catalog_map, reasoning: true),
+        "minimal (null) clamps forward to low"
+      assert_equal "high", Models.resolve_reasoning_effort("medium", map: catalog_map, reasoning: true),
+        "medium (null) clamps forward to high"
+      assert_equal "max", Models.resolve_reasoning_effort("xhigh", map: catalog_map, reasoning: true),
+        "xhigh (null) clamps forward to max"
+      assert_equal "max", Models.resolve_reasoning_effort("max", map: catalog_map, reasoning: true)
+    end
+
+    def test_resolve_reasoning_effort_mapless
+      assert_nil Models.resolve_reasoning_effort("off", map: nil, reasoning: true),
+        "map-less off sends nothing"
+      assert_equal "medium", Models.resolve_reasoning_effort("medium", map: nil, reasoning: true),
+        "no map value falls back to the level itself"
+      assert_equal "high", Models.resolve_reasoning_effort("xhigh", map: nil, reasoning: true),
+        "map-less xhigh clamps down to high"
+      assert_equal "high", Models.resolve_reasoning_effort("max", map: nil, reasoning: true)
+    end
+
+    def test_resolve_reasoning_effort_non_reasoning_sends_nothing
+      assert_nil Models.resolve_reasoning_effort("high", map: owner_map, reasoning: false)
+      assert_nil Models.resolve_reasoning_effort("off", map: owner_map, reasoning: false)
+      assert_nil Models.resolve_reasoning_effort("medium", map: nil, reasoning: false)
+    end
+
+    def test_supported_thinking_levels_per_shape
+      assert_equal %w[off], Models.supported_thinking_levels(map: owner_map, reasoning: false),
+        "a non-reasoning model offers off alone"
+      assert_equal Settings::THINKING_LEVELS, Models.supported_thinking_levels(map: owner_map, reasoning: true),
+        "a full-String map offers the whole ladder"
+      assert_equal %w[low high max], Models.supported_thinking_levels(map: catalog_map, reasoning: true),
+        "null values mark levels unsupported"
+      assert_equal %w[off minimal low medium high], Models.supported_thinking_levels(map: nil, reasoning: true),
+        "the map-less rule: the ladder without xhigh/max"
+      assert_equal %w[off minimal low medium high],
+        Models.supported_thinking_levels(map: {off: "low"}, reasoning: true),
+        "xhigh/max need a PRESENT entry even when other levels map"
+    end
+
+    def test_clamp_thinking_level_forward_then_backward
+      assert_equal "low", Models.clamp_thinking_level("minimal", map: catalog_map, reasoning: true)
+      assert_equal "max", Models.clamp_thinking_level("xhigh", map: catalog_map, reasoning: true)
+      assert_equal "low", Models.clamp_thinking_level("off", map: catalog_map, reasoning: true),
+        "the null-off rung is skipped forward"
+      assert_equal "high", Models.clamp_thinking_level("max", map: nil, reasoning: true),
+        "map-less max clamps backward to high"
+      assert_equal "low", Models.clamp_thinking_level("bogus", map: catalog_map, reasoning: true),
+        "an unknown level lands on the first supported"
+      assert_equal "high", Models.clamp_thinking_level("high", map: catalog_map, reasoning: true),
+        "an exactly-supported level passes through"
     end
   end
 end

@@ -34,11 +34,18 @@ module Tart
     #   but the final response regardless.
     # @param stdout [IO] raw stdout (unbuffered); injectable for tests.
     # @param stderr [IO] injectable for tests.
+    # @param thinking_level [String] the settings-resolved level (pi
+    #   DEFAULT_THINKING_LEVEL "medium" when unset).
+    # @param model_reasoning [Boolean] the boot model's reasoning capability.
+    # @param thinking_level_map [Hash, nil] the boot model's thinkingLevelMap
+    #   (nil = the map-less rule).
     # @return [Integer] the exit code (pi's runPrintMode return).
     def run(prompt:, chat:, tools:, system_prompt: nil, on_event: nil,
-            stdout: $stdout, stderr: $stderr)
+            stdout: $stdout, stderr: $stderr, thinking_level: Settings::DEFAULTS.fetch("thinkingLevel"),
+            model_reasoning: false, thinking_level_map: nil)
       stdout.sync = true
-      agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:)
+      agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,
+        thinking_level:, model_reasoning:, thinking_level_map:)
       Core::Loop.new(session: NullSession.new).run { agent.run(prompt) }
       return error_exit(agent, stderr) if agent.last_error || agent.interrupted?
 

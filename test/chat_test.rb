@@ -1944,6 +1944,55 @@ module Tart
       end
     end
 
+    # I36 AC3: every selection path lands on the AGENT seam —
+    # apply_thinking_selection drives Agent::Loop#set_thinking_level, so
+    # /thinking, the shift+tab cycle, and the menu apply to the next
+    # request without restart (unit-pinned with a spy on the seam).
+    def test_thinking_selections_reach_the_agent_seam
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true}) do |chat, session|
+        levels = []
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:set_thinking_level) { |level| levels << level }
+        end
+        chat.commands = Commands::Handler.new(
+          skills: [], settings: {}, output: ->(text) { @commands_output << text },
+          spawn: ->(&block) { block.call }, agent: -> { chat.agent }, reset: -> {},
+          thinking: ->(arg) { chat.set_thinking_level(arg) },
+          thinking_menu: -> { chat.open_thinking_menu }, quit: -> {}
+        )
+
+        send_message(chat, "/thinking low")
+        assert_equal ["low"], levels, "the /thinking command rides the agent seam"
+
+        chat.on_event(TUI.key_event("tab", modifiers: ["shift"]))
+        assert_equal ["low", "medium"], levels, "the shift+tab cycle rides the agent seam"
+
+        chat.open_thinking_menu
+        chat.on_event(TUI.key_event("down"))
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal ["low", "medium", "high"], levels, "the menu selection rides the agent seam"
+      end
+    end
+
+    # pi cycleThinkingLevel (:2641-2653): a stored level OUTSIDE the gated
+    # set (a switch re-laddered under it) cycles to the FIRST rung — the
+    # JS `indexOf → -1` makes `(−1 + 1) % size` land on index 0, not on
+    # the rung after the floor.
+    def test_cycle_from_an_out_of_set_level_lands_on_the_first_rung
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "max", reasoning: true}) do |chat, session|
+        levels = []
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:set_thinking_level) { |level| levels << level }
+        end
+
+        assert_equal "off", chat.cycle_thinking_level,
+          "the wrap lands on the first rung (the map-less ladder has no max)"
+        assert_equal ["off"], levels, "the wrapped cycle rides the agent seam"
+      end
+    end
+
     # --- the selector menus (I27): key routes, dispatch wiring, the
     # switch seams — pi showSelector/app.model.select/app.models.save ---
 
@@ -1991,8 +2040,9 @@ module Tart
                       default_provider: "openai", thinking_level: "medium", reasoning: false}) do |chat, session|
         switched = []
         chat.agent = Object.new.tap do |agent|
-          agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil|
-            switched << {model_id:, provider:, context_window:}
+          agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil,
+                                                           model_reasoning: nil, thinking_level_map: nil|
+            switched << {model_id:, provider:, context_window:, model_reasoning:, thinking_level_map:}
           end
         end
 
@@ -2001,9 +2051,11 @@ module Tart
         draw(chat, session)
 
         refute chat.menu_open?, "the selection closes the menu (the editor is restored)"
-        assert_equal [{model_id: "glm-5.3", provider: "openai", context_window: 200_000}], switched,
+        assert_equal [{model_id: "glm-5.3", provider: "openai", context_window: 200_000,
+                       model_reasoning: true, thinking_level_map: nil}], switched,
           "the loop seam swaps the runtime chat model (the wire provider — the port's " \
-          "single chat-completions seam) and re-resolves the window"
+          "single chat-completions seam), re-resolves the window, and carries the " \
+          "switched entry's composed reasoning facts (known-tables-second)"
         assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("glm-5.3 • medium"),
           "the footer model segment refreshed (the entry's reasoning flag rides along)"
         assert_includes chat.transcript_lines.join, "Model: glm-5.3",
@@ -2149,14 +2201,53 @@ module Tart
       end
     end
 
-    def test_thinking_menu_lists_all_levels_for_a_reasoning_runtime_model
+    def test_thinking_menu_lists_the_mapless_rule_for_a_reasoning_runtime_model
       with_chat(width: 40, screen_height: 16,
         footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true}) do |chat, session|
         chat.open_thinking_menu
 
         menu = chat.instance_variable_get(:@menu)
+        assert_equal %w[off minimal low medium high], menu.instance_variable_get(:@items).map { |item| item[:value] },
+          "no map = pi's map-less rule: the ladder without xhigh/max (models.ts:1224-1231)"
+      end
+    end
+
+    # The runtime map filters the ladder (I36 — the I27 "xhigh/max never
+    # filter" deviation retired): a mapped model offers exactly
+    # Models.supported_thinking_levels.
+    def test_thinking_menu_gates_by_the_boot_map
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true,
+                      thinking_level_map: {off: nil, minimal: nil, low: "low", medium: nil, high: "high",
+                                           xhigh: nil, max: "max"}}) do |chat, session|
+        chat.open_thinking_menu
+
+        menu = chat.instance_variable_get(:@menu)
+        assert_equal %w[low high max], menu.instance_variable_get(:@items).map { |item| item[:value] },
+          "null values mark levels unsupported (pi getSupportedThinkingLevels)"
+      end
+    end
+
+    # The switch overlay carries the switched entry's map: the ladder
+    # re-gates after a /model switch (pi setModel → _clampThinkingLevel).
+    def test_thinking_ladder_re_gates_on_the_switched_entrys_map
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", reasoning: true,
+                      thinking_level_map: {off: "low", low: "low", medium: "medium", high: "high",
+                                           xhigh: "xhigh", max: "max"}}) do |chat, session|
+        chat.open_thinking_menu
+        menu = chat.instance_variable_get(:@menu)
         assert_equal Settings::THINKING_LEVELS, menu.instance_variable_get(:@items).map { |item| item[:value] },
-          "the full ladder (no thinkingLevelMap in the port's schema — itemized)"
+          "the boot map offers the whole ladder"
+        chat.on_event(TUI.key_event("esc"))
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+        chat.open_thinking_menu
+        menu = chat.instance_variable_get(:@menu)
+        assert_equal %w[off minimal low medium high], menu.instance_variable_get(:@items).map { |item| item[:value] },
+          "the switched entry's map-less shape re-gates (the overlay replaces the boot map)"
       end
     end
 

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../compaction"
+require_relative "../models"
 require_relative "../settings"
 require_relative "bridge"
 require_relative "session"
@@ -63,9 +64,20 @@ module Tart
       # @param compaction [Hash, Compaction::Settings, nil] compaction
       #   settings ({enabled:, reserve_tokens:, keep_recent_tokens:});
       #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
+      # @param thinking_level [String] the session's thinking level (pi
+      #   DEFAULT_THINKING_LEVEL "medium"); {set_thinking_level} changes
+      #   it mid-session — the next request picks it up (the hook reads it
+      #   at request time; no gem state to reset).
+      # @param model_reasoning [Boolean] the model's reasoning capability
+      #   (pi model.reasoning) — gates whether any reasoning_effort is
+      #   ever sent.
+      # @param thinking_level_map [Hash, nil] the model's thinkingLevelMap
+      #   (pi's Partial Record<level, String|null>, symbolized); nil = the
+      #   map-less rule (pi's ladder without xhigh/max, off sends nothing).
       def initialize(chat:, tools:, system_prompt: nil, on_event: nil,
         recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
-        identity: Identity::DEFAULT)
+        identity: Identity::DEFAULT, thinking_level: "medium",
+        model_reasoning: false, thinking_level_map: nil)
         @chat = chat
         @tools = tools
         @on_event = on_event
@@ -73,6 +85,9 @@ module Tart
         @identity = identity
         @context_window = context_window
         @compaction_settings = Compaction::Settings.resolve(compaction)
+        @thinking_level = thinking_level
+        @model_reasoning = model_reasoning == true
+        @thinking_level_map = thinking_level_map
         @overflow_recovery_attempted = false
         @pre_compaction_messages = {}.compare_by_identity
         @entry_ids = {}.compare_by_identity
@@ -87,6 +102,7 @@ module Tart
         @chat.with_instructions(system_prompt) if system_prompt
         seed_messages.each { |message| @chat.add_message(message) }
         install_chat_callbacks
+        install_thinking_seam
       end
 
       # Queues a user message. While the agent runs, it is consumed at the
@@ -109,6 +125,20 @@ module Tart
       # denominator) — the test/launcher readback for the switch seam.
       attr_reader :context_window
 
+      # The session's thinking level (pi agent.state.thinkingLevel) — the
+      # surface's readback ({Render::Chat#apply_thinking_selection} drives
+      # it through {set_thinking_level}).
+      attr_reader :thinking_level
+
+      # The thinking level's runtime seam (pi setThinkingLevel :5163-5172 →
+      # session state): stored only — the request hook reads it at request
+      # time, so the NEXT request carries the new level (pi's per-request
+      # clampThinkingLevel, streamSimple :749). The surface calls it.
+      def set_thinking_level(level)
+        @thinking_level = level
+        self
+      end
+
       # The model-switch seam (I27, /model + the selector menus): swaps
       # the runtime chat model in place — ruby_llm Chat#with_model
       # (live-verified, chat.rb:609: re-resolves provider + connection)
@@ -118,7 +148,14 @@ module Tart
       # the openai provider would otherwise pick :responses; the port's
       # models are assumed, not registry-resolved). Idle-only: the menus
       # open when no turn runs.
-      def switch_model(model_id, provider:, context_window: nil)
+      #
+      # I36: the reasoning facts re-resolve alongside (pi setModel swaps
+      # the Model object, so its reasoning/thinkingLevelMap come from the
+      # switched entry): +model_reasoning:+/+thinking_level_map:+ carry the
+      # switched entry's composed facts ({Settings.thinking_facts}'s rule
+      # — the surface passes them; nil = the entry declares none, the
+      # map-less rule).
+      def switch_model(model_id, provider:, context_window: nil, model_reasoning: nil, thinking_level_map: nil)
         @chat.with_model(model_id, provider:, protocol: :chat_completions, assume_model_exists: true)
         # pi has no cached window to go stale: setModel swaps the Model
         # object (agent-session.ts:2484) and every check reads
@@ -134,6 +171,12 @@ module Tart
         # nil-disabling it). nil still = threshold disabled, pi's
         # `contextWindow ?? 0`.
         @context_window = Settings.resolve_context_window(explicit: context_window, model: @chat.model)
+        # The facts re-resolve wholesale (pi setModel swaps the Model
+        # object — no stale map survives onto the switched model): the
+        # surface passes fully composed facts, so nil IS "the entry
+        # declares none" (the map-less rule), not "keep the previous".
+        @model_reasoning = model_reasoning == true
+        @thinking_level_map = thinking_level_map
         self
       end
 
@@ -516,6 +559,45 @@ module Tart
         end
       end
 
+      # The request seam (I36 — pi's thinking wiring, ONE hook installed at
+      # construction; ruby_llm's before_request runs LAST in Protocol#render,
+      # mutating the symbol-keyed payload in place before serialization, on
+      # BOTH the streaming and sync paths):
+      #
+      # (a) the resolved level reaches the wire (pi streamSimple :745-755 +
+      #     the generic branch :969-976): reasoning_effort =
+      #     Models.resolve_reasoning_effort — the map's value for the clamped
+      #     level, else the level; off sends the map's String `off` value or
+      #     NOTHING (non-reasoning models, map-less off). The gem's own
+      #     thinking config is never set (with_thinking is registry-driven
+      #     and unsettable — Thinking::Controls), so this hook owns the
+      #     field outright. Reading @thinking_level at request time makes
+      #     mid-session changes apply to the next request.
+      #
+      # (b) the replay protocol (pi :1340-1352 — assistantMsg[signature],
+      #     the delta-carried field; live-verified for fireworks:
+      #     reasoning_content): recorded assistant messages KEEP their
+      #     thinking (memory, session file, resume — the I05 strip
+      #     deviation is gone), and the request normalization drops
+      #     ruby_llm's duplicate `reasoning` field so the wire carries
+      #     `reasoning_content` ONLY — the shape pi sends, and the shape the
+      #     strict endpoint accepts (the I05 400 class cannot recur through
+      #     the port's own payload).
+      def install_thinking_seam
+        @chat.before_request do |payload|
+          effort = Models.resolve_reasoning_effort(@thinking_level,
+            map: @thinking_level_map, reasoning: @model_reasoning)
+          if effort
+            payload[:reasoning_effort] = effort
+          else
+            payload.delete(:reasoning_effort)
+          end
+          payload[:messages]&.each do |message|
+            message.delete(:reasoning) if message.is_a?(Hash) && message[:role] == "assistant"
+          end
+        end
+      end
+
       def handle_item(item)
         case item[:type]
         when :chunk
@@ -535,7 +617,6 @@ module Tart
           # Tool results are recorded by the :tool_message item (ruby_llm's
           # after_message); the step's own return would double-count them.
           unless message.role == :tool
-            strip_thinking_replay(message)
             @new_messages << message
             emit(type: :message_end, message:) if message.role == :assistant
             record(message)
@@ -555,29 +636,6 @@ module Tart
 
       def emit(event)
         @on_event&.call(event)
-      end
-
-      # ruby_llm 2.1 replays an assistant reply's thinking on every later
-      # request (protocols/chat_completions/chat.rb format_thinking: both
-      # `reasoning` and `reasoning_content`), which strict OpenAI-compatible
-      # endpoints reject with a schema 400 (fireworks: "Extra inputs are not
-      # permitted, field: 'messages[n].reasoning'") — killing every follow-up
-      # turn after a thinking reply. pi, by contrast, replays the reasoning
-      # field the deltas carried: chat-completions endpoints map deltas to
-      # thinking blocks keyed by signature ∈ {reasoning, reasoning_content,
-      # reasoning_text} (packages/ai/src/api/openai-completions.ts:611-627),
-      # then send the joined thinking back as assistantMsg[signature] — unless
-      # encrypted reasoning_details are preserved (:1340-1351). The port
-      # suppresses it outright (deviation itemized in the iteration record).
-      # Mirrors the gem's own without_native_content
-      # idiom (message.rb:140-146: instance_variable_set on a live message);
-      # narrower than calling without_native_content, which would also strip
-      # tool-call thought signatures (message.rb:316-321).
-      def strip_thinking_replay(message)
-        return unless message.role == :assistant
-
-        message.instance_variable_set(:@thinking, nil)
-        message.instance_variable_set(:@raw_reasoning, nil)
       end
     end
   end

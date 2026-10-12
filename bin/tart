@@ -100,13 +100,18 @@ module Tart
           The model catalog loads from ~/.tart/models.json (pi's shape,
           JSON comments tolerated): {"providers": {"<provider>": {name,
           baseUrl, apiKey, api, "models": [{id, name, reasoning,
-          contextWindow, maxTokens}]}}} plus an optional "default":
-          "<provider/model-id>" boot reference. The boot model resolves
-          the identity-namespaced MODEL/PROVIDER env (below) > the
+          contextWindow, maxTokens, thinkingLevelMap}]}}} plus an optional
+          "default": "<provider/model-id>" boot reference. The boot model
+          resolves the identity-namespaced MODEL/PROVIDER env (below) > the
           models.json default > the settings defaultModel/defaultProvider;
           a provider's baseUrl/apiKey feed the endpoint (the namespaced
-          API_KEY/API_BASE still override). ctrl+s in the model menu
-          persists defaultProvider + defaultModel to ~/.tart/settings.json.
+          API_KEY/API_BASE still override). thinkingLevelMap maps the
+          thinking levels onto the model's reasoning_effort values
+          ("off"→"low" style; a null marks a level unsupported) — the
+          selected level reaches the wire as reasoning_effort through it;
+          a model that cannot turn thinking off floors "off" to the map's
+          String off value. ctrl+s in the model menu persists
+          defaultProvider + defaultModel to ~/.tart/settings.json.
 
         Prompt templates:
           Prompt templates load from ~/.tart/prompts and
@@ -198,11 +203,15 @@ module Tart
       context_files = Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root)
       abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
 
+      boot = Models.resolve_boot_model(models, settings, identity:)
+      chat = build_chat(settings, models, boot, identity:)
       exit Print.run(
         prompt: options[:print],
-        chat: build_chat(settings, models, Models.resolve_boot_model(models, settings, identity:), identity:),
+        chat:,
         tools: build_tools(workdir, settings),
-        system_prompt: system_prompt(workdir, settings, skills.skills, identity, context_files:)
+        system_prompt: system_prompt(workdir, settings, skills.skills, identity, context_files:),
+        thinking_level: Settings.resolve_thinking_level(settings),
+        **boot_thinking_kwargs(settings, models, boot, chat, identity:)
       )
     end
 
@@ -256,7 +265,8 @@ module Tart
           # default is honored by the next /new too.
           boot = Models.resolve_boot_model(models, settings, identity:)
           chat = build_chat(settings, models, boot, identity:)
-          surface.footer_data = footer_data(workdir, settings, boot:, chat:, identity:)
+          facts = footer_data(workdir, settings, boot:, chat:, identity:, models:)
+          surface.footer_data = facts
           surface.agent = Agent::Loop.new(
             chat:,
             tools:,
@@ -266,7 +276,10 @@ module Tart
             seed_messages:,
             context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
             compaction: Settings.compaction_kwargs(settings),
-            identity:
+            identity:,
+            thinking_level: facts.fetch(:thinking_level),
+            model_reasoning: facts.fetch(:reasoning),
+            thinking_level_map: facts[:thinking_level_map]
           )
         end
 
@@ -364,16 +377,19 @@ module Tart
 
     # Footer facts (AC4): the I10 resolved window is the context-usage
     # denominator; the model id is the settings-resolved one; the model
-    # metadata (provider label + reasoning capability — the footer's model
-    # segment, pi footer.ts:226-258) resolves off the chat's registry
-    # model, stageable via <IDENTITY>_MODEL_REASONING (Settings); the
-    # thinking level rides the settings-resolved value.
-    def footer_data(workdir, settings, boot: nil, chat:, identity: Identity::DEFAULT)
+    # metadata (reasoning capability + the I36 thinkingLevelMap — the
+    # footer's model segment and the level ladder's source, pi
+    # footer.ts:226-258) composes catalog-entry-first, known-tables-second
+    # ({Settings.thinking_facts}), stageable via <IDENTITY>_MODEL_REASONING
+    # (Settings); the thinking level rides the settings-resolved value.
+    def footer_data(workdir, settings, boot: nil, chat:, identity: Identity::DEFAULT, models: nil)
       # Optional +boot+: the in-launcher call sites resolve the boot pair
       # per session; the legacy (settings, chat) shape resolves it from
       # settings alone.
       boot ||= {provider: Settings.resolve_setting("defaultProvider", settings),
                 id: Settings.resolve_setting("defaultModel", settings)}
+      facts = Settings.thinking_facts(models && resolve_boot_entry(models, boot),
+        settings, model_id: boot[:id], model: chat.model, identity:)
       # No provider label: pi prefixes the provider only when MORE THAN
       # one provider is available (footer.ts:246-258) — the port resolves
       # a single static provider, so the segment is the bare model (the
@@ -384,11 +400,27 @@ module Tart
         cwd: workdir,
         model: boot[:id],
         default_provider: boot[:provider],
-        reasoning: Settings.model_reasoning_capable(settings, chat.model, identity:),
+        reasoning: facts[:reasoning],
+        thinking_level_map: facts[:thinking_level_map],
         context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
         auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
         thinking_level: Settings.resolve_thinking_level(settings)
       }
+    end
+
+    # The thinking facts as Agent::Loop kwargs (the print-mode seam): the
+    # same composition the interactive boot's footer_data rides.
+    def boot_thinking_kwargs(settings, models, boot, chat, identity:)
+      facts = Settings.thinking_facts(resolve_boot_entry(models, boot),
+        settings, model_id: boot[:id], model: chat.model, identity:)
+      {model_reasoning: facts[:reasoning], thinking_level_map: facts[:thinking_level_map]}
+    end
+
+    # The catalog entry for a boot pair (the I28 cross-resolve): the boot
+    # provider is a WIRE slug for env/settings boots while catalog keys
+    # are endpoint keys — canonical pair resolve first, then the bare id.
+    def resolve_boot_entry(models, boot)
+      models.resolve("#{boot[:provider]}/#{boot[:id]}") || models.resolve(boot[:id].to_s)
     end
 
     def report_diagnostics(diagnostics, surface: nil)

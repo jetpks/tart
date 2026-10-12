@@ -73,6 +73,29 @@ provider.
 modifiers composes onto the user's selection, a project list with a plain
 name replaces it.
 
+### Models
+
+The model catalog loads from `~/.tart/models.json` (pi's shape, JSON
+comments tolerated): `{"providers": {"<provider>": {name, baseUrl,
+apiKey, api, "models": [{id, name, reasoning, contextWindow, maxTokens,
+thinkingLevelMap}]}}}` plus an optional `"default"` boot reference
+(`"<provider/model-id>"`). The boot model resolves the
+identity-namespaced MODEL/PROVIDER env (below) > the models.json default
+> the settings `defaultModel`/`defaultProvider`.
+
+`thinkingLevelMap` maps the thinking levels onto the model's native
+`reasoning_effort` values (`{"off": "low", "low": "low", "medium":
+"medium", ...}`; a `null` marks a level unsupported, and `xhigh`/`max`
+need an explicit entry — without a map they are not offered). The
+selected level reaches the wire as `reasoning_effort` through the map:
+the map's value for the resolved level, else the level itself; a model
+that cannot turn thinking off floors `off` to the map's String `off`
+value (the default fireworks glm floors to `"low"`), and `off` sends
+nothing on models with no such floor. Prior assistant thinking is kept
+in the session and replayed on follow-up requests under
+`reasoning_content` (the field the provider's deltas carried), so later
+turns do not re-think from scratch.
+
 ### Skills
 
 Skills load from `~/.tart/skills` (user) and `<workdir>/.tart/skills`
