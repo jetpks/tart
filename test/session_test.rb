@@ -232,6 +232,58 @@ module Tart
       assert_equal({"readFiles" => ["a.rb"], "modifiedFiles" => []}, compaction["details"])
     end
 
+    # AC3 (I30): the summarization usage persists on the compaction entry
+    # (pi CompactionEntry.usage, session-manager.ts:99) — camelCase, the
+    # round-trip through the file; estimated_tokens_after is not a field
+    # (pi doesn't carry it); nil usage omits the key (pi's optional
+    # usage — JSON drops undefined).
+    def test_recorder_persists_the_summarization_usage_on_the_compaction_entry
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_message(RubyLLM::Message.new(role: :user, content: "hi"))
+      recorder.append_compaction(summary: "the summary", first_kept_entry_id: nil, tokens_before: 42,
+        details: {}, usage: {"input" => 10, "output" => 5, "totalTokens" => 15})
+      recorder.append_compaction(summary: "second", first_kept_entry_id: nil, tokens_before: 1, details: {})
+
+      entries = Agent::Session.load_entries(recorder.path)
+      assert_equal({"input" => 10, "output" => 5, "totalTokens" => 15}, entries[2]["usage"])
+      refute entries[2].key?("estimatedTokensAfter")
+      refute entries[3].key?("usage")
+    end
+
+    # AC3 (I30): the gem's Tokens readers map onto pi's Usage (types.ts
+    # :446) camelCase persisted shape — unreported counts drop,
+    # totalTokens is the component sum (the gem carries no total reader);
+    # nothing reported persists nothing (pi's usage-undefined entries).
+    def test_compaction_usage_maps_the_gem_tokens_to_pis_usage_shape
+      tokens = RubyLLM::Tokens.new(input: 10, output: 5, cache_read: 4, cache_write: 2,
+        thinking: 3, cache_write_by_ttl: {"5m" => 1, "1h" => 2})
+      assert_equal(
+        {"input" => 10, "output" => 5, "cacheRead" => 4, "cacheWrite" => 2,
+         "cacheWrite1h" => 2, "reasoning" => 3, "totalTokens" => 21},
+        Agent::Session.compaction_usage(tokens))
+
+      assert_nil Agent::Session.compaction_usage(RubyLLM::Tokens.new)
+      assert_nil Agent::Session.compaction_usage(nil)
+    end
+
+    # AC3 (I30): the recorder's context projection (pi buildContextEntries
+    # :475-513) — the compaction entry leading, the kept entries from
+    # firstKeptEntryId onward (system messages skipped), the as-loaded
+    # shape load_entries reads back.
+    def test_recorder_context_entries_projects_the_kept_tail
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_message(RubyLLM::Message.new(role: :user, content: "old question"))
+      recorder.append_message(RubyLLM::Message.new(role: :system, content: "prompt state"))
+      kept_id = recorder.append_message(RubyLLM::Message.new(role: :assistant, content: "kept answer"))
+      recorder.append_compaction(summary: "the summary", first_kept_entry_id: kept_id,
+        tokens_before: 1, details: {})
+
+      entries = recorder.context_entries
+      assert_equal "compaction", entries.first["type"]
+      assert_equal ["kept answer"], entries.drop(1).map { |e| e["message"]["content"] }
+      assert_equal Agent::Session.load_entries(recorder.path)[3, 1], entries.drop(1)
+    end
+
     # AC4: compaction-aware context replay (pi buildContextEntries
     # :475-513): the summary, the kept entries from firstKeptEntryId
     # (system messages skipped), everything after — none of the

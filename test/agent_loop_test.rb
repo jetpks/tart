@@ -251,6 +251,15 @@ module Tart
       assert_nil agent.context_window, "no stale window after a no-window switch"
       assert_nil chat.model.context_window, "the re-resolve reads the chat's model"
 
+      # I30 (the I29 residual): a known-models-table entry with no declared
+      # window resolves the table's window (Settings::MODEL_CONTEXT_WINDOWS
+      # — the boot chain's known-models tier) — the compaction denominator
+      # refreshes instead of nil-disabling the threshold trigger.
+      agent.switch_model("accounts/fireworks/models/glm-5p3-flash", provider: "openai")
+      assert_equal "accounts/fireworks/models/glm-5p3-flash", chat.model.id
+      assert_equal Settings::MODEL_CONTEXT_WINDOWS.fetch(chat.model.id), agent.context_window,
+        "the table window resolved; the footer denominator readback refreshes"
+
       # The switched chat still talks to the endpoint (the seam does not
       # strand the connection) — a real request round-trips.
       @server.script([{type: :message, content: "switched"}])
@@ -302,6 +311,53 @@ module Tart
       assert_includes events.map { |e| e[:type] }, :compaction
       compaction = events.find { |e| e[:type] == :compaction }
       assert_equal :threshold, compaction[:reason]
+    end
+
+    # AC3 (I30, the frozen payload): the :compaction event carries exactly
+    # reason/tokens_before/summary/entries — entries the kept
+    # post-compaction replay entries, chronological, no system/summary
+    # message, the same as-loaded shape load_entries reads back (pi's
+    # rebuild source, interactive-mode.ts:3698-3705 — buildContextEntries
+    # + renderSessionEntries(entries.slice(1))). The summarization call's
+    # usage (the mock's fixed 10+5) persists on the compaction entry in
+    # pi's Usage shape; estimated_tokens_after does not.
+    def test_compaction_event_carries_the_kept_replay_entries
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :error, status: 400, message: "This model's maximum context length is 8 tokens"},
+        {type: :message, content: "a summary of the first turn"},
+        {type: :stream, content: "recovered"},
+      ])
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: File.join(@dir, "root"))
+      agent, events = agent_on_kernel(compaction: {keep_recent_tokens: 5}, recorder:)
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      # Turn 1, the overflowing turn-2 step, the summarization one-shot,
+      # the retry.
+      assert_equal 4, @server.captured_requests.size
+
+      compaction = events.find { |e| e[:type] == :compaction }
+      assert_equal %i[type reason tokens_before summary entries], compaction.keys
+      assert_equal :overflow, compaction[:reason]
+      assert_includes compaction[:summary], "a summary of the first turn"
+
+      # The kept tail [first answer, second question] — chronological,
+      # no summarized-away turn, no summary message, the recorded
+      # (as-loaded) entry hashes exactly.
+      entries = compaction[:entries]
+      assert_equal %w[assistant user], entries.map { |e| e["message"]["role"] }
+      assert_equal ["first answer", "second question"], entries.map { |e| e["message"]["content"] }
+      recorded = Agent::Session.load_entries(recorder.path)
+      assert_equal recorded[2, 2], entries, "the payload IS the recorded kept slice"
+
+      persisted = recorded.find { |e| e["type"] == "compaction" }
+      # The gem's chat_completions mapping reports an unexplained cache
+      # write as 0 (protocols/chat_completions/chat.rb:191-195) — the
+      # reader's value persists as-is.
+      assert_equal({"input" => 10, "output" => 5, "cacheWrite" => 0, "totalTokens" => 15},
+        persisted["usage"])
+      refute persisted.key?("estimatedTokensAfter")
     end
 
     # AC1 (I29): the zero-usage fallback — the knob strips the usage
