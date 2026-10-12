@@ -68,6 +68,11 @@ module Tart
       # chat-viewport.ts:33 editor minSize 3).
       MIN_EDITOR_ROWS = 3
 
+      # pi's alt-screen flash dwell (alt-screen-flash.ts:13
+      # DEFAULT_DURATION_MS = 1000) — the copy confirmation's opacity
+      # window. A test seam shortens it ({@flash_seconds}).
+      FLASH_SECONDS = 1.0
+
       # pi status-indicator.ts:85-95 — the compaction-start border labels,
       # minus the cancel hint (deviation: ctrl+c aborts the whole run in the
       # port, not just the compaction — BRIEF §5.1, itemized).
@@ -139,7 +144,7 @@ module Tart
         # unsynchronized — see the class comments; the selection reads
         # this surface's live transcript through its content seam.
         @viewport = Viewport.new
-        @selection_state = Selection.new(line_reader: ->(row) { plain_content_line(row) })
+        @selection_state = Selection.new(line_reader: ->(row) { selection_line(row) })
         # The running compaction's reason (the border-status label's key).
         @compaction_reason = nil
         # The /resume session picker (item 2, pi SessionSelectorComponent
@@ -182,6 +187,13 @@ module Tart
           line_sink: ->(text, fg:) { @transcript_state.enqueue_scrollback(text, fg:) }
         )
         @last_ctrl_c = nil
+        # The copy confirmation's flash ({flash} — the message token) and
+        # its dwell; and the last assistant message's text (pi
+        # getLastAssistantText — ctrl+x's fallback copy source), tracked
+        # at the assistant completions.
+        @flash = nil
+        @flash_seconds = FLASH_SECONDS
+        @last_assistant_text = nil
         @live = +""
         # The in-flight message's reasoning (pi's live thinking block): the
         # joined chunk.thinking deltas, rendered dim while it grows and
@@ -232,6 +244,11 @@ module Tart
       def scrollbar_hide_delay_ms=(ms)
         @viewport.hide_delay_ms = ms
       end
+
+      # The flash confirmation's dwell in seconds ({FLASH_SECONDS}) —
+      # the same test-seam shape: tests inject 0 instead of sleeping
+      # real seconds.
+      attr_writer :flash_seconds
 
       # @return [Boolean] whether an agent run is in flight.
       def busy?
@@ -368,6 +385,9 @@ module Tart
             if message.role == :assistant
               @footer.accumulate_usage(message)
               handled = complete(message.content)
+              # pi getLastAssistantText (agent-session.ts:4347): the last
+              # assistant message's trimmed text — ctrl+x's fallback.
+              @last_assistant_text = handled&.strip
               # The reasoning buffer threads in as data and clears after
               # the render (the flush lived inside enqueue_message at
               # base — same row order, buffer reset with the completion).
@@ -458,6 +478,15 @@ module Tart
           clear_transcript
           entries = Agent::Session.load_entries(path)
           @transcript_state.replay_entries(entries)
+          # The resumed session's last assistant text is ctrl+x's fallback
+          # (pi getLastAssistantText reads the loaded messages).
+          @last_assistant_text = entries.filter_map { |entry|
+            message = entry.is_a?(Hash) && entry["message"]
+            next unless message.is_a?(Hash) && message["role"] == "assistant" &&
+              message["content"].is_a?(String) && !message["content"].strip.empty?
+
+            message["content"].strip
+          }.last
           compactions = entries.count { |entry| entry.is_a?(Hash) && entry["type"] == "compaction" }
           if compactions.positive?
             times = compactions == 1 ? "1 time" : "#{compactions} times"
@@ -538,6 +567,7 @@ module Tart
         @selection_state.reset
         @live = +""
         @reasoning = +""
+        @last_assistant_text = nil # the fresh session has no messages to copy
         # pi's footer stats re-derive from the fresh (empty) session.
         @footer.reset_usage
       end
@@ -640,6 +670,11 @@ module Tart
           # :119 — both default ctrl+s): the OPEN menu's set-as-default;
           # inert without one.
           ctrl ? menu_set_as_default : @editor.insert_printable(event)
+        when "x"
+          # app.message.copy (pi keybindings.ts:63, default ctrl+x →
+          # handleCopyCommand {flashConfirmation: true, preferSelection:
+          # true}, interactive-mode.ts:3114): the copy seam; bare x types.
+          ctrl ? copy_message : @editor.insert_printable(event)
         # While the list is active up/down navigate the LIST (history
         # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
         when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.history_previous
@@ -729,6 +764,7 @@ module Tart
         @footer.invalidate_branch # per-turn branch invalidation
         if @commands && text.start_with?("/")
           text = @commands.expand_skill(text)
+          return if !busy? && gate_thinking_level(text)
           return if !busy? && @commands.dispatch(text)
         end
         # The !-prefix bash intercepts BEFORE the user echo (pi handleSubmit
@@ -743,6 +779,83 @@ module Tart
         else
           @kernel.async { @agent.run(text) }
         end
+      end
+
+      # --- app.message.copy (pi handleCopyCommand :6637-6669) + its flash ---
+
+      # ctrl+x (interactive-mode.ts:3114 — {flashConfirmation: true,
+      # preferSelection: true}): the ACTIVE selection's text, else the
+      # last assistant message's, each through the seam's OSC 52 write
+      # with the flash confirmation; no source is pi's showError
+      # (:6651-6653). Deviation, itemized: pi's selection branch is gated
+      # on !getCopyOnSelect() (copy-on-select OFF only — when it's on the
+      # release already copied); the port's copy-on-select is
+      # unconditionally on ({Selection#release}), so keeping the gate
+      # literal would make the branch dead — the whole-screen iteration
+      # pins selection-else-last-assistant.
+      def copy_message
+        text = @selection_state.selection_text || @last_assistant_text
+        if text
+          TUI.osc52_copy(text)
+          flash("Copied!")
+        else
+          error_line("No agent messages to copy yet.")
+        end
+      end
+
+      # pi's alt-screen flash (alt-screen-flash.ts): a reversed
+      # " <message> " composited at the finished screen's top-right for
+      # 1000ms, then one redraw. The port composites at render
+      # ({transcript_widget}'s row 0) and clears through the kernel timer
+      # — the scrollbar-hide arm's shape; a newer flash's token wins
+      # (equal? guard — stale clears drop).
+      def flash(message)
+        token = @flash = {text: message}
+        @kernel.request_draw
+        @kernel.async do
+          sleep(@flash_seconds)
+          next unless @flash.equal?(token)
+
+          @flash = nil
+          @kernel.request_draw
+        end
+      end
+
+      # One flash row composited over +line+'s cells at the right edge
+      # (pi compositeTuiLine :1667-1687 — the covered cells replace; the
+      # gap between the row's content and the flash renders as bare
+      # spaces; the message truncates right to the width).
+      def flash_row(line, width)
+        text = " #{@flash[:text]} "
+        flash_width = [TUI.text_width(text), width].min
+        text = Text.clip_text(text, flash_width)
+        base = Text.clip_spans(line.spans, width - flash_width)
+        base_width = base.sum { |span| TUI.text_width(span.content) }
+        TUI.line(base + [TUI.span(" " * (width - flash_width - base_width) + text, modifiers: [:reversed])])
+      end
+
+      # A surface-initiated error line (pi showError :4623-4627 — a
+      # spacer + an error-fg "Error: <message>" chat line).
+      def error_line(message)
+        @transcript_state.enqueue_region([Panel.blank_line, TUI.line("Error: #{message}", fg: Theme[:error])])
+      end
+
+      # /thinking's runtime gate (pi handleThinkingCommand :5143-5157 —
+      # the command validates the arg against the RUNTIME model's
+      # available levels, not the global ladder): an arg outside the
+      # gated set renders pi's showError with the GATED list and
+      # dispatches nothing; bare /thinking and available levels fall
+      # through to the dispatcher. The surface owns the gate — the
+      # frozen Commands::Handler renders the full ladder (:169) and
+      # knows nothing of the runtime reasoning capability.
+      def gate_thinking_level(text)
+        return false unless text.start_with?("/thinking ")
+
+        arg = text.split(/\s+/, 2)[1].to_s.strip
+        return false if arg.empty? || available_thinking_levels.include?(arg)
+
+        error_line(%(Unknown thinking level "#{arg}". Available levels: #{available_thinking_levels.join(", ")}.))
+        true
       end
 
       # --- transcript scroll state (pi scroll-view.ts follow-end) ---
@@ -769,16 +882,19 @@ module Tart
         end
       end
 
+      # The session viewport's height (the 24 fallback matches
+      # {viewport_width}'s 80 — the headless defaults' shape).
+      def screen_height
+        area = @session.viewport_area
+        area ? area.height : 24
+      end
+
       # The transcript area's row budget — the page size and the mouse
       # mapping's viewport bound (pi chat-viewport geometry, shared with
       # {build_widget}): the viewport minus the dock — spacer 1 + editor +
       # footer (pi chat-viewport.ts:22-45, the widgets-above default
       # Spacer(1); AC2).
-      def transcript_area_rows(height = nil)
-        unless height
-          area = @session.viewport_area
-          height = area ? area.height : 24
-        end
+      def transcript_area_rows(height = screen_height)
         [height - editor_area_rows(height) - FOOTER_ROWS - dock_spacer_rows(height), 1].max
       end
 
@@ -837,38 +953,126 @@ module Tart
         mark_scrollbar_activity(@viewport.wheel(event, display_lines.size, transcript_area_rows))
       end
 
-      # Maps a terminal cell to a selection point in buffer coordinates (pi
-      # getScrollSelectionPoint :1133-1155): the transcript area starts at
-      # row 0 (the fullscreen composition's first child); the column
-      # clamps to the area's width (the scrollbar gutter excluded while
-      # overflowing — pi clamps to the scrollview box). nil below the
-      # transcript area.
+      # Maps a terminal cell to a selection point (pi getSelectionPoint
+      # :1145-1152): transcript-area rows map into buffer coordinates (pi
+      # getScrollSelectionPoint :1133-1155 — the area starts at row 0, the
+      # column clamps to the area's width, the scrollbar gutter excluded
+      # while overflowing — pi clamps to the scrollview box); rows BELOW
+      # take pi's non-scrollview branch (plain terminal row/col, clamped)
+      # re-expressed in the port's row space: a NEGATIVE synthetic row,
+      # terminal row − screen height (counted up from the screen's last
+      # row — disjoint from the buffer rows, stable under transcript
+      # growth, inverted by {selection_line}). A nil point (a press on an
+      # empty transcript) drops the selection.
       def content_point(y, x)
         rows = transcript_area_rows
-        return nil unless y < rows
-
-        lines = display_lines
-        return nil if lines.empty?
-
-        row = (@viewport.offset + y).clamp(0, lines.size - 1)
         # pi clamps to the scrollview box — full width for "auto" (the
         # rail overlays the last column, no reserved gutter to exclude;
         # scroll-view.ts:80-82 getContentWidth).
-        Selection::Point.new(row, x.clamp(0, viewport_width - 1))
+        col = x.clamp(0, viewport_width - 1)
+        if y < rows
+          lines = display_lines
+          return nil if lines.empty?
+
+          return Selection::Point.new((@viewport.offset + y).clamp(0, lines.size - 1), col)
+        end
+        Selection::Point.new(y - screen_height, col)
+      end
+
+      # The selection's line reader (pi getSelectionSourceLine :1165-1171,
+      # whole-screen I28): transcript buffer rows answer the display
+      # Line's span contents; the dock's synthetic rows answer the
+      # composed plain text ({below_line}). pi reads the last-rendered
+      # screen buffer (previousScreen); the gem exposes no live
+      # screen-buffer readback, so the port composes from the same
+      # builders that render the rows — same bytes, different source
+      # (itemized).
+      def selection_line(row)
+        return plain_content_line(row) if row >= 0
+
+        below_line(row + screen_height)
       end
 
       # The buffer row's plain text (the display Line's span contents) —
-      # the selection's content seam (the {Selection} machine reads it
-      # through its injected reader).
+      # the transcript rows' content seam.
       def plain_content_line(row)
         display_lines[row].spans.map(&:content).join
       end
 
-      def editor_area_rows(height)
+      # A below-transcript terminal row's composed plain text: the
+      # footer's two rows, the editor slot's borders and content rows,
+      # else the dock spacer (a blank). The border bytes mirror the gem
+      # Block's render (byte-verified: the title then dashes to width;
+      # a titleless/blank border is all dashes).
+      def below_line(y)
+        footer_top = screen_height - FOOTER_ROWS
+        return below_widget_line(y - footer_top) { @footer.lines(footer_data, viewport_width) } if y >= footer_top
+
+        editor_top = footer_top - editor_area_rows
+        if y >= editor_top
+          offset = y - editor_top
+          return editor_border_text(status_title) if offset.zero?
+          return "─" * viewport_width if offset == editor_area_rows - 1
+
+          line = editor_slot_lines[offset - 1]
+          return line ? line.spans.map(&:content).join : ""
+        end
+        "" # the dock spacer — a blank row
+      end
+
+      # The +row+-th line of a dock widget's composed rows (the reader's
+      # footer answer; a short composition answers blank).
+      def below_widget_line(row)
+        line = yield[row]
+        line ? line.spans.map(&:content).join : ""
+      end
+
+      # The editor block's top-border row bytes (the status title rides
+      # it — custom-editor.ts renderTopBorder; the gem renders the title
+      # first, dashes to width).
+      def editor_border_text(title)
+        return "─" * viewport_width unless title
+
+        title + "─" * [viewport_width - TUI.text_width(title), 0].max
+      end
+
+      def editor_area_rows(height = screen_height)
         return [@picker.widget_rows + 2, height - 1].min if @picker # + borders
         return [@menu.widget_rows + 2, height - 1].min if @menu # + borders
 
         [MIN_EDITOR_ROWS + @autocomplete.rows, height - 1].min
+      end
+
+      # The editor slot's top border row (the composition's third child:
+      # the transcript/spacer carve the top, the footer the bottom).
+      def editor_area_top
+        screen_height - FOOTER_ROWS - editor_area_rows
+      end
+
+      # The editor slot's content lines (the input row + the suggestion
+      # list; a mounted picker/menu renders its own rows in the slot —
+      # the same compositions the widget builders wrap).
+      def editor_slot_lines
+        return @picker.lines(viewport_width) if @picker
+        return @menu.lines(viewport_width) if @menu
+
+        editor_content_lines
+      end
+
+      # The editor's content lines (the input row + the suggestion rows)
+      # — the edit box's inner rows, shared by {editor_widget}'s build
+      # and the selection's dock composition ({below_line}).
+      def editor_content_lines
+        inner = [viewport_width - 1, 1].max
+        [TUI.line(Text.clip_spans(@editor.input_spans, inner))] + @autocomplete.lines(inner)
+      end
+
+      # The selection highlight over composed dock rows (the transcript's
+      # highlight_row pass extended below the transcript area — I28 AC2):
+      # each line re-styled at its synthetic row (terminal row − screen
+      # height, {content_point}'s below-space).
+      def highlight_lines(lines, top)
+        lines.map.with_index { |line, i| @selection_state.highlight_row(line, top + i - screen_height) }
       end
 
       # The fullscreen three-area composition (AC1, pi chat-viewport.ts):
@@ -887,7 +1091,7 @@ module Tart
             transcript_widget(transcript_rows),
             dock_spacer_widget,
             picker_or_menu_widget || editor_widget,
-            @footer.widget(footer_data, viewport_width),
+            footer_widget,
           ],
           constraints: [
             TUI.constraint_min(transcript_rows),
@@ -943,10 +1147,23 @@ module Tart
         window = @viewport.window(lines, rows).map.with_index do |line, i|
           @selection_state.highlight_row(line, @viewport.offset + i)
         end
-        return TUI.paragraph(text: window, wrap: false) unless @viewport.scrollbar_visible?(lines, rows)
+        if @viewport.scrollbar_visible?(lines, rows)
+          glyphs = @viewport.scrollbar_glyphs(lines.size, rows)
+          window = window.map.with_index { |line, i| @viewport.overlay_rail_cell(line, glyphs[i], width) }
+        end
+        # pi's flash composite (compositeFlashes :1664): the flash rows
+        # land over the finished screen from row 0, right-aligned —
+        # row 0 is the transcript area's first row.
+        window[0] = flash_row(window[0], width) if @flash && window[0]
+        TUI.paragraph(text: window, wrap: false)
+      end
 
-        glyphs = @viewport.scrollbar_glyphs(lines.size, rows)
-        TUI.paragraph(text: window.map.with_index { |line, i| @viewport.overlay_rail_cell(line, glyphs[i], width) }, wrap: false)
+      # The footer's widget with the selection highlight over its rows
+      # (I28 AC2 — the composed lines, highlighted at their synthetic
+      # rows, wrapped as at base).
+      def footer_widget
+        lines = highlight_lines(@footer.lines(footer_data, viewport_width), screen_height - FOOTER_ROWS)
+        TUI.paragraph(text: lines, wrap: false)
       end
 
       # The edit box (pi CustomEditor, item 5): full-width from column 0,
@@ -959,10 +1176,11 @@ module Tart
       # padding the layout width is width − 1). The suggestion list renders
       # below the input row, inside the editor area (pi editor.ts:618-634
       # — the area height grows by the list height; the port's standing
-      # I12 placement).
+      # I12 placement). The content rows carry the selection highlight at
+      # their synthetic rows (I28 AC2; the border rows stay unhighlighted
+      # — the gem's native Block composes them, itemized).
       def editor_widget
-        inner = [viewport_width - 1, 1].max
-        content = [TUI.line(Text.clip_spans(@editor.input_spans, inner))] + @autocomplete.lines(inner)
+        content = highlight_lines(editor_content_lines, editor_area_top + 1)
         TUI.block(
           title: status_title,
           borders: [:top, :bottom],
@@ -1076,13 +1294,33 @@ module Tart
         apply_thinking_selection(level, persist: false)
       end
 
+      # The runtime model's reasoning capability (pi supportsThinking,
+      # agent-session.ts:2665-2668 — model?.reasoning): the boot fact
+      # overlaid by the runtime switch ({footer_data}).
+      def reasoning_capable?
+        !!footer_data[:reasoning]
+      end
+
+      # pi getAvailableThinkingLevels (:2657-2662 →
+      # getSupportedThinkingLevels, models.ts:1224-1231): a non-reasoning
+      # model offers [off] alone; a reasoning model the full ladder. The
+      # runtime switch re-gates (the reasoning flag rides the per-frame
+      # footer view). The port's catalog schema carries no
+      # thinkingLevelMap — xhigh/max never filter (itemized).
+      def available_thinking_levels
+        reasoning_capable? ? Settings::THINKING_LEVELS : %w[off]
+      end
+
       # pi cycleThinkingLevel (agent-session.ts:2641-2653): the next
       # level in THINKING_LEVEL_OPTIONS order, wrapping — app.thinking.cycle
       # (shift+tab), kept in-session when bare /thinking became the menu
-      # (I27). (Public — the keybinding's callable.)
+      # (I27); no thinking support is a no-op (:2645-2646). (Public — the
+      # keybinding's callable.)
       def cycle_thinking_level
+        return unless reasoning_capable?
+
         current = @mutex.synchronize { thinking_level || Settings::DEFAULTS.fetch("thinkingLevel") }
-        levels = Settings::THINKING_LEVELS
+        levels = available_thinking_levels
         next_level = levels[(levels.index(current) + 1) % levels.size]
         set_thinking_level(next_level)
         next_level
@@ -1096,12 +1334,30 @@ module Tart
       # Selection applies through the same state the command path uses.
       def open_thinking_menu
         @mutex.synchronize do
-          @menu = ModelMenu.thinking(
-            current: thinking_level || Settings::DEFAULTS.fetch("thinkingLevel"),
-            default: default_thinking_level,
+          @menu = ModelMenu.new(variant: :thinking, items: thinking_menu_items, query_seed: nil,
+            search_text: ->(item) { "#{item[:value]} #{item[:description]}" },
             on_select: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: false) },
-            on_select_as_default: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: true) }
-          )
+            on_select_as_default: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: true) })
+        end
+      end
+
+      # The gated menu's items (ModelMenu.thinking's item shape over
+      # {available_thinking_levels}): the sealed family constructor pins
+      # the full ladder, so the gate builds here — pi's layering
+      # (showThinkingSelector :5176-5183 passes
+      # session.getAvailableThinkingLevels into the component).
+      def thinking_menu_items
+        levels = available_thinking_levels
+        # pi's session level is clamped to the model's set (setModel →
+        # _clampThinkingLevel, agent-session.ts:2684-2686) — a stored
+        # level outside the gated set reads as the gate's floor (off).
+        current = thinking_level || Settings::DEFAULTS.fetch("thinkingLevel")
+        current = levels.first unless levels.include?(current)
+        default = default_thinking_level
+        levels.map do |level|
+          description = ModelMenu::LEVEL_DESCRIPTIONS.fetch(level)
+          description = "#{description} · default" if default == level
+          {value: level, label: level, description:, current: current == level, default: false}
         end
       end
 
@@ -1195,20 +1451,35 @@ module Tart
       end
 
       # The ✓ current marker's ref: the runtime switch, else the boot
-      # model (footer_data).
+      # model (footer_data) — cross-resolved against the catalog.
       def current_model_ref
         return @runtime_model if @runtime_model
 
-        data = @footer_data || {}
-        {provider: data.fetch(:default_provider, "openai"), id: data[:model]}
+        boot_model_ref
       end
 
       # The · default badge's ref: the settings-resolved boot pair —
       # footer_data[:model] stays the boot value (the runtime switch
       # overlays the per-frame view, never these facts).
       def default_model_ref
+        boot_model_ref
+      end
+
+      # The boot pair's ref, cross-resolved against the catalog (I28 AC4,
+      # the I27-verdict residual): an env/Settings boot names the WIRE
+      # provider (TART_PROVIDER=openai — a native slug) while the catalog
+      # keys the model under a non-native endpoint key (mock) — the ref
+      # must match the catalog's key or the ✓/· markers drop. The catalog
+      # entry serving the id supplies the matching provider (canonical
+      # pair resolve first, then bare id; ambiguity keeps the boot pair).
+      # pi needs none of this — its provider keys ARE wire slugs. Port
+      # seam, itemized: models.json keys are endpoint configs, the
+      # runtime pair is a wire pair.
+      def boot_model_ref
         data = @footer_data || {}
-        {provider: data.fetch(:default_provider, "openai"), id: data[:model]}
+        ref = {provider: data.fetch(:default_provider, "openai"), id: data[:model]}
+        entry = @models&.resolve("#{ref[:provider]}/#{ref[:id]}") || @models&.resolve(ref[:id].to_s)
+        entry ? {provider: entry[:provider], id: entry[:id]} : ref
       end
 
       # The settings-resolved thinking level (the · default badge) —
