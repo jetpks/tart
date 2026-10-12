@@ -173,10 +173,42 @@ module TuiSplitRig
 
       home = File.join(stage, "home", "tart")
       FileUtils.mkdir_p(home)
-      runner.stage_tart_home(home)
+      runner.stage_tart_home(home, 4711)
       tart_settings = JSON.parse(File.read(File.join(home, ".tart", "settings.json")))
       assert_equal({"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0},
         tart_settings.fetch("compaction"), "tart's knobs zeroed too (settings.rb compaction_kwargs)")
+    end
+
+    # I27: sessions carry the per-Runner token and the leftover check greps
+    # only it — concurrent rig processes don't flake each other's cleanup.
+    def test_session_names_and_leftover_check_are_token_scoped
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_text_turn.yml"))
+      a = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      b = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      refute_equal a.token, b.token, "each runner gets its own token"
+
+      name = a.session_name("pi", 1)
+      assert_match(/^tui-split-rig-#{a.token}-pi-s1_text_turn-r1-/, name)
+      refute_match(/#{b.token}/, name)
+    end
+
+    # I27: the tart menu staging mirrors pi's models.json shape with ≥2 mock
+    # models so the /model menu has something to select; staged unconditionally
+    # (the menu probe needs it without a context_window), settings.json stays
+    # context_window-gated.
+    def test_tart_home_stages_two_mock_models
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_text_turn.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      home = File.join(Dir.mktmpdir("tui-split-rig-home-"))
+      runner.stage_tart_home(home, 4711)
+
+      models = JSON.parse(File.read(File.join(home, ".tart", "models.json")))
+      provider = models.dig("providers", "mock")
+      assert_equal "http://127.0.0.1:4711/v1", provider.fetch("baseUrl")
+      assert_operator provider.fetch("models").size, :>=, 2, "the menu needs ≥2 mock models"
+      assert_equal %w[mock-1 mock-2], provider.fetch("models").map { |m| m.fetch("id") }
+      refute File.exist?(File.join(home, ".tart", "settings.json")),
+        "settings.json stays context_window-gated (s1–s6 don't stage it)"
     end
 
   end
