@@ -294,10 +294,11 @@ module Tart
       # shapes — user echoes, assistant thinking-then-content markdown,
       # tool blocks (the assistant's recorded tool_calls joined to their
       # recorded results), compaction summaries — as the entries carry
-      # them. Recorded gaps (itemized, never invented): thinking is
-      # stripped before record (agent/loop.rb strip_thinking_replay), so no
-      # reasoning block replays; non-string (multimodal) content is
-      # skipped; usage only when the provider reported it.
+      # them. Recorded gaps (itemized, never invented): non-string
+      # (multimodal) content is skipped; usage only when the provider
+      # reported it. Since I36 the recorded `thinking` REPLAYS as the dim
+      # markdown block ({replay_assistant}) — the old
+      # strip-thinkings-before-record is gone.
       def replay_entries(entries, update_footer: true, populate_history: true)
         results = entries.filter_map do |entry|
           next unless entry.is_a?(Hash) && entry["type"] == "message"
@@ -394,15 +395,31 @@ module Tart
       # Shared by the completion path and the live region (item 3: pi
       # re-renders the whole streaming message as markdown on every
       # update — interactive-mode.ts:3519-3535, assistant-message.ts
-      # :107-109).
-      def self.markdown_lines(text, width, prose_fg: nil, bg: nil)
+      # :107-109) — and, since I37, by the reasoning block
+      # ({reasoning_lines}).
+      #
+      # +prose_fg+ recolors the PROSE spans (the panel's custom-text
+      # override). +prose_modifiers+ unions modifiers into the same spans
+      # (the reasoning default style — pi's defaultTextStyle {color,
+      # italic}: applyDefaultStyle reaches the text tokens and the
+      # strong/em/del runs, never the themed structure — markdown.ts
+      # :382-413/:683-698 vs :477-493/:567-585/:695-697). "Prose" is the
+      # CONVERTER's nil-fg vocabulary — plain text, bold/em/del runs,
+      # list-item text; every structure span (code/heading/link/quote/
+      # list-bullet/code-block — a non-nil fg from Render::Markdown::FG)
+      # gains nothing.
+      def self.markdown_lines(text, width, prose_fg: nil, bg: nil, prose_modifiers: nil)
         content_width = width - Panel::OUTPUT_PAD.length * 2
         rows = Render::Markdown.rows(text, width: content_width).flat_map { |row| Text.wrap_row(row, content_width) }
         rows.map do |row|
           themed = row.map do |span|
             fg = Theme.md_fg(span.fg)
-            fg = prose_fg if fg.nil? && prose_fg # the panel's prose-color override
-            Render::Markdown::Span.new(text: span.text, fg:, modifiers: span.modifiers)
+            modifiers = span.modifiers
+            if span.fg.nil?
+              fg = prose_fg if prose_fg
+              modifiers = (modifiers | prose_modifiers) if prose_modifiers
+            end
+            Render::Markdown::Span.new(text: span.text, fg:, modifiers:)
           end
           bg ? panel_markdown_row(themed, bg, width) : Panel.padded_row(themed)
         end
@@ -425,11 +442,19 @@ module Tart
         count.to_i.to_s.gsub(/(\d)(?=(\d{3})+$)/, '\\1,')
       end
 
-      # Reasoning text as dim italic display lines (pi assistant-message.ts
-      # :140-150: thinkingText fg, italic; markdown-of-reasoning is cut,
-      # plain dim text — itemized reduction).
+      # Reasoning text as DIM MARKDOWN (pi assistant-message.ts:99-176:
+      # the thinking runs render as a Markdown component over
+      # defaultTextStyle {color: thinkingText, italic: true}): the SAME
+      # converter as the content, the prose default riding the nil-fg
+      # spans ({markdown_lines} +prose_fg+/+prose_modifiers+ — structure
+      # keeps its theme fns). Stripped first (pi thinking.trim(),
+      # assistant-message.ts:125 — leading/trailing delta whitespace no
+      # longer renders blank rows). Shared by all three sites — the live
+      # region, the completion, the replay (one path: the settled-shape
+      # discipline). The I13 "markdown-of-reasoning is cut" ruling
+      # retired (I37 — the owner's live finding is the ruling).
       def self.reasoning_lines(text, width)
-        Text.wrap(text, width - Panel::OUTPUT_PAD.length * 2).map { |line| TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(line, fg: Theme[:thinkingText], modifiers: [:italic])]) }
+        markdown_lines(text.strip, width, prose_fg: Theme[:thinkingText], prose_modifiers: [:italic])
       end
 
       private

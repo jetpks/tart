@@ -46,6 +46,11 @@ module Tart
     class Chat
       SPINNER = %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏].freeze
 
+      # pi loader.ts:17 DEFAULT_INTERVAL_MS — the spinner's frame dwell: the
+      # glyph advances on TIME, never on renders ({spinner_glyph} derives
+      # the frame from the monotonic clock at each already-animated frame).
+      SPINNER_INTERVAL_SECONDS = 0.08
+
       # How long one draw re-arms the animation window while the agent works
       # (frame pacing: deadline-paced at the frame rate while busy, purely
       # event-driven when idle — the I02 static-loop property).
@@ -131,9 +136,14 @@ module Tart
       # @param models [Models::Config, nil] the models.json catalog (the
       #   /model selector's entries, I27); nil (tests) degenerates the
       #   catalog to the boot model (see {model_menu_entries}).
+      # @param clock [Proc] +call+ → Float monotonic seconds — the ONLY
+      #   time source for the spinner ({spinner_glyph}; the viewport.rb
+      #   monotonic precedent, the UserBash constructor-seam idiom).
+      #   Tests pin fake time with zero sleeps.
       def initialize(session:, kernel:, footer_data: nil, branch_reader: Footer::DEFAULT_BRANCH_READER, autocomplete: nil,
         motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
-        prompts: [], skills: [], context_files: [], extensions: [], models: nil)
+        prompts: [], skills: [], context_files: [], extensions: [], models: nil,
+        clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) })
         @session = session
         @kernel = kernel
         @footer_data = footer_data
@@ -221,7 +231,12 @@ module Tart
         @reasoning = +""
         @busy = false
         @tool = nil
-        @frames = 0
+        # The spinner's time anchor (pi's Loader frame clock): the glyph is
+        # derived from the elapsed monotonic seconds at render
+        # ({spinner_glyph}), never from the render count. nil until the
+        # first status-kind start re-anchors it ({restart_spinner!}).
+        @clock = clock
+        @spinner_started_at = nil
         # The footer state machine (I24 wave 4): the branch cache and the
         # usage accounting (pi footer-data-provider.ts + footer.ts), fed
         # the launcher facts per frame from {@footer_data}.
@@ -362,7 +377,6 @@ module Tart
           enqueue_motd if @motd_pending
           @motd_pending = false
           @transcript_state.flush_scrollback
-          @frames += 1
           widget = build_widget
         end
         # Keep frames deadline-paced while the agent works (spinner, live
@@ -390,6 +404,9 @@ module Tart
           case event[:type]
           when :agent_start
             @busy = true
+            # pi turn_start creates the working indicator (interactive-mode.ts
+            # :3427-3433) — the Loader's frame-0 reset.
+            restart_spinner!
             @footer.invalidate_branch # per-turn branch invalidation (pi's provider cache, reduced)
           when :message_start
             @live = +""
@@ -438,6 +455,9 @@ module Tart
             # (status-indicator.ts:85-95 minus the cancel hint) until the
             # result (+:compaction+) or the run end clears it.
             @compaction_reason = event[:reason]
+            # pi constructs CompactionStatusIndicator (:3681) — a new
+            # Loader, frame 0.
+            restart_spinner!
           when :compaction
             # pi compaction_end's result arm (interactive-mode.ts:3686-3725):
             # the chat container clears and rebuilds from the post-compaction
@@ -448,8 +468,11 @@ module Tart
             # INVALIDATES — post-compaction the context numerator is
             # unknown until the next LLM response (the "?") — never /new's
             # usage reset. The border status came from :compaction_start
-            # (the frozen I12 contract); its clearing here stays.
+            # (the frozen I12 contract); its clearing here stays — and
+            # re-anchors the spinner (pi clearStatusIndicator :3694 → the
+            # next working indicator restarts).
             @compaction_reason = nil
+            restart_spinner!
             wipe_transcript
             # The header container survives pi's chatContainer clear
             # (interactive-mode.ts:633-639 — sibling containers; the s7
@@ -1334,8 +1357,8 @@ module Tart
       # seam exposes no bottom-title/multi-style border row (tui.rb is
       # shared), so the rows are composed here as span lines inside the
       # editor's paragraph — the BYTES and the segment routing (border
-      # color for the border, the status style for the embedded status)
-      # are pi's ({Editor.scroll_border} is unit-pinned).
+      # color for the border, the embedded status's per-kind colors) are
+      # pi's ({Editor.scroll_border} is unit-pinned).
       def editor_top_border_line
         status = status_title
         hidden = @editor.scroll_offset
@@ -1347,7 +1370,7 @@ module Tart
         end
 
         TUI.line(status_border_segments(hidden, status).map do |text, segment|
-          TUI.span(text, fg: segment == :status ? Theme[:dim] : editor_border_color)
+          TUI.span(text, fg: status_segment_fg(segment))
         end)
       end
 
@@ -1358,13 +1381,15 @@ module Tart
       end
 
       # The top border's segments with an embedded working status
-      # (custom-editor.ts:36-66): "── " + status + " " on the left (the
-      # status in its own style — the base border title rode title_style
-      # dim), the hidden-rows label centered in the border color, and on
-      # collision the status degrades to the spinner alone (pi
+      # (custom-editor.ts:36-66): "── " + status + " " on the left (pi's
+      # single-space shape — the status rides UNFLANKED since I37), the
+      # hidden-rows label centered in the border color, and on collision
+      # the status degrades to the spinner alone (pi
       # renderSpinnerInBorder) — after which the centered form may fit
       # again (pi re-runs canFitOverflow against the degraded status).
-      # Returns [text, :status|:border] pairs.
+      # Returns [text, :border|:spinner|:message] pairs — the spinner
+      # glyph and the message are separate segments so each takes its
+      # own color ({status_segment_fg}).
       def status_border_segments(hidden, status)
         width = viewport_width
         label = hidden.positive? ? " ↑ #{hidden} more " : nil
@@ -1376,14 +1401,19 @@ module Tart
         left_block = 3 + status_width + 1
         if label && label_width + 2 <= width && overflow_start - left_block >= 1
           tail = " #{"─" * (overflow_start - left_block)}#{label}#{"─" * (width - overflow_start - label_width)}"
-          return [["── ", :border], [status, :status], [tail, :border]]
+          return [["── ", :border], *status_spans(status), [tail, :border]]
         end
         if width >= status_width + 5
-          return [["── ", :border], [status, :status], [" #{"─" * (width - status_width - 4)}", :border]]
+          return [["── ", :border], *status_spans(status), [" #{"─" * (width - status_width - 4)}", :border]]
         end
 
+        # pi degrades to the spinner alone here too (custom-editor.ts:66-67
+        # re-renders renderSpinnerInBorder before the prefix math).
+        status = spinner_glyph
+        status_width = TUI.text_width(status)
         prefix = [3, [width - status_width, 0].max].min
-        [["─" * prefix, :border], [status, :status], ["─" * [[width - prefix - status_width, 0].max, 0].max, :border]]
+        [["─" * prefix, :border], *status_spans(status),
+         ["─" * [[width - prefix - status_width, 0].max, 0].max, :border]]
       end
 
       # custom-editor.ts:44-46 canFitOverflow: the label needs its width
@@ -1396,8 +1426,60 @@ module Tart
         ((width - label_width) / 2) - (3 + TUI.text_width(status) + 1) >= 1
       end
 
+      # The status block's spans over the composed "<glyph> <message>"
+      # (pi renderInBorder's slice — the Loader's `<glyph> <message>`
+      # text): the leading glyph and the message are separate segments
+      # so each carries its own color ({status_segment_fg}); the
+      # degraded bare-glyph form (renderSpinnerInBorder) is the spinner
+      # alone. The split is positional — the glyph was composed from ONE
+      # clock read in {status_title}; re-deriving it here could race a
+      # frame tick.
+      def status_spans(status)
+        glyph, message = status.split(" ", 2)
+        return [[glyph, :spinner]] unless message
+
+        [[glyph, :spinner], [" #{message}", :message]]
+      end
+
       def spinner_glyph
-        SPINNER[@frames % SPINNER.size]
+        # pi loader.ts — the frame displayed at time t is
+        # frames[floor((t − anchor)/interval) mod n] whatever the render
+        # cadence: pi's setInterval advances the frame on TIME (+
+        # requestRender); the port derives the same frame from the
+        # monotonic clock at each already-animated frame (the
+        # BUSY_FRAME_SECONDS cadence is unchanged) — no timer task. nil
+        # anchor → frame 0 (pi setIndicator resets currentFrame).
+        return SPINNER.first unless @spinner_started_at
+
+        elapsed = @clock.call - @spinner_started_at
+        SPINNER[(elapsed / SPINNER_INTERVAL_SECONDS).floor % SPINNER.size]
+      end
+
+      # pi's per-indicator frame-0 reset (loader.ts setIndicator): every
+      # status-kind (re)start re-anchors the spinner — :agent_start
+      # creates the working indicator (interactive-mode.ts:3427-3433),
+      # :compaction_start constructs CompactionStatusIndicator (:3681),
+      # the :compaction result clears it (clearStatusIndicator :3694 —
+      # the next working indicator restarts).
+      def restart_spinner!
+        @spinner_started_at = @clock.call
+      end
+
+      # The embedded status's per-segment colors (pi's embedded colorFns):
+      # the border dashes ride the editor border color; the WORKING
+      # status's spinner AND message ride it too (interactive-mode.ts
+      # :2346-2359 — the embedded colorFn overrides both constructor
+      # defaults with editor.borderColor — bashMode in bash mode, else
+      # the thinking-level ladder — dereferenced lazily per frame, so a
+      # mid-turn level change re-colors the status); the COMPACTION
+      # indicator has no colorFn — its constructor defaults hold (accent
+      # spinner, muted message — status-indicator.ts:80-96).
+      def status_segment_fg(segment)
+        return editor_border_color if segment == :border
+        return Theme[:accent] if segment == :spinner && @compaction_reason
+        return Theme[:muted] if segment == :message && @compaction_reason
+
+        editor_border_color
       end
 
       # The session's thinking level (pi agent.state.thinkingLevel): nil
@@ -1411,19 +1493,25 @@ module Tart
         # embedWorkingStatus — unmeasurable at settle, stays): the three
         # persistent statuses are transcript tail rows now
         # ({Transcript::StatusEntry} — pi showStatus :3824-3842). Direct
-        # ivars — this runs inside render_frame's synchronize.
+        # ivars — this runs inside render_frame's synchronize. UNFLANKED
+        # since I37: pi's renderInBorder slices the Text pad and the
+        # border composition adds its own single spaces
+        # (custom-editor.ts:26-29/:60-66) — the I34-era " #{…} " wrapper
+        # double-spaced the row.
         return nil unless @busy || @compaction_reason
 
-        " #{status_line} "
+        "#{spinner_glyph} #{status_message}"
       end
 
-      def status_line
-        # The running compaction displaces the working/tool detail (pi
-        # status-indicator.ts:85-95 via interactive-mode.ts:3672-3681).
-        return "#{SPINNER[@frames % SPINNER.size]} #{COMPACTION_LABELS.fetch(@compaction_reason, "Compacting context...")}" if @compaction_reason
+      def status_message
+        # The running compaction displaces the working message (pi
+        # status-indicator.ts:85-95 via interactive-mode.ts:3672-3681);
+        # the working message is pi's constant defaultWorkingMessage
+        # (interactive-mode.ts:487) — the I04-era phase-detail vocabulary
+        # ("thinking"/"…"/"tool: <name>") retires with I37.
+        return COMPACTION_LABELS.fetch(@compaction_reason, "Compacting context...") if @compaction_reason
 
-        detail = @tool ? "tool: #{@tool}" : (@live.empty? ? "thinking" : "…")
-        "#{SPINNER[@frames % SPINNER.size]} #{detail}"
+        "Working"
       end
 
       # The footer's per-frame data view: the launcher facts with the
@@ -1453,12 +1541,14 @@ module Tart
       end
 
       # The streaming region (item 3, pi interactive-mode.ts:3519-3535 +
-      # assistant-message.ts:107-109): the reasoning block stays plain dim
-      # italic (the I13 standing ruling — markdown-of-reasoning is cut,
-      # itemized) and the CONTENT re-renders as markdown on every delta —
-      # pi re-renders the whole streaming message each update, no
-      # incremental cleverness. The transcript area's tail clip bounds it
-      # (deltas append; the window slides).
+      # assistant-message.ts:107-109): the reasoning block renders as DIM
+      # MARKDOWN through the shared converter ({Transcript.reasoning_lines}
+      # — the thinkingText+italic prose default over the markdown theme,
+      # pi assistant-message.ts:99-176; the I13 markdown-of-reasoning cut
+      # retired by the owner's live finding) and the CONTENT re-renders as
+      # markdown on every delta — pi re-renders the whole streaming
+      # message each update, no incremental cleverness. The transcript
+      # area's tail clip bounds it (deltas append; the window slides).
       #
       # The region renders the assistant message's SETTLED shape from the
       # first delta (pi updateContent runs while streaming — the leading
