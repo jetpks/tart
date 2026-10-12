@@ -12,10 +12,12 @@ require_relative "editor"
 require_relative "kill_ring"
 require_relative "autocomplete"
 require_relative "picker"
+require_relative "model_menu"
 require_relative "selection"
 require_relative "viewport"
 require_relative "slash_source"
 require_relative "transcript"
+require_relative "../models"
 
 module Tart
   module Render
@@ -113,9 +115,12 @@ module Tart
       # @param settings_root [String] the user config dir the MOTD's
       #   [Context] section reports (injectable so tests never touch
       #   ~/.tart).
+      # @param models [Models::Config, nil] the models.json catalog (the
+      #   /model selector's entries, I27); nil (tests) degenerates the
+      #   catalog to the boot model (see {model_menu_entries}).
       def initialize(session:, kernel:, footer_data: nil, branch_reader: Footer::DEFAULT_BRANCH_READER, autocomplete: nil,
         motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
-        prompts: [], extensions: [])
+        prompts: [], extensions: [], models: nil)
         @session = session
         @kernel = kernel
         @footer_data = footer_data
@@ -141,6 +146,13 @@ module Tart
         # reduced): nil = closed; open it holds the {Picker} over the
         # launcher-built [{path:, label:}] list (newest first).
         @picker = nil
+        # The selector menus (I27, pi showSelector): nil = closed; open
+        # it holds the {ModelMenu} — the /thinking level menu or the
+        # /model menu — mounted in place of the editor. The runtime
+        # model switch ({@runtime_model}, the overlay into the footer
+        # view) rides with it.
+        @menu = nil
+        @runtime_model = nil
         # The transcript/scrollback assembly (I25 wave 5): the scrollback
         # queue, the flat transcript buffer, the ctrl+o expandable
         # registry (pi toolOutputExpanded/setToolsExpanded —
@@ -185,6 +197,7 @@ module Tart
         # the launcher facts per frame from {@footer_data}.
         @footer = Footer.new(branch_reader:)
         @settings_root = settings_root
+        @models = models
         @identity = identity
         @prompts = prompts
         @extensions = extensions
@@ -280,6 +293,17 @@ module Tart
       # @return [Integer] the picker's selection index (test readback).
       def picker_index
         @mutex.synchronize { @picker ? @picker.selected : 0 }
+      end
+
+      # The open selector menu's readbacks (test seams, the picker
+      # readbacks' shape): whether a menu is open and its current
+      # selection.
+      def menu_open?
+        @mutex.synchronize { !@menu.nil? }
+      end
+
+      def menu_selection
+        @mutex.synchronize { @menu&.selection }
       end
 
       # @return [Integer] the transcript viewport's top-line offset (test
@@ -524,14 +548,17 @@ module Tart
       end
 
       # The key dispatch (pi interactive-mode.ts's component wiring): every
-      # key routes into the editor, the suggestion list, or the picker —
-      # the coordinator owns the routing, the objects own the state.
+      # key routes into the editor, the suggestion list, the picker, or
+      # the selector menu — the coordinator owns the routing, the
+      # objects own the state.
       def edit_input(event)
         if event.paste?
           @editor.insert(event.content)
           @autocomplete.cancel # pi editor.ts:1261 — paste cancels the list
           return
         end
+
+        ctrl = event.modifiers.include?("ctrl")
 
         # The picker owns every key while open (pi: the selector takes
         # focus — showSelector { focus: selector }); it closes itself on
@@ -541,7 +568,17 @@ module Tart
           return
         end
 
-        ctrl = event.modifiers.include?("ctrl")
+        # The selector menus (I27) take focus the same way; ctrl+s is
+        # the set-as-default (app.models.save / app.thinking.save) —
+        # persistence itself stays on this surface (the Settings write
+        # + status lines).
+        if @menu
+          return menu_set_as_default if ctrl && event.code == "s"
+
+          @menu = nil unless @menu.handle(event)
+          return
+        end
+
         alt = event.modifiers.include?("alt")
         printable = event.text? && !(event.modifiers & %w[ctrl alt]).any?
         case event.code
@@ -594,13 +631,29 @@ module Tart
           # app.tools.expand (pi keybindings.ts:50, default ctrl+o — the
           # GLOBAL tool-output toggle, setToolsExpanded).
           ctrl ? set_tool_output_expanded(!@transcript_state.tool_output_expanded) : @editor.insert_printable(event)
+        when "l"
+          # app.model.select (pi keybindings.ts:49, default ctrl+l): the
+          # model menu.
+          ctrl ? open_model_menu : @editor.insert_printable(event)
+        when "s"
+          # app.models.save / app.thinking.save (pi keybindings.ts:37,
+          # :119 — both default ctrl+s): the OPEN menu's set-as-default;
+          # inert without one.
+          ctrl ? menu_set_as_default : @editor.insert_printable(event)
         # While the list is active up/down navigate the LIST (history
         # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
         when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.history_previous
         when "down" then @autocomplete.suggestions ? @autocomplete.navigate(1) : @editor.history_next
         when "tab"
-          if @autocomplete.suggestions then @autocomplete.apply(@editor)
-          else @autocomplete.update(@editor) # explicit trigger (pi handleTabCompletion)
+          # app.thinking.cycle (pi keybindings.ts:33-35, default
+          # shift+tab): the in-session level cycle — kept when bare
+          # /thinking became the menu (I27).
+          if event.modifiers.include?("shift")
+            cycle_thinking_level
+          elsif @autocomplete.suggestions
+            @autocomplete.apply(@editor)
+          else
+            @autocomplete.update(@editor) # explicit trigger (pi handleTabCompletion)
           end
         # Transcript paging (pi keybindings.ts:114-115 tui.editor.pageUp/
         # pageDown, defaultKeys pageUp/ctrl+pageUp, pageDown/ctrl+pageDown;
@@ -740,6 +793,7 @@ module Tart
       # The pointer's buffer point is composed here ({content_point} —
       # viewport state + geometry) and threaded into the selection.
       def handle_mouse(event)
+        return menu_mouse(event) if @menu
         return wheel(event) if event.scroll?
         return unless event.left?
 
@@ -748,6 +802,31 @@ module Tart
         when "drag" then @selection_state.drag(content_point(event.y, event.x))
         when "up" then @selection_state.release(content_point(event.y, event.x))
         end
+      end
+
+      # The open menu's click-to-select (pi: mouse events route to the
+      # focused component — select-list.ts:109-134 press/release): a left
+      # press moves the selection, the release on the same row selects
+      # and closes. The terminal cell maps into the list window
+      # ({menu_list_top}); wheel keeps scrolling the transcript behind
+      # the menu (itemized).
+      def menu_mouse(event)
+        return unless event.left?
+
+        row = event.y - menu_list_top
+        case event.kind
+        when "down" then @menu.press(row)
+        when "up" then @menu.release(row)
+        end
+      end
+
+      # The terminal row of the menu's first list item: the menu area
+      # docks above the footer (the editor slot), its top border is one
+      # row, the list starts {ModelMenu#list_offset} content rows in.
+      def menu_list_top
+        height = @session.viewport_area&.height || 24
+        area_top = height - FOOTER_ROWS - (@menu.widget_rows + 2)
+        area_top + 1 + @menu.list_offset
       end
 
       # One wheel event: the lines-per-event math and the wheel constants
@@ -787,6 +866,7 @@ module Tart
 
       def editor_area_rows(height)
         return [@picker.widget_rows + 2, height - 1].min if @picker # + borders
+        return [@menu.widget_rows + 2, height - 1].min if @menu # + borders
 
         [MIN_EDITOR_ROWS + @autocomplete.rows, height - 1].min
       end
@@ -806,7 +886,7 @@ module Tart
           children: [
             transcript_widget(transcript_rows),
             dock_spacer_widget,
-            @picker ? @picker.widget(viewport_width) : editor_widget,
+            picker_or_menu_widget || editor_widget,
             @footer.widget(footer_data, viewport_width),
           ],
           constraints: [
@@ -816,6 +896,16 @@ module Tart
             TUI.constraint_length(FOOTER_ROWS),
           ]
         )
+      end
+
+      # The picker/menu slot: whichever selector is mounted in place of
+      # the editor (pi showSelector's container swap), else nil → the
+      # editor.
+      def picker_or_menu_widget
+        return @picker.widget(viewport_width) if @picker
+        return @menu.widget(viewport_width) if @menu
+
+        nil
       end
 
       # The dock spacer's rendered rows (pi widgetsAbove shrink 1, minSize 0
@@ -896,7 +986,7 @@ module Tart
       def editor_border_color
         return Theme[:bashMode] if @editor.bash_mode?
 
-        level = thinking_level if @footer_data&.fetch(:reasoning, nil)
+        level = thinking_level if footer_data[:reasoning]
         token = "thinking_#{level || :off}".to_sym
         Theme::TOKENS.key?(token) ? Theme[token] : Theme[:thinking_off]
       end
@@ -928,13 +1018,19 @@ module Tart
       end
 
       # The footer's per-frame data view: the launcher facts with the
-      # runtime thinking level overlaid when set ({thinking_level} — pi
-      # footer.ts:226-244 reads the live session level over the
-      # settings-resolved one). nil footer_data renders from what the
-      # surface knows alone, as at base.
+      # runtime overlays — the thinking level ({thinking_level}, pi
+      # footer.ts:226-244) and the switched model's id, context window,
+      # and reasoning capability (I27, the footer model segment's
+      # refresh after a /model switch). nil footer_data renders from
+      # what the surface knows alone, as at base.
       def footer_data
         data = @footer_data || {}
-        @thinking_level ? data.merge(thinking_level: @thinking_level) : data
+        data = data.merge(thinking_level: @thinking_level) if @thinking_level
+        return data unless @runtime_model
+
+        data = data.merge(model: @runtime_model[:id])
+        data = data.merge(context_window: @runtime_model[:context_window]) if @runtime_model[:context_window]
+        @runtime_model[:reasoning].nil? ? data : data.merge(reasoning: @runtime_model[:reasoning])
       end
 
       # The transcript buffer's display lines — completed content plus the
@@ -977,25 +1073,148 @@ module Tart
       # border color ({editor_border_color}) — pi footer.invalidate +
       # updateEditorBorderColor. (Public — the dispatcher's callable.)
       def set_thinking_level(level)
-        @mutex.synchronize do
-          @thinking_level = level
-          @border_status = "Thinking level: #{level}"
-        end
-        @kernel.request_draw
+        apply_thinking_selection(level, persist: false)
       end
 
       # pi cycleThinkingLevel (agent-session.ts:2641-2653): the next
-      # level in THINKING_LEVEL_OPTIONS order, wrapping — the port's
-      # analog for the bare /thinking command (pi opens its selector
-      # there; the port has no selector UI, the cycle is the keybinding's
-      # behavior — itemized deviation). (Public — the dispatcher's
-      # callable.)
+      # level in THINKING_LEVEL_OPTIONS order, wrapping — app.thinking.cycle
+      # (shift+tab), kept in-session when bare /thinking became the menu
+      # (I27). (Public — the keybinding's callable.)
       def cycle_thinking_level
         current = @mutex.synchronize { thinking_level || Settings::DEFAULTS.fetch("thinkingLevel") }
         levels = Settings::THINKING_LEVELS
         next_level = levels[(levels.index(current) + 1) % levels.size]
         set_thinking_level(next_level)
         next_level
+      end
+
+      # --- the selector menus (I27, pi showSelector family) ---
+
+      # The /thinking selector (pi showThinkingSelector :5168-5183): the
+      # session level (the settings default when unset) is the ✓ row;
+      # the settings-resolved default carries the · default badge.
+      # Selection applies through the same state the command path uses.
+      def open_thinking_menu
+        @mutex.synchronize do
+          @menu = ModelMenu.thinking(
+            current: thinking_level || Settings::DEFAULTS.fetch("thinkingLevel"),
+            default: default_thinking_level,
+            on_select: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: false) },
+            on_select_as_default: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: true) }
+          )
+        end
+      end
+
+      # The /model selector (pi showModelSelector :5342-5361): the
+      # catalog is models.json (the static snapshot — the network
+      # refresh is cut, itemized); an empty catalog degenerates to the
+      # boot model so ctrl+s set-as-default works out of the box
+      # (itemized port extension). +seed+ pre-fills the search (/model
+      # <unknown-arg>, pi's initialSearchInput).
+      def open_model_menu(seed = nil)
+        @mutex.synchronize do
+          @menu = ModelMenu.model(
+            entries: model_menu_entries, current: current_model_ref, default: default_model_ref, seed:,
+            on_select: ->(item) { close_menu; apply_model_selection(item, persist: false) },
+            on_select_as_default: ->(item) { close_menu; apply_model_selection(item, persist: true) }
+          )
+        end
+      end
+
+      # The /model <ref> direct switch (pi handleModelCommand's
+      # exact-match path — setModel {persist:false} + the "Model: <id>"
+      # status). Public — the dispatcher's callable.
+      def switch_model(entry)
+        apply_model_selection(entry, persist: false)
+      end
+
+      public :open_thinking_menu, :open_model_menu, :switch_model
+
+      private
+
+      # ctrl+s (pi app.models.save / app.thinking.save): the OPEN menu's
+      # select-and-persist. The menu closes itself through the callback
+      # (pi selectLevel → done()); inert without one.
+      def menu_set_as_default
+        @menu&.select_as_default
+      end
+
+      def close_menu
+        @menu = nil
+      end
+
+      # pi selectThinkingLevel (:5163-5172): the session level, the
+      # footer's re-ladder and the editor border's (the overlays flow
+      # through {footer_data}), the status; persist:true reports "Default
+      # thinking level" and writes the settings default (ctrl+s).
+      def apply_thinking_selection(level, persist:)
+        @mutex.synchronize do
+          @thinking_level = level
+          @border_status = "#{persist ? "Default thinking level" : "Thinking level"}: #{level}"
+        end
+        Settings.save(@settings_root, "thinkingLevel" => level) if persist
+        @kernel.request_draw
+      end
+
+      # The switch seam (pi selectModel → session.setModel { persist }):
+      # swap the runtime chat model (the loop re-resolves the context
+      # window — Loop#switch_model), refresh the footer model segment +
+      # the editor border re-ladder (the runtime overlays flow into
+      # {footer_data}), report, and persist the default when asked.
+      def apply_model_selection(entry, persist:)
+        status = persist ? "Default model: #{entry[:provider]}/#{entry[:id]}" : "Model: #{entry[:id]}"
+        @mutex.synchronize do
+          @runtime_model = entry
+          @border_status = status
+        end
+        # The wire provider is the models.json key mapped onto the port's
+        # carried seam (Models.wire_provider — the loop's with_model
+        # needs a native slug); the window re-resolves in the loop seam.
+        @agent&.switch_model(entry[:id], provider: Models.wire_provider(entry[:provider]),
+          context_window: entry[:context_window])
+        Settings.save(@settings_root, "defaultProvider" => entry[:provider], "defaultModel" => entry[:id]) if persist
+        @kernel.request_draw
+      end
+
+      # The menu's catalog: models.json's entries; empty/absent → the
+      # boot model alone (the degenerate single-entry menu).
+      def model_menu_entries
+        catalog = @models&.model_entries
+        return catalog if catalog && !catalog.empty?
+
+        [boot_model_entry]
+      end
+
+      # The boot entry from the launcher facts (footer_data): the
+      # resolved model/provider/window/reasoning.
+      def boot_model_entry
+        data = @footer_data || {}
+        model = data.fetch(:model, nil) || "no-model"
+        {provider: data.fetch(:default_provider, "openai"), id: model, name: model,
+         reasoning: data[:reasoning], context_window: data[:context_window]}
+      end
+
+      # The ✓ current marker's ref: the runtime switch, else the boot
+      # model (footer_data).
+      def current_model_ref
+        return @runtime_model if @runtime_model
+
+        data = @footer_data || {}
+        {provider: data.fetch(:default_provider, "openai"), id: data[:model]}
+      end
+
+      # The · default badge's ref: the settings-resolved boot pair —
+      # footer_data[:model] stays the boot value (the runtime switch
+      # overlays the per-frame view, never these facts).
+      def default_model_ref
+        data = @footer_data || {}
+        {provider: data.fetch(:default_provider, "openai"), id: data[:model]}
+      end
+
+      # The settings-resolved thinking level (the · default badge) —
+      # footer_data's fact, or the built-in default.
+      def default_thinking_level
+        (@footer_data || {}).fetch(:thinking_level, nil) || Settings::DEFAULTS.fetch("thinkingLevel")
       end
 
       public :set_thinking_level, :cycle_thinking_level
@@ -1014,6 +1233,8 @@ module Tart
         @border_status = "Tool output: #{expanded ? "expanded" : "collapsed"}"
         @kernel.request_draw
       end
+
+      public :set_tool_output_expanded
     end
   end
 end

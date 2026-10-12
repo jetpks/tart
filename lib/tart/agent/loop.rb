@@ -100,6 +100,25 @@ module Tart
         !@steering_queue.empty?
       end
 
+      # The resolved context window (the compaction threshold's
+      # denominator) — the test/launcher readback for the switch seam.
+      attr_reader :context_window
+
+      # The model-switch seam (I27, /model + the selector menus): swaps
+      # the runtime chat model in place — ruby_llm Chat#with_model
+      # (live-verified, chat.rb:609: re-resolves provider + connection)
+      # — and re-resolves the context window the compaction math uses.
+      # The provider/protocol/assumption kwargs match the launcher's
+      # build_chat (+provider+ is the WIRE slug — Models.wire_provider;
+      # the openai provider would otherwise pick :responses; the port's
+      # models are assumed, not registry-resolved). Idle-only: the menus
+      # open when no turn runs.
+      def switch_model(model_id, provider:, context_window: nil)
+        @chat.with_model(model_id, provider:, protocol: :chat_completions, assume_model_exists: true)
+        @context_window = context_window if context_window
+        self
+      end
+
       # Runs the agent to completion of the prompt and every queued message.
       # Must be called on the kernel reactor fiber (as the Core::Loop work
       # block): every model/tool step is bridged to a worker thread and this

@@ -223,6 +223,31 @@ module Tart
       agent.new_messages.last.role == :assistant
     end
 
+    # The model-switch seam (I27 AC3): the same chat object re-resolves
+    # model + provider in place (ruby_llm Chat#with_model — live-verified
+    # chat.rb:609), and the context window re-resolves (the compaction
+    # threshold's denominator follows the switched model).
+    def test_switch_model_swaps_the_runtime_chat_and_re_resolves_the_window
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      agent = Agent::Loop.new(chat:, tools: empty_tools, context_window: 1000)
+
+      assert_equal "tart-test-model", chat.model.id
+      assert_equal 1000, agent.context_window
+
+      agent.switch_model("glm-5.3", provider: "openai", context_window: 200_000)
+
+      assert_equal "glm-5.3", chat.model.id, "the runtime chat model swapped in place"
+      assert_equal 200_000, agent.context_window, "the window re-resolved for the compaction math"
+
+      # The switched chat still talks to the endpoint (the seam does not
+      # strand the connection) — a real request round-trips.
+      @server.script([{type: :message, content: "switched"}])
+      result = nil
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      kernel.run { result = agent.run("hi") }
+      assert_equal "switched", result.last.content
+    end
+
     # AC2: threshold compaction after a completed turn — usage (the mock
     # reports 10+5 tokens) over context_window - reserve compacts; the next
     # request carries [summary message, kept tail, queued message] and none

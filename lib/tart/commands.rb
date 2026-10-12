@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require_relative "models"
 
 module Tart
   module Commands
@@ -23,18 +24,21 @@ module Tart
     # an unknown skill passes through as plain text (:2155); the expanded
     # block is what the model receives and what the session records.
     #
-    # The frozen builtin set is exactly these seven (each pi cut is bound
-    # to a feature the port lacks — itemized in the lane's deviation
-    # table): pi's other 17 published builtins (model, tree,
-    # scoped-models, export, import, share, bug, copy, name, session,
-    # changelog, hotkeys, fork, clone, trust, login, logout, reload) plus
-    # its hidden debug commands are cut. /thinking (pi slash-commands.ts
-    # :23, "Set thinking level", argumentHint <level>) IS in — the level
-    # drives the footer segment and the editor border color.
+    # The builtin set (I27 adds /model — the port's reduction count is
+    # down to 16 of pi's published builtins: tree, scoped-models,
+    # export, import, share, bug, copy, name, session, changelog,
+    # hotkeys, fork, clone, trust, login, logout, reload — each cut
+    # bound to a feature the port lacks, itemized in the lane's
+    # deviation table). /thinking (pi slash-commands.ts:23, "Set
+    # thinking level", argumentHint <level>) — the level drives the
+    # footer segment and the editor border color; /model (pi
+    # slash-commands.ts, argumentHint <provider/model>) switches the
+    # chat model against the models.json catalog.
     BUILTINS = {
       "new" => {description: "Start a new session"},
       "compact" => {description: "Manually compact the session context", args: true},
       "resume" => {description: "Resume a different session"},
+      "model" => {description: "Switch the chat model", args: true, argument_hint: "<provider/model>"},
       "skills" => {description: "List loaded skills"},
       "settings" => {description: "Show resolved settings"},
       "thinking" => {description: "Set thinking level", args: true},
@@ -88,15 +92,24 @@ module Tart
     # @param reset [Proc] starts a fresh session (/new).
     # @param resume [Proc, nil] opens the session picker (/resume); nil
     #   (test doubles) makes /resume a no-op.
-    # @param thinking [Proc] sets the session's thinking level —
-    #   +call(:cycle)+ cycles, +call(level)+ sets (the surface's seam;
-    #   /thinking, pi selectThinkingLevel).
+    # @param thinking [Proc] sets the session's thinking level
+    #   (+call(level)+; the surface's seam; /thinking's exact-arg path,
+    #   pi selectThinkingLevel).
+    # @param thinking_menu [Proc, nil] opens the thinking-level selector
+    #   (bare /thinking, pi showThinkingSelector); nil = no-op.
+    # @param models [Models::Config, nil] the models.json catalog
+    #   (/model's exact-match resolution, pi findExactModelMatch).
+    # @param model [Proc, nil] switches the chat model — +call(entry)+
+    #   with a resolved catalog entry (/model <ref>, pi session.setModel).
+    # @param model_menu [Proc, nil] opens the model selector —
+    #   +call(seed)+ with the pre-filled search or nil (pi
+    #   showModelSelector).
     # @param prompts [Array<Prompts::Template>] the loaded templates
     #   (/name expansion; empty = templates never match).
     # @param quit [Proc] exits the app (/quit).
     class Handler
       def initialize(skills:, settings:, output:, spawn:, agent:, reset:, resume: nil, thinking: nil,
-        quit:, prompts: [])
+        quit:, prompts: [], thinking_menu: nil, models: nil, model: nil, model_menu: nil)
         @skills = skills
         @settings = settings
         @output = output
@@ -107,6 +120,10 @@ module Tart
         @thinking = thinking
         @quit = quit
         @prompts = prompts
+        @thinking_menu = thinking_menu
+        @models = models
+        @model = model
+        @model_menu = model_menu
       end
 
       # Expands /skill:<name> then /<template> text (pi agent-session.ts
@@ -130,6 +147,7 @@ module Tart
         when "skills" then list_skills
         when "settings" then show_settings
         when "thinking" then dispatch_thinking(text)
+        when "model" then dispatch_model(text)
         when "help" then show_help
         end
         true
@@ -138,18 +156,33 @@ module Tart
       private
 
       # pi handleThinkingCommand (:5145-5163): an arg sets the exact
-      # level; the bare command opens pi's selector — the port has no
-      # selector UI, so it cycles (the app.thinking.cycle behavior,
-      # itemized). An unknown level is pi's showError text.
+      # level; the bare command opens pi's selector (the port's menu —
+      # I27; the shift+tab cycle stays on the keybinding). An unknown
+      # level is pi's showError text.
       def dispatch_thinking(text)
         arg = text.split(/\s+/, 2)[1].to_s.strip
         if arg.empty?
-          @thinking&.call(:cycle)
+          @thinking_menu&.call
         elsif Settings::THINKING_LEVELS.include?(arg)
           @thinking&.call(arg)
         else
           @output.call(%(Unknown thinking level "#{arg}". Available levels: #{Settings::THINKING_LEVELS.join(", ")}.))
         end
+      end
+
+      # pi handleModelCommand (:5192-5216): no arg opens the selector;
+      # an exact catalog match switches directly ("Model: <id>"
+      # status through the switch seam); anything else opens the
+      # selector pre-seeded with the arg (pi's initialSearchInput).
+      def dispatch_model(text)
+        arg = text.split(/\s+/, 2)[1].to_s.strip
+        if arg.empty?
+          @model_menu&.call(nil)
+          return
+        end
+
+        entry = @models&.resolve(arg)
+        entry ? @model&.call(entry) : @model_menu&.call(arg)
       end
 
       # pi handleCompactCommand (interactive-mode.ts:7080): compact now.

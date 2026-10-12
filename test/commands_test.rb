@@ -57,7 +57,7 @@ module Tart
     # --- the frozen builtin set ---
 
     def test_builtin_set_is_exactly_the_frozen_commands
-      assert_equal %w[new compact resume skills settings thinking help quit], Commands::BUILTINS.keys
+      assert_equal %w[new compact resume model skills settings thinking help quit], Commands::BUILTINS.keys
     end
 
     # --- /thinking (pi handleThinkingCommand :5145) ---
@@ -80,18 +80,71 @@ module Tart
         "the error carries pi's showError text"
     end
 
-    # The bare command cycles (pi's app.thinking.cycle — the port has no
-    # selector UI, itemized).
-    def test_thinking_dispatch_bare_cycles
-      levels = []
+    # The bare command opens the thinking selector menu (pi
+    # showThinkingSelector — the port's menu, I27; the shift+tab cycle
+    # stays on the keybinding).
+    def test_thinking_dispatch_bare_opens_the_menu
+      opened = []
       handler = Commands::Handler.new(
         skills: @skills, settings: {}, output: ->(text) { @calls[:output] << text },
         spawn: ->(&block) { block.call }, agent: -> { @agent }, reset: -> {},
-        thinking: ->(arg) { levels << arg }, quit: -> {}
+        thinking_menu: -> { opened << true }, quit: -> {}
       )
 
       assert handler.dispatch("/thinking")
-      assert_equal [:cycle], levels, "the bare command cycles"
+      assert_equal [true], opened, "the bare command opens the menu"
+    end
+
+    # --- /model (pi handleModelCommand :5192-5216) ---
+
+    # No arg opens the model menu; an exact catalog match switches
+    # directly through the model seam (never opens the menu); anything
+    # else opens the menu pre-seeded with the arg.
+    def test_model_dispatch_menu_exact_and_seeded
+      menus = []
+      switches = []
+      models = Models::Config.new(
+        providers: {
+          "glm" => {name: "GLM", base_url: nil, api_key: nil, api: nil,
+                    models: [{provider: "glm", id: "glm-5.3", name: "GLM 5.3",
+                              reasoning: true, context_window: 200_000, max_tokens: nil}]}
+        },
+        default: nil, error: nil
+      )
+      handler = Commands::Handler.new(
+        skills: @skills, settings: {}, output: ->(text) { @calls[:output] << text },
+        spawn: ->(&block) { block.call }, agent: -> { @agent }, reset: -> {},
+        models:, model: ->(entry) { switches << entry },
+        model_menu: ->(seed) { menus << seed }, quit: -> {}
+      )
+
+      assert handler.dispatch("/model")
+      assert_equal [nil], menus, "the bare command opens the menu unseeded"
+
+      assert handler.dispatch("/model glm/glm-5.3")
+      assert_equal [nil], menus, "an exact match switches directly (the menu stays shut)"
+      assert_equal({provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+                    context_window: 200_000, max_tokens: nil}, switches.last)
+
+      assert handler.dispatch("/model nope")
+      assert_equal [nil, "nope"], menus, "an unknown arg opens the menu pre-seeded"
+    end
+
+    # Without a catalog (no models.json), an arg opens the menu seeded —
+    # never a crash, never a switch.
+    def test_model_dispatch_without_catalog_seeds_the_menu
+      menus = []
+      switches = []
+      handler = Commands::Handler.new(
+        skills: @skills, settings: {}, output: ->(text) { @calls[:output] << text },
+        spawn: ->(&block) { block.call }, agent: -> { @agent }, reset: -> {},
+        model: ->(entry) { switches << entry },
+        model_menu: ->(seed) { menus << seed }, quit: -> {}
+      )
+
+      assert handler.dispatch("/model glm/glm-5.3")
+      assert_equal ["glm/glm-5.3"], menus
+      assert_empty switches
     end
 
     # /resume (item 2, pi slash-commands.ts:41 + interactive-mode.ts
