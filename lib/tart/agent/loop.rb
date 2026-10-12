@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../compaction"
+require_relative "../settings"
 require_relative "bridge"
 require_relative "session"
 require_relative "status"
@@ -118,13 +119,17 @@ module Tart
         # pi has no cached window to go stale: setModel swaps the Model
         # object (agent-session.ts:2484) and every check reads
         # model.contextWindow live (:2965). The port's cache re-resolves
-        # instead: the declared window, else the switched chat's model (the
-        # gem's registry resolution — under the boot path's
-        # assume_model_exists a mock lands on Model.default with no
-        # context_window, nil = threshold disabled, pi's `contextWindow ??
-        # 0`). The explicit-override chain (TART_CONTEXT_WINDOW) still
-        # stands in resolved_context_window.
-        @context_window = context_window || @chat.model&.context_window
+        # instead, through the boot chain's resolution (Settings
+        # .resolve_context_window, settings tier excluded — the loop holds
+        # no settings; bin/tart resolves them at boot): the catalog-
+        # declared window, else TART_CONTEXT_WINDOW, else the switched
+        # chat's model (the gem's registry resolution — under the boot
+        # path's assume_model_exists a mock lands on Model.default with no
+        # context_window), else the known-models table (I30: a table entry
+        # with no declared window keeps the threshold armed instead of
+        # nil-disabling it). nil still = threshold disabled, pi's
+        # `contextWindow ?? 0`.
+        @context_window = Settings.resolve_context_window(explicit: context_window, model: @chat.model)
         self
       end
 
@@ -352,9 +357,17 @@ module Tart
           tokens_before: preparation.tokens_before,
           # pi CompactionDetails (compaction.ts:37-40).
           details: {"readFiles" => lists[:read_files], "modifiedFiles" => lists[:modified_files]},
+          usage: Session.compaction_usage(preparation.usage),
         )
         @pre_compaction_messages = @chat.messages.each_with_object({}.compare_by_identity) { |message, set| set[message] = true }
-        emit(type: :compaction, reason:, tokens_before: preparation.tokens_before, summary:)
+        # pi's rebuild source (interactive-mode.ts:3698-3705):
+        # buildContextEntries + renderSessionEntries(entries.slice(1)) —
+        # the recorder's context projection minus the leading compaction
+        # entry: the kept post-compaction replay entries, chronological,
+        # no system/summary message. No recorder, nothing recorded,
+        # nothing to replay.
+        entries = @recorder ? @recorder.context_entries.drop(1) : []
+        emit(type: :compaction, reason:, tokens_before: preparation.tokens_before, summary:, entries:)
         true
       end
 

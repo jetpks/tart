@@ -121,16 +121,45 @@ module Tart
       end
 
       # Compaction entry factory (pi CompactionEntry :91-104 /
-      # appendCompaction :1260-1285), the port's entry subset (no usage,
-      # fromHook, or systemMessage field). A null first-kept entry falls
-      # back to the compaction entry's own id (pi's
-      # `firstKeptEntryId ?? id`).
-      def compaction_entry(summary:, first_kept_entry_id:, tokens_before:, details:,
+      # appendCompaction :1260-1285), the port's field subset (no fromHook
+      # or systemMessage field). +usage+ is the summarization call's pi
+      # Usage hash ({compaction_usage}); nil omits the key (pi's optional
+      # usage — JSON drops undefined). A null first-kept entry falls back
+      # to the compaction entry's own id (pi's `firstKeptEntryId ?? id`).
+      def compaction_entry(summary:, first_kept_entry_id:, tokens_before:, details:, usage: nil,
                            id:, parent_id:, timestamp:)
-        {
+        entry = {
           type: "compaction", id:, parentId: parent_id, timestamp:,
           summary:, firstKeptEntryId: first_kept_entry_id || id, tokensBefore: tokens_before, details:
         }
+        entry[:usage] = usage if usage
+        entry
+      end
+
+      # The summarization call's persisted usage (pi Usage, types.ts:446 —
+      # the CompactionEntry.usage field, session-manager.ts:99) from the
+      # gem's Tokens readers (tokens.rb:35-37): camelCase keys, unreported
+      # counts omitted; totalTokens is the component sum (pi
+      # calculateContextTokens's fallback — the gem carries no total
+      # reader). Nothing reported persists nothing (pi's usage-undefined
+      # entries). The cost object is cut: the port carries no pricing
+      # layer and no endpoint that reports one, and a fabricated zero
+      # would lie (the gem's own false-zero doctrine, cost.rb:19-20).
+      def compaction_usage(tokens)
+        return nil unless tokens
+
+        usage = {
+          "input" => tokens.input,
+          "output" => tokens.output,
+          "cacheRead" => tokens.cache_read,
+          "cacheWrite" => tokens.cache_write
+        }
+        return nil unless usage.values.compact.any?
+
+        usage["cacheWrite1h"] = tokens.cache_write_by_ttl["1h"] if tokens.cache_write_by_ttl&.key?("1h")
+        usage["reasoning"] = tokens.thinking if tokens.thinking
+        usage["totalTokens"] = Compaction.calculate_context_tokens(tokens)
+        usage.compact
       end
 
       # pi sessionEntryToContextMessages :439 for the message subset: message
@@ -200,10 +229,14 @@ module Tart
       # everything after the compaction entry; the pre-compaction summarized
       # messages are gone. Files without compaction entries replay exactly
       # as before.
-      def context_messages(path)
-        entries = load_entries(path)
+      # pi buildContextEntries :475-513 over a flat chronological entry
+      # list: the latest compaction entry, the kept entries from its
+      # firstKeptEntryId up to the compaction (system messages skipped),
+      # and everything after the compaction entry; without a compaction
+      # entry, the list unchanged.
+      def context_entries(entries)
         compaction_index = entries.rindex { |entry| entry.is_a?(Hash) && entry["type"] == "compaction" }
-        return entries.filter_map { |entry| entry_to_context_message(entry) } unless compaction_index
+        return entries unless compaction_index
 
         compaction = entries[compaction_index]
         context_entries = [compaction]
@@ -216,7 +249,11 @@ module Tart
           context_entries << entry
         end
         context_entries.concat(entries[(compaction_index + 1)..] || [])
-        context_entries.filter_map { |entry| entry_to_context_message(entry) }
+        context_entries
+      end
+
+      def context_messages(path)
+        context_entries(load_entries(path)).filter_map { |entry| entry_to_context_message(entry) }
       end
 
       def message_entry_with_role?(entry, role)
@@ -377,15 +414,27 @@ module Tart
           entry[:id]
         end
 
+        # The session's context projection (pi SessionManager
+        # .buildContextEntries :475-513): the latest compaction entry, the
+        # kept entries from its firstKeptEntryId onward (system messages
+        # skipped), and everything after it — the as-loaded entry shape
+        # (what load_entries reads back), so a live consumer reads exactly
+        # the resume replay's shape.
+        def context_entries
+          Session.context_entries(JSON.parse(JSON.generate(@entries)))
+        end
+
         # Appends a compaction entry as a child of the current leaf and
         # advances the leaf (pi SessionManager.appendCompaction :1260-1285,
-        # the port's field subset). Returns the entry id.
-        def append_compaction(summary:, first_kept_entry_id:, tokens_before:, details:)
+        # the port's field subset). +usage+ is the summarization call's pi
+        # Usage hash ({Session.compaction_usage}). Returns the entry id.
+        def append_compaction(summary:, first_kept_entry_id:, tokens_before:, details:, usage: nil)
           entry = Session.compaction_entry(
             summary:,
             first_kept_entry_id:,
             tokens_before:,
             details:,
+            usage:,
             id: Session.generate_id(@ids),
             parent_id: @leaf_id,
             timestamp: Session.now_iso,
