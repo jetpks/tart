@@ -231,8 +231,8 @@ module Tart
         chat.on_agent_event({type: :agent_start})
         tool_start(chat, "grep")
         draw(chat, session)
-        assert_includes editor_area(session, chat), "tool: grep",
-          "the tool name renders in the editor's status border while it runs"
+        assert_includes editor_area(session, chat), "Working",
+          "the border status is pi's constant working message while the tool runs"
 
         tool_end(chat, "grep", "done\nmore")
         draw(chat, session)
@@ -265,11 +265,12 @@ module Tart
         stream(chat, "streaming")
         draw(chat, session)
         # The status renders in the editor's top border (after the corner
-        # glyph) — scan cells, not lead cells. The dim TOKEN color (dark
-        # has no dimTokens — the attribute pin was the system-theme
-        # artifact; pi's border title rides theme.fg("dim")).
-        assert fg_cell?(session, ->(symbol, _x, _y) { Render::Chat::SPINNER.include?(symbol) }, Theme[:dim]),
-          "the status line renders the dim token color"
+        # glyph) — scan cells, not lead cells. I37: the WORKING status's
+        # spinner AND message ride the editor border color (pi's embedded
+        # colorFn, interactive-mode.ts:2346-2359 — not the base border
+        # title's dim); this fixture is non-reasoning → the off token.
+        assert fg_cell?(session, ->(symbol, _x, _y) { Render::Chat::SPINNER.include?(symbol) }, Theme[:thinking_off]),
+          "the working status renders the editor border color"
 
         finish_message(chat, "assistant answer") # transcript: assistant, terminal default
         tool_end(chat, "grep", "tool output")    # transcript: tool, muted
@@ -289,6 +290,164 @@ module Tart
         # keeps the terminal default, visually apart from the colored echo.
         assert_nil session.cell_fg(0, input_row(session)),
           "the input line keeps the terminal default"
+      end
+    end
+
+    # --- the time-gated spinner + the status spans/colors (I37, pi
+    # loader.ts + interactive-mode.ts:2346-2359): the glyph derives from
+    # the injected clock at render — renders alone never move it — and
+    # the working status rides the editor border color while the
+    # compaction indicator keeps its constructor defaults. ---
+
+    def test_spinner_advances_on_time_not_renders
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        stream(chat, "hi")
+        draw(chat, session)
+        assert_equal "⠋", status_spinner_glyph(session), "t=0 renders frame 0"
+
+        now = 0.040
+        draw(chat, session)
+        assert_equal "⠋", status_spinner_glyph(session),
+          "two renders within 80ms of the anchor show the SAME frame"
+
+        now = 0.081
+        draw(chat, session)
+        assert_equal "⠙", status_spinner_glyph(session), "frame 1 at +81ms"
+
+        now = 0.160
+        draw(chat, session)
+        assert_equal "⠹", status_spinner_glyph(session), "frame 2 (SPINNER[2]) at +160ms — exactly floor(160ms/80ms)"
+
+        3.times { draw(chat, session) }
+        assert_equal "⠹", status_spinner_glyph(session),
+          "repeated renders without clock advance never move the glyph (the render counter is gone)"
+      end
+    end
+
+    def test_spinner_reanchors_at_every_status_kind_restart
+      now = 10.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        now = 10.40 # mid-working, a late frame: floor(0.40/0.08) % 10 = 5
+        draw(chat, session)
+        assert_equal "⠴", status_spinner_glyph(session), "the late frame shows"
+
+        chat.on_agent_event({type: :compaction_start, reason: :threshold})
+        draw(chat, session)
+        assert_equal "⠋", status_spinner_glyph(session),
+          "compaction_start re-anchors (pi constructs a new Loader — frame 0)"
+
+        chat.on_agent_event({type: :compaction, reason: :threshold, tokens_before: 100, summary: "s", entries: []})
+        draw(chat, session)
+        assert_equal "⠋", status_spinner_glyph(session),
+          "the :compaction result re-anchors again (pi clearStatusIndicator → the next working indicator restarts)"
+      end
+    end
+
+    def test_working_status_spans_read_the_editor_border_color
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        y = status_border_row_index(session)
+        assert_equal Theme[:thinking_off], session.cell_fg(3, y),
+          "the spinner cell rides the editor border color (off-default fixture)"
+        assert_equal Theme[:thinking_off], session.cell_fg(session.buffer_content[y].index("Working"), y),
+          "the message cell rides it too (pi's embedded colorFn overrides both constructor defaults)"
+      end
+    end
+
+    # pi updateEditorBorderColor in bash mode (:4516-4518): the embedded
+    # working status rides the bashMode token too (the colorFn reads
+    # editor.borderColor, not the ladder).
+    def test_working_status_reads_the_bash_mode_token_in_bash_mode
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        "!ech".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        y = status_border_row_index(session)
+        assert_equal Theme[:bashMode], session.cell_fg(3, y),
+          "the spinner cell rides the bashMode border color in bash mode"
+        assert_equal Theme[:bashMode], session.cell_fg(session.buffer_content[y].index("Working"), y),
+          "the message cell rides it too"
+      end
+    end
+
+    def test_working_status_recolors_with_a_mid_turn_thinking_level_change
+      now = 0.0
+      with_chat(width: 40, clock: -> { now },
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, reasoning: true}) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        chat.set_thinking_level("high")
+        draw(chat, session)
+        y = status_border_row_index(session)
+        assert_equal Theme[:thinking_high], session.cell_fg(3, y), "the set level's ladder token"
+        assert_equal Theme[:thinking_high], session.cell_fg(session.buffer_content[y].index("Working"), y),
+          "both cells take the ladder token"
+
+        chat.set_thinking_level("low") # mid-turn — pi's lazy borderColor deref
+        draw(chat, session)
+        assert_equal Theme[:thinking_low], session.cell_fg(3, y),
+          "the same status recolors on the next draw"
+        assert_equal Theme[:thinking_low], session.cell_fg(session.buffer_content[y].index("Working"), y)
+      end
+    end
+
+    def test_compaction_status_reads_accent_spinner_and_muted_message
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :compaction_start, reason: :threshold})
+        draw(chat, session)
+        y = status_border_row_index(session)
+        row = session.buffer_content[y]
+        assert_includes row, "Auto-compacting...", "COMPACTION_LABELS text unchanged"
+        assert_equal Theme[:accent], session.cell_fg(3, y),
+          "the compaction spinner keeps the accent constructor default (no colorFn)"
+        assert_equal Theme[:muted], session.cell_fg(row.index("Auto-compacting..."), y),
+          "the compaction message keeps the muted constructor default"
+      end
+    end
+
+    def test_working_border_row_matches_pis_single_space_layout
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        assert_equal "── ⠋ Working #{"─" * 27}", status_border_row(session).rstrip,
+          "── ⠋ Working + ONE space + dashes to width (pi custom-editor.ts:60-66 — the double flanks are gone)"
+      end
+    end
+
+    def test_narrow_width_degrades_the_status_to_the_spinner_alone
+      now = 0.0
+      with_chat(width: 8, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        assert_equal "───⠋────", status_border_row(session).rstrip,
+          "width < status + 5: the spinner alone between dashes (pi renderSpinnerInBorder, custom-editor.ts:66-67)"
+        assert_equal Theme[:thinking_off], session.cell_fg(3, status_border_row_index(session)),
+          "the lone glyph rides the spinner's color"
+      end
+    end
+
+    def test_label_collision_degrades_the_status_to_the_spinner_alone
+      now = 0.0
+      with_chat(width: 24, screen_height: 12, clock: -> { now }) do |chat, session|
+        "abcdefghi".each_char do |char|
+          chat.on_event(TUI.key_event(char))
+          chat.on_event(TUI.key_event("enter", modifiers: ["shift"])) unless char == "i"
+        end
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        y = session.buffer_content.index { |row| row.include?("⠋") } # the box grew — find the border row
+        row = session.buffer_content[y]
+        assert_includes row, "↑ 4 more", "the centered label renders"
+        refute_includes row, "Working", "the full status degraded to the spinner alone (pi canFitOverflow refit)"
+        assert_equal "── ⠋ ── ↑ 4 more ───────", row.rstrip, "pi's degraded centered form"
+        assert_equal Theme[:thinking_off], session.cell_fg(row.index("⠋"), y), "the degraded glyph keeps the spinner's color"
       end
     end
 
@@ -1772,10 +1931,11 @@ module Tart
     end
 
     # Live markdown (item 3, pi interactive-mode.ts:3519-3535 +
-    # assistant-message.ts:107-109): the live region's CONTENT re-renders
-    # as markdown on every delta — proven by styled readback BEFORE
-    # :message_end; the reasoning block above it stays plain dim italic
-    # (the I13 standing ruling, itemized).
+    # assistant-message.ts:107-109): the live region re-renders as
+    # markdown on every delta — proven by styled readback BEFORE
+    # :message_end; since I37 the reasoning block above the content rides
+    # the same converter (the dim-markdown routing — the I13 cut
+    # retired).
     def test_live_region_renders_markdown_mid_stream
       with_chat do |chat, session|
         chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
@@ -1791,6 +1951,91 @@ module Tart
         assert_includes thinking[4], :italic
         refute_includes live_region(session, chat), "**",
           "no raw markdown markers survive into the live region's rendered rows"
+      end
+    end
+
+    # --- reasoning as dim markdown (I37, pi assistant-message.ts:99-176):
+    # ONE converter path for the live, completed, and replay shapes — the
+    # thinkingText+italic prose default over the markdown theme, structure
+    # spans keeping their theme fns. The I13 cut retires. ---
+
+    # Reasoning fixture with a bold run, an inline code span, and a list.
+    REASONING_MD = "**bold** and `code`\n\n- item one"
+
+    def test_reasoning_renders_as_dim_markdown_mid_stream
+      with_chat(width: 40) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk(nil, REASONING_MD)})
+        draw(chat, session)
+        assert_reasoning_markdown_cells(session, chat)
+        live = live_region(session, chat)
+        refute_includes live, "**", "no raw markers in the live region"
+        refute_includes live, "`"
+      end
+    end
+
+    def test_reasoning_renders_as_dim_markdown_at_completion
+      with_chat(width: 40) do |chat, session|
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk(nil, REASONING_MD)})
+        chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("answer")})
+        chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "answer")})
+        draw(chat, session)
+        assert_reasoning_markdown_cells(session, chat)
+      end
+    end
+
+    def test_reasoning_renders_as_dim_markdown_on_replay
+      dir = File.join(@dir, "sessions")
+      FileUtils.mkpath(dir)
+      recorded = File.join(dir, "reasoning_md_replay_test-session.jsonl")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"reasoning-md-replay","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"go"}}
+        {"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":"answer","thinking":#{REASONING_MD.to_json}}}
+      JSONL
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+        assert_reasoning_markdown_cells(session, chat)
+      end
+    end
+
+    # The shared cell readback (the [y, x, symbol, fg, modifiers] scan):
+    # bold rides thinkingText+italic, the codespan and the list marker
+    # keep their theme fns (no prose styling), plain prose rides
+    # thinkingText+italic, and no raw markers survive.
+    def assert_reasoning_markdown_cells(session, chat)
+      cells = transcript_cells(session, chat)
+      bold = cells.find { |cell| cell[2] == "b" }
+      assert_equal Theme[:thinkingText], bold[3], "the bold run rides the thinkingText prose color"
+      assert_equal [:bold, :italic], bold[4], "bold + the italic default (pi defaultTextStyle inside strong)"
+      code = cells.find { |cell| cell[2] == "c" }
+      assert_equal Theme[:md_code], code[3], "the codespan keeps its theme fn (no prose styling)"
+      refute_includes code[4], :italic
+      marker = cells.find { |cell| cell[2] == "-" }
+      assert_equal Theme[:md_list_bullet], marker[3], "the list marker keeps its theme fn"
+      refute_includes marker[4], :italic
+      prose = cells.find { |cell| cell[2] == "a" } # the "and" run — before any content rows
+      assert_equal Theme[:thinkingText], prose[3], "plain prose rides thinkingText"
+      assert_includes prose[4], :italic
+      rows = chat.transcript_lines.join
+      refute_includes rows, "**", "no raw markdown markers survive into the rendered rows"
+      refute_includes rows, "`"
+    end
+
+    # pi thinking.trim() (assistant-message.ts:125): leading/trailing
+    # delta whitespace strips before the markdown routing — no blank edge
+    # rows.
+    def test_reasoning_delta_whitespace_strips_to_no_blank_edge_rows
+      with_chat(width: 40) do |chat, session|
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk(nil, "\n\n pondering \n\n")})
+        chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "")})
+        draw(chat, session)
+        assert_equal ["", " pondering"], chat.transcript_lines,
+          "the strip kills the blank edge rows the delta whitespace would render"
       end
     end
 
@@ -4167,12 +4412,13 @@ module Tart
     # readback). Width 9 makes wrapping observable ("aaaa bbbb" is exactly 9
     # cells). motd: false — the MOTD block is pinned by its own tests.
     def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false,
-      models: nil, settings_root: nil)
+      models: nil, settings_root: nil, clock: nil)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
         kernel = IdleKernel.new
-        chat = Render::Chat.new(session:, kernel:,
-          footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
-          models:, settings_root: settings_root || @dir)
+        kwargs = {session:, kernel:, footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
+          models:, settings_root: settings_root || @dir}
+        kwargs[:clock] = clock if clock # the spinner's fake-time seam (pi's 80ms dwell pinned, zero sleeps)
+        chat = Render::Chat.new(**kwargs)
         yield(chat, session, kernel)
       end
     end
@@ -4307,6 +4553,22 @@ module Tart
     def editor_area(session, chat)
       h = session.buffer_content.size
       session.buffer_content[(h - 5)..(h - 3)].join
+    end
+
+    # The editor's top border row while the 3-row box holds (the status
+    # line's row — pi custom-editor.ts renderTopBorder).
+    def status_border_row(session)
+      session.buffer_content[status_border_row_index(session)]
+    end
+
+    def status_border_row_index(session)
+      session.buffer_content.size - 5
+    end
+
+    # The status's spinner glyph: "── " prefix, then the glyph (pi's
+    # single-space border layout).
+    def status_spinner_glyph(session)
+      status_border_row(session)[3]
     end
 
     def footer_text(session)
