@@ -14,6 +14,11 @@ module TuiSplitRig
   #   responses:
   #     - type: stream
   #       content: "..."
+  #   context_window: 10         # optional: shrink BOTH apps' context window
+  #                              # (pi's staged models.json + tart's
+  #                              # TART_CONTEXT_WINDOW) and zero both apps'
+  #                              # compaction knobs — the threshold-trigger
+  #                              # lever (s7). Unset: the 32768 defaults.
   #   env:                       # optional per-app env overrides (the
   #     tart:                    # runner layers them over its staged
   #       TART_IDENTITY: tart    # env — the branding/staging seam)
@@ -24,7 +29,7 @@ module TuiSplitRig
   class Scenario
     APPS = %w[pi tart].freeze
 
-    attr_reader :name, :prompt, :expected_requests, :responses, :env
+    attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -55,6 +60,18 @@ module TuiSplitRig
         symbolized
       end
       @env = parse_env(data)
+      @context_window = parse_context_window(data)
+    end
+
+    # The optional scenario context window (s7's compaction lever): a
+    # positive integer or absent. Validated at load, not at boot.
+    def parse_context_window(data)
+      raw = data["context_window"]
+      return nil if raw.nil?
+
+      raise Error, "#{@path}: context_window must be a positive integer" unless raw.is_a?(Integer) && raw.positive?
+
+      raw
     end
 
     # The optional per-app env overrides: app name → {ENV_VAR => value},

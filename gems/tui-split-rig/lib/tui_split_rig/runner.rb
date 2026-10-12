@@ -58,6 +58,23 @@ module TuiSplitRig
       Result.new(exit_code: summary.fetch("exit_code"), summary: summary, out_dir: @out_dir)
     end
 
+    # The per-app boot primitives the probe reuses (bin/tool-pending-probe
+    # drives a mid-flight capture through the same staging the runner uses
+    # — the probe needs the panes DURING the turn, not at settle).
+    def boot_session(app, mock, n, stage)
+      home = File.join(stage, "home", app)
+      sandbox = File.join(stage, "sandbox", app)
+      [home, sandbox].each { |dir| FileUtils.mkdir_p(dir) }
+      agent_dir = app == "pi" ? stage_pi_agent(stage, mock.port) : nil
+      stage_tart_home(home) if app == "tart"
+
+      session = "tui-split-rig-#{app}-#{@scenario.name}-r#{n}-#{format('%04x', rand(65_536))}"
+      command = app == "pi" ? pi_command(home, agent_dir) : tart_command(sandbox, home, mock.port)
+      tmux("kill-session", "-t", session) if session_exists?(session)
+      tmux("new-session", "-d", *GEOMETRY, "-c", sandbox, "-s", session, command)
+      {session:, home:, sandbox:}
+    end
+
     private
 
     def run_once(n, registry)
@@ -77,15 +94,8 @@ module TuiSplitRig
     end
 
     def run_app(app, mock, n, stage)
-      home = File.join(stage, "home", app)
-      sandbox = File.join(stage, "sandbox", app)
-      [home, sandbox].each { |dir| FileUtils.mkdir_p(dir) }
-      agent_dir = app == "pi" ? stage_pi_agent(stage, mock.port) : nil
-
-      session = "tui-split-rig-#{app}-#{@scenario.name}-r#{n}-#{format('%04x', rand(65_536))}"
-      command = app == "pi" ? pi_command(home, agent_dir) : tart_command(sandbox, home, mock.port)
-      tmux("kill-session", "-t", session) if session_exists?(session)
-      tmux("new-session", "-d", *GEOMETRY, "-c", sandbox, "-s", session, command)
+      boot = boot_session(app, mock, n, stage)
+      session = boot[:session]
 
       boot = settle(session, "boot")
       alive = session_exists?(session)
@@ -122,6 +132,7 @@ module TuiSplitRig
     def stage_pi_agent(stage, port)
       agent_dir = File.join(stage, "agent", "pi")
       FileUtils.mkdir_p(agent_dir)
+      window = @scenario.context_window || 32_768
       config = {
         providers: {
           mock: {
@@ -129,7 +140,7 @@ module TuiSplitRig
             apiKey: "mock-key",
             api: "openai-completions",
             models: [
-              {id: "mock-1", name: "Mock 1", reasoning: false, contextWindow: 32_768, maxTokens: 512},
+              {id: "mock-1", name: "Mock 1", reasoning: false, contextWindow: window, maxTokens: 512},
             ],
           },
         },
@@ -142,8 +153,31 @@ module TuiSplitRig
       # indexed-16 fallback: accent 38;5;5, neutrals as the [2m dim
       # attribute. Every style measured against that config was an
       # artifact — dark renders truecolor 38;2;r;g;b tokens instead.
-      File.write(File.join(agent_dir, "settings.json"), JSON.pretty_generate({theme: "dark"}))
+      #
+      # A scenario context_window shrinks BOTH compaction knobs to zero
+      # (settings-manager.ts:822 — the same keys the port's settings.json
+      # compaction block reads): with the window at a few tokens the
+      # threshold trigger fires after the first completed turn in either
+      # app — the s7 compaction scenario's lever. Unset (s1–s6), nothing
+      # changes: pi's defaults (settings-defaults.ts:9-13) hold.
+      settings = {theme: "dark"}
+      settings[:compaction] = {enabled: true, reserveTokens: 0, keepRecentTokens: 0} if @scenario.context_window
+      File.write(File.join(agent_dir, "settings.json"), JSON.pretty_generate(settings))
       agent_dir
+    end
+
+    # The tart-side mirror of the pi compaction staging: the staged HOME's
+    # global settings (settings.rb global root — HOME/.tart/settings.json)
+    # carrying the same zeroed compaction knobs. The context window itself
+    # rides the TART_CONTEXT_WINDOW env in tart_command.
+    def stage_tart_home(home)
+      return unless @scenario.context_window
+
+      dir = File.join(home, ".tart")
+      FileUtils.mkdir_p(dir)
+      File.write(File.join(dir, "settings.json"), JSON.pretty_generate(
+        "compaction" => {"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0}
+      ))
     end
 
     # Pane commands are exec-wrapped so the pane's default shell (fish)
@@ -174,7 +208,7 @@ module TuiSplitRig
         "TART_PROVIDER" => "openai",
         "TART_API_KEY" => "mock-key",
         "TART_API_BASE" => "http://127.0.0.1:#{port}",
-        "TART_CONTEXT_WINDOW" => "32768"
+        "TART_CONTEXT_WINDOW" => (@scenario.context_window || 32_768).to_s
       ))} #{Shellwords.escape(@bundle_bin)} exec bin/tart #{Shellwords.escape(sandbox)}"
     end
 
@@ -189,7 +223,7 @@ module TuiSplitRig
       env.map { |key, value| "#{key}=#{Shellwords.escape(value)}" }.join(" ")
     end
 
-    # -- settle -----------------------------------------------------------
+    # -- settle --
 
     def capture(session)
       # A dead pane/session is a legitimate mid-run state (we surface it in
@@ -243,6 +277,13 @@ module TuiSplitRig
     ensure
       tmux("kill-session", "-t", session) if session_exists?(session)
     end
+
+    # The probe drives the pane lifecycle directly (bin/tool-pending-probe
+    # captures DURING the turn — settle here would wait it out); the staging
+    # methods are public for the same reason (the load pin asserts their
+    # staged files).
+    public :capture, :capture_styled, :settle, :teardown, :boot_session,
+      :stage_pi_agent, :stage_tart_home
 
     def pane_pid_tree(session)
       out = Open3.capture2("tmux", "list-panes", "-t", session, "-F", PANE_PID_FORMAT)[0].to_s

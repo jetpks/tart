@@ -113,6 +113,39 @@ module TuiSplitRig
       assert_equal "The long tool calls ran; fixed final reply for the spike.", scenario.responses[2][:content]
     end
 
+    def test_loads_the_shipped_s7_compaction_scenario
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s7_compaction.yml"))
+      assert_equal "s7_compaction", scenario.name
+      assert_equal "hello compact", scenario.prompt
+      assert_equal 2, scenario.expected_requests
+      assert_equal 2, scenario.responses.size
+      assert_equal 10, scenario.context_window,
+        "the threshold-trigger lever: both apps' context windows shrink to 10 (I26)"
+    end
+
+    def test_loads_the_shipped_probe_tool_pending_scenario
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/probe_tool_pending.yml"))
+      assert_equal "probe_tool_pending", scenario.name
+      assert_equal "run the sleeper", scenario.prompt
+      assert_equal 2, scenario.expected_requests
+      assert_equal({command: "sleep 6"}, scenario.responses[0][:tool_calls][0][:arguments],
+        "the slow bash call gives the probe its mid-flight window")
+      assert_nil scenario.context_window, "the probe needs no window shrink"
+    end
+
+    def test_context_window_is_optional_and_defaults_to_nil
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert_nil Scenario.load(path).context_window
+    end
+
+    def test_non_positive_context_window_is_a_rig_error
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\ncontext_window: 0\nresponses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/context_window must be a positive integer/, error.message)
+    end
+
     def test_missing_required_field_raises_a_rig_error
       path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "broken.yml")
       File.write(path, "name: broken\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
@@ -122,6 +155,28 @@ module TuiSplitRig
 
     def test_absent_scenario_file_raises_a_rig_error
       assert_raises(Error) { Scenario.load("/nonexistent/scenario.yml") }
+    end
+
+    # The context-window lever shrinks BOTH apps consistently: pi's staged
+    # models.json + zeroed compaction knobs, tart's TART_CONTEXT_WINDOW env
+    # + the same zeroed knobs in the staged HOME's settings.json (I26).
+    def test_context_window_stages_both_apps_compaction_knobs
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s7_compaction.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      stage = File.join(runner.out_dir, "run-1")
+      agent_dir = runner.stage_pi_agent(stage, 4711)
+      models = JSON.parse(File.read(File.join(agent_dir, "models.json")))
+      assert_equal 10, models.dig("providers", "mock", "models", 0, "contextWindow")
+      settings = JSON.parse(File.read(File.join(agent_dir, "settings.json")))
+      assert_equal({"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0},
+        settings.fetch("compaction"), "pi's compaction knobs zeroed (settings-manager.ts:822)")
+
+      home = File.join(stage, "home", "tart")
+      FileUtils.mkdir_p(home)
+      runner.stage_tart_home(home)
+      tart_settings = JSON.parse(File.read(File.join(home, ".tart", "settings.json")))
+      assert_equal({"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0},
+        tart_settings.fetch("compaction"), "tart's knobs zeroed too (settings.rb compaction_kwargs)")
     end
 
   end
