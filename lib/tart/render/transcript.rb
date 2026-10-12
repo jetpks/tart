@@ -27,8 +27,16 @@ module Tart
       # An expandable block riding the scrollback queue: the rows built at
       # the CURRENT toggle state + the builder (re-invoked with the new
       # state at the ctrl+o toggle; the drain records the transcript
-      # range). pi's expandable tool children.
+      # range). pi's expandable tool children — and, since I33, the MOTD
+      # header block + the loaded-resource sections.
       MarkedRegion = Struct.new(:rows, :builder)
+
+      # A persistent status waiting for the flush (pi showStatus,
+      # interactive-mode.ts:3824-3842): a Spacer(1) + dim one-pad text row
+      # at the chat container's tail, a subsequent status REPLACING the
+      # text in place while the pair is still the tail. The text wraps at
+      # flush time (the live width) — the row count follows pi's Text.
+      StatusEntry = Struct.new(:text)
 
       # The tool name that dispatches to pi's shell renderers (bash.ts:115
       # createShellRenderers — shared by bash and powershell; the port
@@ -62,12 +70,17 @@ module Tart
         @transcript = []
         # The ctrl+o global tool-output toggle (pi toolOutputExpanded,
         # setToolsExpanded — interactive-mode.ts:6810-6826): every
-        # expandable block rebuilds in place; the border status reports
+        # expandable block rebuilds in place; the status row reports
         # (coordinator-side). The expandable registry tracks each block's
         # transcript row range + row builder (recorded at drain time — the
         # scrollback is a cross-thread queue, the transcript is flat).
         @tool_output_expanded = false
         @expandable_blocks = []
+        # The tail status pair's Line objects (the replace-in-place check
+        # — pi's lastStatusSpacer/lastStatusText comparison; identity
+        # survives expandable rebuilds above the pair, which shift indexes
+        # but never row objects).
+        @status_pair = nil
         # pi's chat container is a separate component from the header
         # (interactive-mode.ts:633-639); its leading-spacer gate (children
         # non-empty, :3930-3931) reads this — any chat region since the
@@ -85,9 +98,10 @@ module Tart
       # to flip — pi's setToolsExpanded call site).
       attr_reader :tool_output_expanded
 
-      # A pre-built region pushed raw (the MOTD block, the compaction
-      # line's blank, the flushed reasoning rows): no container gate —
-      # none of the three base call sites rides one.
+      # A pre-built region pushed raw (the compaction line's blank, the
+      # flushed reasoning rows): no container gate — none of the base call
+      # sites rides one. (The MOTD blocks ride {push_expandable} since
+      # I33 — they flip.)
       def enqueue_region(lines)
         @scrollback << lines
       end
@@ -232,36 +246,57 @@ module Tart
       end
 
       # Completed lines move into the transcript buffer (pi: completed
-      # content into scrollback). Entries are final display Lines — or a
+      # content into scrollback). Entries are final display Lines — a
       # {MarkedRegion}: an expandable block, whose transcript range is
       # recorded at drain time so the ctrl+o toggle can rebuild it in
-      # place (pi setToolsExpanded's child sweep). The inline
-      # insert_before path is retired from the interactive surface — the
-      # buffer is drawn wholesale every frame.
+      # place (pi setToolsExpanded's child sweep) — or a {StatusEntry}:
+      # the replace-or-append status pair. The inline insert_before path
+      # is retired from the interactive surface — the buffer is drawn
+      # wholesale every frame.
       def flush_scrollback
         until @scrollback.empty?
           item = @scrollback.pop
-          if item.is_a?(MarkedRegion)
+          case item
+          when MarkedRegion
             @expandable_blocks << {start: @transcript.size, size: item.rows.length,
                                    builder: item.builder}
             @transcript.concat(item.rows)
+          when StatusEntry
+            flush_status(item.text)
           else
             @transcript.concat(item)
           end
         end
       end
 
+      # A persistent status row (pi showStatus :3824-3842 — the three
+      # sites: thinking-level selection, model selection, the tool-output
+      # toggle). Never transient, never border chrome.
+      def enqueue_status(text)
+        return if text.nil? || text.empty?
+
+        @scrollback << StatusEntry.new(text)
+      end
+
       # The ctrl+o toggle's state half (pi setToolsExpanded's child sweep):
       # every registered block rebuilds collapsed↔expanded in place.
-      # Returns whether the state changed — the coordinator reports the
-      # border status and requests the draw only then (the base gate).
+      # Blocks register in ascending start order (the drain appends at the
+      # tail), so the walk carries the row DELTA: an earlier block's size
+      # change shifts every later block's start (the boot header +
+      # sections flip exposed the stale-start latent). Returns whether the
+      # state changed — the coordinator reports the status row and
+      # requests the draw only then (the base gate).
       def set_tool_output_expanded(expanded)
         return false if expanded == @tool_output_expanded
 
         @tool_output_expanded = expanded
+        delta = 0
         @expandable_blocks.each do |registered|
+          start = registered[:start] + delta
           rows = registered[:builder].call(expanded)
-          @transcript[registered[:start], registered[:size]] = rows
+          @transcript[start, registered[:size]] = rows
+          delta += rows.length - registered[:size]
+          registered[:start] = start
           registered[:size] = rows.length
         end
         true
@@ -269,15 +304,16 @@ module Tart
 
       # The /new + resume shared reset's component half (the coordinator's
       # {Chat#clear_transcript} component reset — the {Footer#reset_usage}
-      # I24 precedent): the buffer, the queue and the expandable registry
-      # drop. The chat container emptied with the transcript (pi
-      # renderCurrentSessionState, interactive-mode.ts:2210-2216) — the
-      # leading-spacer gate restarts. The ctrl+o toggle state survives
-      # (base behavior).
+      # I24 precedent): the buffer, the queue, the expandable registry and
+      # the status pair drop. The chat container emptied with the
+      # transcript (pi renderCurrentSessionState, interactive-mode.ts
+      # :2210-2216) — the leading-spacer gate restarts. The ctrl+o toggle
+      # state survives (base behavior).
       def reset
         @transcript = []
         @scrollback.clear
         @expandable_blocks.clear
+        @status_pair = nil
         @chat_started = false
       end
 
@@ -332,6 +368,30 @@ module Tart
       # The threaded width seam: the surface's viewport width.
       def viewport_width
         @width_reader.call
+      end
+
+      # pi showStatus (:3824-3842): a Spacer(1) + dim one-pad text row at
+      # the tail — REPLACED in place while that pair is still the tail
+      # (the lastStatusSpacer/lastStatusText comparison), else appended.
+      # The pair arms the leading-spacer gate: pi's gate reads the chat
+      # container's children, and the status children count.
+      def flush_status(text)
+        rows = [Panel.blank_line]
+        rows.concat(Text.wrap(text, viewport_width - Panel::OUTPUT_PAD.length * 2).map do |row|
+          TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(row, fg: Theme[:dim])])
+        end)
+        @transcript.pop(@status_pair.size) if status_at_tail?
+        @transcript.concat(rows)
+        @status_pair = rows
+        @chat_started = true
+      end
+
+      # Whether the recorded status pair is still the transcript's tail
+      # (by Line identity — rebuilds above shift indexes, not objects).
+      def status_at_tail?
+        pair = @status_pair
+        !pair.nil? && pair.size <= @transcript.size &&
+          pair.each_with_index.all? { |line, i| @transcript[-pair.size + i].equal?(line) }
       end
 
       # The submitted prompt's echo (item 4, pi UserMessageComponent,
@@ -538,10 +598,14 @@ module Tart
 
       # The expandable-block enqueue: the block rides the scrollback as a
       # {MarkedRegion} (the drain records its transcript range for the
-      # ctrl+o toggle's in-place rebuild).
+      # ctrl+o toggle's in-place rebuild). Public — the coordinator's MOTD
+      # header + resource-section blocks ride the same registry (I33, pi
+      # BuiltInHeader/setToolsExpanded's container sweep).
       def push_expandable(builder)
         @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder)
       end
+
+      public :push_expandable
 
       # The write tool block (I18 — pi write.ts renderers over the
       # tool-turn component): the constructor's Spacer + render-box

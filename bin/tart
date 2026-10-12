@@ -195,13 +195,14 @@ module Tart
       warn "tart: #{models.error}" if models.error
       require_api_key(settings, models, identity:)
       skills = Skills.load(cwd: workdir)
+      context_files = Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root)
       abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
 
       exit Print.run(
         prompt: options[:print],
         chat: build_chat(settings, models, Models.resolve_boot_model(models, settings, identity:), identity:),
         tools: build_tools(workdir, settings),
-        system_prompt: system_prompt(workdir, settings, skills.skills, identity)
+        system_prompt: system_prompt(workdir, settings, skills.skills, identity, context_files:)
       )
     end
 
@@ -221,6 +222,10 @@ module Tart
       # failure sets its error (surfaced below, never a crash).
       models = Models.load
       require_api_key(settings, models, identity:)
+      # The discovered context files (pi's contextFiles: the system-prompt
+      # sources + the agents files) — the system prompt's <project_context>
+      # section and the MOTD's [Context] section share the load (I33).
+      context_files = Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root)
 
       # The resume path is known before the surface is built: a resumed
       # boot skips the MOTD (item 3 — pi's chat container gets the
@@ -234,9 +239,9 @@ module Tart
       TUI.run(viewport: :fullscreen, bracketed_paste: true) do |session|
         kernel = Core::Loop.new(session:)
         surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
-          mcp_servers:, resume: resume_path, identity:, models:)
+          mcp_servers:, resume: resume_path, identity:, models:, context_files:)
         tools = build_tools(workdir, settings, mcp_servers:)
-        prompt = system_prompt(workdir, settings, skills.skills, identity)
+        prompt = system_prompt(workdir, settings, skills.skills, identity, context_files:)
 
         # /new's reset seam: a fresh session is a new recorder (new session
         # file, no parent) plus a fresh Agent::Loop on the same settings,
@@ -323,17 +328,11 @@ module Tart
 
     # Identity.resolve's invalid value aborts the launch — pi's CLI prints
     # its errors bare ("Error: <message>", cli.ts:333); the port's
-    # app-name prefix stays (no comparable pi prefix, itemized).
-    # The identity seam (I16, free-form since I32): CLI > TART_IDENTITY
-    # env > settings "identity" (Tart::Identity is the one resolution
-    # point). The resolved face is recorded for the one render path that
-    # cannot take it threaded (chat.rb's frozen Motd header call) — pi's
-    # CLI prints its errors bare ("Error: <message>", cli.ts:333); the
-    # port's app-name prefix stays (no comparable pi prefix, itemized).
+    # app-name prefix stays (no comparable pi prefix, itemized). The face
+    # threads explicitly to every consumer (I33 — the render paths take it
+    # through the surface constructor; no boot-recorded global).
     def resolve_identity(options, settings)
-      identity = Identity.resolve(cli: options[:identity], settings:)
-      Identity.current = identity
-      identity
+      Identity.resolve(cli: options[:identity], settings:)
     rescue Identity::Error => e
       abort "tart: #{e.message}"
     end
@@ -404,12 +403,14 @@ module Tart
     # <docs> (pi's own install paths, owner ruling 2026-10-12), the
     # discovered context files, the loaded skills, <cwd> — replacing the
     # I04-era terse string. The loadout is the settings-resolved one (the
-    # same list Tools::Registry builds from).
-    def system_prompt(workdir, settings, skills, identity)
+    # same list Tools::Registry builds from). +context_files+ is the
+    # launcher's single ContextFiles.load (shared with the MOTD's
+    # [Context] section, I33).
+    def system_prompt(workdir, settings, skills, identity, context_files:)
       Agent::SystemPrompt.build(
         selected_tools: Settings.selected_tools(settings),
         cwd: workdir,
-        context_files: Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root),
+        context_files: context_files,
         docs_paths: Agent::SystemPrompt.pi_docs_paths,
         skills: skills,
         identity: identity
@@ -422,7 +423,7 @@ module Tart
     # of silently degenerating the /model menu to the boot model (the
     # defect the post-integration probe caught: the launcher wired the
     # catalog into build_chat/the handler/footer_data but not here).
-    def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:)
+    def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:, context_files: [])
       Render::Chat.new(
         session:, kernel:,
         # Autocomplete sources (AC1): the builtin slash commands + the
@@ -431,7 +432,7 @@ module Tart
         autocomplete: Render::SlashSource.new(commands: Commands::BUILTINS, skills: skills,
           prompts: prompts),
         motd: resume.nil?,
-        identity:, prompts:, extensions: mcp_servers.keys,
+        identity:, prompts:, skills:, context_files:, extensions: mcp_servers.keys,
         models:
       )
     end

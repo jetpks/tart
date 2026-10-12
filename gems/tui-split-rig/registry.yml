@@ -52,3 +52,18 @@ classes:
   # the footer's values.
   - name: compaction-token-estimate
     pattern: 'Compacted from [\d,]+ tokens'
+  # The staged-resource path WRAP FRAGMENTS (I33): the expanded section
+  # rows render full display paths (formatDisplayPath) through pi's
+  # word-wrap — a path longer than the pane hard-breaks into width-cell
+  # rows whose tail keeps only a fragment of the staged path (the break
+  # lands wherever the per-run staging root's length puts it, so the
+  # fragment varies per checkout/out-dir), and the home-contracted user
+  # rows (~/.pi/agent/... vs ~/.tart/...) differ per app by design. The
+  # base s9 run's evidence: `-x/pi/AGENTS.md`, `-x/pi/.pi/skills/demo.md`.
+  # The class forgives ONLY bare path rows (a single whitespace-free
+  # fragment after the indent) ending in .md — staged AGENTS.md / skill /
+  # prompt shapes; every full staged path row still classifies through
+  # the run-N/path classes above (first match wins), and any other
+  # divergence on those rows still surfaces.
+  - name: staged-path-wrap-fragment
+    pattern: '^\s*\S+\.md$'

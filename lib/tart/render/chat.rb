@@ -114,6 +114,14 @@ module Tart
       #   templates — the MOTD's [Prompts] section (injectable so tests
       #   never touch the filesystem; the empty default renders no
       #   section, as in pi).
+      # @param skills [Array<Skills::Skill>] the loaded skill structs —
+      #   the MOTD's [Skills] section (file_path feeds the expanded scope
+      #   groups; the SlashSource name-only view stays the completion
+      #   catalog).
+      # @param context_files [Array<{path:, content:}>] the discovered
+      #   context files (Agent::ContextFiles.load) — the MOTD's [Context]
+      #   input ahead of the config sources (pi's contextFiles = the
+      #   system-prompt sources + the agents files, :1843-1853).
       # @param extensions [Array<String>] the loaded MCP server names —
       #   the MOTD's [Extensions] section (the port's loaded
       #   external-resource analog; empty renders none).
@@ -125,7 +133,7 @@ module Tart
       #   catalog to the boot model (see {model_menu_entries}).
       def initialize(session:, kernel:, footer_data: nil, branch_reader: Footer::DEFAULT_BRANCH_READER, autocomplete: nil,
         motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
-        prompts: [], extensions: [], models: nil)
+        prompts: [], skills: [], context_files: [], extensions: [], models: nil)
         @session = session
         @kernel = kernel
         @footer_data = footer_data
@@ -147,11 +155,14 @@ module Tart
         @selection_state = Selection.new(line_reader: ->(row) { selection_line(row) })
         # The running compaction's reason (the border-status label's key).
         @compaction_reason = nil
-        # The header-container rows the boot MOTD enqueued (the compaction
-        # rebuild restores them — pi's headerContainer survives the
-        # compaction_end chatContainer clear). nil = no header on screen
-        # (motd: false, or the /resume screen) — the rebuild restores none.
-        @header_rows = nil
+        # Whether the boot/new header block is on screen (the compaction
+        # rebuild re-enqueues it — pi's headerContainer survives the
+        # compaction_end chatContainer clear). Since I33 the header rides
+        # the expandable registry ({enqueue_motd_header} — the flip
+        # rebuilds it at the CURRENT toggle state). false = no header on
+        # screen (motd: false, or the /resume screen) — the rebuild
+        # restores none.
+        @header_enqueued = false
         # The /resume session picker (item 2, pi SessionSelectorComponent
         # reduced): nil = closed; open it holds the {Picker} over the
         # launcher-built [{path:, label:}] list (newest first).
@@ -178,7 +189,6 @@ module Tart
           history_sink: ->(text) { @editor.add_to_history(text) },
           reseed_sink: ->(message) { @footer.reseed_usage(message) }
         )
-        @border_status = nil
         # The !-prefix bash execution state machine (backlog C, pi
         # handleBashCommand): the coordinator routes into it — submit's
         # parse, escape's cancel, agent_end's deferred-record flush. The
@@ -217,6 +227,8 @@ module Tart
         @models = models
         @identity = identity
         @prompts = prompts
+        @skills = skills
+        @context_files = context_files
         @extensions = extensions
         # The runtime thinking level (nil = the settings default shows;
         # /thinking sets it — pi agent.state.thinkingLevel).
@@ -375,7 +387,6 @@ module Tart
           case event[:type]
           when :agent_start
             @busy = true
-            @border_status = nil # pi's status indicators clear on agent events
             @footer.invalidate_branch # per-turn branch invalidation (pi's provider cache, reduced)
           when :message_start
             @live = +""
@@ -431,8 +442,10 @@ module Tart
             # The header container survives pi's chatContainer clear
             # (interactive-mode.ts:633-639 — sibling containers; the s7
             # capture: art + help + onboarding ride again, no resource
-            # listings). The boot's captured shape, exact rows.
-            @transcript_state.enqueue_region(@header_rows) if @header_rows
+            # listings). Re-enqueued as the EXPANDABLE block — rebuilt at
+            # its CURRENT expansion state (pi's live header rides the
+            # toggle).
+            enqueue_motd_header if @header_enqueued
             entries = event[:entries].is_a?(Array) ? event[:entries] : []
             @transcript_state.replay_entries(entries, update_footer: false, populate_history: false)
             @transcript_state.enqueue_compaction_panel(event[:summary], event[:tokens_before])
@@ -465,16 +478,21 @@ module Tart
       # The /new surface (bin/tart's reset seam): pi handleClearCommand →
       # newSession → renderCurrentSessionState — the chat container clears,
       # initial state re-renders, then the accent "✓ New session started"
-      # line (interactive-mode.ts:6926-6936, 2209-2216). The port's flat
-      # transcript analog: drop the buffer and stream state, re-render the
-      # MOTD block, then the accent line (deviation, itemized: pi's header
-      # lives in a separate container and never re-renders). Cross-lane
-      # contract: bin/tart's reset lambda calls this after swapping in the
-      # fresh agent (start_session + surface.new_session).
+      # line (interactive-mode.ts:6926-6936, 2209-2216). pi's shape: the
+      # HEADER container untouched (never cleared, never re-rendered — its
+      # live state rides the toggle), the loadedResourcesContainer cleared
+      # and NEVER re-rendered (sections are boot-once). The port's flat
+      # buffer wipes both, so the header block RE-ENQUEUES as the one
+      # faithful translation (at the CURRENT toggle state; tart-mode's
+      # fresh random art is the sanctioned identity presentation), and the
+      # resource sections drop out of the path entirely (the sections-
+      # resurrect was a real /new divergence — I33). Cross-lane contract:
+      # bin/tart's reset lambda calls this after swapping in the fresh
+      # agent (start_session + surface.new_session).
       def new_session
         @mutex.synchronize do
           clear_transcript
-          enqueue_motd
+          enqueue_motd_header
           @transcript_state.enqueue_scrollback("✓ New session started", fg: Theme[:accent])
         end
       end
@@ -541,41 +559,65 @@ module Tart
         text
       end
 
-      # The startup MOTD block: the header-container shape (pi
-      # interactive-mode.ts:1075-1077 — Spacer(1), the header, Spacer(1))
-      # around the identity's header content. In tart-mode the content is
-      # the owner's art, the version line, the hints line, then the
-      # [Context] and [Skills] resource sections (pi's showLoadedResources
-      # :1778-1860; the [Prompts]/[Extensions]/[Themes] sections and
-      # package-update notices are cut — the port loads none of them,
-      # itemized). pi-mode renders pi's actual built-in header bytes.
+      # The startup MOTD: the header-container block as ONE expandable
+      # (pi interactive-mode.ts:1075-1077 — Spacer(1), the header,
+      # Spacer(1); BuiltInHeader extends ExpandableText :256-270) plus
+      # each loaded-resource section as its own expandable (pi
+      # showLoadedResources' per-section ExpandableText children, swept by
+      # the same toggle :4568-4572). The ctrl+o flip rebuilds every block
+      # collapsed↔expanded in place ({Transcript#set_tool_output_expanded}).
+      # Boot-only: /new re-enqueues the header alone ({new_session}), the
+      # compaction rebuild ditto (the sections are boot-once, the I31
+      # ruling).
       def enqueue_motd
-        # The header-container shape (Spacer(1), the header, Spacer(1)) —
-        # captured so the compaction rebuild can restore the exact rows
-        # (pi's headerContainer is a separate container the compaction_end
-        # clear never touches; re-rendering would resurrect the port-only
-        # resource listings and tart-mode's random art would swap).
-        header = [Panel.blank_line]
-        header.concat(@identity == Identity::PI ? Motd.pi_header_lines : Motd.tart_header_lines(viewport_width))
-        @header_rows = [*header, Panel.blank_line]
-        lines = header.dup
-        # The loaded-resource sections ride BOTH identities (pi
-        # showLoadedResources renders for any theme/identity — the owner's
-        # missing [Context]/[Skills]/[Prompts]/[Extensions] block; each
-        # section opens with its blank, the enqueue's trailing blank is
-        # the header container's closing Spacer). Wrapped at the content
-        # width, as the sections always have. The section inputs gather
-        # from this surface's constructor state (Motd is stateless —
-        # everything threads).
-        Motd.sections(viewport_width - Panel::OUTPUT_PAD.length * 2,
-          context: Motd.context_sources(@settings_root, @footer_data&.fetch(:cwd, nil) || Dir.pwd),
-          skills: Motd.motd_skill_names(@autocomplete.source),
-          prompts: @prompts, extensions: @extensions).each do |header, rows|
-          lines << Panel.blank_line << TUI.line("#{Panel::OUTPUT_PAD}#{header}", fg: Theme[:md_heading])
-          lines.concat(rows)
+        enqueue_motd_header
+        enqueue_motd_sections
+      end
+
+      # The header-container block: the identity's header content between
+      # its Spacers, built at the CURRENT global toggle state (pi
+      # getStartupExpansionState = verbose || toolOutputExpanded; the port
+      # has no --verbose, cut, itemized). Registered so the flip and the
+      # compaction rebuild re-invoke the builder. The tart art samples
+      # ONCE per block (the flip must restore the collapsed bytes exactly;
+      # a /new re-enqueue samples fresh art — the sanctioned presentation).
+      def enqueue_motd_header
+        @header_enqueued = true
+        logo_lines = Motd.motd_logo_lines
+        @transcript_state.push_expandable(->(expanded) { motd_header_rows(expanded, logo_lines) })
+      end
+
+      def motd_header_rows(expanded, logo_lines)
+        header = @identity == Identity::PI ? Motd.pi_header_lines(expanded:) : Motd.tart_header_lines(viewport_width, @identity, expanded:, logo_lines:)
+        [Panel.blank_line, *header, Panel.blank_line]
+      end
+
+      # The loaded-resource sections (boot-once). Each block mirrors pi's
+      # container children — paddingX-0 components (addLoadedSection's
+      # ExpandableText(..., 0, 0): the header row and the expanded bodies
+      # render at column 0; only the COMPACT lists carry the port's pad,
+      # the frozen I24 shape).
+      # container children: the [Context] branch's LEADING Spacer rides
+      # its block (interactive-mode.ts:1852-1853 — the contextFiles branch
+      # only), every section carries its TRAILING Spacer (addLoadedSection
+      # :1814). The section inputs gather from this surface's constructor
+      # state (Motd is stateless — everything threads).
+      def enqueue_motd_sections
+        cwd = @footer_data&.fetch(:cwd, nil) || Dir.pwd
+        Motd.sections(viewport_width,
+          context: @context_files.map { |file| file.fetch(:path) } + Motd.context_sources(@settings_root, cwd),
+          skills: @skills, prompts: @prompts, extensions: @extensions,
+          user_root: @settings_root, project_root: File.join(cwd, Settings::CONFIG_DIR)).each do |section|
+          @transcript_state.push_expandable(->(expanded) { motd_section_rows(section, expanded) })
         end
-        lines << Panel.blank_line
-        @transcript_state.enqueue_region(lines)
+      end
+
+      def motd_section_rows(section, expanded)
+        rows = [TUI.line(section.name, fg: Theme[:md_heading])]
+        rows.concat(expanded ? section.expanded_rows : section.collapsed_rows)
+        rows.unshift(Panel.blank_line) if section.leading_blank
+        rows << Panel.blank_line
+        rows
       end
 
       # The /new + resume shared reset: the buffer and stream state drop
@@ -587,7 +629,7 @@ module Tart
         wipe_transcript
         # The capture dies with the screen it rode (the /resume screen
         # re-renders no MOTD — the itemized cut; /new re-captures below).
-        @header_rows = nil
+        @header_enqueued = false
         @last_assistant_text = nil # the fresh session has no messages to copy
         # pi's footer stats re-derive from the fresh (empty) session.
         @footer.reset_usage
@@ -1250,11 +1292,11 @@ module Tart
       end
 
       def status_title
-        # pi shows the compaction indicator regardless of the streaming
-        # state (a manual /compact runs outside a turn in the port); the
-        # toggle status rides the same slot until the next agent event.
-        # Direct ivars — this runs inside render_frame's synchronize.
-        return " #{@border_status} " if @border_status && !@busy
+        # The transient working/compaction spinner ONLY (pi
+        # embedWorkingStatus — unmeasurable at settle, stays): the three
+        # persistent statuses are transcript tail rows now
+        # ({Transcript::StatusEntry} — pi showStatus :3824-3842). Direct
+        # ivars — this runs inside render_frame's synchronize.
         return nil unless @busy || @compaction_reason
 
         " #{status_line} "
@@ -1435,12 +1477,13 @@ module Tart
 
       # pi selectThinkingLevel (:5163-5172): the session level, the
       # footer's re-ladder and the editor border's (the overlays flow
-      # through {footer_data}), the status; persist:true reports "Default
-      # thinking level" and writes the settings default (ctrl+s).
+      # through {footer_data}), the status (pi showStatus — the transcript
+      # tail row, I33); persist:true reports "Default thinking level" and
+      # writes the settings default (ctrl+s).
       def apply_thinking_selection(level, persist:)
         @mutex.synchronize do
           @thinking_level = level
-          @border_status = "#{persist ? "Default thinking level" : "Thinking level"}: #{level}"
+          @transcript_state.enqueue_status("#{persist ? "Default thinking level" : "Thinking level"}: #{level}")
         end
         Settings.save(@settings_root, "thinkingLevel" => level) if persist
         @kernel.request_draw
@@ -1450,12 +1493,13 @@ module Tart
       # swap the runtime chat model (the loop re-resolves the context
       # window — Loop#switch_model), refresh the footer model segment +
       # the editor border re-ladder (the runtime overlays flow into
-      # {footer_data}), report, and persist the default when asked.
+      # {footer_data}), report (pi showStatus — the transcript tail row,
+      # I33), and persist the default when asked.
       def apply_model_selection(entry, persist:)
         status = persist ? "Default model: #{entry[:provider]}/#{entry[:id]}" : "Model: #{entry[:id]}"
         @mutex.synchronize do
           @runtime_model = entry
-          @border_status = status
+          @transcript_state.enqueue_status(status)
         end
         # The wire provider is the models.json key mapped onto the port's
         # carried seam (Models.wire_provider — the loop's with_model
@@ -1526,16 +1570,14 @@ module Tart
 
       # app.tools.expand (pi setToolsExpanded :6810-6826): the GLOBAL
       # toggle — every expandable block rebuilds collapsed↔expanded in
-      # place; the border status reports (pi showStatus). The registry
-      # sweep is the component's state half; the report + draw stay here
-      # (the frozen public op — I25 extraction). Cuts, itemized: the
-      # header's startup-help flip (the expanded header's full hint
-      # list + loaded-resources sections are unported) — the block sweep
-      # is the feature.
+      # place (the registry sweep; since I33 that includes the MOTD header
+      # block + the loaded-resource sections, pi's container sweep
+      # :4568-4572), and the status reports as pi's showStatus — a
+      # persistent transcript tail row, never the editor border.
       def set_tool_output_expanded(expanded)
         return unless @transcript_state.set_tool_output_expanded(expanded)
 
-        @border_status = "Tool output: #{expanded ? "expanded" : "collapsed"}"
+        @transcript_state.enqueue_status("Tool output: #{expanded ? "expanded" : "collapsed"}")
         @kernel.request_draw
       end
 

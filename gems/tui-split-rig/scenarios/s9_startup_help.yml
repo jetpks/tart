@@ -1,0 +1,21 @@
+# S9 — the startup-help flip (I33, BRIEF §8): one tiny text turn, then
+# ctrl+o AFTER the reply settles (post_settle_keys) — the settled screen
+# carries pi's EXPANDED startup header (the full 19-line hint list, the
+# notice line gone), the EXPANDED loaded-resource sections, and the
+# showStatus row ("Tool output: expanded" as a transcript row, not the
+# editor border). stage_project_resources fills [Context]/[Skills]/
+# [Prompts] with real content in both apps (AGENTS.md, one project skill,
+# one user skill, one prompt template — byte-identical per app).
+#
+# Baseline EXPECTED to exit 1 at the pre-I33 base: the port's header and
+# sections are static collapsed rows and the toggle status rides the
+# editor border — the candidate list IS the header/startup-help work list
+# (the s7 precedent).
+name: s9_startup_help
+prompt: "hi"
+expected_requests: 1
+post_settle_keys: ["C-o"]
+stage_project_resources: true
+responses:
+  - type: stream
+    content: "Startup help staged; fixed reply for the scenario."
