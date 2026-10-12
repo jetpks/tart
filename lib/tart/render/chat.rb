@@ -9,6 +9,7 @@ require_relative "bash_block"
 require_relative "file_blocks"
 require_relative "tool_block"
 require_relative "editor"
+require_relative "kill_ring"
 require_relative "autocomplete"
 require_relative "picker"
 require_relative "selection"
@@ -641,6 +642,11 @@ module Tart
             @editor.insert_printable(event)
           end
         when "w" then ctrl ? @editor.delete_word_backward : @editor.insert_printable(event)
+        # The emacs kill/yank slice (I26, pi keybindings.ts:129-135): the
+        # kill ops exit history browsing and push the cut span themselves.
+        when "u" then ctrl ? @editor.delete_to_line_start : @editor.insert_printable(event)
+        when "k" then ctrl ? @editor.delete_to_line_end : @editor.insert_printable(event)
+        when "y" then ctrl ? @editor.yank : (alt ? @editor.yank_pop : @editor.insert_printable(event))
         else @editor.insert_printable(event)
         end
         # pi editor.ts:1228-1251 — the list re-filters on every printable
