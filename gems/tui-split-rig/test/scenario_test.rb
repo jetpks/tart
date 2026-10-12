@@ -231,6 +231,68 @@ module TuiSplitRig
       assert_match(/suppress_usage must be a boolean/, error.message)
     end
 
+    # --- the post-settle keys + the resource staging (I33, s9) ---
+
+    def test_post_settle_keys_default_to_empty_and_load_from_the_shipped_s9
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert_empty Scenario.load(path).post_settle_keys
+
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s9_startup_help.yml"))
+      assert_equal ["C-o"], scenario.post_settle_keys
+      assert scenario.stage_project_resources, "s9 stages the loaded-resource set"
+    end
+
+    def test_post_settle_keys_must_be_a_list_of_strings
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\npost_settle_keys: C-o\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/post_settle_keys must be a list of key strings/, error.message)
+
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\npost_settle_keys: [1, 2]\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/post_settle_keys must be a list of key strings/, error.message)
+    end
+
+    def test_non_boolean_stage_project_resources_is_a_rig_error
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nstage_project_resources: sure\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/stage_project_resources must be a boolean/, error.message)
+    end
+
+    # The staging writes BOTH apps' resource sets byte-identical: AGENTS.md
+    # at the cwd, a project skill + prompt under each config dir, a user
+    # skill in the staged agent dir (pi) / settings root (tart) — with a
+    # DISTINCT user-skill name (the base s9 run: same-name skills fire
+    # both apps' collision diagnostics).
+    def test_stage_project_resources_writes_both_apps_resource_sets
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s9_startup_help.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      home = File.join(Dir.mktmpdir("tui-split-rig-home-"), "tart")
+      sandbox = File.join(Dir.mktmpdir("tui-split-rig-sandbox-"))
+      agent_dir = File.join(Dir.mktmpdir("tui-split-rig-agent-"), "pi")
+      FileUtils.mkdir_p(home)
+
+      runner.stage_project_resources(home:, sandbox:, agent_dir:)
+
+      assert File.file?(File.join(sandbox, "AGENTS.md"))
+      assert_equal File.read(File.join(sandbox, ".pi", "skills", "demo.md")),
+        File.read(File.join(sandbox, ".tart", "skills", "demo.md")), "the project skills are byte-identical"
+      assert_equal File.read(File.join(sandbox, ".pi", "prompts", "demo.md")),
+        File.read(File.join(sandbox, ".tart", "prompts", "demo.md")), "the prompt templates are byte-identical"
+      refute_equal File.read(File.join(sandbox, ".pi", "skills", "demo.md")),
+        File.read(File.join(agent_dir, "skills", "demo-user.md")), "the user skill carries its own name"
+      assert_equal File.read(File.join(agent_dir, "skills", "demo-user.md")),
+        File.read(File.join(home, ".tart", "skills", "demo-user.md")), "the user skills are byte-identical"
+      [File.join(sandbox, ".pi", "skills", "demo.md"), File.join(agent_dir, "skills", "demo-user.md")].each do |path|
+        assert_match(/\A---\nname: /, File.read(path), "valid frontmatter (a missing description blocks the port's load)")
+      end
+    end
+
     # --- the prefix-aware env staging (I32 AC4) ---(
 
     def runner_for(name)

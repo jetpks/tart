@@ -74,6 +74,10 @@ module TuiSplitRig
       [home, sandbox].each { |dir| FileUtils.mkdir_p(dir) }
       agent_dir = app == "pi" ? stage_pi_agent(stage, mock.port) : nil
       stage_tart_home(home, mock.port) if app == "tart"
+      # BEFORE the boot (the apps scan resources at startup — a staged file
+      # landing after the scan is a race): the scenario's loaded-resource
+      # set, byte-identical per app (the s9 instrument).
+      stage_project_resources(home:, sandbox:, agent_dir:) if @scenario.stage_project_resources
 
       session = session_name(app, n)
       command = app == "pi" ? pi_command(home, agent_dir) : tart_command(sandbox, home, mock.port)
@@ -116,6 +120,15 @@ module TuiSplitRig
       alive = session_exists?(session)
       tmux("send-keys", "-t", session, @scenario.prompt, "Enter") if alive
       reply = alive ? settle(session, "reply") : {ms: nil, timed_out: true}
+      # The scenario's post-settle keys (the s9 instrument): each token
+      # sent after the reply settles, then a re-settle, so the capture
+      # shows the flow's SETTLED screen. A dead pane sends nothing.
+      @scenario.post_settle_keys.each do |key|
+        next unless session_exists?(session)
+
+        tmux("send-keys", "-t", session, key)
+        reply = settle(session, "post-settle #{key}")
+      end
 
       # A dead session still gets a capture file (empty) — the rig reports
       # the failure, it never crashes on a missing artifact.
@@ -145,7 +158,11 @@ module TuiSplitRig
     # PI_CODING_AGENT_DIR at this path also suppresses first-time setup,
     # and sessions land under it.
     def stage_pi_agent(stage, port)
-      agent_dir = File.join(stage, "agent", "pi")
+      # pi's real layout: the agent dir lives under HOME (~/.pi/agent,
+      # config.ts:610) — the staged tree mirrors that, so the resource
+      # paths under it ~-contract exactly like the port's settings-root
+      # paths (the s9 [Skills] rows).
+      agent_dir = File.join(stage, "home", "pi", ".pi", "agent")
       FileUtils.mkdir_p(agent_dir)
       window = @scenario.context_window || 32_768
       config = {
@@ -214,6 +231,73 @@ module TuiSplitRig
         "compaction" => {"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0}
       ))
     end
+
+    # The loaded-resource set the [Context]/[Skills]/[Prompts] sections
+    # list (the s9 instrument, stage_project_resources): AGENTS.md at the
+    # cwd, one project skill + one project prompt template under each
+    # app's config dir (pi resource-loader.ts:991-998 — agentDir + the
+    # cwd CONFIG_DIR; tart's mirror: skills.rb/prompts.rb load roots),
+    # one user skill in the staged agent dir (pi: agentDir/skills; tart:
+    # the staged settings root's skills/). Byte-identical per app; valid
+    # frontmatter (a missing description blocks the port's load).
+    def stage_project_resources(home:, sandbox:, agent_dir:)
+      File.write(File.join(sandbox, "AGENTS.md"), AGENTS_MD)
+      # Pre-seed pi's project-trust store (the dialog's own "Trust"
+      # outcome — trust-manager.ts:214: <agentDir>/trust.json, keyed by
+      # the canonicalized cwd): the staged .pi dir would otherwise pop
+      # the trust dialog at boot, racing the prompt typing (the base s9
+      # run swallowed the prompt once).
+      # Pre-seed pi's project-trust store (the dialog's own "Trust"
+      # outcome — trust-manager.ts:214: <agentDir>/trust.json, keyed by
+      # the canonicalized cwd): the staged .pi dir would otherwise pop
+      # the trust dialog at boot, racing the prompt typing (the base s9
+      # run swallowed the prompt once).
+      if agent_dir
+        FileUtils.mkdir_p(agent_dir)
+        File.write(File.join(agent_dir, "trust.json"), JSON.generate({File.realpath(sandbox) => true}))
+      end
+      {"pi" => ".pi", "tart" => ".tart"}.each do |app, config_dir|
+        root = File.join(sandbox, config_dir)
+        FileUtils.mkdir_p(File.join(root, "skills"))
+        FileUtils.mkdir_p(File.join(root, "prompts"))
+        File.write(File.join(root, "skills", "demo.md"), DEMO_SKILL_MD)
+        File.write(File.join(root, "prompts", "demo.md"), DEMO_PROMPT_MD)
+      end
+      # A DISTINCT user-skill name: the same name in both scopes fires
+      # both apps' collision diagnostics (pi's [Skill conflicts] section
+      # — a cut section the base s9 run surfaced).
+      user_skills = {"pi" => agent_dir && File.join(agent_dir, "skills"), "tart" => File.join(home, ".tart", "skills")}
+      user_skills.compact.each do |_app, dir|
+        FileUtils.mkdir_p(dir)
+        File.write(File.join(dir, "demo-user.md"), DEMO_USER_SKILL_MD)
+      end
+    end
+
+    AGENTS_MD = <<~MD.freeze
+      # Demo project
+
+      Staged context file for the s9 startup-help scenario.
+    MD
+    DEMO_SKILL_MD = <<~MD.freeze
+      ---
+      name: demo
+      description: Staged demo skill for the s9 startup-help scenario.
+      ---
+      Staged demo skill body.
+    MD
+    DEMO_USER_SKILL_MD = <<~MD.freeze
+      ---
+      name: demo-user
+      description: Staged demo user skill for the s9 startup-help scenario.
+      ---
+      Staged demo user skill body.
+    MD
+    DEMO_PROMPT_MD = <<~MD.freeze
+      ---
+      description: Staged demo prompt template for the s9 startup-help scenario.
+      ---
+      Staged demo prompt body.
+    MD
 
     # Pane commands are exec-wrapped so the pane's default shell (fish)
     # replaces itself: pane_pid resolves to the app process, no fish
@@ -337,7 +421,7 @@ module TuiSplitRig
     # methods are public for the same reason (the load pin asserts their
     # staged files and env).
     public :capture, :capture_styled, :settle, :teardown, :boot_session,
-      :stage_pi_agent, :stage_tart_home, :session_name, :pi_command, :tart_command
+      :stage_pi_agent, :stage_tart_home, :stage_project_resources, :session_name, :pi_command, :tart_command
 
     def pane_pid_tree(session)
       out = Open3.capture2("tmux", "list-panes", "-t", session, "-F", PANE_PID_FORMAT)[0].to_s

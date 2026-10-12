@@ -23,6 +23,18 @@ module TuiSplitRig
   #                              # usage payload — both apps' triggers must
   #                              # fall back to the estimate (the Case-3
   #                              # zero-usage path, s8). Default: false.
+#   post_settle_keys: ["C-o"]  # optional: tmux key tokens sent AFTER the
+#                              # reply settles, each followed by a re-settle,
+#                              # before the capture — the settled-screen
+#                              # instrument for post-reply key flows (s9's
+#                              # ctrl+o startup-help flip). Default: none.
+#   stage_project_resources: true  # optional: write the loaded-resource set
+#                              # into BOTH apps' run sandbox — AGENTS.md at
+#                              # the cwd, one project skill, one user skill
+#                              # in the staged agent dir (pi: agentDir
+#                              # skills/; tart: staged settings root
+#                              # skills/), one project prompt template —
+#                              # byte-identical per app (s9). Default: false.
   #   env:                       # optional per-app env overrides (the
   #     tart:                    # runner layers them over its staged
   #       TART_IDENTITY: tart    # env — the branding/staging seam)
@@ -33,7 +45,8 @@ module TuiSplitRig
   class Scenario
     APPS = %w[pi tart].freeze
 
-    attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage
+    attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage,
+                :post_settle_keys, :stage_project_resources
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -66,6 +79,8 @@ module TuiSplitRig
       @env = parse_env(data)
       @context_window = parse_context_window(data)
       @suppress_usage = parse_suppress_usage(data)
+      @post_settle_keys = parse_post_settle_keys(data)
+      @stage_project_resources = parse_stage_project_resources(data)
     end
 
     # The optional scenario context window (s7's compaction lever): a
@@ -86,6 +101,28 @@ module TuiSplitRig
       return false if raw.nil?
 
       raise Error, "#{@path}: suppress_usage must be a boolean" unless raw == true || raw == false
+
+      raw
+    end
+
+    # The optional post-settle key list (the s9 instrument): a list of
+    # tmux key tokens (strings), or absent → [].
+    def parse_post_settle_keys(data)
+      raw = data["post_settle_keys"]
+      return [] if raw.nil?
+
+      raise Error, "#{@path}: post_settle_keys must be a list of key strings" unless raw.is_a?(Array) && raw.all?(String)
+
+      raw.map { |key| String(key) }
+    end
+
+    # The optional loaded-resource staging knob (the s9 instrument): a
+    # boolean or absent.
+    def parse_stage_project_resources(data)
+      raw = data["stage_project_resources"]
+      return false if raw.nil?
+
+      raise Error, "#{@path}: stage_project_resources must be a boolean" unless raw == true || raw == false
 
       raw
     end

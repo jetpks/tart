@@ -1089,7 +1089,7 @@ module Tart
       source = Render::SlashSource.new(commands: {"new" => {description: "x"}}, skills: skills)
       TUI.run(headless: true, viewport: :fullscreen, width: 60, screen_height: 24) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
-          settings_root: @dir, autocomplete: source, identity: "tart",
+          settings_root: @dir, autocomplete: source, identity: "tart", skills:,
           footer_data: {cwd: @dir})
         draw(chat, session)
         lines = chat.transcript_lines
@@ -1100,7 +1100,7 @@ module Tart
           "a random logo piece from the owner's collection renders in full (padded)"
         assert_includes lines, " tart v#{Tart::VERSION}", "the version line renders Tart::VERSION (padded)"
         assert_includes lines.join, "/ commands", "the hints line carries the port's real keys"
-        refute_includes lines.join, "! ", "no `!` bash hint — the port has no bash mode"
+        refute_includes lines.join, "! ", "no `!` hint on the FROZEN compact line (the expanded header lists it — I33)"
 
         context_i = lines.index { |line| line.include?("[Context]") }
         skills_i = lines.index { |line| line.include?("[Skills]") }
@@ -1134,6 +1134,153 @@ module Tart
       end
     end
 
+    # --- I33: the startup-help flip, the section flip, and the
+    # showStatus transcript rows ---
+
+    # AC1: ctrl+o after boot expands the startup header IN PLACE to pi's
+    # expanded shape (the live-oracle capture, hint 1 on the mark's line,
+    # hints 2–19 one per row, the notice gone); a second ctrl+o restores
+    # the collapsed bytes exactly and reports collapsed. The header block
+    # registers at BOOT (before any turn) — the flip exercises the
+    # boot-time expandable range.
+    def test_ctrl_o_flips_the_startup_header_in_place
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          footer_data: {cwd: @dir})
+        draw(chat, session)
+        collapsed = chat.transcript_lines
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        expanded = chat.transcript_lines
+        assert_equal " ▀▀█  v#{Identity::ORACLE_VERSION}", expanded[1], "the mark + version lead"
+        assert_equal " █▀ █ escape to interrupt", expanded[2], "hint 1 rides the mark's second line"
+        assert_equal " ctrl+c to clear", expanded[3], "hints 2–19 one per row"
+        assert_equal " drop files to attach", expanded[20]
+        assert_equal "", expanded[21]
+        assert_equal " #{Render::Motd::PI_ONBOARDING_LINE}", expanded[22]
+        refute_includes expanded.join, Render::Motd::PI_NOTICE_LINE, "the notice renders ONLY collapsed"
+        assert_equal "", expanded[-2], "the status pair's leading Spacer"
+        assert_equal " Tool output: expanded", expanded[-1], "the toggle status is a transcript tail row (AC4)"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        restored = chat.transcript_lines
+        assert_equal collapsed, restored[0, collapsed.size], "the second press restores the collapsed bytes exactly"
+        assert_equal " Tool output: collapsed", restored[-1]
+      end
+    end
+
+    # AC2: the loaded-resource sections flip with the same toggle —
+    # expanded bodies in pi's shapes ([Context] display paths, the scope
+    # groups, /name entries), compact bodies restored on the flip-back.
+    def test_ctrl_o_flips_the_resource_sections_in_place
+      FileUtils.mkpath(File.join(@dir, ".tart", "skills"))
+      File.write(File.join(@dir, ".tart", "settings.json"), "{}")
+      File.write(File.join(@dir, ".tart", "skills", "demo.md"), "---\nname: demo\ndescription: d\n---\nb")
+      skills = Skills.load(cwd: @dir, root: @dir, claude_dir: File.join(@dir, "claude-skills")).skills
+      template = Prompts::Template.new(name: "council", description: "d", content: "b",
+        file_path: File.join(@dir, ".tart", "prompts", "council.md"))
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          identity: "tart", footer_data: {cwd: @dir}, skills:, prompts: [template], extensions: [])
+        draw(chat, session)
+        collapsed = chat.transcript_lines
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        expanded = chat.transcript_lines
+        assert_includes expanded.join, "  project", "the scope-group label renders (pi formatScopeGroups)"
+        assert_includes expanded.join, "    #{File.join(@dir, '.tart', 'skills', 'demo.md')}",
+          "the skill's full display path renders"
+        assert_includes expanded.join, "    /council", "the prompt renders as /name"
+        assert_includes expanded.join, "  #{File.join(@dir, '.tart', 'settings.json')}",
+          "the [Context] display path renders"
+        refute_includes expanded.join, "  demo
+", "no compact list survives the flip"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_equal collapsed, chat.transcript_lines[0, collapsed.size], "the compact bodies restore byte-exact"
+      end
+    end
+
+    # AC2: /new drops the resource sections entirely (pi
+    # renderCurrentSessionState clears loadedResourcesContainer — boot-
+    # once) and re-enqueues the header block at the CURRENT toggle state.
+    def test_new_session_rerenders_the_header_alone_at_the_current_state
+      FileUtils.mkpath(File.join(@dir, ".tart", "skills"))
+      File.write(File.join(@dir, ".tart", "skills", "demo.md"), "---\nname: demo\ndescription: d\n---\nb")
+      skills = Skills.load(cwd: @dir, root: @dir, claude_dir: File.join(@dir, "claude-skills")).skills
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          identity: "tart", footer_data: {cwd: @dir}, skills:)
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join, "[Skills]", "the boot renders the sections"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"])) # flip BEFORE /new
+        chat.new_session
+        draw(chat, session)
+        lines = chat.transcript_lines
+        refute_includes lines.join, "[Skills]", "the sections are boot-once (pi's cleared container)"
+        refute_includes lines.join, "pgup/pgdn scroll", "the header re-enqueued EXPANDED (the current state — no compact line)"
+        assert_includes lines.join, " !! to run bash (no context)", "the expanded hint list rode the re-enqueue"
+      end
+    end
+
+    # AC2: the compaction rebuild restores the header AT ITS CURRENT
+    # expansion state — and never resurrects the sections (I31 ruling).
+    def test_compaction_rebuild_restores_the_header_at_its_current_state
+      with_chat(width: 60, screen_height: 24, motd: true,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, auto_compact: true}) do |chat, session|
+        draw(chat, session)
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"])) # flip BEFORE the compaction
+        chat.on_agent_event({type: :compaction, reason: :threshold, tokens_before: 100, summary: "s", entries: []})
+        draw(chat, session)
+
+        lines = chat.transcript_lines
+        refute_includes lines.join, Render::Motd::PI_NOTICE_LINE,
+          "the header rebuilt EXPANDED (pi's live header rides the toggle)"
+        assert_includes lines.join, " drop files to attach"
+      end
+    end
+
+    # AC4: the persistent statuses render as pi's showStatus — a blank row
+    # then a dim one-pad row at the tail, REPLACED in place while still
+    # the tail — and the editor border never carries them.
+    def test_statuses_render_as_transcript_tail_rows_replaced_in_place
+      with_chat(width: 60, screen_height: 24, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", default_provider: "openai"}) do |chat, session|
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: false,
+          context_window: 200_000, max_tokens: nil)
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_equal "", lines[-2], "the status pair's blank row"
+        assert_equal " Model: glm-5.3", lines[-1], "the dim status row at the tail"
+        refute_includes editor_area(session, chat), "Model:", "the editor border never carries the status"
+
+        chat.set_thinking_level("high") # a second status while the pair is still the tail
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_equal " Thinking level: high", lines[-1], "replaced in place (pi showStatus's tail rule)"
+        refute_includes lines.join, "Model: glm-5.3", "the replaced status is GONE (pi updates the same line)"
+
+        draw(chat, session) # a later frame — the status persists at settle
+        assert_includes chat.transcript_lines.join, "Thinking level: high", "statuses are persistent history"
+      end
+    end
+
+    # The status row renders the dim token (pi showStatus's theme.fg("dim")).
+    def test_status_row_renders_dim
+      with_chat(width: 60, screen_height: 24, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", default_provider: "openai"}) do |chat, session|
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: false,
+          context_window: 200_000, max_tokens: nil)
+        draw(chat, session)
+        status_y = session.buffer_content.rindex { |row| row.include?("Model: glm-5.3") }
+        assert_equal Theme[:dim], session.cell_fg(1, status_y), "the status renders dim"
+      end
+    end
     # pi-mode's MOTD (I16 AC2): the oracle's built-in header bytes — the
     # half-block mark with the tracked oracle version on its first line,
     # the hints on its second, the ctrl+o notice, then the onboarding
@@ -1637,9 +1784,8 @@ module Tart
           "single chat-completions seam) and re-resolves the window"
         assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("glm-5.3 • medium"),
           "the footer model segment refreshed (the entry's reasoning flag rides along)"
-        border_row = session.buffer_content.index { |row| row.include?("─") }
-        assert session.buffer_content[border_row].include?("Model: glm-5.3"),
-          "the border status reports pi's showStatus text"
+        assert_includes chat.transcript_lines.join, "Model: glm-5.3",
+          "the status reports pi's showStatus text (the transcript tail row, I33)"
       end
     end
 
@@ -1679,9 +1825,8 @@ module Tart
         assert_equal "glm-5.3", saved["defaultModel"], "defaultModel persisted"
         assert_equal true, saved["unknownKey"], "unknown keys survive the write"
         assert_equal "high", saved["thinkingLevel"], "unmodified keys survive"
-        border_row = session.buffer_content.index { |row| row.include?("─") }
-        assert session.buffer_content[border_row].include?("Default model: glm/glm-5.3"),
-          "the persisted status reports the pair"
+        assert_includes chat.transcript_lines.join, "Default model: glm/glm-5.3",
+          "the persisted status reports the pair (the transcript tail row, I33)"
       end
     end
 
@@ -1697,9 +1842,8 @@ module Tart
         refute chat.menu_open?
         saved = JSON.parse(File.read(File.join(@dir, "settings.json")))
         assert_equal "medium", saved["thinkingLevel"], "the settings default persisted"
-        border_row = session.buffer_content.index { |row| row.include?("─") }
-        assert session.buffer_content[border_row].include?("Default thinking level: medium"),
-          "the persisted status reports the level"
+        assert_includes chat.transcript_lines.join, "Default thinking level: medium",
+          "the persisted status reports the level (the transcript tail row, I33)"
       end
     end
 
@@ -1723,8 +1867,7 @@ module Tart
         draw(chat, session)
 
         refute chat.menu_open?, "the click selected and closed (pi click → onSelect)"
-        border_row = session.buffer_content.index { |row| row.include?("─") }
-        assert session.buffer_content[border_row].include?("Model: glm-5.3"),
+        assert_includes chat.transcript_lines.join, "Model: glm-5.3",
           "the clicked entry switched (the drawn frame's flush renders the status)"
       end
     end
@@ -1819,7 +1962,7 @@ module Tart
         assert_includes chat.transcript_lines.join, 'Unknown thinking level "high". Available levels: off.',
           "the error lists the GATED set (pi handleThinkingCommand :5153-5155)"
         assert_nil chat.instance_variable_get(:@thinking_level), "the level holds (no status rode)"
-        assert_nil chat.instance_variable_get(:@border_status), "no selection status rendered"
+        refute_includes chat.transcript_lines.join, "Thinking level:", "no selection status rendered"
       end
     end
 
