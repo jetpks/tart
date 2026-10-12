@@ -19,7 +19,13 @@ module Tart
 
       # The write tool block (I18 — pi write.ts renderers), +expanded+ =
       # the content preview uncapped (write.ts:117 maxLines = expanded ?
-      # lines.length : 10 — the hint dies with the cap).
+      # lines.length : 10 — the hint dies with the cap). The SUCCESS
+      # result renders NOTHING (formatWriteResult is undefined unless
+      # error, write.ts:128-143); an error renders its text in the error
+      # token after a blank (the leading "\n", write.ts:143). Cuts,
+      # itemized: the syntax highlighting (highlightCode — the port has
+      # no highlighter; invisible to text files) and the ctrl+o expand
+      # binding (backlog C) — the hint's TEXT renders for byte parity.
       def write_block_rows(args, result, width, expanded:)
         bg = Panel.tool_panel_bg(result)
         region = [Panel.blank_line, Panel.panel_blank_line(width, bg)]
@@ -63,6 +69,31 @@ module Tart
         end
         region << Panel.panel_blank_line(width, bg)
         region
+      end
+
+      # The PENDING write block (I34 — pi's isPartial shape,
+      # tool-execution.ts:271-277): the settled shape truncated to the
+      # call — PLAIN Spacer blank, pending-bg pad, the call rows
+      # ({write_call_rows} over the pending bg), pending-bg pad. The
+      # content exists mid-call but pi renders renderCall only.
+      def pending_write_block_rows(args, width)
+        pending_block_rows(width, write_call_rows(args, width, bg: Theme[:tool_pending_bg]))
+      end
+
+      # The PENDING read block (I34): the read call alone between the
+      # pads — the compact classification gate is !expanded, so the
+      # pending call renders the collapsed classification exactly as the
+      # settled collapsed block's call line (read.ts:35-42/:79-90).
+      def pending_read_block_rows(args, width)
+        pending_block_rows(width, read_call_rows(args, width, false, bg: Theme[:tool_pending_bg]))
+      end
+
+      # The pending families' shared skeleton (I34): the PLAIN Spacer
+      # blank (bash_block.rb:46's rule), the pending-bg pad, the call
+      # rows, the closing pending-bg pad.
+      def pending_block_rows(width, call_rows)
+        bg = Theme[:tool_pending_bg]
+        [Panel.blank_line, Panel.panel_blank_line(width, bg), *call_rows, Panel.panel_blank_line(width, bg)]
       end
 
       # pi read.ts:122-131 formatReadResult's expanded body: the result

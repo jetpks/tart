@@ -412,14 +412,23 @@ module Tart
             end
           when :tool_execution_start
             @tool = event[:tool_call].name
+            # The PENDING block's enqueue (I34 — pi renders the running
+            # call's block immediately under toolPendingBg, the component
+            # added to the chat container at :tool_execution_start,
+            # interactive-mode.ts:3611-3621): paints on the next frame
+            # while the tool runs; the finalize replaces it in place.
+            call = event[:tool_call]
+            @transcript_state.enqueue_pending_tool_block(call.name, call.arguments)
           when :tool_execution_end
             @tool = nil
             call = event[:tool_call]
-            # The per-tool block dispatch (pi's per-tool renderers): bash
-            # owns the shell shapes (I17 — the frozen :tool_execution_end
-            # contract carries `duration:`), write/read their file-tool
-            # shapes (I18), the rest the generic ⎿ line.
-            @transcript_state.enqueue_tool_block(call.name, call.arguments, event[:result], event[:duration])
+            # The settle (I34): the pending block replaced IN PLACE with
+            # the per-tool block dispatch's rows (pi's per-tool renderers
+            # — bash owns the shell shapes, I17 — the frozen
+            # :tool_execution_end contract carries `duration:`; write/read
+            # their file-tool shapes, I18; the rest the generic ⎿ line).
+            # No live pending (the replay path) falls back to the append.
+            @transcript_state.finalize_tool_block(call.name, call.arguments, event[:result], event[:duration])
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after
             # prepare succeeds): the border shows pi's per-reason label
@@ -457,9 +466,16 @@ module Tart
             # _pendingBashMessages flush) — never mid-tool-sequence.
             @user_bash.flush_pending
             if event[:interrupted] == true
+              # The orphaned pending block's finalize (I34 — pi's abort
+              # arm loops pendingTools with the "Operation aborted" error
+              # result, interactive-mode.ts:3573-3586); the interrupt
+              # scrollback line stays (additive).
+              @transcript_state.finalize_pending_as_error("Operation aborted")
               handled = "interrupted"
               @transcript_state.enqueue_scrollback(handled, fg: Theme[:warning])
             elsif event[:error]
+              # pi's error arm: the same loop with the error's message.
+              @transcript_state.finalize_pending_as_error(event[:error].message.to_s)
               handled = "error: #{event[:error].message}"
               @transcript_state.enqueue_scrollback(handled, fg: Theme[:error])
             end

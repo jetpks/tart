@@ -794,6 +794,228 @@ module Tart
       end
     end
 
+    # --- the PENDING tool block (I34 — pi tool-execution.ts:90-91 +
+    # --- updateDisplay :271-277 isPartial; the event wiring pins) ---
+
+    # AC1: the start event enqueues the pending block and it paints on
+    # the next drawn frame while the tool "runs" — the four rows (PLAIN
+    # blank, pending pad, bold toolTitle header, pending pad).
+    def test_pending_block_paints_mid_flight
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+
+        assert_equal ["", "", " $ sleep 6", ""], chat.transcript_lines,
+          "the pending block is the call rows alone — no output, no Took, no hint"
+        rows = session.buffer_content
+        header = rows.index { |row| row.include?("$ sleep 6") }
+        x = rows[header].index("$")
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(x, header),
+          "the header rides the pending bg #34383a (the I26 measured bytes)"
+        assert_equal Theme[:toolTitle], session.cell_fg(x, header), "the header is toolTitle"
+        assert_includes session.cell_modifiers(x, header), :bold, "the header is bold"
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(0, header - 1), "the opening pad"
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(0, header + 1), "the closing pad"
+      end
+    end
+
+    # AC2, drained case: start → draw → end lands the final block
+    # BYTE-IDENTICAL (rows and position) to a control chat that received
+    # only the end event — no pending-bg row survives.
+    def test_flushed_pending_settles_byte_identical_to_the_control
+      control = with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_end(chat, "bash", "out", duration: 1.0, arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        [chat.transcript_lines, session.buffer_content]
+      end
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        tool_end(chat, "bash", "out", duration: 1.0, arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+
+        assert_equal control[0], chat.transcript_lines, "rows and position byte-identical"
+        assert_equal control[1], session.buffer_content, "the drawn frame is byte-identical"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg]), "no pending bg survives the settle"
+      end
+    end
+
+    # AC2, fast path: start → end with NO draw between — the queued
+    # region swaps in place, the pending rows never reach the buffer.
+    def test_queued_pending_settles_byte_identical_to_the_control
+      control = with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_end(chat, "bash", "res", arguments: {"command" => "fast"})
+        draw(chat, session)
+        [chat.transcript_lines, session.buffer_content]
+      end
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "fast"})
+        tool_end(chat, "bash", "res", arguments: {"command" => "fast"})
+        draw(chat, session)
+
+        assert_equal control[0], chat.transcript_lines
+        assert_equal control[1], session.buffer_content
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg]),
+          "no pending rows ever painted"
+      end
+    end
+
+    # AC4: ctrl+o mid-flight corrupts neither the buffer nor the registry
+    # — the constant-size builder rebuilds the pending block identically,
+    # and the settled block toggles normally afterward.
+    def test_ctrl_o_mid_flight_and_the_settled_toggle
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "seq 1 12"})
+        draw(chat, session)
+        pending_rows = chat.transcript_lines
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+
+        # The toggle reports in the tail status pair (pi showStatus) — the
+        # pending block itself must rebuild identically at the buffer head
+        # (constant-size builder) and the registry must still resolve.
+        assert_equal pending_rows, chat.transcript_lines[0, pending_rows.length],
+          "the toggle rebuilds the pending block identically (constant-size builder)"
+        assert chat.transcript_lines.any? { |row| row.include?("Tool output: expanded") },
+          "the registry resolved (the toggle state flipped)"
+        tool_end(chat, "bash", (1..12).to_a.join("\n"), arguments: {"command" => "seq 1 12"})
+        draw(chat, session)
+        expanded = chat.transcript_lines
+        refute_includes expanded.join, "earlier lines",
+          "the finalize reads the toggle state at replacement time — the flipped state rides through"
+        assert_includes expanded.join, " 12", "the whole output renders expanded"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        collapsed = chat.transcript_lines
+        assert_includes collapsed.join, "earlier lines", "the finalized block collapses"
+        assert_operator collapsed.length, :<, expanded.length
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_equal expanded, chat.transcript_lines, "the toggle round-trips"
+      end
+    end
+
+    # AC4: the orphaned pending block finalizes at :agent_end's
+    # interrupted arm pi's way (interactive-mode.ts:3573-3586) — the call
+    # rows + "Operation aborted" under toolErrorBg; the interrupt
+    # scrollback line stays.
+    def test_interrupt_finalizes_the_orphaned_pending_block
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        chat.on_agent_event({type: :agent_end, interrupted: true})
+        draw(chat, session)
+
+        rows = session.buffer_content
+        aborted = rows.index { |row| row.include?("Operation aborted") }
+        refute_nil aborted, "the orphan finalizes with pi's abort text"
+        assert_equal Theme[:tool_error_bg], session.cell_bg(rows[aborted].index("O"), aborted),
+          "the error text rides toolErrorBg"
+        header = rows.index { |row| row.include?("$ sleep 6") }
+        assert_equal Theme[:tool_error_bg], session.cell_bg(rows[header].index("$"), header),
+          "the whole block re-renders the error bg (the same component, pi's updateResult)"
+        assert_includes chat.transcript_lines, "interrupted", "the interrupt scrollback line stays"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg]), "no pending bg survives"
+      end
+    end
+
+    # AC4: the error arm finalizes with the error's message.
+    def test_error_finalizes_the_orphaned_pending_block_with_the_message
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        chat.on_agent_event({type: :agent_end, error: StandardError.new("boom")})
+        draw(chat, session)
+
+        assert_includes chat.transcript_lines.join, "boom", "the error text lands in the block"
+        assert_includes chat.transcript_lines, "error: boom", "the error scrollback line stays"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg])
+      end
+    end
+
+    # AC3: the replay (resume) renders final blocks only — zero
+    # pending-bg spans (the pending machinery never engages).
+    def test_resume_replays_render_no_pending_bg
+      dir = File.join(@dir, "sessions")
+      FileUtils.mkpath(dir)
+      recorded = File.join(dir, "pending_replay_test-session.jsonl")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"pending-replay","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"run the sleeper"}}
+        {"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":"","tool_calls":{"call_1":{"id":"call_1","name":"bash","arguments":{"command":"sleep 6"}}},"finish_reason":"tool_calls","input_tokens":10,"output_tokens":5}}
+        {"type":"message","id":"e3","parentId":"e2","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"tool","content":"slept","tool_call_id":"call_1"}}
+      JSONL
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+
+        assert_includes chat.transcript_lines.join, "$ sleep 6", "the final block replays"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg]), "zero pending-bg spans on replay"
+      end
+    end
+
+    # AC1 per family: write/read/generic pendings are the call rows alone
+    # under the pending bg (each family interrupted off first — the
+    # transcript keeps only the finished blocks below).
+    def test_pending_shapes_per_family
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "write", arguments: {"path" => "note.txt", "content" => "parity note"})
+        draw(chat, session)
+        assert_equal " write note.txt", chat.transcript_lines.reject(&:empty?).last, "the write call rows alone"
+        write_row = session.buffer_content.index { |r| r.include?("write note.txt") }
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(1, write_row)
+
+        chat.on_agent_event({type: :agent_end, interrupted: true}) # clear the orphan for the next family
+        draw(chat, session)
+        tool_start(chat, "read", arguments: {"path" => "note.txt"})
+        draw(chat, session)
+        assert_equal " read note.txt", chat.transcript_lines.reject(&:empty?).last, "the read call rows alone"
+        read_row = session.buffer_content.index { |r| r.include?("read note.txt") }
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(1, read_row)
+
+        chat.on_agent_event({type: :agent_end, interrupted: true})
+        draw(chat, session)
+        tool_start(chat, "grep")
+        draw(chat, session)
+        assert_equal "  ⎿ grep", chat.transcript_lines.reject(&:empty?).last, "the generic ⎿ call line alone"
+        grep_row = session.buffer_content.index { |r| r.rstrip == "  ⎿ grep" }
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(2, grep_row)
+      end
+    end
+
+    # AC4: a sequential multi-tool turn lands both blocks in order with
+    # no pending residue — byte-identical to a control chat that received
+    # only the end events.
+    def test_sequential_multi_tool_turn_leaves_no_residue
+      control = with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_end(chat, "bash", "one", arguments: {"command" => "echo one"})
+        tool_end(chat, "bash", "two", arguments: {"command" => "echo two"})
+        draw(chat, session)
+        chat.transcript_lines
+      end
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "echo one"})
+        draw(chat, session)
+        tool_end(chat, "bash", "one", arguments: {"command" => "echo one"})
+        draw(chat, session)
+        tool_start(chat, "bash", arguments: {"command" => "echo two"})
+        draw(chat, session)
+        tool_end(chat, "bash", "two", arguments: {"command" => "echo two"})
+        draw(chat, session)
+
+        lines = chat.transcript_lines
+        assert_equal control, lines, "two settled blocks, byte-identical to the control"
+        one = lines.index(" $ echo one")
+        two = lines.index(" $ echo two")
+        refute_nil one
+        refute_nil two
+        assert_operator one, :<, two, "the blocks land in call order"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg])
+      end
+    end
+
     def test_chat_runs_inside_the_seam_lifecycle_and_restores
       TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: false)
@@ -3702,8 +3924,8 @@ module Tart
       chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "done", tokens)})
     end
 
-    def tool_start(chat, name)
-      chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(name)})
+    def tool_start(chat, name, arguments: {})
+      chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(name, arguments)})
     end
 
     # `duration:` rides the frozen :tool_execution_end contract (Float
@@ -3775,6 +3997,14 @@ module Tart
     # The buffer's transcript rows, stripped and non-empty.
     def transcript_lines(session, chat)
       session.buffer_content[0, transcript_height(session, chat)].map(&:rstrip).reject(&:empty?)
+    end
+
+    # Whether any buffer cell renders +bg+ (the I34 pending-survival scan:
+    # no #34383a span may survive a settle or appear on the replay path).
+    def buffer_bg_hit?(session, bg)
+      session.buffer_content.each_with_index.any? do |row, y|
+        row.chars.each_index.any? { |x| session.cell_bg(x, y) == bg }
+      end
     end
 
     # The editor area rows (block borders + inner content).
