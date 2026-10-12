@@ -42,3 +42,13 @@ classes:
   # candidate (a real port-only listing, left on the work list).
   - name: staged-settings-path
     pattern: 'settings\.json'
+  # The compaction panel's token row (I31): each app's estimate runs over
+  # its own deliberately different context — pi counts content + sections
+  # + toolsAdded (compaction.ts:296-311), the port message text + its wire
+  # tool schemas — so the number is each app's own honest measurement and
+  # differs by design (2026-10-12 owner direction). The panel bytes stay
+  # pinned by the chat tests; the class forgives only the number, at line
+  # level, exactly as footer-provider-prefix's `mock-1$` anchor forgives
+  # the footer's values.
+  - name: compaction-token-estimate
+    pattern: 'Compacted from [\d,]+ tokens'

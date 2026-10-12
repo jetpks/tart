@@ -383,6 +383,32 @@ module Tart
       assert_equal :threshold, compaction[:reason]
     end
 
+    # AC2 (I31): the zero-usage estimate covers the WIRE context — the
+    # message text AND the registered tool schemas (pi's system.toolsAdded
+    # arm, compaction.ts:302-311), counted once. The window sits between
+    # the text-only estimate (10) and the tools-inclusive estimate
+    # (10 + the ls definition component): without the threading the
+    # trigger never fires and the run stops at 1 request.
+    def test_zero_usage_threshold_estimate_covers_the_wire_tools
+      @server.suppress_usage!
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+      ])
+      tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
+      agent, events = agent_on_kernel(
+        tools:, compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 50
+      )
+      run_agent(agent, "first question")
+
+      # Turn + summarization: the second request proves the tools component
+      # pushed the estimate over the window.
+      assert_equal 2, @server.captured_requests.size
+      compaction = events.find { |e| e[:type] == :compaction }
+      assert_equal :threshold, compaction[:reason]
+      assert_operator compaction[:tokens_before], :>, 49
+    end
+
     # AC3 (I12): compaction_start fires once per started compaction, with
     # the reason, BEFORE the completed-compaction event (pi
     # agent-session.ts:3119 — after prepare, before the summary call).

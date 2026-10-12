@@ -295,7 +295,7 @@ module Tart
         return false unless window.is_a?(Integer) && window.positive?
 
         tokens = Compaction.trigger_tokens(@chat.messages, message,
-          pre_compaction_messages: @pre_compaction_messages)
+          pre_compaction_messages: @pre_compaction_messages, tools: @chat.tools)
         return false if tokens.nil?
 
         Compaction.should_compact?(tokens, window, @compaction_settings)
@@ -320,7 +320,7 @@ module Tart
       # compaction entry → emit the compaction event. Returns whether a
       # compaction happened.
       def run_compaction(reason:)
-        preparation = Compaction.prepare(@chat.messages, @compaction_settings)
+        preparation = Compaction.prepare(@chat.messages, @compaction_settings, tools: @chat.tools)
         return false unless preparation
 
         # pi emits compaction_start once per started compaction, after
@@ -350,7 +350,7 @@ module Tart
         # pi CompactionResult.estimatedTokensAfter (agent-session.ts:2850):
         # the pure estimateMessagesTokens over the post-compaction history
         # (:366-371 — chars/4, never usage-backed). Data only.
-        preparation.estimated_tokens_after = Compaction.full_estimate(@chat.messages)[:tokens]
+        preparation.estimated_tokens_after = Compaction.full_estimate(@chat.messages, tools: @chat.tools)[:tokens]
         @recorder&.append_compaction(
           summary:,
           first_kept_entry_id: @entry_ids[kept.first],
