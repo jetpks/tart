@@ -206,25 +206,34 @@ path only).
 
 ### Input-line editing
 
-The input line is a single-line editor with a visible cursor (the grapheme at
-the insertion point renders inverse-video; at end-of-input a highlighted
-trailing space), mid-line editing, in-memory history, and word-wise
-operations — the pi `editor.ts`/`input.ts`/`word-navigation.ts` subset
-(single-line; no multi-line editing, undo/kill-ring, or autocomplete):
+The input line is a multi-line editor with a visible cursor (the grapheme at
+the insertion point renders inverse-video; at end-of-line a highlighted
+trailing space): logical lines wrap into visual rows at the box width (pi's
+visual-line model — `editor.ts` wordWrapLine/layoutText), the box grows with
+the content up to pi's visible-window cap (`max(5, floor(rows * 0.3))`, with
+` ↑ N more ` / ` ↓ N more ` borders), and the cursor navigates wrapped rows
+with pi's sticky column. Mid-line editing, in-memory history, the emacs
+kill/yank ring, and word-wise operations come from the pi
+`editor.ts`/`input.ts`/`word-navigation.ts` subset (no undo, no paste-marker
+compaction, autocomplete unchanged):
 
 | Key | Action |
 |---|---|
 | printable characters | insert at the cursor |
-| Left / Right | move the cursor one character (Ctrl+B / Ctrl+F too) |
-| Backspace | delete before the cursor |
-| Delete / Ctrl+D | delete after the cursor |
-| Home / End (Ctrl+A / Ctrl+E) | jump to line start / end |
-| Alt+Left or Alt+B (Ctrl+Left) | jump one word backward |
-| Alt+Right or Alt+F (Ctrl+Right) | jump one word forward |
-| Ctrl+W or Alt+Backspace | delete one word backward |
-| Alt+D or Alt+Delete | delete one word forward |
-| Up / Down | recall previous / next sent message |
-| Enter | send (steers a running agent) |
+| Left / Right | move one character, wrapping across lines (Ctrl+B / Ctrl+F too) |
+| Up / Down | move one visual row (sticky column); recall previous / next sent message at the editor's top/bottom |
+| Backspace | delete before the cursor (merges lines at a line start) |
+| Delete / Ctrl+D | delete after the cursor (merges lines at a line end; exits when empty) |
+| Home / End (Ctrl+A / Ctrl+E) | jump to the logical line's start / end |
+| Alt+Left or Alt+B (Ctrl+Left) | jump one word backward (crosses line starts) |
+| Alt+Right or Alt+F (Ctrl+Right) | jump one word forward (crosses line ends) |
+| Ctrl+W or Alt+Backspace | delete one word backward (the newline at a line start) |
+| Alt+D or Alt+Delete | delete one word forward (the newline at a line end) |
+| Ctrl+U / Ctrl+K | kill to the logical line's start / end (the newline at a boundary merges the lines) |
+| Ctrl+Y / Alt+Y | yank / yank-pop (multi-line ring text splices across lines) |
+| Shift+Enter or Alt+Enter, Ctrl+J | insert a newline |
+| Enter | send (a `\\` before the cursor becomes a newline instead; steers a running agent) |
+| PageUp / PageDown | page the editor's visual rows (sticky column, clamped) |
 
 History is in-memory for the session (most recent first, capped at 100,
 no consecutive duplicates): Up walks older entries, Down returns toward the

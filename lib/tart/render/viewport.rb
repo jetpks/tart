@@ -57,21 +57,13 @@ module Tart
         @hide_delay_ms = nil
       end
 
-      # One page of transcript rows (pi keybindings.ts:114-115). A page
-      # away from the end detaches (+follow+ false — pi scrollBy sets
-      # followingEnd = followEnd && next === maxScrollTop); the render
-      # ({window}) re-follows whenever the offset lands at the end, and
-      # keeps a detached offset put as new output arrives. Returns the
-      # scrollbar-activity epoch when the page MOVED (the Chat
-      # coordinator arms the hide timer); nil when nothing moved.
-      def scroll_page(direction, content_size, rows)
-        scroll_by(direction * rows, content_size, rows)
-      end
-
       # One wheel event: lines-per-event (alt+wheel 5×, pi :710) in the
       # event's direction (pi parseWheelEvent :705-723), routed into
       # {scroll_by} — the Chat coordinator threads the content size and
       # the area's row budget. Returns {scroll_by}'s epoch (see above).
+      # The wheel is the transcript's ONLY user-scroll seam since I35:
+      # the page keys page the editor (pi pageScroll — the I12
+      # transcript mapping retired, Viewport#scroll_page with it).
       def wheel(event, content_size, rows)
         lines = WHEEL_LINES_PER_EVENT * (event.modifiers.include?("alt") ? ALT_WHEEL_MULTIPLIER : 1)
         scroll_by(WHEEL_DIRECTION.fetch(event.kind) * lines, content_size, rows)

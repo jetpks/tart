@@ -3,11 +3,13 @@
 require_relative "../test_helper"
 
 module Tart
-  # The input-line editor's state behavior (I22 wave 2): the moved
-  # editor-state tests — input edits, cursor readback, history recall,
-  # word boundaries, word jumps, insert-printable — driving Editor
-  # directly. The Chat coordinator's key dispatch stays covered in
-  # test/chat_test.rb.
+  # The editor's state behavior (I22 wave 2; multi-line since I35): the
+  # moved editor-state tests — input edits, cursor readback, history
+  # recall, word boundaries, word jumps, insert-printable — driving
+  # Editor directly. The multi-line/visual-line halves (wrap, sticky
+  # column, boundary kills, newline/paste, paging) live in
+  # editor_multiline_test.rb; the Chat coordinator's key dispatch stays
+  # covered in test/chat_test.rb.
   class EditorTest < Test
     def test_printable_characters_insert_at_the_cursor
       editor = Render::Editor.new
@@ -122,6 +124,20 @@ module Tart
       editor.move_word_forward
       editor.insert_printable(TUI.key_event("Z"))
       assert_equal "hello YXworldZ", editor.input, "alt+f jumps one word forward"
+    end
+
+    # I35: the pre-multiline cursor readback holds — the cursor is the
+    # FLAT offset over the joined text, line 0's column on a single line.
+    def test_the_cursor_readback_is_flat_over_the_joined_text
+      editor = Render::Editor.new
+      editor.insert("ab")
+      editor.add_new_line
+      editor.insert("cdef")
+      editor.move_end
+      assert_equal 7, editor.cursor, "2 chars + the newline separator + 4"
+      editor.move_start
+      editor.move_left # wraps to line 0's end
+      assert_equal 2, editor.cursor, "line 0's end == the line's char count"
     end
   end
 end

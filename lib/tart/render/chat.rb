@@ -139,11 +139,14 @@ module Tart
         @footer_data = footer_data
         @agent = nil
         @mutex = Mutex.new
-        # The input-line editor (pi's Input — the editor state and
-        # operations) and its suggestion list over the injected completion
-        # source (pi editor.ts autocompleteState/autocompleteList +
-        # SelectList). Both unsynchronized — see the class comment.
-        @editor = Editor.new
+        # The multi-line input editor (pi's Editor — the visual-line state
+        # and operations) and its suggestion list over the injected
+        # completion source (pi editor.ts autocompleteState/
+        # autocompleteList + SelectList). Both unsynchronized — see the
+        # class comment. The rows_reader seam shares the screen height
+        # with the render window and the editor's page size (pi reads
+        # terminal.rows at both sites).
+        @editor = Editor.new(rows_reader: -> { screen_height })
         @autocomplete = Autocomplete.new(source: autocomplete)
         # The viewport state machines (I23 wave 3): the transcript scroll
         # state — the offset over the buffer, the follow-end pin and the
@@ -675,7 +678,7 @@ module Tart
       # objects own the state.
       def edit_input(event)
         if event.paste?
-          @editor.insert(event.content)
+          @editor.insert_paste(event.content)
           @autocomplete.cancel # pi editor.ts:1261 — paste cancels the list
           return
         end
@@ -713,8 +716,26 @@ module Tart
         # mechanism, Task#stop — no second path), idle escape is a no-op;
         # pi's double-escape /tree//fork is cut — no session branching).
         when "enter"
-          @autocomplete.apply(@editor) if @autocomplete.suggestions
-          submit
+          # pi editor.ts:889-919 — the newline keys route to addNewLine
+          # BEFORE the submit path (tui.input.newLine = shift+enter/
+          # ctrl+j, keybindings.ts:143; alt+enter is pi's terminal
+          # fallback arm), and plain enter submits — with the
+          # no-shift+enter terminal workaround: a "\\" before the cursor
+          # is deleted and a newline inserted instead (:906-917). The
+          # list keeps pi's select.confirm fall-through: a "/"-prefix
+          # completion applies then submits (editor.ts:790-816).
+          if event.modifiers.include?("shift") || alt
+            @autocomplete.cancel # pi addNewLine editor.ts:1329
+            @editor.add_new_line
+          elsif @autocomplete.suggestions
+            @autocomplete.apply(@editor)
+            submit
+          elsif @editor.backslash_before_cursor?
+            @editor.delete_backward
+            @editor.add_new_line
+          else
+            submit
+          end
         when "esc"
           # pi onEscape (interactive-mode.ts:3069-3092): a streaming run
           # aborts through the kernel's interrupt path; a running user
@@ -768,9 +789,11 @@ module Tart
           # true}, interactive-mode.ts:3114): the copy seam; bare x types.
           ctrl ? copy_message : @editor.insert_printable(event)
         # While the list is active up/down navigate the LIST (history
-        # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
-        when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.history_previous
-        when "down" then @autocomplete.suggestions ? @autocomplete.navigate(1) : @editor.history_next
+        # yields — pi custom-editor.ts:127-131 → editor.ts:766-771);
+        # otherwise pi's cursorUp/cursorDown dispatch runs (history at
+        # the visual extremes per its gating, else one visual row).
+        when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.cursor_up
+        when "down" then @autocomplete.suggestions ? @autocomplete.navigate(1) : @editor.cursor_down
         when "tab"
           # app.thinking.cycle (pi keybindings.ts:33-35, default
           # shift+tab): the in-session level cycle — kept when bare
@@ -782,20 +805,18 @@ module Tart
           else
             @autocomplete.update(@editor) # explicit trigger (pi handleTabCompletion)
           end
-        # Transcript paging (pi keybindings.ts:114-115 tui.editor.pageUp/
+        # Editor paging (pi keybindings.ts:114-115 tui.editor.pageUp/
         # pageDown, defaultKeys pageUp/ctrl+pageUp, pageDown/ctrl+pageDown;
-        # the gem spells the codes "page_up"/"page_down") — the port maps
-        # the action onto the transcript viewport (the port's editor is
-        # single-line; mapping judgment, itemized). The list wins while
-        # active (pi's precedence: the list owns the vertical keys).
-        when "page_up"
-          unless @autocomplete.suggestions
-            mark_scrollbar_activity(@viewport.scroll_page(-1, display_lines.size, transcript_area_rows))
-          end
-        when "page_down"
-          unless @autocomplete.suggestions
-            mark_scrollbar_activity(@viewport.scroll_page(1, display_lines.size, transcript_area_rows))
-          end
+        # the gem spells the codes "page_up"/"page_down") — I35 OPTION A:
+        # the page keys page the EDITOR's visual rows (pi pageScroll,
+        # editor.ts:1961-1973 — pi's editor pages even with the list
+        # open, :960-967 fall-through, so no list guard); the transcript
+        # stays wheel-only (the I12 transcript page mapping and its
+        # Viewport helper retired with it). The editor paging is silent:
+        # pi's pageScroll marks no
+        # scrollbar activity (it never touches the transcript).
+        when "page_up" then @editor.page_scroll(-1)
+        when "page_down" then @editor.page_scroll(1)
         when "backspace"
           alt ? @editor.delete_word_backward : @editor.delete_backward
           @autocomplete.update(@editor) # pi editor.ts:1449-1463 — re-filter/re-trigger
@@ -822,6 +843,15 @@ module Tart
             @editor.insert_printable(event)
           end
         when "w" then ctrl ? @editor.delete_word_backward : @editor.insert_printable(event)
+        when "j"
+          # tui.input.newLine's ctrl+j arm (keybindings.ts:143); pi's
+          # addNewLine cancels the list (editor.ts:1329).
+          if ctrl
+            @autocomplete.cancel
+            @editor.add_new_line
+          else
+            @editor.insert_printable(event)
+          end
         # The emacs kill/yank slice (I26, pi keybindings.ts:129-135): the
         # kill ops exit history browsing and push the cut span themselves.
         when "u" then ctrl ? @editor.delete_to_line_start : @editor.insert_printable(event)
@@ -1103,8 +1133,8 @@ module Tart
         editor_top = footer_top - editor_area_rows
         if y >= editor_top
           offset = y - editor_top
-          return editor_border_text(status_title) if offset.zero?
-          return "─" * viewport_width if offset == editor_area_rows - 1
+          return editor_top_border_line.spans.map(&:content).join if offset.zero?
+          return editor_bottom_border_line.spans.map(&:content).join if offset == editor_area_rows - 1
 
           line = editor_slot_lines[offset - 1]
           return line ? line.spans.map(&:content).join : ""
@@ -1119,20 +1149,16 @@ module Tart
         line ? line.spans.map(&:content).join : ""
       end
 
-      # The editor block's top-border row bytes (the status title rides
-      # it — custom-editor.ts renderTopBorder; the gem renders the title
-      # first, dashes to width).
-      def editor_border_text(title)
-        return "─" * viewport_width unless title
-
-        title + "─" * [viewport_width - TUI.text_width(title), 0].max
-      end
-
+      # pi chat-viewport.ts:33 — the editor dock is shrink 1, minSize 3
+      # ({MIN_EDITOR_ROWS}): the two border rows + the windowed input
+      # rows (always ≥ 1 — the empty editor lays out one row) + the
+      # suggestion list, capped at the screen (the cap is what makes the
+      # dock yield under pressure — pi's VStack shrink).
       def editor_area_rows(height = screen_height)
         return [@picker.widget_rows + 2, height - 1].min if @picker # + borders
         return [@menu.widget_rows + 2, height - 1].min if @menu # + borders
 
-        [MIN_EDITOR_ROWS + @autocomplete.rows, height - 1].min
+        [MIN_EDITOR_ROWS - 1 + @editor.windowed_rows(editor_inner_width) + @autocomplete.rows, height - 1].min
       end
 
       # The editor slot's top border row (the composition's third child:
@@ -1151,12 +1177,20 @@ module Tart
         editor_content_lines
       end
 
-      # The editor's content lines (the input row + the suggestion rows)
-      # — the edit box's inner rows, shared by {editor_widget}'s build
-      # and the selection's dock composition ({below_line}).
+      # The editor's content lines (the windowed input rows + the
+      # suggestion rows) — the edit box's inner rows, shared by
+      # {editor_widget}'s build and the selection's dock composition
+      # ({below_line}). The editor wraps at the inner width itself (pi
+      # layoutText's contentWidth — one column reserved for the cursor,
+      # paddingX 0), so rows arrive render-ready; no clip pass.
       def editor_content_lines
-        inner = [viewport_width - 1, 1].max
-        [TUI.line(Text.clip_spans(@editor.input_spans, inner))] + @autocomplete.lines(inner)
+        @editor.input_rows(editor_inner_width) + @autocomplete.lines(editor_inner_width)
+      end
+
+      # The editor's wrap width (pi render :536-556: layoutWidth =
+      # width − 1 — one column reserved for the cursor at paddingX 0).
+      def editor_inner_width
+        [viewport_width - 1, 1].max
       end
 
       # The selection highlight over composed dock rows (the transcript's
@@ -1266,24 +1300,15 @@ module Tart
       # paddingX 0 (pi's editorPaddingX default, settings-defaults.ts:46)
       # with pi's one reserved cursor column (editor.ts:518-521: without
       # padding the layout width is width − 1). The suggestion list renders
-      # below the input row, inside the editor area (pi editor.ts:618-634
+      # below the input rows, inside the editor area (pi editor.ts:618-634
       # — the area height grows by the list height; the port's standing
-      # I12 placement). The content rows carry the selection highlight at
-      # their synthetic rows (I28 AC2; the border rows stay unhighlighted
-      # — the gem's native Block composes them, itemized).
+      # I12 placement). Since I35 the area composes its own border rows
+      # (see {editor_top_border_line}); the content rows carry the
+      # selection highlight at their synthetic rows (I28 AC2) and the
+      # border rows stay unhighlighted, itemized as at base.
       def editor_widget
         content = highlight_lines(editor_content_lines, editor_area_top + 1)
-        TUI.block(
-          title: status_title,
-          borders: [:top, :bottom],
-          # pi updateEditorBorderColor (interactive-mode.ts:4514-4522):
-          # the border follows the input — bash mode (a leading "!")
-          # renders the bashMode token; otherwise the session's thinking
-          # level (getThinkingBorderColor — {editor_border_color}).
-          border_style: TUI.style(fg: editor_border_color),
-          title_style: TUI.style(fg: Theme[:dim]),
-          children: [TUI.paragraph(text: content, wrap: false)]
-        )
+        TUI.paragraph(text: [editor_top_border_line, *content, editor_bottom_border_line], wrap: false)
       end
 
       # pi getThinkingBorderColor (theme.ts:348) over the session's level
@@ -1299,6 +1324,80 @@ module Tart
         level = thinking_level if footer_data[:reasoning]
         token = "thinking_#{level || :off}".to_sym
         Theme::TOKENS.key?(token) ? Theme[token] : Theme[:thinking_off]
+      end
+
+      # The editor area's composed border rows (pi renderTopBorder/
+      # renderBottomBorder, editor.ts:509-518 + createScrollBorder
+      # :279-296): dashes in the border color; when the window hides
+      # rows, the centered " ↑/↓ N more " label. Deviation, itemized: pi
+      # wraps each border segment in borderColor(...) directly; the gem
+      # seam exposes no bottom-title/multi-style border row (tui.rb is
+      # shared), so the rows are composed here as span lines inside the
+      # editor's paragraph — the BYTES and the segment routing (border
+      # color for the border, the status style for the embedded status)
+      # are pi's ({Editor.scroll_border} is unit-pinned).
+      def editor_top_border_line
+        status = status_title
+        hidden = @editor.scroll_offset
+        unless status || hidden.positive?
+          return TUI.line("─" * viewport_width, fg: editor_border_color)
+        end
+        unless status
+          return TUI.line(Editor.scroll_border("↑", hidden, viewport_width), fg: editor_border_color)
+        end
+
+        TUI.line(status_border_segments(hidden, status).map do |text, segment|
+          TUI.span(text, fg: segment == :status ? Theme[:dim] : editor_border_color)
+        end)
+      end
+
+      def editor_bottom_border_line
+        hidden = @editor.hidden_below
+        row = hidden.positive? ? Editor.scroll_border("↓", hidden, viewport_width) : "─" * viewport_width
+        TUI.line(row, fg: editor_border_color)
+      end
+
+      # The top border's segments with an embedded working status
+      # (custom-editor.ts:36-66): "── " + status + " " on the left (the
+      # status in its own style — the base border title rode title_style
+      # dim), the hidden-rows label centered in the border color, and on
+      # collision the status degrades to the spinner alone (pi
+      # renderSpinnerInBorder) — after which the centered form may fit
+      # again (pi re-runs canFitOverflow against the degraded status).
+      # Returns [text, :status|:border] pairs.
+      def status_border_segments(hidden, status)
+        width = viewport_width
+        label = hidden.positive? ? " ↑ #{hidden} more " : nil
+        status = spinner_glyph if label && !status_label_fit?(status, label, width)
+
+        status_width = TUI.text_width(status)
+        label_width = label ? TUI.text_width(label) : 0
+        overflow_start = (width - label_width) / 2
+        left_block = 3 + status_width + 1
+        if label && label_width + 2 <= width && overflow_start - left_block >= 1
+          tail = " #{"─" * (overflow_start - left_block)}#{label}#{"─" * (width - overflow_start - label_width)}"
+          return [["── ", :border], [status, :status], [tail, :border]]
+        end
+        if width >= status_width + 5
+          return [["── ", :border], [status, :status], [" #{"─" * (width - status_width - 4)}", :border]]
+        end
+
+        prefix = [3, [width - status_width, 0].max].min
+        [["─" * prefix, :border], [status, :status], ["─" * [[width - prefix - status_width, 0].max, 0].max, :border]]
+      end
+
+      # custom-editor.ts:44-46 canFitOverflow: the label needs its width
+      # plus margins, and the centered label's start must clear the
+      # status block ("── " + status + " ") by at least one dash.
+      def status_label_fit?(status, label, width)
+        label_width = TUI.text_width(label)
+        return false unless label_width + 2 <= width
+
+        ((width - label_width) / 2) - (3 + TUI.text_width(status) + 1) >= 1
+      end
+
+      def spinner_glyph
+        SPINNER[@frames % SPINNER.size]
       end
 
       # The session's thinking level (pi agent.state.thinkingLevel): nil
