@@ -411,17 +411,22 @@ module Tart
             # result (+:compaction+) or the run end clears it.
             @compaction_reason = event[:reason]
           when :compaction
-            # pi: after compaction, context tokens are unknown until the
-            # next LLM response (footer "?"); the event itself renders a
-            # post-hoc compaction line (the compaction-start border status
-            # came from :compaction_start — the frozen I12 contract).
+            # pi compaction_end's result arm (interactive-mode.ts:3686-3725):
+            # the chat container clears and rebuilds from the post-compaction
+            # KEPT entries (the payload's `entries` — the frozen lane
+            # contract, the same shape the replay consumes) through the
+            # replay machinery, then the panel appends LAST (pi
+            # addMessageToChat after renderSessionEntries). The footer
+            # INVALIDATES — post-compaction the context numerator is
+            # unknown until the next LLM response (the "?") — never /new's
+            # usage reset. The border status came from :compaction_start
+            # (the frozen I12 contract); its clearing here stays.
             @compaction_reason = nil
+            wipe_transcript
+            entries = event[:entries].is_a?(Array) ? event[:entries] : []
+            @transcript_state.replay_entries(entries, update_footer: false, populate_history: false)
+            @transcript_state.enqueue_compaction_panel(event[:summary], event[:tokens_before])
             @footer.mark_usage_stale
-            # the compaction line is a region too (pi :3903-3904)
-            @transcript_state.enqueue_region([Panel.blank_line])
-            @transcript_state.enqueue_scrollback(
-              "✻ compacted (#{event[:reason]}, #{event[:tokens_before]} tokens)", fg: Theme[:dim]
-            )
           when :agent_end
             @busy = false
             @compaction_reason = nil
@@ -562,14 +567,23 @@ module Tart
       # transcript state resets through its component (the I24
       # {@footer.reset_usage} precedent).
       def clear_transcript
+        wipe_transcript
+        @last_assistant_text = nil # the fresh session has no messages to copy
+        # pi's footer stats re-derive from the fresh (empty) session.
+        @footer.reset_usage
+      end
+
+      # The transcript-side clear WITHOUT the /new halves (pi
+      # chatContainer.clear() + renderSessionEntries' resetTextSelection —
+      # selection coordinates point into the transcript being replaced,
+      # #9311): the compaction rebuild's clear half. The footer usage and
+      # the copy source are the /new halves — untouched here.
+      def wipe_transcript
         @transcript_state.reset
         @viewport.reset
         @selection_state.reset
         @live = +""
         @reasoning = +""
-        @last_assistant_text = nil # the fresh session has no messages to copy
-        # pi's footer stats re-derive from the fresh (empty) session.
-        @footer.reset_usage
       end
 
       def viewport_width

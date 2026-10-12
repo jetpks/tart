@@ -200,6 +200,17 @@ module Tart
         end
       end
 
+      # The compaction panel enqueue (pi addMessageToChat case
+      # compactionSummary — the live rebuild and the replay both land
+      # here): the case's unconditional Spacer(1), then the panel as an
+      # expandable region riding the ctrl+o global state (pi
+      # component.setExpanded(this.toolOutputExpanded) on both paths).
+      def enqueue_compaction_panel(summary, tokens_before)
+        @chat_started = true
+        @scrollback << [Panel.blank_line]
+        push_expandable(->(expanded) { compaction_panel_rows(summary, tokens_before, expanded) })
+      end
+
       # The resume replay (item 3, pi renderSessionEntries, interactive-
       # mode.ts :3900-3975): the recorded entries through the live-turn
       # shapes — user echoes, assistant thinking-then-content markdown,
@@ -209,7 +220,7 @@ module Tart
       # stripped before record (agent/loop.rb strip_thinking_replay), so no
       # reasoning block replays; non-string (multimodal) content is
       # skipped; usage only when the provider reported it.
-      def replay_entries(entries)
+      def replay_entries(entries, update_footer: true, populate_history: true)
         results = entries.filter_map do |entry|
           next unless entry.is_a?(Hash) && entry["type"] == "message"
           message = entry["message"]
@@ -217,7 +228,7 @@ module Tart
 
           [message["tool_call_id"], message["content"]]
         end.to_h
-        entries.each { |entry| replay_entry(entry, results) }
+        entries.each { |entry| replay_entry(entry, results, update_footer:, populate_history:) }
       end
 
       # Completed lines move into the transcript buffer (pi: completed
@@ -301,6 +312,14 @@ module Tart
         TUI.line([TUI.span(Panel::OUTPUT_PAD, bg: bg), *content, Panel.panel_tail(content_width, width, bg)])
       end
 
+      # pi's toLocaleString() comma grouping (compaction-summary-message.ts
+      # tokenStr — the en-US form every capture renders): 12345 → "12,345".
+      # The footer's {Text.format_tokens} is pi's COMPACT formatTokens — a
+      # different format; the panel keeps pi's full grouped form.
+      def self.grouped_tokens(count)
+        count.to_i.to_s.gsub(/(\d)(?=(\d{3})+$)/, '\\1,')
+      end
+
       # Reasoning text as dim italic display lines (pi assistant-message.ts
       # :140-150: thinkingText fg, italic; markdown-of-reasoning is cut,
       # plain dim text — itemized reduction).
@@ -354,6 +373,51 @@ module Tart
       # customMessageText prose (pi's color override — token colors
       # still apply, the prose callback doesn't). paddingY 1 both ways;
       # every row through the {OUTPUT_PAD} rule + the full-width bg.
+      # The compaction panel rows (pi compaction-summary-message.ts — the
+      # skill panel's Box(outputPad, 1, customMessageBg) shape with the
+      # label on its own row): the padY top, the bold customMessageLabel
+      # [compaction] row, the bg'd inner Spacer(1) (the Box bgs every
+      # child line), then the state's content. Collapsed: the three-fg-run
+      # hint row — customMessageText "Compacted from N tokens (", the dim
+      # ctrl+o key, customMessageText " to expand)". Expanded: the bold
+      # markdown header + blank + the summary as customMessageText prose
+      # over the panel (the skill panel's markdown machinery).
+      # MouseRegion click-to-toggle cut — the standing skill-panel
+      # deviation (the port's mouse owns selection).
+      def compaction_panel_rows(summary, tokens_before, expanded)
+        bg = Theme[:custom_message_bg]
+        summary = "" unless summary.is_a?(String) # malformed-entry tolerance
+        label = TUI.span("[compaction]", fg: Theme[:custom_message_label], modifiers: [:bold], bg: bg)
+        rows = [Panel.panel_blank_line(viewport_width, bg),
+                Panel.padded_spans_row([label], viewport_width, bg),
+                Panel.panel_blank_line(viewport_width, bg)]
+        if expanded
+          header = "**Compacted from #{Transcript.grouped_tokens(tokens_before)} tokens**\n\n"
+          rows.concat(Transcript.markdown_lines(header + summary, viewport_width,
+            prose_fg: Theme[:custom_message_text], bg: bg))
+        else
+          rows << Panel.padded_spans_row(
+            [TUI.span("Compacted from #{Transcript.grouped_tokens(tokens_before)} tokens (",
+                      fg: Theme[:custom_message_text], bg: bg),
+             TUI.span("ctrl+o", fg: Theme[:dim], bg: bg),
+             TUI.span(" to expand)", fg: Theme[:custom_message_text], bg: bg)], viewport_width, bg
+          )
+        end
+        rows << Panel.panel_blank_line(viewport_width, bg)
+        rows
+      end
+
+      # The skill-invocation panel (pi skill-invocation-message.ts:
+      # Box(outputPad, 1, customMessageBg), collapsed by default, the
+      # ctrl+o toggle sweeps it via the expandable registry — pi
+      # component.setExpanded(this.toolOutputExpanded)). Collapsed: one
+      # content row — the bold customMessageLabel [skill], the
+      # customMessageText name, the dim " (ctrl+o to expand)" hint
+      # (keyText app.tools.expand). Expanded: the label row, then the
+      # bold-markdown name header + the content as markdown over
+      # customMessageText prose (pi's color override — token colors
+      # still apply, the prose callback doesn't). paddingY 1 both ways;
+      # every row through the {OUTPUT_PAD} rule + the full-width bg.
       # pi's click-to-toggle MouseRegion is cut — the port's mouse owns
       # selection (itemized).
       def skill_panel_rows(block, expanded:)
@@ -379,7 +443,7 @@ module Tart
         rows
       end
 
-      def replay_entry(entry, results)
+      def replay_entry(entry, results, update_footer:, populate_history:)
         return unless entry.is_a?(Hash)
 
         case entry["type"]
@@ -388,24 +452,24 @@ module Tart
           return unless message.is_a?(Hash)
 
           case message["role"]
-          when "user" then replay_user(message)
-          when "assistant" then replay_assistant(message, results)
+          when "user" then replay_user(message, populate_history:)
+          when "assistant" then replay_assistant(message, results, update_footer:)
           when "bashExecution" then replay_user_bash(message)
           end
         when "compaction"
-          # pi :3903-3904 — a compaction summary is a spaced region,
-          # markdown-rendered (CompactionSummaryMessageComponent).
-          @scrollback << [Panel.blank_line]
-          enqueue_markdown(entry["summary"]) if entry["summary"].is_a?(String)
+          # pi :3903-3904 — Spacer(1), then the panel at its
+          # chronological position (renderSessionEntries case
+          # compactionSummary, riding the global expand state).
+          enqueue_compaction_panel(entry["summary"], entry["tokensBefore"])
         end
       end
 
-      def replay_user(message)
+      def replay_user(message, populate_history:)
         content = message["content"]
         return unless content.is_a?(String) && !content.strip.empty?
 
         enqueue_user_submission(content)
-        @history_sink.call(content) # pi renderInitialMessages populateHistory
+        @history_sink.call(content) if populate_history # pi renderInitialMessages populateHistory
       end
 
       # The replayed !-prefix bash execution (pi addMessageToChat's
@@ -426,7 +490,7 @@ module Tart
         )
       end
 
-      def replay_assistant(message, results)
+      def replay_assistant(message, results, update_footer:)
         content = message["content"]
         has_content = content.is_a?(String) && !content.strip.empty?
         reasoning = message["thinking"]
@@ -434,7 +498,7 @@ module Tart
         tool_calls = message["tool_calls"].is_a?(Hash) ? message["tool_calls"] : {}
         return unless has_content || has_reasoning || tool_calls.any?
 
-        @reseed_sink.call(message)
+        @reseed_sink.call(message) if update_footer
         # pi assistant-message.ts:103-105 — the spacer rides VISIBLE
         # content only (a tool-call-only assistant entry renders no blank
         # of its own; its tool block brings one).

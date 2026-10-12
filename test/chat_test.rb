@@ -3096,14 +3096,204 @@ module Tart
         chat.on_agent_event({type: :compaction, reason: :manual, tokens_before: 100, summary: "s"})
         draw(chat, session)
         refute_includes editor_area(session, chat), "Compacting context...", "cleared by the result event"
-        assert_includes transcript_lines(session, chat), "✻ compacted (manual, 100 tokens)",
-          "the post-hoc compaction line renders unchanged"
 
         chat.on_agent_event({type: :compaction_start, reason: :threshold})
         chat.on_agent_event({type: :agent_end})
         draw(chat, session)
         refute_includes editor_area(session, chat), "Auto-compacting...", "cleared by the run end"
       end
+    end
+
+    # --- the compaction panel + live rebuild (I30, pi
+    # compaction-summary-message.ts + compaction_end's result arm):
+    # the frozen payload shape injected directly (the lane contract). ---
+
+    # Collapsed panel bytes (AC1): the label row, the bg'd inner Spacer,
+    # then the three-fg-run hint row — customMessageText / dim ctrl+o /
+    # customMessageText — over the customMessageBg container (the
+    # skill-panel precedent), the dim ✻ scrollback line gone.
+    def test_compaction_renders_the_collapsed_panel_bytes
+      with_chat(width: 60) do |chat, session|
+        chat.on_agent_event({type: :compaction, reason: :threshold, tokens_before: 12_345, summary: "kept"})
+        draw(chat, session)
+
+        lines = chat.transcript_lines
+        assert_includes lines.join, "[compaction]", "the label row renders"
+        assert_includes lines.join, "Compacted from 12,345 tokens (ctrl+o to expand)",
+          "the grouped tokens hint row renders (toLocaleString grouping)"
+        refute_includes lines.join, "✻ compacted", "the dim scrollback line is replaced by the panel"
+
+        y_abs = session.buffer_content.index { |row| row.include?("[compaction]") }
+        row = session.buffer_content[y_abs]
+        assert_equal Theme[:custom_message_label], session.cell_fg(row.index("["), y_abs)
+        assert_includes session.cell_modifiers(row.index("["), y_abs), :bold
+        assert_equal Theme[:custom_message_bg], session.cell_bg(0, y_abs),
+          "the label row rides the customMessageBg container"
+
+        hint_y = session.buffer_content.index { |row| row.include?("Compacted from") }
+        hint_row = session.buffer_content[hint_y]
+        assert_equal Theme[:custom_message_text], session.cell_fg(hint_row.index("Compacted"), hint_y)
+        assert_equal Theme[:dim], session.cell_fg(hint_row.index("ctrl+o"), hint_y),
+          "the key rides the dim run (pi's three-fg-run split)"
+        assert_equal Theme[:custom_message_text], session.cell_fg(hint_row.index(" to expand"), hint_y)
+        assert_equal Theme[:custom_message_bg], session.cell_bg(hint_row.index("ctrl+o"), hint_y),
+          "the hint row rides the panel bg too"
+      end
+    end
+
+    # ctrl+o expands the compaction panel in place (the GLOBAL expand
+    # family — pi setExpanded(this.toolOutputExpanded) in the toggle's
+    # sweep): the bold markdown header + the summary as
+    # customMessageText prose, and back.
+    def test_ctrl_o_expands_the_compaction_panel
+      with_chat(width: 60) do |chat, session|
+        chat.on_agent_event({type: :compaction, reason: :manual, tokens_before: 15, summary: "earlier context"})
+        draw(chat, session)
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_includes lines.join, "Compacted from 15 tokens", "the bold markdown header renders expanded"
+        assert_includes lines.join, "earlier context", "the summary renders over the panel"
+        refute_includes lines.join, "(ctrl+o to expand)", "the hint dies expanded"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join, "(ctrl+o to expand)", "the second press collapses again"
+      end
+    end
+
+    # The live rebuild (AC2, pi compaction_end's result arm): the
+    # transcript clears — the MOTD wiped and NOT re-rendered — the kept
+    # entries re-render chronologically through the replay machinery,
+    # the panel appends LAST; the footer invalidates (the "?") without
+    # resetting the usage totals; the border status clears.
+    def test_compaction_rebuilds_kept_entries_then_the_panel
+      FileUtils.mkpath(File.join(@dir, ".tart"))
+      File.write(File.join(@dir, ".tart", "settings.json"), "{}") # the [Context] section's input
+      with_chat(width: 60, screen_height: 24, motd: true,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, auto_compact: true}) do |chat, session|
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join, "[Context]", "the MOTD renders before the compaction"
+        finish_message(chat, "kept reply")
+        assistant_done(chat, TokensDouble.new(10, 5, 0, 0))
+        send_message(chat, "hello")
+
+        chat.on_agent_event({type: :compaction_start, reason: :threshold})
+        chat.on_agent_event({type: :compaction, reason: :threshold, tokens_before: 100, summary: "the summary",
+                             entries: [
+                               {"type" => "message", "message" => {"role" => "user", "content" => "hello"}},
+                               {"type" => "message", "message" => {"role" => "assistant", "content" => "kept reply"}}
+                             ]})
+        draw(chat, session)
+
+        lines = chat.transcript_lines
+        joined = lines.join("\n")
+        refute_includes joined, "✻ compacted", "the dim line is replaced by the rebuild"
+        refute_includes joined, "[Context]", "the MOTD is wiped and NOT re-rendered"
+        refute_includes joined, "tart v#{Tart::VERSION}", "no fresh MOTD block (pi's settled screen has none)"
+        assert_includes joined, " hello", "the kept user entry re-renders through the replay machinery"
+        assert_includes joined, "kept reply", "the kept assistant entry re-renders"
+        panel_y = lines.index { |line| line.include?("Compacted from 100 tokens") }
+        assert panel_y, "the panel renders"
+        assert_operator panel_y, :>, lines.rindex { |line| line.include?("kept reply") },
+          "the panel appends LAST (pi addMessageToChat after renderSessionEntries)"
+        refute_includes editor_area(session, chat), "Auto-compacting",
+          "the border status clears on the result (the frozen I12 contract)"
+      end
+    end
+
+    # The rebuild's footer half (AC2): usage NOT reset (invalidate, not
+    # /new's reset) — the accumulated totals survive and the context
+    # numerator goes stale (pi's post-compaction "?").
+    def test_compaction_rebuild_invalidates_the_footer_without_resetting_usage
+      with_chat(width: 60, screen_height: 12,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, auto_compact: true}) do |chat, session|
+        assistant_done(chat, TokensDouble.new(10, 5, 0, 0))
+        draw(chat, session)
+        assert_includes footer_text(session), "↑10", "sanity: the totals accumulate"
+
+        chat.on_agent_event({type: :compaction, reason: :threshold, tokens_before: 100, summary: "s",
+                             entries: [{"type" => "message", "message" => {"role" => "assistant", "content" => "kept reply"}}]})
+        draw(chat, session)
+        footer = footer_text(session)
+        assert_includes footer, "↑10 ↓5", "the usage totals are NOT reset (pi invalidate, not /new)"
+        assert_includes footer, "?/1.0k (auto)", "the context numerator is stale (pi's post-compaction ?)"
+      end
+    end
+
+    # The rebuild does not duplicate editor history (pi's rebuild passes
+    # populateHistory: false — the pre-compaction entries are already
+    # there): the up-walk stops at the oldest entry instead of
+    # re-walking rebuilt copies.
+    def test_compaction_rebuild_does_not_duplicate_editor_history
+      with_headless_chat do |chat|
+        send_message(chat, "older")
+        send_message(chat, "newer")
+        chat.on_agent_event({type: :compaction, reason: :manual, tokens_before: 10, summary: "s",
+                             entries: [{"type" => "message", "message" => {"role" => "user", "content" => "older"}},
+                                       {"type" => "message", "message" => {"role" => "user", "content" => "newer"}}]})
+        chat.on_event(TUI.key_event("up"))
+        assert_equal "newer", chat.input
+        chat.on_event(TUI.key_event("up"))
+        assert_equal "older", chat.input
+        chat.on_event(TUI.key_event("up"))
+        assert_equal "older", chat.input, "the walk stops at the oldest — no rebuilt duplicates"
+      end
+    end
+
+    # An absent `entries` (the pre-integration worktree: the loop does
+    # not carry the payload yet) degrades gracefully — the panel renders
+    # over the cleared transcript (an empty replay, a blank transcript).
+    def test_compaction_without_entries_renders_the_panel_over_a_cleared_transcript
+      with_chat(width: 60) do |chat, session|
+        finish_message(chat, "pre-compaction reply")
+        draw(chat, session)
+        chat.on_agent_event({type: :compaction, reason: :overflow, tokens_before: 7, summary: "s"})
+        draw(chat, session)
+        lines = chat.transcript_lines
+        refute_includes lines.join, "pre-compaction reply", "the transcript cleared"
+        assert_includes lines.join, "[compaction]", "the panel still renders"
+        assert_includes lines.join, "Compacted from 7 tokens (ctrl+o to expand)",
+          "the panel rides the payload it carries (0 entries renders no rows)"
+      end
+    end
+
+    # The replay panel (AC1, pi renderSessionEntries case
+    # compactionSummary): a persisted compaction entry renders the
+    # panel — Spacer(1) + the collapsible container — at its
+    # chronological position, replacing the bare-markdown render; the
+    # compaction-count status line survives (pi renderInitialMessages
+    # :4209-4225 renders it after the entries).
+    def test_resume_renders_the_persisted_compaction_entry_as_the_panel
+      recorded = recorded_session_fixture
+      File.open(recorded, "a") do |file|
+        file.write("\n")
+        file.write(JSON.generate(
+          type: "compaction", id: "c1", parentId: "e4", timestamp: Agent::Session.now_iso,
+          summary: "earlier context", firstKeptEntryId: "e4", tokensBefore: 12_345, details: {}
+        ))
+      end
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_includes lines.join, "[compaction]", "the panel renders for the persisted entry"
+        assert_includes lines.join, "Compacted from 12,345 tokens (ctrl+o to expand)",
+          "the grouped tokens hint renders on the replay path too"
+        panel_y = lines.index { |line| line.include?("[compaction]") }
+        assert_operator panel_y, :>, lines.index { |line| line.include?("The file contains") },
+          "the panel renders at its chronological position (after the earlier entries)"
+        assert_includes lines.join, "Session compacted 1 time",
+          "the count status survives alongside the panels (pi renderInitialMessages)"
+      end
+    end
+
+    def test_grouped_tokens_matches_pi_s_locale_grouping
+      assert_equal "15", Render::Transcript.grouped_tokens(15)
+      assert_equal "12,345", Render::Transcript.grouped_tokens(12_345)
+      assert_equal "1,000,000", Render::Transcript.grouped_tokens(1_000_000)
+      assert_equal "0", Render::Transcript.grouped_tokens(0)
     end
 
     def test_escape_while_running_cancels_only_the_list_kernel_driven
