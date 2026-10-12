@@ -226,16 +226,8 @@ module Tart
 
       TUI.run(viewport: :fullscreen, bracketed_paste: true) do |session|
         kernel = Core::Loop.new(session:)
-        surface = Render::Chat.new(
-          session:, kernel:,
-          # Autocomplete sources (AC1): the builtin slash commands + the
-          # loaded skills + the prompt templates (the same catalog the
-          # Commands::Handler routes).
-          autocomplete: Render::SlashSource.new(commands: Commands::BUILTINS, skills: skills.skills,
-            prompts: prompts.templates),
-          motd: resume_path.nil?,
-          identity:, prompts: prompts.templates, extensions: mcp_servers.keys
-        )
+        surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
+          mcp_servers:, resume: resume_path, identity:, models:)
         tools = build_tools(workdir, settings, mcp_servers:)
         prompt = system_prompt(workdir, skills.skills)
 
@@ -400,6 +392,26 @@ module Tart
       return base if skills.empty?
 
       "#{base}\n\n#{Skills.format_skills_for_prompt(skills, Skills.skill_file_read_tool(SELECTED_TOOLS)).strip}"
+    end
+
+    # The chat surface (I27): the launcher's construction seam — the
+    # models.json catalog is REQUIRED, not defaulted: forgetting to
+    # thread it fails loud at construction (the boot crash pin) instead
+    # of silently degenerating the /model menu to the boot model (the
+    # defect the post-integration probe caught: the launcher wired the
+    # catalog into build_chat/the handler/footer_data but not here).
+    def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:)
+      Render::Chat.new(
+        session:, kernel:,
+        # Autocomplete sources (AC1): the builtin slash commands + the
+        # loaded skills + the prompt templates (the same catalog the
+        # Commands::Handler routes).
+        autocomplete: Render::SlashSource.new(commands: Commands::BUILTINS, skills: skills,
+          prompts: prompts),
+        motd: resume.nil?,
+        identity:, prompts:, extensions: mcp_servers.keys,
+        models:
+      )
     end
 
     # The chat (I27): the boot model pair resolves env > models.json

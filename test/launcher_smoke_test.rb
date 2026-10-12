@@ -134,6 +134,49 @@ module Tart
       assert_nil Executable.resume_hint(nil, "tart"), "no recorder (boot failure) — nothing"
     end
 
+    # The surface construction seam (I27): the launcher wires the loaded
+    # models.json catalog into the chat surface — build_surface's catalog
+    # is REQUIRED, so a launcher that forgets it fails loud at construction
+    # instead of silently degenerating the /model menu to the boot model
+    # (the defect the post-integration probe caught: the catalog was
+    # threaded into build_chat/the handler/footer_data but not the
+    # surface; the class-level tests inject models: directly and never
+    # see the seam).
+    def test_build_surface_threads_the_catalog_into_the_model_menu
+      launcher
+      home = Dir.mktmpdir("tart-surface-home-")
+      FileUtils.mkdir_p(File.join(home, ".tart"))
+      File.write(File.join(home, ".tart", "models.json"), <<~JSON)
+        {"providers": {"mock": {"models": [{"id": "mock-1"}, {"id": "mock-2"}]}}}
+      JSON
+      models = Models.load(root: File.join(home, ".tart"))
+
+      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 24) do |session|
+        surface = Executable.build_surface(session:, kernel: idle_kernel,
+          skills: [], prompts: [], mcp_servers: {}, resume: nil,
+          identity: Identity::DEFAULT, models: models)
+        surface.open_model_menu
+
+        assert surface.menu_open?, "the menu opens"
+        assert_equal "mock-1", surface.menu_selection&.fetch(:id),
+          "the menu lists the catalog (not the degenerate boot model)"
+        surface.on_event(TUI.key_event("down"))
+        assert_equal "mock-2", surface.menu_selection&.fetch(:id),
+          "the second catalog entry is reachable — both staged models are in the menu"
+      end
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
+    # A render-idle kernel double (the menu assertions read state; the
+    # render loop never runs) — chat_test's IdleKernel shape.
+    def idle_kernel
+      Object.new.tap do |k|
+        k.define_singleton_method(:animate) { |**| nil }
+        k.define_singleton_method(:request_draw) { nil }
+      end
+    end
+
     def smoke_env(home, server)
       {
         "PATH" => ENV.fetch("PATH", nil),
