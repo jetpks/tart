@@ -1,38 +1,79 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# tool-pending-probe — the I26 mid-flight capture probe (NOT a parity gate;
-# evidence for the scratch report only).
+# tool-pending-probe — the I26 mid-flight capture probe; since I34 also a
+# deterministic GATE for the pending-state render (AC5).
 #
 # Drives BOTH apps through the probe_tool_pending scenario (one slow bash
 # call) and captures the screen DURING the tool execution — the settle-based
 # runner can only see the settled end state. Question answered: pi renders
 # its tool panel mid-flight with the toolPendingBg background
-# (tool-execution.ts:90-91, dark.json:37 okhsl(229 5% 24%)); the port
-# enqueues the tool block only at :tool_execution_end (chat.rb) — the
-# mid-flight frames show nothing.
+# (tool-execution.ts:90-91, dark.json:37 okhsl(229 5% 24%)); before I34 the
+# port enqueued the tool block only at :tool_execution_end (chat.rb) — the
+# mid-flight frames showed nothing.
 #
-#   tool-pending-probe [--out DIR]
+#   tool-pending-probe [--out DIR] [--gate]
 #
-# Output: per app, numbered frame pairs (<app>-frame-NN.txt/.styled) plus a
-# digest line per frame on stdout (tool rows present? bg SGR set).
+# Default (evidence) mode: per app, numbered frame pairs
+# (<app>-frame-NN.txt/.styled) plus a digest line per frame on stdout (tool
+# rows present? bg SGR set). Exit 0.
+#
+# --gate (the frozen instrument, I34 AC5): per app, PASS iff (a) at least
+# one pre-settle frame shows ≥1 tool-mark row AND the pending-bg SGR
+# 48;2;52;56;58 (Theme[:tool_pending_bg] #34383a), and (b) the settled
+# frame (the last capture — the loop exits after 4 identical frames) shows
+# exactly one tool-mark row AND zero occurrences of that SGR. Both apps must
+# pass (pi = the oracle control). On pass prints TOOL_PENDING_GATE_OK and
+# exits 0; otherwise prints the failing condition's per-frame digest and
+# exits 1.
 #
 # Stdlib only — runs without Bundler.
 
 require "optparse"
 require_relative "../lib/tui_split_rig"
 
-options = {out: "tmp/tool-pending-probe-#{Time.now.to_i}"}
+options = {out: "tmp/tool-pending-probe-#{Time.now.to_i}", gate: false}
 parser = OptionParser.new do |p|
   p.on("--out DIR", "output directory (default tmp/tool-pending-probe-<ts>)") { |d| options[:out] = d }
+  p.on("--gate", "the I34 deterministic gate: pending bg mid-flight, exactly one settled block, no pending bg at settle") do
+    options[:gate] = true
+  end
 end
 parser.parse!(ARGV)
 
 BG_SGR = /\[48;2;[\d;]+m/
 TOOL_MARK = "sleep 6"
+# Theme[:tool_pending_bg] #34383a = rgb(52,56,58) (pi dark.json:36
+# toolPendingBg) — the mid-flight bg the gate exists to pin.
+PENDING_SGR = /\[48;2;52;56;58m/
 
 def bg_set(text)
   text.scan(BG_SGR).tally.map { |sgr, n| "#{sgr}x#{n}" }.sort
+end
+
+# The gate's per-frame facts (the failing-condition digest).
+def pending_sgr_count(styled)
+  styled.scan(PENDING_SGR).length
+end
+
+# The AC5 verdict for one app: (a) ≥1 pre-settle frame with a tool-mark row
+# AND the pending-bg SGR; (b) the settled frame (the last capture — the loop
+# exits after 4 identical frames) shows exactly one tool-mark row and zero
+# pending-bg occurrences. Returns nil when both hold, else the digest lines.
+def gate_failure(app, frames)
+  pre = frames[0...-1]
+  settled = frames.last
+  return "#{app}: no frames captured" if settled.nil?
+
+  a_ok = pre.any? { |frame| frame[:tool_rows] >= 1 && frame[:pending].positive? }
+  b_ok = settled[:tool_rows] == 1 && settled[:pending].zero?
+  return nil if a_ok && b_ok
+
+  lines = []
+  lines << "#{app}: FAIL (a) no pre-settle frame with a tool-mark row + the pending-bg SGR" unless a_ok
+  lines << "#{app}: FAIL (b) settled frame tool-rows=#{settled[:tool_rows]} (want 1) pending-sgr=#{settled[:pending]} (want 0)" unless b_ok
+  frames.each { |frame| lines << format("  %s frame %02d: tool-rows=%d pending-sgr=%d", app, frame[:n], frame[:tool_rows], frame[:pending]) }
+  lines
 end
 
 scenario = TuiSplitRig::Scenario.load(File.expand_path("../scenarios/probe_tool_pending.yml", __dir__))
@@ -41,6 +82,7 @@ stage = File.expand_path(options[:out])
 FileUtils.mkdir_p(stage)
 
 mock = MockLLMServer.new.script(scenario.responses).start
+gate_failures = []
 begin
   %w[pi tart].each do |app|
     mock.rearm!
@@ -52,6 +94,7 @@ begin
     frame = 0
     last = nil
     same = 0
+    frames = []
     loop do
       plain = runner.capture(session)
       styled = runner.capture_styled(session)
@@ -61,6 +104,7 @@ begin
       tool_rows = plain.lines.count { |line| line.include?(TOOL_MARK) }
       puts format("%s frame %02d: tool-mark-rows=%d bg=%s",
         app, frame, tool_rows, bg_set(styled).join(","))
+      frames << {n: frame, tool_rows:, pending: pending_sgr_count(styled)} if options[:gate]
 
       same = plain == last ? same + 1 : 0
       last = plain
@@ -70,9 +114,19 @@ begin
       sleep 0.5
     end
     runner.teardown(session)
+    if options[:gate]
+      failure = gate_failure(app, frames)
+      gate_failures.concat(failure) if failure
+    end
   end
 ensure
   mock.stop
 end
 
 puts "frames at #{stage}"
+if options[:gate]
+  gate_failures.each { |line| puts line }
+  exit 1 unless gate_failures.empty?
+
+  puts "TOOL_PENDING_GATE_OK"
+end

@@ -31,22 +31,31 @@ module Tart
         "#{minutes / 60}h #{minutes % 60}m #{remainder}s"
       end
 
+      # pi formatShellCall (renderers/bash.ts:41-44): the header is
+      # toolTitle bold — NOT bashMode (that token is the user-bash !
+      # block's header; the old bashMode pin was the system-theme
+      # artifact). An empty command renders the "..." placeholder.
+      def format_shell_call(command)
+        "$ #{command.to_s.empty? ? "..." : command}"
+      end
+
       # The bash tool block (I17 — pi's shell renderer over the tool-turn
       # component), +expanded+ = pi's toolOutputExpanded state: the output
       # renders whole (no collapse, no hint — bash.ts:67-70 `if
       # (options.expanded) addChild(Text)` vs the VisualLinePreview); the
-      # notice + Took compose identically in both states.
+      # notice + Took compose identically in both states. The output
+      # lines render blank-separated from the header (bash.ts:78-84 — the
+      # Text children's leading "\n"), and the muted `Took <duration>`
+      # line rides after (bash.ts:105-109 — a nil/absent duration, the
+      # replay path, renders none; the recorded gap is itemized, never
+      # invented).
       def bash_block_rows(command, output, duration, width, expanded:, error: false)
         # The Box(1,1) panel (tool-execution.ts:90): the Spacer blank
         # stays PLAIN, every row after rides the result bg (an isError
         # result renders toolErrorBg — tool-execution.ts:272-275).
         bg = error ? Theme[:tool_error_bg] : Theme[:tool_success_bg]
         region = [Panel.blank_line, Panel.panel_blank_line(width, bg)]
-        # pi formatShellCall (renderers/bash.ts:41-44): the header is
-        # toolTitle bold — NOT bashMode (that token is the user-bash !
-        # block's header; the old bashMode pin was the system-theme
-        # artifact).
-        region.concat(Panel.padded_fg_rows("$ #{command.to_s.empty? ? "..." : command}",
+        region.concat(Panel.padded_fg_rows(format_shell_call(command),
           width, fg: Theme[:toolTitle], modifiers: [:bold], bg: bg))
         body, notice = split_truncation_notice(output)
         unless body.empty?
@@ -68,6 +77,20 @@ module Tart
         end
         region << Panel.panel_blank_line(width, bg)
         region
+      end
+
+      # The PENDING bash block (I34 — pi renders the running call's block
+      # under toolPendingBg mid-flight, tool-execution.ts:90-91 +
+      # updateDisplay :271-277 isPartial): the settled shape truncated to
+      # the call — the PLAIN Spacer blank, the pending-bg pad, the bold
+      # toolTitle `$ <command>` header, the pending-bg pad. No output, no
+      # Took, no expand hint — nothing exists to show yet.
+      def pending_block_rows(command, width)
+        bg = Theme[:tool_pending_bg]
+        [Panel.blank_line, Panel.panel_blank_line(width, bg),
+         *Panel.padded_fg_rows(format_shell_call(command), width,
+           fg: Theme[:toolTitle], modifiers: [:bold], bg: bg),
+         Panel.panel_blank_line(width, bg)]
       end
 
       # pi renderers/bash.ts:88-99 — the DISPLAYED notice is composed from

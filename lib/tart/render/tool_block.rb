@@ -40,9 +40,10 @@ module Tart
       # contentText panel (tool-execution.ts:90-92 — Text over the result
       # bg) around {tool_line}'s preview, full-width bg rows; the port's
       # I17 wrap geometry (viewport width, tool_line's own indent) stands —
-      # unmeasured by any scenario, the bg is the pi-source carry.
-      def generic_panel_rows(name, result, width)
-        bg = Panel.tool_panel_bg(result)
+      # unmeasured by any scenario, the bg is the pi-source carry. +bg:+
+      # overrides the result-derived bg (I34 — the PENDING shape rides
+      # Theme[:tool_pending_bg] while the call runs, result nil).
+      def generic_panel_rows(name, result, width, bg: Panel.tool_panel_bg(result))
         region = [Panel.panel_blank_line(width, bg)]
         Text.wrap(tool_line(name, result), width).each do |row|
           fill = [width - TUI.text_width(row), 0].max
