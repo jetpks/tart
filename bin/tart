@@ -21,10 +21,6 @@ require_relative "../lib/tart"
 
 module Tart
   module Executable
-    # The built-in defaults are Settings::DEFAULTS (the settings module's
-    # resolution bottoms out there); the loadout is its tool base.
-    SELECTED_TOOLS = Settings::DEFAULT_TOOLS
-
     # async 2.46's reactor wrapper instantiates an IO::Buffer on the first
     # in-reactor IO (once per process) and ruby 4.0.7 blames the outermost
     # user frame with an experimental warning — on a quiet first turn it
@@ -72,7 +68,8 @@ module Tart
           compaction {enabled, reserveTokens, keepRecentTokens},
           defaultTools (plain names replace the default loadout; +name
           adds, -name removes). Environment overrides settings for
-          model/provider/apiBase/apiKey (TART_* above).
+          model/provider/apiBase/apiKey — under the identity's namespace
+          (see Environment).
 
         Skills:
           Skills load from ~/.tart/skills (user) and <workdir>/.tart/skills
@@ -105,11 +102,11 @@ module Tart
           baseUrl, apiKey, api, "models": [{id, name, reasoning,
           contextWindow, maxTokens}]}}} plus an optional "default":
           "<provider/model-id>" boot reference. The boot model resolves
-          TART_MODEL/TART_PROVIDER > the models.json default > the
-          settings defaultModel/defaultProvider; a provider's baseUrl/
-          apiKey feed the endpoint (TART_API_KEY/TART_API_BASE still
-          override). ctrl+s in the model menu persists defaultProvider +
-          defaultModel to ~/.tart/settings.json.
+          the identity-namespaced MODEL/PROVIDER env (below) > the
+          models.json default > the settings defaultModel/defaultProvider;
+          a provider's baseUrl/apiKey feed the endpoint (the namespaced
+          API_KEY/API_BASE still override). ctrl+s in the model menu
+          persists defaultProvider + defaultModel to ~/.tart/settings.json.
 
         Prompt templates:
           Prompt templates load from ~/.tart/prompts and
@@ -125,15 +122,22 @@ module Tart
           the loadout as mcp__<server>__<tool>.
 
         Environment:
-          TART_MODEL         model id (default: #{Settings::DEFAULTS["defaultModel"]})
-          TART_PROVIDER      LLM provider (default: #{Settings::DEFAULTS["defaultProvider"]}, chat-completions protocol)
-          TART_API_KEY       provider API key (required; no default)
-          TART_API_BASE      OpenAI-compatible endpoint (default: #{Settings::DEFAULTS["apiBase"]})
-          TART_CONTEXT_WINDOW  context-window override in tokens (default: the model's
+          Every app variable speaks the resolved identity's namespace —
+          the face (below) uppercased: pi reads PI_MODEL, tart
+          TART_MODEL, foo FOO_MODEL. Shown here as <IDENTITY>_*. Only
+          TART_IDENTITY and TART_MCP_CONFIG are literal TART_ knobs
+          (bootstrap: the identity key cannot depend on its own output).
+
+          <IDENTITY>_MODEL         model id (default: #{Settings::DEFAULTS["defaultModel"]})
+          <IDENTITY>_PROVIDER      LLM provider (default: #{Settings::DEFAULTS["defaultProvider"]}, chat-completions protocol)
+          <IDENTITY>_API_KEY       provider API key (required; no default)
+          <IDENTITY>_API_BASE      OpenAI-compatible endpoint (default: #{Settings::DEFAULTS["apiBase"]})
+          <IDENTITY>_CONTEXT_WINDOW  context-window override in tokens (default: the model's
                              context window; the default fireworks model resolves to
                              #{Settings::MODEL_CONTEXT_WINDOWS[Settings::DEFAULTS["defaultModel"]]})
           TART_MCP_CONFIG    MCP config path (default: ~/.tart/mcp.json)
-          TART_IDENTITY      the face to show: pi (default) or tart (--identity overrides)
+          TART_IDENTITY      the face to show: any non-empty name — pi (default),
+                             tart, or your own (--identity overrides)
 
         Keys: type + Enter to send (steers a running agent); Escape
         interrupts a running turn; Ctrl+C clears the input (twice exits);
@@ -160,7 +164,7 @@ module Tart
           options[:resume_given] = true
         end
         parser.on("--identity IDENTITY",
-          "the face to show: pi (default) or tart (see Identity)") do |identity|
+          "the face to show: any non-empty name (default pi) — branding, prompt preamble and the app env namespace follow it") do |identity|
           options[:identity] = identity
         end
         parser.on("-h", "--help", "show this help") { $stdout.write(usage); exit 0 }
@@ -186,25 +190,28 @@ module Tart
       result = Settings.load(cwd: workdir)
       settings = result.settings
       report_diagnostics(result.diagnostics)
+      identity = resolve_identity(options, settings)
       models = Models.load
       warn "tart: #{models.error}" if models.error
-      require_api_key(settings, models)
+      require_api_key(settings, models, identity:)
       skills = Skills.load(cwd: workdir)
       abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
 
       exit Print.run(
         prompt: options[:print],
-        chat: build_chat(settings, models, Models.resolve_boot_model(models, settings)),
+        chat: build_chat(settings, models, Models.resolve_boot_model(models, settings, identity:), identity:),
         tools: build_tools(workdir, settings),
-        system_prompt: system_prompt(workdir, skills.skills)
+        system_prompt: system_prompt(workdir, settings, skills.skills, identity)
       )
     end
 
     def interactive(options, workdir)
       result = Settings.load(cwd: workdir)
       settings = result.settings
-      # The identity seam (I16): CLI > TART_IDENTITY env > settings
-      # "identity" (Tart::Identity is the one resolution point).
+      # The identity seam (I16, free-form since I32): CLI > TART_IDENTITY
+      # env > settings "identity" (Tart::Identity is the one resolution
+      # point). Resolved before any env-tier read so the namespace is
+      # settled (the load order: file → identity → env overrides).
       identity = resolve_identity(options, settings)
       skills = Skills.load(cwd: workdir)
       prompts = Prompts.load(cwd: workdir)
@@ -213,7 +220,7 @@ module Tart
       # boot-model resolution's middle layer; a load/parse/schema
       # failure sets its error (surfaced below, never a crash).
       models = Models.load
-      require_api_key(settings, models)
+      require_api_key(settings, models, identity:)
 
       # The resume path is known before the surface is built: a resumed
       # boot skips the MOTD (item 3 — pi's chat container gets the
@@ -229,7 +236,7 @@ module Tart
         surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
           mcp_servers:, resume: resume_path, identity:, models:)
         tools = build_tools(workdir, settings, mcp_servers:)
-        prompt = system_prompt(workdir, skills.skills)
+        prompt = system_prompt(workdir, settings, skills.skills, identity)
 
         # /new's reset seam: a fresh session is a new recorder (new session
         # file, no parent) plus a fresh Agent::Loop on the same settings,
@@ -239,12 +246,12 @@ module Tart
           recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_target)
           current_recorder = recorder
           seed_messages = resume_target ? Agent::Session.context_messages(resume_target) : []
-          # The boot model resolves per session (env > models.json
-          # "default" > Settings — I27), so a ctrl+s persisted default
-          # is honored by the next /new too.
-          boot = Models.resolve_boot_model(models, settings)
-          chat = build_chat(settings, models, boot)
-          surface.footer_data = footer_data(workdir, settings, boot:, chat:)
+          # The boot model resolves per session (identity-namespaced env >
+          # models.json "default" > Settings — I27), so a ctrl+s persisted
+          # default is honored by the next /new too.
+          boot = Models.resolve_boot_model(models, settings, identity:)
+          chat = build_chat(settings, models, boot, identity:)
+          surface.footer_data = footer_data(workdir, settings, boot:, chat:, identity:)
           surface.agent = Agent::Loop.new(
             chat:,
             tools:,
@@ -252,8 +259,9 @@ module Tart
             on_event: ->(event) { surface.on_agent_event(event) },
             recorder:,
             seed_messages:,
-            context_window: Settings.resolve_context_window(settings:, model: chat.model),
-            compaction: Settings.compaction_kwargs(settings)
+            context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
+            compaction: Settings.compaction_kwargs(settings),
+            identity:
           )
         end
 
@@ -316,8 +324,16 @@ module Tart
     # Identity.resolve's invalid value aborts the launch — pi's CLI prints
     # its errors bare ("Error: <message>", cli.ts:333); the port's
     # app-name prefix stays (no comparable pi prefix, itemized).
+    # The identity seam (I16, free-form since I32): CLI > TART_IDENTITY
+    # env > settings "identity" (Tart::Identity is the one resolution
+    # point). The resolved face is recorded for the one render path that
+    # cannot take it threaded (chat.rb's frozen Motd header call) — pi's
+    # CLI prints its errors bare ("Error: <message>", cli.ts:333); the
+    # port's app-name prefix stays (no comparable pi prefix, itemized).
     def resolve_identity(options, settings)
-      Identity.resolve(cli: options[:identity], settings:)
+      identity = Identity.resolve(cli: options[:identity], settings:)
+      Identity.current = identity
+      identity
     rescue Identity::Error => e
       abort "tart: #{e.message}"
     end
@@ -338,22 +354,22 @@ module Tart
       Agent::Session.preview(path) || File.basename(path)
     end
 
-    # The boot provider's key (I27): env > the models.json provider
-    # config > the Settings key.
-    def require_api_key(settings, models = nil)
-      boot = Models.resolve_boot_model(models, settings)
-      key = ENV["TART_API_KEY"] || models&.provider(boot[:provider])&.fetch(:api_key, nil) ||
-        Settings.resolve_setting("apiKey", settings)
-      abort "TART_API_KEY is not set (see --help)." if key.nil?
+    # The boot provider's key (I27): identity-namespaced env > the
+    # models.json provider config > the Settings key.
+    def require_api_key(settings, models = nil, identity: Identity::DEFAULT)
+      boot = Models.resolve_boot_model(models, settings, identity:)
+      key = ENV[Identity.env_key(identity, "API_KEY")] || models&.provider(boot[:provider])&.fetch(:api_key, nil) ||
+        Settings.resolve_setting("apiKey", settings, identity:)
+      abort "#{Identity.env_prefix(identity)}API_KEY is not set (see --help)." if key.nil?
     end
 
     # Footer facts (AC4): the I10 resolved window is the context-usage
     # denominator; the model id is the settings-resolved one; the model
     # metadata (provider label + reasoning capability — the footer's model
     # segment, pi footer.ts:226-258) resolves off the chat's registry
-    # model, stageable via TART_MODEL_PROVIDER / TART_MODEL_REASONING
-    # (Settings); the thinking level rides the settings-resolved value.
-    def footer_data(workdir, settings, boot: nil, chat:)
+    # model, stageable via <IDENTITY>_MODEL_REASONING (Settings); the
+    # thinking level rides the settings-resolved value.
+    def footer_data(workdir, settings, boot: nil, chat:, identity: Identity::DEFAULT)
       # Optional +boot+: the in-launcher call sites resolve the boot pair
       # per session; the legacy (settings, chat) shape resolves it from
       # settings alone.
@@ -369,8 +385,8 @@ module Tart
         cwd: workdir,
         model: boot[:id],
         default_provider: boot[:provider],
-        reasoning: Settings.model_reasoning_capable(settings, chat.model),
-        context_window: Settings.resolve_context_window(settings:, model: chat.model),
+        reasoning: Settings.model_reasoning_capable(settings, chat.model, identity:),
+        context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
         auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
         thinking_level: Settings.resolve_thinking_level(settings)
       }
@@ -383,15 +399,21 @@ module Tart
       end
     end
 
-    # The port's custom preamble plus the skills block (pi emits the
-    # <skills> section when a reader tool is available, system-prompt.ts:
-    # 175-182 — read/bash are always in the launcher's loadout).
-    def system_prompt(workdir, skills = [])
-      base = "You are a coding assistant working in #{workdir}. " \
-        "Inspect files with read/grep/find before editing; keep answers brief."
-      return base if skills.empty?
-
-      "#{base}\n\n#{Skills.format_skills_for_prompt(skills, Skills.skill_file_read_tool(SELECTED_TOOLS)).strip}"
+    # The composed harness prompt (pi's system-prompt.ts, wired I32): the
+    # full section stack — the identity-named preamble, <tools>, <rules>,
+    # <docs> (pi's own install paths, owner ruling 2026-10-12), the
+    # discovered context files, the loaded skills, <cwd> — replacing the
+    # I04-era terse string. The loadout is the settings-resolved one (the
+    # same list Tools::Registry builds from).
+    def system_prompt(workdir, settings, skills, identity)
+      Agent::SystemPrompt.build(
+        selected_tools: Settings.selected_tools(settings),
+        cwd: workdir,
+        context_files: Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root),
+        docs_paths: Agent::SystemPrompt.pi_docs_paths,
+        skills: skills,
+        identity: identity
+      )
     end
 
     # The chat surface (I27): the launcher's construction seam — the
@@ -414,16 +436,16 @@ module Tart
       )
     end
 
-    # The chat (I27): the boot model pair resolves env > models.json
-    # "default" > Settings ({Models.resolve_boot_model}); the resolved
-    # provider's models.json config (baseUrl/apiKey/api) slots between
-    # the env overrides and the Settings keys — TART_API_KEY/TART_API_BASE
-    # keep working against it.
-    def build_chat(settings, models, boot)
+    # The chat (I27): the boot model pair resolves identity-namespaced env
+    # > models.json "default" > Settings ({Models.resolve_boot_model});
+    # the resolved provider's models.json config (baseUrl/apiKey/api)
+    # slots between the env overrides and the Settings keys — the
+    # identity-namespaced API_KEY/API_BASE keep working against it.
+    def build_chat(settings, models, boot, identity: Identity::DEFAULT)
       provider = models.provider(boot[:provider])
       context = RubyLLM.context do |config|
-        config.openai_api_key = ENV["TART_API_KEY"] || provider&.fetch(:api_key, nil) || Settings.resolve_setting("apiKey", settings)
-        config.openai_api_base = ENV["TART_API_BASE"] || provider&.fetch(:base_url, nil) || Settings.resolve_setting("apiBase", settings)
+        config.openai_api_key = ENV[Identity.env_key(identity, "API_KEY")] || provider&.fetch(:api_key, nil) || Settings.resolve_setting("apiKey", settings, identity:)
+        config.openai_api_base = ENV[Identity.env_key(identity, "API_BASE")] || provider&.fetch(:base_url, nil) || Settings.resolve_setting("apiBase", settings, identity:)
         config.request_timeout = 120
         config.max_retries = 1
       end

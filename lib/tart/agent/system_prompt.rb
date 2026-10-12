@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../skills"
+require_relative "context_files"
 
 module Tart
   module Agent
@@ -18,6 +19,12 @@ module Tart
     # port (the goldens depend on it).
     module SystemPrompt
       DEFAULT_SELECTED_TOOLS = %w[read bash edit write].freeze
+
+      # pi's installed package (the <docs> paths point at it — owner
+      # ruling 2026-10-12: pi's paths stay). Resolved like pi's own
+      # getPackageDir (config.ts): realpath the `pi` on PATH, walk up to
+      # the package.json carrying this name.
+      PI_PACKAGE = "@earendil-works/pi-coding-agent"
 
       # Tool snippets and guideline bullets, from pi's tools
       # (*ToolSystemPromptContribution).
@@ -43,30 +50,36 @@ module Tart
           "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with " \
             "large unchanged regions."
         ],
-        "bash" => ["You can inspect PI_* environment variables for current model and session details."]
+        # The %s takes the identity's env namespace (pi bash.ts:47 — pi
+        # mode renders PI_* byte-identically, tart TART_*, foo FOO_*).
+        "bash" => ["You can inspect %s* environment variables for current model and session details."]
       }.freeze
 
-      PREAMBLE = "You are an expert coding assistant operating inside pi, a coding agent harness. You help " \
+      # pi system-prompt.ts:144-145 — the identity name templates in
+      # ("inside foo", owner ruling 1); pi mode is byte-identical.
+      PREAMBLE = "You are an expert coding assistant operating inside %s, a coding agent harness. You help " \
         "users by reading files, executing commands, editing code, and writing new files."
 
       module_function
 
       # Ordered section hash (pi's buildSystemPromptSections); +skills+ is
       # additive — empty (the default) emits no `<skills>` section.
-      # +docs_paths+ replaces pi's getReadmePath/getDocsPath/getExamplesPath
-      # dynamic segment.
+      # +docs_paths+ carries pi's getReadmePath/getDocsPath/getExamplesPath
+      # triple ({pi_docs_paths}); nil (pi's install not found — pi itself
+      # can never be in that state) emits no `<docs>` section.
       def sections(selected_tools: DEFAULT_SELECTED_TOOLS, append_system_prompt: "", cwd:,
-                   context_files: [], docs_paths: nil, skills: [])
+                   context_files: [], docs_paths: nil, skills: [], identity: Identity::DEFAULT)
         declared = selected_tools
 
         result = {}
-        result[:preamble] = PREAMBLE
+        result[:preamble] = format(PREAMBLE, identity)
         visible_tools = declared.select { |name| TOOL_SNIPPETS[name] }
         tools = visible_tools.empty? ? "(none)" : visible_tools.map { |name| "- #{name}: #{TOOL_SNIPPETS[name]}" }.join("\n")
         result[:tools] = "#{tools}\n\nIn addition to the tools above, you may have access to other custom tools " \
           "depending on the project."
-        result[:rules] = build_rules(declared)
-        readme, docs, examples = docs_paths
+        result[:rules] = build_rules(declared, identity)
+        if docs_paths
+          readme, docs, examples = docs_paths
         result[:docs] = "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, " \
           "themes, skills, or TUI):\n" \
           "- Main documentation: #{readme}\n" \
@@ -83,6 +96,7 @@ module Tart
           "- When working on pi topics, read the docs and examples, and follow .md cross-references before " \
           "implementing\n" \
           "- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
+        end
         result[:addendum] = append_system_prompt unless append_system_prompt.empty?
         unless context_files.empty?
           result[:project_context] = [
@@ -105,7 +119,9 @@ module Tart
       end
 
       # The rule bullets (pi's buildRules): trimmed, deduped, order kept.
-      def build_rules(selected_tools)
+      # Tool guideline bullets format their %s holes with the identity's
+      # env namespace (pi mode → PI_*).
+      def build_rules(selected_tools, identity = Identity::DEFAULT)
         rules = []
         seen = []
         add = lambda do |rule|
@@ -124,7 +140,7 @@ module Tart
         add.call("Use bash for file operations like ls, rg, find") if has_bash && !has_grep && !has_find && !has_ls
 
         selected_tools.each do |name|
-          (TOOL_GUIDELINES[name] || []).each { |rule| add.call(rule) }
+          (TOOL_GUIDELINES[name] || []).each { |rule| add.call(format(rule, Identity.env_prefix(identity))) }
         end
         add.call("Be concise in your responses")
         add.call("Show file paths clearly when working with files")
@@ -136,9 +152,51 @@ module Tart
       # by a blank line, empty parts dropped. Sections wraps each
       # non-preamble section in its tag exactly once.
       def build(selected_tools: DEFAULT_SELECTED_TOOLS, append_system_prompt: "", cwd:, context_files: [],
-                docs_paths: nil, skills: [])
-        ordered = sections(selected_tools:, append_system_prompt:, cwd:, context_files:, docs_paths:, skills:)
+                docs_paths: nil, skills: [], identity: Identity::DEFAULT)
+        ordered = sections(selected_tools:, append_system_prompt:, cwd:, context_files:, docs_paths:,
+                           skills:, identity:)
         ordered.values.reject { |content| content.nil? || content.empty? }.join("\n\n")
+      end
+
+      # pi's <docs> triple (config.ts getReadmePath/getDocsPath/
+      # getExamplesPath :443-457): resolve(join(packageDir, ...)). nil when
+      # the package can't be located ({pi_package_dir}).
+      def pi_docs_paths(pi_bin: nil)
+        dir = pi_package_dir(pi_bin:)
+        dir && [File.join(dir, "README.md"), File.join(dir, "docs"), File.join(dir, "examples")]
+      end
+
+      # pi getPackageDir (config.ts:107-114): realpath the running entry —
+      # the `pi` on PATH, a symlink into the package — and walk up to the
+      # directory whose package.json carries pi's name. The realpath also
+      # settles mise-style alias dirs (…/node/latest/bin/pi →
+      # …/node/24.18.0/…), matching the paths pi itself renders. nil when
+      # `pi` is absent or the walk bottoms out.
+      def pi_package_dir(pi_bin: nil)
+        pi_bin ||= ENV["PATH"].to_s.split(File::PATH_SEPARATOR).lazy
+                              .map { |dir| File.join(dir, "pi") }
+                              .find { |candidate| File.file?(candidate) && File.executable?(candidate) }
+        return nil unless pi_bin
+
+        real = File.realpath(pi_bin)
+        dir = File.dirname(real)
+        loop do
+          package_json = File.join(dir, "package.json")
+          return dir if File.file?(package_json) && parse_package_name(package_json) == PI_PACKAGE
+
+          parent = File.dirname(dir)
+          return nil if parent == dir
+
+          dir = parent
+        end
+      rescue Errno::ENOENT
+        nil
+      end
+
+      def parse_package_name(path)
+        JSON.parse(File.read(path))["name"]
+      rescue JSON::ParserError, StandardError
+        nil
       end
     end
   end

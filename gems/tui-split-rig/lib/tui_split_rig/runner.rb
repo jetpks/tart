@@ -184,7 +184,7 @@ module TuiSplitRig
     # The tart-side mirror of the pi compaction staging: the staged HOME's
     # global settings (settings.rb global root — HOME/.tart/settings.json)
     # carrying the same zeroed compaction knobs. The context window itself
-    # rides the TART_CONTEXT_WINDOW env in tart_command.
+    # rides the identity-namespaced CONTEXT_WINDOW env in tart_command.
     #
     # The model-menu staging (I27): HOME/.tart/models.json — pi's staged
     # models.json shape (providers → {baseUrl, apiKey, api, models}) with
@@ -220,12 +220,13 @@ module TuiSplitRig
     # survives teardown, and no real HOME dotfile is ever touched (staged
     # HOME on every pane, pi included).
     def pi_command(home, agent_dir)
-      "exec env #{env_list(staged_env("pi",
+      staged = staged_env("pi",
         "HOME" => home,
         "PATH" => "#{File.dirname(@pi_bin)}:#{ENV.fetch('PATH', '')}",
         "PI_CODING_AGENT_DIR" => agent_dir,
         "PI_OFFLINE" => "1"
-      ))} #{Shellwords.escape(@pi_bin)} --model mock/mock-1"
+      )
+      "exec env #{env_flags(staged)} #{Shellwords.escape(@pi_bin)} --model mock/mock-1"
     end
 
     def tart_command(sandbox, home, port)
@@ -235,16 +236,34 @@ module TuiSplitRig
       # `bundle check` clean under a staged HOME, no .bundle/ created). An
       # empty BUNDLE_PATH HIDES those gems (bundler exits before boot),
       # which is why I01 shipped a pre-populated bundle dir.
-      "cd #{Shellwords.escape(@tart_dir)} && exec env #{env_list(staged_env("tart",
+      #
+      # The scenario's staged identity decides the env namespace (I32
+      # AC4): the parity scenarios run tart in pi mode → PI_*; s1_tart
+      # stages TART_IDENTITY=tart → TART_*. TART_IDENTITY itself stays the
+      # launcher-owned bootstrap knob, always spelled literally.
+      identity = @scenario.env.fetch("tart", {}).fetch("TART_IDENTITY", "pi")
+      prefix = "#{identity.upcase}_"
+      staged = staged_env("tart",
         "HOME" => home,
         "PATH" => "#{File.dirname(@bundle_bin)}:#{ENV.fetch('PATH', '')}",
         "BUNDLE_FROZEN" => "true",
-        "TART_MODEL" => "mock-1",
-        "TART_PROVIDER" => "openai",
-        "TART_API_KEY" => "mock-key",
-        "TART_API_BASE" => "http://127.0.0.1:#{port}",
-        "TART_CONTEXT_WINDOW" => (@scenario.context_window || 32_768).to_s
-      ))} #{Shellwords.escape(@bundle_bin)} exec bin/tart #{Shellwords.escape(sandbox)}"
+        "TART_IDENTITY" => identity,
+        "#{prefix}MODEL" => "mock-1",
+        "#{prefix}PROVIDER" => "openai",
+        "#{prefix}API_KEY" => "mock-key",
+        "#{prefix}API_BASE" => "http://127.0.0.1:#{port}",
+        "#{prefix}CONTEXT_WINDOW" => (@scenario.context_window || 32_768).to_s
+      )
+      "cd #{Shellwords.escape(@tart_dir)} && exec env #{env_flags(staged)} #{Shellwords.escape(@bundle_bin)} exec bin/tart #{Shellwords.escape(sandbox)}"
+    end
+
+    # The -u flags scrubbing the parent environment's PI_*/TART_* keys —
+    # the operator's real PI_API_KEY must not leak into a staged run —
+    # followed by the staged assignments. Staged keys are never scrubbed:
+    # they always win.
+    def env_flags(staged)
+      scrub = ENV.keys.grep(/\A(?:PI|TART)_/) - staged.keys
+      [*scrub.flat_map { |key| ["-u", key] }, *env_list(staged)].join(" ")
     end
 
     # The scenario's per-app env overrides (Scenario#env — the
@@ -316,9 +335,9 @@ module TuiSplitRig
     # The probe drives the pane lifecycle directly (bin/tool-pending-probe
     # captures DURING the turn — settle here would wait it out); the staging
     # methods are public for the same reason (the load pin asserts their
-    # staged files).
+    # staged files and env).
     public :capture, :capture_styled, :settle, :teardown, :boot_session,
-      :stage_pi_agent, :stage_tart_home, :session_name
+      :stage_pi_agent, :stage_tart_home, :session_name, :pi_command, :tart_command
 
     def pane_pid_tree(session)
       out = Open3.capture2("tmux", "list-panes", "-t", session, "-F", PANE_PID_FORMAT)[0].to_s

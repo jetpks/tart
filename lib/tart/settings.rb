@@ -58,13 +58,16 @@ module Tart
     # DEFAULT_TOOL_NAMES is its four core tools — recorded divergence).
     DEFAULT_TOOLS = %w[read write edit bash find grep ls].freeze
 
-    # env → settings → built-in default, per key (AC2).
+    # env → settings → built-in default, per key (AC2/AC4). The env KEY
+    # rides the resolved identity's namespace ({Identity.env_key}):
+    # pi mode reads PI_MODEL, tart TART_MODEL, foo FOO_MODEL — the SUFFIX
+    # column here, prefixed at read time.
     RESOLUTION_ENV = {
-      "defaultModel" => "TART_MODEL",
-      "defaultProvider" => "TART_PROVIDER",
-      "apiBase" => "TART_API_BASE",
-      "apiKey" => "TART_API_KEY",
-      "modelReasoning" => "TART_MODEL_REASONING"
+      "defaultModel" => "MODEL",
+      "defaultProvider" => "PROVIDER",
+      "apiBase" => "API_BASE",
+      "apiKey" => "API_KEY",
+      "modelReasoning" => "MODEL_REASONING"
     }.freeze
 
     MODEL_CONTEXT_WINDOWS = {
@@ -103,19 +106,22 @@ module Tart
     end
 
     # env → settings → built-in default for one carried key (bin/tart's
-    # model/provider/apiBase/apiKey resolution, AC2).
-    def resolve_setting(key, settings, env: ENV)
-      env[RESOLUTION_ENV.fetch(key)] || settings[key] || DEFAULTS[key]
+    # model/provider/apiBase/apiKey resolution, AC2). The env tier speaks
+    # the identity's namespace (AC4): resolve_setting("apiKey", settings,
+    # identity: "foo") reads FOO_API_KEY.
+    def resolve_setting(key, settings, identity: Identity::DEFAULT, env: ENV)
+      env[Identity.env_key(identity, RESOLUTION_ENV.fetch(key))] || settings[key] || DEFAULTS[key]
     end
 
-    # Explicit kwarg → TART_CONTEXT_WINDOW → settings.contextWindow →
-    # model context window → registry-default table → nil (AC2; pi has no
-    # contextWindow setting — the registry is its only source — recorded
-    # port extension).
-    def resolve_context_window(explicit: nil, settings: {}, model: nil, env: ENV)
+    # Explicit kwarg → <IDENTITY>_CONTEXT_WINDOW → settings.contextWindow →
+    # model context window → registry-default table → nil (AC2/AC4; pi has
+    # no contextWindow setting — the registry is its only source — recorded
+    # port extension). The env tier rides the identity's namespace, like
+    # every app env read.
+    def resolve_context_window(explicit: nil, settings: {}, model: nil, identity: Identity::DEFAULT, env: ENV)
       return explicit if explicit
 
-      env_value = env["TART_CONTEXT_WINDOW"]
+      env_value = env[Identity.env_key(identity, "CONTEXT_WINDOW")]
       return Integer(env_value, 10) if env_value&.match?(/\A\d+\z/)
 
       window = settings["contextWindow"]
@@ -144,12 +150,12 @@ module Tart
     # when its available-model snapshot spans >1 provider (footer.ts:246
     # -258) — the port's static snapshot is one provider, so the prefix
     # never fires. Stageable for rigs/mocks: the modelReasoning setting
-    # (TART_MODEL_REASONING env) overrides everything; an assumed model
+    # (<IDENTITY>_MODEL_REASONING env) overrides everything; an assumed model
     # (no registry entry) falls back to the known-models table — the
     # owner's daily-driver glm declares reasoning in pi's book, and the
     # footer/border parity dies without it.
-    def model_reasoning_capable(settings, model)
-      staged = resolve_setting("modelReasoning", settings)
+    def model_reasoning_capable(settings, model, identity: Identity::DEFAULT)
+      staged = resolve_setting("modelReasoning", settings, identity:)
       return staged == true || staged == "true" unless staged.nil?
 
       MODEL_REASONING.fetch(model&.id) do

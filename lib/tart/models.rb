@@ -111,19 +111,20 @@ module Tart
       nil
     end
 
-    # The boot model (I27): TART_MODEL/TART_PROVIDER env > the
+    # The boot model (I27): <IDENTITY>_MODEL/<IDENTITY>_PROVIDER env > the
     # models.json "default" reference > Settings defaultModel/
-    # defaultProvider. Deviation from pi's findInitialModel precedence
+    # defaultProvider — the env keys ride the identity's namespace (AC4).
+    # Deviation from pi's findInitialModel precedence
     # (model-resolver.ts:511-580 — CLI > scoped > settings saved-default
     # > first-available), itemized: pi has no models.json default key and
     # puts the settings default first; the port prefers a declared
     # catalog default over its compiled-in Settings default so a user's
     # models.json outranks the shipped fireworks default.
-    def resolve_boot_model(config, settings, env: ENV)
-      if (model = env["TART_MODEL"])
-        return {provider: env["TART_PROVIDER"] || settings["defaultProvider"], id: model}
+    def resolve_boot_model(config, settings, identity: Identity::DEFAULT, env: ENV)
+      if (model = env[Identity.env_key(identity, "MODEL")])
+        return {provider: env[Identity.env_key(identity, "PROVIDER")] || settings["defaultProvider"], id: model}
       end
-      if (provider = env["TART_PROVIDER"])
+      if (provider = env[Identity.env_key(identity, "PROVIDER")])
         return {provider:, id: settings["defaultModel"]}
       end
       if config&.default && (entry = config.resolve(config.default))

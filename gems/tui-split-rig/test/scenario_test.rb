@@ -231,5 +231,63 @@ module TuiSplitRig
       assert_match(/suppress_usage must be a boolean/, error.message)
     end
 
+    # --- the prefix-aware env staging (I32 AC4) ---(
+
+    def runner_for(name)
+      Runner.new(scenario: Scenario.load(File.join(RIG_ROOT, "scenarios/#{name}.yml")),
+                 out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+    end
+
+    # The parity scenarios run tart in pi mode (no TART_IDENTITY staged):
+    # the boot env speaks PI_*, and TART_IDENTITY stages the literal
+    # bootstrap value pi.
+    def test_parity_scenarios_stage_pi_prefix_env_for_tart
+      command = runner_for("s1_text_turn").tart_command("/sandbox", "/home", 4711)
+      assert_includes command, "TART_IDENTITY=pi"
+      assert_includes command, "PI_MODEL=mock-1"
+      assert_includes command, "PI_PROVIDER=openai"
+      assert_includes command, "PI_API_KEY=mock-key"
+      assert_includes command, "PI_API_BASE=http://127.0.0.1:4711"
+      assert_includes command, "PI_CONTEXT_WINDOW=32768"
+      refute_includes command, "TART_MODEL="
+      refute_includes command, "TART_API_KEY="
+    end
+
+    # s1_tart (tart mode) stages TART_* unchanged.
+    def test_s1_tart_stages_the_tart_namespace
+      command = runner_for("s1_tart").tart_command("/sandbox", "/home", 4711)
+      assert_includes command, "TART_IDENTITY=tart"
+      assert_includes command, "TART_MODEL=mock-1"
+      assert_includes command, "TART_API_KEY=mock-key"
+      assert_includes command, "TART_CONTEXT_WINDOW=32768"
+      refute_includes command, "PI_MODEL="
+    end
+
+    # The parent environment's PI_*/TART_* keys are scrubbed (-u) — the
+    # operator's real PI_API_KEY must not leak into a staged run — while
+    # the staged keys themselves always win (never scrubbed).
+    def test_staging_scrubs_parent_pi_and_tart_env
+      ENV["PI_SESSION_ID"] = "operator-session"
+      ENV["PI_API_KEY"] = "operator-key"
+      ENV["TART_MODEL"] = "operator-model"
+      ENV["TART_CONTEXT_WINDOW"] = "1"
+      command = runner_for("s1_text_turn").tart_command("/sandbox", "/home", 4711)
+      assert_includes command, "-u PI_SESSION_ID"
+      assert_includes command, "-u TART_MODEL"
+      assert_includes command, "-u TART_CONTEXT_WINDOW"
+      assert_includes command, "PI_API_KEY=mock-key", "staged values still stage"
+      # pi's pane scrubs too, but never its own staged keys.
+      pi_command = runner_for("s1_text_turn").pi_command("/home", "/agent")
+      assert_includes pi_command, "-u PI_API_KEY"
+      assert_includes pi_command, "-u TART_MODEL"
+      assert_includes pi_command, "PI_OFFLINE=1"
+      refute_includes pi_command, "-u PI_OFFLINE"
+    ensure
+      ENV.delete("PI_SESSION_ID")
+      ENV.delete("PI_API_KEY")
+      ENV.delete("TART_MODEL")
+      ENV.delete("TART_CONTEXT_WINDOW")
+    end
+
   end
 end
