@@ -39,6 +39,8 @@ module Tart
         @history = []
         @history_index = -1 # -1 = not browsing (pi: editor.ts historyIndex)
         @history_draft = nil
+        @kill_ring = KillRing.new
+        @last_action = nil
       end
 
       # The clear op (the escape bash-mode clear and the ctrl+c app.clear —
@@ -46,6 +48,7 @@ module Tart
       def clear
         @input.clear
         @cursor = 0
+        @last_action = nil
       end
 
       # The completion-apply write surface (pi applyCompletion): the token
@@ -55,18 +58,25 @@ module Tart
       def replace_token(lead, text, cursor)
         @input = "#{@input[0, lead]}#{text}"
         @cursor = cursor
+        @last_action = nil
       end
 
       # --- input-line editing primitives (each leaves history browsing) ---
 
+      # pi insertCharacter (editor.ts:1201-1213) tags typing "type-word";
+      # the port's paste path shares this insert (pi's handlePaste leaves
+      # the slot nil) — observation-free: the slot is only ever tested
+      # against :kill/:yank, and both values sit outside those windows.
       def insert(text)
         exit_history_browsing
         @input.insert(@cursor, text)
         @cursor += text.length
+        @last_action = :type_word
       end
 
       def delete_backward
         exit_history_browsing
+        @last_action = nil # pi handleBackspace editor.ts:1374
         return if @cursor.zero?
 
         @input = @input[0, @cursor - 1] + @input[@cursor..]
@@ -75,6 +85,7 @@ module Tart
 
       def delete_forward
         exit_history_browsing
+        @last_action = nil # pi handleForwardDelete editor.ts:1781
         return if @cursor >= @input.length
 
         @input = @input[0, @cursor] + @input[(@cursor + 1)..]
@@ -82,50 +93,123 @@ module Tart
 
       def move_left
         exit_history_browsing
+        @last_action = nil # pi moveCursor editor.ts:1892
         @cursor -= 1 if @cursor.positive?
       end
 
       def move_right
         exit_history_browsing
+        @last_action = nil
         @cursor += 1 if @cursor < @input.length
       end
 
       def move_start
         exit_history_browsing
+        @last_action = nil # pi moveToLineStart editor.ts:1613
         @cursor = 0
       end
 
       def move_end
         exit_history_browsing
+        @last_action = nil # pi moveToLineEnd editor.ts:1618
         @cursor = @input.length
       end
 
       def move_word_backward
         exit_history_browsing
+        @last_action = nil # pi moveWordBackwards editor.ts:1961
         @cursor = self.class.find_word_backward(@input, @cursor)
       end
 
       def move_word_forward
         exit_history_browsing
+        @last_action = nil # pi moveWordForwards
         @cursor = self.class.find_word_forward(@input, @cursor)
       end
 
-      # pi's deleteWordBackwards (input.ts:309): move one word backward,
-      # delete what the move crossed.
+      # --- the emacs kill ring (I26): pi's kill/yank slice — every kill
+      # op exits history browsing first (editor.ts:1627) and pushes the cut
+      # span (backward = prepend, forward = append), accumulating iff the
+      # previous action was itself a kill (the lastAction window,
+      # editor.ts:352). The single-line editor's at-column-0/end-of-line
+      # line-merge branches (editor.ts:1641-1655, 1673-1686) are N/A —
+      # itemized cuts, never silent.
+
+      # pi deleteToStartOfLine (editor.ts:1626-1655).
+      def delete_to_line_start
+        exit_history_browsing
+        return if @cursor.zero?
+
+        @kill_ring.push(@input[0, @cursor], prepend: true, accumulate: @last_action == :kill)
+        @last_action = :kill
+        @input = @input[@cursor..]
+        @cursor = 0
+      end
+
+      # pi deleteToEndOfLine (editor.ts:1657-1687).
+      def delete_to_line_end
+        exit_history_browsing
+        return if @cursor >= @input.length
+
+        @kill_ring.push(@input[@cursor..], prepend: false, accumulate: @last_action == :kill)
+        @last_action = :kill
+        @input = @input[0, @cursor]
+      end
+
+      # pi yank (editor.ts:1998-2007): paste the most recent entry at the
+      # cursor; the insert leaves history browsing (pi insertYankedText).
+      def yank
+        return if @kill_ring.length.zero?
+
+        text = @kill_ring.peek
+        exit_history_browsing
+        @input = "#{@input[0, @cursor]}#{text}#{@input[@cursor..]}"
+        @cursor += text.length
+        @last_action = :yank
+      end
+
+      # pi yankPop (editor.ts:2013-2031): only immediately after a yank
+      # and with more than one entry; the previously yanked span (the peek
+      # before rotation) is deleted, the ring rotates, the new peek is
+      # inserted.
+      def yank_pop
+        return unless @last_action == :yank && @kill_ring.length > 1
+
+        yanked = @kill_ring.peek
+        exit_history_browsing
+        @input = @input[0, @cursor - yanked.length] + @input[@cursor..]
+        @cursor -= yanked.length
+        @kill_ring.rotate
+        text = @kill_ring.peek
+        @input = "#{@input[0, @cursor]}#{text}#{@input[@cursor..]}"
+        @cursor += text.length
+        @last_action = :yank
+      end
+
+      # pi deleteWordBackwards (editor.ts:1692-1735) is a kill op: the
+      # crossed span enters the ring, accumulating per the lastAction
+      # window captured BEFORE the movement resets it (input.ts:309 shape).
       def delete_word_backward
         return if @cursor.zero?
 
         exit_history_browsing
+        was_kill = @last_action == :kill
         target = self.class.find_word_backward(@input, @cursor)
+        @kill_ring.push(@input[target...@cursor], prepend: true, accumulate: was_kill)
+        @last_action = :kill
         @input = @input[0, target] + @input[@cursor..]
         @cursor = target
       end
 
+      # pi deleteWordForward (editor.ts:1737-1775), the mirror kill op.
       def delete_word_forward
         return if @cursor >= @input.length
 
         exit_history_browsing
+        was_kill = @last_action == :kill
         target = self.class.find_word_forward(@input, @cursor)
+        @kill_ring.push(@input[@cursor...target], prepend: false, accumulate: was_kill)
+        @last_action = :kill
         @input = @input[0, @cursor] + @input[target..]
       end
 
@@ -166,6 +250,7 @@ module Tart
       def history_next = navigate_history(1)
 
       def navigate_history(direction)
+        @last_action = nil # pi navigateHistory editor.ts:454
         return if @history.empty?
 
         new_index = @history_index - direction

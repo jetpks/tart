@@ -2023,6 +2023,91 @@ module Tart
       end
     end
 
+    # --- the emacs kill ring (I26, pi keybindings.ts:129-135): ctrl+u/k
+    # kill, ctrl+y yanks, alt+y pops — driven through the key surface.
+
+    def test_ctrl_u_kills_to_line_start_and_ctrl_y_yanks_it_back
+      with_headless_chat do |chat|
+        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("a", modifiers: ["ctrl"]))
+        6.times { chat.on_event(TUI.key_event("right")) }
+        chat.on_event(TUI.key_event("u", modifiers: ["ctrl"]))
+        assert_equal "world", chat.input, "ctrl+u deletes to line start"
+        chat.on_event(TUI.key_event("y", modifiers: ["ctrl"]))
+        assert_equal "hello world", chat.input, "ctrl+y yanks the killed span"
+      end
+    end
+
+    def test_ctrl_k_kills_to_line_end
+      with_headless_chat do |chat|
+        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("a", modifiers: ["ctrl"]))
+        5.times { chat.on_event(TUI.key_event("right")) }
+        chat.on_event(TUI.key_event("k", modifiers: ["ctrl"]))
+        assert_equal "hello", chat.input, "ctrl+k deletes to line end"
+        chat.on_event(TUI.key_event("y", modifiers: ["ctrl"]))
+        assert_equal "hello world", chat.input, "ctrl+y restores the killed span"
+      end
+    end
+
+    def test_consecutive_ctrl_k_kills_accumulate_and_alt_y_cycles
+      with_headless_chat do |chat|
+        %w[first second third].each do |word|
+          word.each_char { |char| chat.on_event(TUI.key_event(char)) }
+          chat.on_event(TUI.key_event("a", modifiers: ["ctrl"]))
+          chat.on_event(TUI.key_event("k", modifiers: ["ctrl"])) # ctrl+k at line end is a no-op (single-line)
+        end
+        chat.on_event(TUI.key_event("y", modifiers: ["ctrl"]))
+        assert_equal "third", chat.input, "yank takes the most recent entry"
+        chat.on_event(TUI.key_event("y", modifiers: ["alt"]))
+        assert_equal "second", chat.input, "alt+y cycles oldest-ward"
+        chat.on_event(TUI.key_event("y", modifiers: ["alt"]))
+        assert_equal "first", chat.input
+        chat.on_event(TUI.key_event("y", modifiers: ["alt"]))
+        assert_equal "third", chat.input, "the cycle wraps"
+      end
+    end
+
+    def test_alt_y_is_a_no_op_without_a_prior_yank
+      with_headless_chat do |chat|
+        "first".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("a", modifiers: ["ctrl"]))
+        chat.on_event(TUI.key_event("k", modifiers: ["ctrl"]))
+        "x".each_char { |char| chat.on_event(TUI.key_event(char)) } # typing closes the yank window
+        chat.on_event(TUI.key_event("y", modifiers: ["alt"]))
+        assert_equal "x", chat.input, "alt+y without a preceding yank does nothing"
+      end
+    end
+
+    # Regression pins (I26): ctrl+a/ctrl+e are settled surface (base) —
+    # the kill-ring wiring must not have shifted them.
+    def test_ctrl_a_and_ctrl_e_still_move_to_line_start_and_end
+      with_headless_chat do |chat|
+        "hello".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("a", modifiers: ["ctrl"]))
+        chat.on_event(TUI.key_event("X"))
+        assert_equal "Xhello", chat.input, "ctrl+a still moves to line start"
+        chat.on_event(TUI.key_event("e", modifiers: ["ctrl"]))
+        chat.on_event(TUI.key_event("Y"))
+        assert_equal "XhelloY", chat.input, "ctrl+e still moves to line end"
+      end
+    end
+
+    # Regression pins (I26 Grounds 3 audit): alt+backspace/alt+d are the
+    # deleteWordBackward/Forward defaults — already bound at base, pinned
+    # so the kill-ring wiring keeps them that way.
+    def test_alt_backspace_and_alt_d_delete_words
+      with_headless_chat do |chat|
+        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("a", modifiers: ["ctrl"]))
+        5.times { chat.on_event(TUI.key_event("right")) }
+        chat.on_event(TUI.key_event("d", modifiers: ["alt"]))
+        assert_equal "hello", chat.input, "alt+d deletes the word forward (keybindings.ts:128)"
+        chat.on_event(TUI.key_event("backspace", modifiers: ["alt"]))
+        assert_equal "", chat.input, "alt+backspace deletes the word backward (keybindings.ts:124)"
+      end
+    end
+
     # --- autocomplete (AC1, I12): the /-triggered fuzzy suggestion list,
     # with pi's key precedence (the list owns up/down/escape/enter while
     # active — history and interrupt yield). ---
