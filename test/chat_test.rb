@@ -1536,7 +1536,8 @@ module Tart
         handler = Commands::Handler.new(
           skills: [], settings: {}, output: ->(text) { @commands_output << text },
           spawn: ->(&block) { block.call }, agent: -> { nil }, reset: -> {},
-          thinking: ->(arg) { arg == :cycle ? chat.cycle_thinking_level : chat.set_thinking_level(arg) },
+          thinking: ->(arg) { chat.set_thinking_level(arg) },
+          thinking_menu: -> { chat.open_thinking_menu },
           quit: -> {}
         )
 
@@ -1549,12 +1550,211 @@ module Tart
           "the editor border follows the level (getThinkingBorderColor — the bottom border row is all glyph cells)"
 
         handler.dispatch("/thinking")
+        assert chat.menu_open?, "the bare command opens the thinking selector (pi showThinkingSelector)"
+        assert_equal "high", chat.menu_selection&.fetch(:value), "the menu opens on the current level"
+        chat.on_event(TUI.key_event("esc"))
+        refute chat.menu_open?, "escape cancels the menu"
         draw(chat, session)
-        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("m • xhigh"),
-          "the bare command cycles to the next level"
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("m • high"),
+          "a cancelled selection leaves the level alone"
 
         handler.dispatch("/thinking nope")
         assert @commands_output.last.include?("Unknown thinking level"), "unknown levels error, the level holds"
+      end
+    end
+
+    # The shift+tab cycle (I27, app.thinking.cycle — keybindings.ts:33-35):
+    # the in-session level cycle stays when bare /thinking became the menu.
+    def test_shift_tab_cycles_the_thinking_level
+      with_chat(width: 40, screen_height: 12,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true}) do |chat, session|
+        chat.on_event(TUI.key_event("tab", modifiers: ["shift"]))
+        draw(chat, session)
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("m • high"),
+          "shift+tab cycles medium → high"
+      end
+    end
+
+    # --- the selector menus (I27): key routes, dispatch wiring, the
+    # switch seams — pi showSelector/app.model.select/app.models.save ---
+
+    def model_catalog
+      Models::Config.new(
+        providers: {
+          "glm" => {name: "GLM", base_url: nil, api_key: nil, api: nil,
+                    models: [{provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+                              context_window: 200_000, max_tokens: nil}]},
+          "zai" => {name: "Z.ai", base_url: nil, api_key: nil, api: nil,
+                    models: [{provider: "zai", id: "glm-5-air", name: "Air", reasoning: false,
+                              context_window: 130_000, max_tokens: nil}]}
+        },
+        default: nil, error: nil
+      )
+    end
+
+    # ctrl+l opens the model menu over the real catalog (the boot model
+    # is not in it → no current flag, the provider sort leads).
+    def test_ctrl_l_opens_the_model_menu
+      with_headless_chat(models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", default_provider: "openai"}) do |chat|
+        chat.on_event(TUI.key_event("l", modifiers: ["ctrl"]))
+
+        assert chat.menu_open?, "ctrl+l opens the model menu (app.model.select)"
+        assert_equal "glm-5.3", chat.menu_selection&.fetch(:id), "the menu opens on the first sorted row"
+      end
+    end
+
+    # The degenerate catalog (no models.json): the boot model alone — so
+    # ctrl+s set-as-default works out of the box (itemized extension).
+    def test_model_menu_degenerates_to_the_boot_model_without_a_catalog
+      with_headless_chat(footer_data: {cwd: @dir, model: "boot-model", default_provider: "openai"}) do |chat|
+        chat.on_event(TUI.key_event("l", modifiers: ["ctrl"]))
+
+        assert chat.menu_open?
+        assert_equal "boot-model", chat.menu_selection&.fetch(:id),
+          "the boot model is the single entry"
+      end
+    end
+
+    def test_model_menu_enter_switches_the_model_and_refreshes_the_surface
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "medium", reasoning: false}) do |chat, session|
+        switched = []
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil|
+            switched << {model_id:, provider:, context_window:}
+          end
+        end
+
+        chat.open_model_menu
+        chat.on_event(TUI.key_event("enter"))
+        draw(chat, session)
+
+        refute chat.menu_open?, "the selection closes the menu (the editor is restored)"
+        assert_equal [{model_id: "glm-5.3", provider: "openai", context_window: 200_000}], switched,
+          "the loop seam swaps the runtime chat model (the wire provider — the port's " \
+          "single chat-completions seam) and re-resolves the window"
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("glm-5.3 • medium"),
+          "the footer model segment refreshed (the entry's reasoning flag rides along)"
+        border_row = session.buffer_content.index { |row| row.include?("─") }
+        assert session.buffer_content[border_row].include?("Model: glm-5.3"),
+          "the border status reports pi's showStatus text"
+      end
+    end
+
+    # The reasoning capability re-ladders the editor border: the switched
+    # entry's reasoning flag flows through the footer view
+    # (getThinkingBorderColor — pi updateEditorBorderColor).
+    def test_model_switch_re_ladders_the_editor_border
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", reasoning: false}) do |chat, session|
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil)
+        draw(chat, session)
+
+        border_row = session.buffer_content.rindex { |row| row.include?("─") }
+        assert_equal Theme[:thinking_off], session.cell_fg(0, border_row)
+      end
+    end
+
+    # ctrl+s in the model menu: the set-as-default persistence (pi
+    # app.models.save → settingsManager.setDefaultModelAndProvider) —
+    # the write preserves unknown keys, the status reports the pair.
+    def test_model_menu_ctrl_s_persists_the_default_model
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai"}) do |chat, session|
+        FileUtils.mkpath(@dir)
+        File.write(File.join(@dir, "settings.json"), '{"unknownKey": true, "thinkingLevel": "high"}')
+
+        chat.open_model_menu
+        chat.on_event(TUI.key_event("s", modifiers: ["ctrl"]))
+        draw(chat, session)
+
+        refute chat.menu_open?, "ctrl+s selects-and-persists and closes (pi selectLevel → done)"
+        saved = JSON.parse(File.read(File.join(@dir, "settings.json")))
+        assert_equal "glm", saved["defaultProvider"], "defaultProvider persisted"
+        assert_equal "glm-5.3", saved["defaultModel"], "defaultModel persisted"
+        assert_equal true, saved["unknownKey"], "unknown keys survive the write"
+        assert_equal "high", saved["thinkingLevel"], "unmodified keys survive"
+        border_row = session.buffer_content.index { |row| row.include?("─") }
+        assert session.buffer_content[border_row].include?("Default model: glm/glm-5.3"),
+          "the persisted status reports the pair"
+      end
+    end
+
+    # ctrl+s in the thinking menu persists the default level (pi
+    # app.thinking.save → setThinkingLevel {persist:true}).
+    def test_thinking_menu_ctrl_s_persists_the_default_level
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true}) do |chat, session|
+        chat.open_thinking_menu
+        chat.on_event(TUI.key_event("s", modifiers: ["ctrl"]))
+        draw(chat, session)
+
+        refute chat.menu_open?
+        saved = JSON.parse(File.read(File.join(@dir, "settings.json")))
+        assert_equal "medium", saved["thinkingLevel"], "the settings default persisted"
+        border_row = session.buffer_content.index { |row| row.include?("─") }
+        assert session.buffer_content[border_row].include?("Default thinking level: medium"),
+          "the persisted status reports the level"
+      end
+    end
+
+    # The click-to-select mount (pi select-list.ts:109-134): the press
+    # moves the selection, the release on the same row selects and
+    # closes.
+    def test_model_menu_click_to_select
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai"}) do |chat, session|
+        chat.open_model_menu
+        draw(chat, session)
+
+        # The first list row sits at the menu area's list window top
+        # (area top + top border + list_offset); the catalog (no current
+        # flag — the boot model is not in it) sorts glm-5.3 first.
+        menu = chat.instance_variable_get(:@menu)
+        list_top = (16 - 2 - (menu.widget_rows + 2)) + 1 + menu.list_offset
+        chat.on_event(TUI.mouse_event(kind: "down", x: 2, y: list_top, button: "left"))
+        chat.on_event(TUI.mouse_event(kind: "up", x: 2, y: list_top, button: "left"))
+        draw(chat, session)
+
+        refute chat.menu_open?, "the click selected and closed (pi click → onSelect)"
+        border_row = session.buffer_content.index { |row| row.include?("─") }
+        assert session.buffer_content[border_row].include?("Model: glm-5.3"),
+          "the clicked entry switched (the drawn frame's flush renders the status)"
+      end
+    end
+
+    # The /model dispatch wiring through the bin-shaped handler: bare →
+    # the menu, exact → the direct switch, unknown → the menu pre-seeded
+    # (pi handleModelCommand).
+    def test_model_command_dispatch_menu_exact_and_seeded
+      with_headless_chat(models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", default_provider: "openai"}) do |chat|
+        chat.commands = Commands::Handler.new(
+          skills: [], settings: {}, output: ->(text) { @commands_output << text },
+          spawn: ->(&block) { block.call }, agent: -> { nil }, reset: -> {},
+          models: model_catalog, model: ->(entry) { chat.switch_model(entry) },
+          model_menu: ->(seed) { chat.open_model_menu(seed) },
+          thinking_menu: -> { chat.open_thinking_menu }, quit: -> {}
+        )
+
+        send_message(chat, "/model")
+        assert chat.menu_open?, "the bare command opens the menu"
+        chat.on_event(TUI.key_event("esc"))
+        refute chat.menu_open?
+
+        send_message(chat, "/model glm/glm-5.3")
+        refute chat.menu_open?, "an exact match switches directly"
+
+        send_message(chat, "/model air")
+        assert chat.menu_open?, "an unknown arg opens the menu pre-seeded"
+        assert_equal "glm-5-air", chat.menu_selection&.fetch(:id),
+          "the seed filtered the catalog to the match at the top row"
       end
     end
 
@@ -1999,20 +2199,9 @@ module Tart
       end
     end
 
-    # pi updateEditorBorderColor :1109-1117 — the editor's border renders
-    # the bashMode token while the input starts with "!".
-    def test_bash_mode_border_renders_the_bash_mode_token
-      with_chat(width: 40) do |chat, session|
-        "!ech".each_char { |char| chat.on_event(TUI.key_event(char)) }
-        draw(chat, session)
-
-        buffer = session.buffer_content
-        border_row = buffer.index { |row| row.include?("─") }
-        assert_equal Theme[:bashMode], session.cell_fg(0, border_row),
-          "the editor border announces bash mode (getBashModeBorderColor)"
-      end
-    end
-
+    # (A byte-identical duplicate of the bash-mode border test above
+    # shadowed it at HEAD — the second definition won, the first never
+    # ran; dropped, the suite's run count reconciles with its source.)
     def test_ctrl_w_deletes_word_backward_through_the_key_surface
       with_headless_chat do |chat|
         "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
@@ -2828,20 +3017,23 @@ module Tart
     # A chat surface on the headless fullscreen test terminal for key-surface
     # tests (draw/readback assertions use with_chat; these only need the
     # editor's key path, which never draws).
-    def with_headless_chat(autocomplete: nil, width: 40)
+    def with_headless_chat(autocomplete: nil, width: 40, models: nil, settings_root: nil, footer_data: nil)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height: 12) do |session|
-        yield Render::Chat.new(session:, kernel: IdleKernel.new, autocomplete:, motd: false), session
+        yield Render::Chat.new(session:, kernel: IdleKernel.new, autocomplete:, motd: false,
+          models:, settings_root: settings_root || @dir, footer_data:), session
       end
     end
 
     # Render-only tests: the real headless fullscreen test terminal (buffer
     # readback). Width 9 makes wrapping observable ("aaaa bbbb" is exactly 9
     # cells). motd: false — the MOTD block is pinned by its own tests.
-    def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false)
+    def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false,
+      models: nil, settings_root: nil)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
         kernel = IdleKernel.new
         chat = Render::Chat.new(session:, kernel:,
-          footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:)
+          footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
+          models:, settings_root: settings_root || @dir)
         yield(chat, session, kernel)
       end
     end

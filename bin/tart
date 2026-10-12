@@ -82,16 +82,34 @@ module Tart
           message; loaded skills are listed with /skills.
 
         Commands:
-          /new /compact /resume /skills /settings /thinking /help /quit —
-          /new starts a fresh session, /compact compacts the context now,
-          /resume opens the session picker (arrows navigate, enter
-          resumes, escape cancels), /thinking sets or cycles (bare) the
-          thinking level, /quit exits (when idle). Slash text matching no
-          command goes to the model.
+          /new /compact /resume /model /skills /settings /thinking /help /
+          quit — /new starts a fresh session, /compact compacts the
+          context now, /resume opens the session picker (arrows navigate,
+          enter resumes, escape cancels), /model [provider/model] opens
+          the model selector (or switches directly on an exact match),
+          /thinking [level] opens the thinking-level selector (or sets
+          the level directly), /quit exits (when idle). Slash text
+          matching no command goes to the model.
+          Selector menus: fuzzy search filters, up/down navigate, enter
+          selects, ctrl+s selects and saves as the default, escape/
+          ctrl+c cancels. ctrl+l opens the model menu; shift+tab cycles
+          thinking levels in-session.
           Autocomplete: type / to get a fuzzy list of commands, skills,
           and prompt templates; up/down pick, tab (or enter) apply,
           escape dismisses. PageUp/PageDown scroll the transcript when
           the list is hidden.
+
+        Models:
+          The model catalog loads from ~/.tart/models.json (pi's shape,
+          JSON comments tolerated): {"providers": {"<provider>": {name,
+          baseUrl, apiKey, api, "models": [{id, name, reasoning,
+          contextWindow, maxTokens}]}}} plus an optional "default":
+          "<provider/model-id>" boot reference. The boot model resolves
+          TART_MODEL/TART_PROVIDER > the models.json default > the
+          settings defaultModel/defaultProvider; a provider's baseUrl/
+          apiKey feed the endpoint (TART_API_KEY/TART_API_BASE still
+          override). ctrl+s in the model menu persists defaultProvider +
+          defaultModel to ~/.tart/settings.json.
 
         Prompt templates:
           Prompt templates load from ~/.tart/prompts and
@@ -119,8 +137,9 @@ module Tart
 
         Keys: type + Enter to send (steers a running agent); Escape
         interrupts a running turn; Ctrl+C clears the input (twice exits);
-        "!cmd" runs whole-line bash without the model ("!!cmd" also keeps
-        it out of context).
+        ctrl+l opens the model menu; shift+tab cycles thinking levels;
+        "!cmd" runs whole-line bash without the model ("!!cmd" also
+        keeps it out of context).
 
         Surface: fullscreen three-area layout — transcript, bordered editor
         (its top border carries the working/tool status), footer (cwd, git
@@ -167,13 +186,15 @@ module Tart
       result = Settings.load(cwd: workdir)
       settings = result.settings
       report_diagnostics(result.diagnostics)
-      require_api_key(settings)
+      models = Models.load
+      warn "tart: #{models.error}" if models.error
+      require_api_key(settings, models)
       skills = Skills.load(cwd: workdir)
       abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
 
       exit Print.run(
         prompt: options[:print],
-        chat: build_chat(settings),
+        chat: build_chat(settings, models, Models.resolve_boot_model(models, settings)),
         tools: build_tools(workdir, settings),
         system_prompt: system_prompt(workdir, skills.skills)
       )
@@ -188,7 +209,11 @@ module Tart
       skills = Skills.load(cwd: workdir)
       prompts = Prompts.load(cwd: workdir)
       mcp_servers = Mcp::Config.load(mcp_config_path)
-      require_api_key(settings)
+      # The models.json catalog (I27): the /model menu's entries and the
+      # boot-model resolution's middle layer; a load/parse/schema
+      # failure sets its error (surfaced below, never a crash).
+      models = Models.load
+      require_api_key(settings, models)
 
       # The resume path is known before the surface is built: a resumed
       # boot skips the MOTD (item 3 — pi's chat container gets the
@@ -222,8 +247,12 @@ module Tart
           recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_target)
           current_recorder = recorder
           seed_messages = resume_target ? Agent::Session.context_messages(resume_target) : []
-          chat = build_chat(settings)
-          surface.footer_data = footer_data(workdir, settings, chat:)
+          # The boot model resolves per session (env > models.json
+          # "default" > Settings — I27), so a ctrl+s persisted default
+          # is honored by the next /new too.
+          boot = Models.resolve_boot_model(models, settings)
+          chat = build_chat(settings, models, boot)
+          surface.footer_data = footer_data(workdir, settings, boot:, chat:)
           surface.agent = Agent::Loop.new(
             chat:,
             tools:,
@@ -252,7 +281,11 @@ module Tart
           spawn: ->(&block) { kernel.async(&block) },
           agent: -> { surface.agent },
           reset: lambda { start_session.call(nil); surface.new_session },
-          thinking: ->(arg) { arg == :cycle ? surface.cycle_thinking_level : surface.set_thinking_level(arg) },
+          thinking: ->(arg) { surface.set_thinking_level(arg) },
+          thinking_menu: -> { surface.open_thinking_menu },
+          models:,
+          model: ->(entry) { surface.switch_model(entry) },
+          model_menu: ->(seed) { surface.open_model_menu(seed) },
           prompts: prompts.templates,
           resume: lambda do
             sessions = Agent::Session.list(cwd: workdir)
@@ -268,6 +301,7 @@ module Tart
         resume.call(resume_path) if resume_path
         start_session.call(nil) unless resume_path
         report_diagnostics(result.diagnostics, surface:)
+        surface.command_line(models.error) if models.error
         skills.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
         prompts.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
 
@@ -312,8 +346,13 @@ module Tart
       Agent::Session.preview(path) || File.basename(path)
     end
 
-    def require_api_key(settings)
-      abort "TART_API_KEY is not set (see --help)." if Settings.resolve_setting("apiKey", settings).nil?
+    # The boot provider's key (I27): env > the models.json provider
+    # config > the Settings key.
+    def require_api_key(settings, models = nil)
+      boot = Models.resolve_boot_model(models, settings)
+      key = ENV["TART_API_KEY"] || models&.provider(boot[:provider])&.fetch(:api_key, nil) ||
+        Settings.resolve_setting("apiKey", settings)
+      abort "TART_API_KEY is not set (see --help)." if key.nil?
     end
 
     # Footer facts (AC4): the I10 resolved window is the context-usage
@@ -322,14 +361,22 @@ module Tart
     # segment, pi footer.ts:226-258) resolves off the chat's registry
     # model, stageable via TART_MODEL_PROVIDER / TART_MODEL_REASONING
     # (Settings); the thinking level rides the settings-resolved value.
-    def footer_data(workdir, settings, chat:)
+    def footer_data(workdir, settings, boot: nil, chat:)
+      # Optional +boot+: the in-launcher call sites resolve the boot pair
+      # per session; the legacy (settings, chat) shape resolves it from
+      # settings alone.
+      boot ||= {provider: Settings.resolve_setting("defaultProvider", settings),
+                id: Settings.resolve_setting("defaultModel", settings)}
       # No provider label: pi prefixes the provider only when MORE THAN
       # one provider is available (footer.ts:246-258) — the port resolves
       # a single static provider, so the segment is the bare model (the
-      # owner's live "(openai) " finding).
+      # owner's live "(openai) " finding). I27: the boot pair is threaded
+      # (the /model selector's default badge + degenerate catalog), the
+      # model id from the boot resolution (env > models.json > settings).
       {
         cwd: workdir,
-        model: Settings.resolve_setting("defaultModel", settings),
+        model: boot[:id],
+        default_provider: boot[:provider],
         reasoning: Settings.model_reasoning_capable(settings, chat.model),
         context_window: Settings.resolve_context_window(settings:, model: chat.model),
         auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
@@ -355,16 +402,21 @@ module Tart
       "#{base}\n\n#{Skills.format_skills_for_prompt(skills, Skills.skill_file_read_tool(SELECTED_TOOLS)).strip}"
     end
 
-    def build_chat(settings)
+    # The chat (I27): the boot model pair resolves env > models.json
+    # "default" > Settings ({Models.resolve_boot_model}); the resolved
+    # provider's models.json config (baseUrl/apiKey/api) slots between
+    # the env overrides and the Settings keys — TART_API_KEY/TART_API_BASE
+    # keep working against it.
+    def build_chat(settings, models, boot)
+      provider = models.provider(boot[:provider])
       context = RubyLLM.context do |config|
-        config.openai_api_key = Settings.resolve_setting("apiKey", settings)
-        config.openai_api_base = Settings.resolve_setting("apiBase", settings)
+        config.openai_api_key = ENV["TART_API_KEY"] || provider&.fetch(:api_key, nil) || Settings.resolve_setting("apiKey", settings)
+        config.openai_api_base = ENV["TART_API_BASE"] || provider&.fetch(:base_url, nil) || Settings.resolve_setting("apiBase", settings)
         config.request_timeout = 120
         config.max_retries = 1
       end
       context.chat(
-        model: Settings.resolve_setting("defaultModel", settings),
-        provider: Settings.resolve_setting("defaultProvider", settings),
+        model: boot[:id], provider: Models.wire_provider(boot[:provider]),
         protocol: :chat_completions, assume_model_exists: true
       )
     end

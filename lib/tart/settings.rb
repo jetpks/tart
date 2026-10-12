@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "fileutils"
 require_relative "agent/session"
 
 module Tart
@@ -221,6 +222,22 @@ module Tart
           override_value
         end
       end
+    end
+
+    # The write surface (I27, pi settings-manager.ts setDefaultModel /
+    # setDefaultModelAndProvider → persistScopedSettings): merge the
+    # updates over the CURRENT file contents — unknown and unmodified
+    # keys survive verbatim (pi rewrites the whole scoped file, never a
+    # schema projection) — then pretty-print. An unparseable existing
+    # file counts as empty (the {read_file} idiom). +root+ is the user
+    # config dir (~/.tart); the path is returned.
+    def save(root, updates)
+      path = File.join(root, ROOT_KEY)
+      existing = File.file?(path) ? read_file(path).first : {}
+      merged = deep_merge(existing, updates)
+      FileUtils.mkdir_p(root)
+      File.write(path, "#{JSON.pretty_generate(merged)}\n")
+      path
     end
 
     # pi tryLoadFromStorage (:367-379): a file that fails to parse counts

@@ -75,6 +75,43 @@ module Tart
       assert result.diagnostics.first.message.include?("invalid settings JSON")
     end
 
+    # --- the write surface (I27, the ctrl+s set-as-default path) ---
+
+    def test_save_writes_the_updates_and_the_file_round_trips
+      path = Settings.save(@root, "defaultProvider" => "glm", "defaultModel" => "glm-5.3")
+
+      assert_equal @user_path, path
+      settings = load_settings.settings
+      assert_equal "glm-5.3", settings["defaultModel"]
+      assert_equal "glm", settings["defaultProvider"]
+    end
+
+    def test_save_preserves_unknown_and_unmodified_keys
+      write_settings(@user_path, '{"defaultModel": "m", "notARealKey": {"deep": [1]}, "compaction": {"reserveTokens": 1000}}')
+
+      Settings.save(@root, "defaultProvider" => "glm")
+      saved = JSON.parse(File.read(@user_path))
+
+      assert_equal "m", saved["defaultModel"], "unmodified keys survive"
+      assert_equal ({"deep" => [1]}), saved["notARealKey"], "unknown keys are preserved verbatim (never clobbered)"
+      assert_equal 1000, saved.dig("compaction", "reserveTokens"), "nested blocks survive"
+      assert_equal "glm", saved["defaultProvider"]
+      refute saved.key?("thinkingLevel"), "only the asked-for keys are written"
+    end
+
+    def test_save_creates_the_dir_and_over_an_unparseable_file_starts_fresh
+      path = Settings.save(File.join(@root, "nested"), "thinkingLevel" => "high")
+
+      assert_equal File.join(@root, "nested", "settings.json"), path
+      assert_equal "high", JSON.parse(File.read(path))["thinkingLevel"]
+
+      FileUtils.rm_rf(@root)
+      FileUtils.mkpath(@root)
+      File.write(@user_path, "{not json")
+      Settings.save(@root, "thinkingLevel" => "low")
+      assert_equal "low", JSON.parse(File.read(@user_path))["thinkingLevel"]
+    end
+
     # --- env → settings → built-in default, per key ---
 
     def test_model_provider_api_base_and_api_key_resolve_env_over_settings_over_default
