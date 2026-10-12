@@ -1,0 +1,78 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# tool-pending-probe — the I26 mid-flight capture probe (NOT a parity gate;
+# evidence for the scratch report only).
+#
+# Drives BOTH apps through the probe_tool_pending scenario (one slow bash
+# call) and captures the screen DURING the tool execution — the settle-based
+# runner can only see the settled end state. Question answered: pi renders
+# its tool panel mid-flight with the toolPendingBg background
+# (tool-execution.ts:90-91, dark.json:37 okhsl(229 5% 24%)); the port
+# enqueues the tool block only at :tool_execution_end (chat.rb) — the
+# mid-flight frames show nothing.
+#
+#   tool-pending-probe [--out DIR]
+#
+# Output: per app, numbered frame pairs (<app>-frame-NN.txt/.styled) plus a
+# digest line per frame on stdout (tool rows present? bg SGR set).
+#
+# Stdlib only — runs without Bundler.
+
+require "optparse"
+require_relative "../lib/tui_split_rig"
+
+options = {out: "tmp/tool-pending-probe-#{Time.now.to_i}"}
+parser = OptionParser.new do |p|
+  p.on("--out DIR", "output directory (default tmp/tool-pending-probe-<ts>)") { |d| options[:out] = d }
+end
+parser.parse!(ARGV)
+
+BG_SGR = /\[48;2;[\d;]+m/
+TOOL_MARK = "sleep 6"
+
+def bg_set(text)
+  text.scan(BG_SGR).tally.map { |sgr, n| "#{sgr}x#{n}" }.sort
+end
+
+scenario = TuiSplitRig::Scenario.load(File.expand_path("../scenarios/probe_tool_pending.yml", __dir__))
+runner = TuiSplitRig::Runner.new(scenario:, runs: 1, app: "both", out: File.join(options[:out], "unused"))
+stage = File.expand_path(options[:out])
+FileUtils.mkdir_p(stage)
+
+mock = MockLLMServer.new.script(scenario.responses).start
+begin
+  %w[pi tart].each do |app|
+    mock.rearm!
+    boot = runner.boot_session(app, mock, 1, stage)
+    session = boot.fetch(:session)
+    runner.settle(session, "boot")
+    system("tmux", "send-keys", "-t", session, scenario.prompt, "Enter")
+
+    frame = 0
+    last = nil
+    same = 0
+    loop do
+      plain = runner.capture(session)
+      styled = runner.capture_styled(session)
+      frame += 1
+      File.write(File.join(stage, "#{app}-frame-#{format('%02d', frame)}.txt"), plain)
+      File.write(File.join(stage, "#{app}-frame-#{format('%02d', frame)}.styled"), styled)
+      tool_rows = plain.lines.count { |line| line.include?(TOOL_MARK) }
+      puts format("%s frame %02d: tool-mark-rows=%d bg=%s",
+        app, frame, tool_rows, bg_set(styled).join(","))
+
+      same = plain == last ? same + 1 : 0
+      last = plain
+      break if same >= 4 # settled — the turn is over
+
+      break if frame >= 40 # hard cap ≈ 20 s
+      sleep 0.5
+    end
+    runner.teardown(session)
+  end
+ensure
+  mock.stop
+end
+
+puts "frames at #{stage}"

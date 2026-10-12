@@ -1,0 +1,17 @@
+# The tool-pending-state probe's driver (I26 — NOT a parity gate): a
+# single bash call that sleeps long enough to give the probe a mid-flight
+# window (bin/tool-pending-probe captures DURING the tool execution).
+# Runnable as an ordinary settle-based scenario too (same shape as s2).
+name: probe_tool_pending
+prompt: "run the sleeper"
+expected_requests: 2
+responses:
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_probe_1
+        name: bash
+        arguments:
+          command: "sleep 6"
+  - type: stream
+    content: "The sleeper ran; fixed final reply for the probe."

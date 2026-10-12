@@ -34,3 +34,11 @@ classes:
   # class covers both spellings of the stats line's right segment.
   - name: footer-provider-prefix
     pattern: '\(mock\) mock-1$|mock-1$'
+  # The port's MOTD [Context] section lists the staged settings file by
+  # absolute path (I26 s7 stages HOME/.tart/settings.json for the zeroed
+  # compaction knobs; pi's staged agent-dir settings render no pi-motd
+  # line). The path fragments (full or wrapped mid-path) are path noise,
+  # not a rendering difference — the [Context] heading itself stays a
+  # candidate (a real port-only listing, left on the work list).
+  - name: staged-settings-path
+    pattern: 'settings\.json'
