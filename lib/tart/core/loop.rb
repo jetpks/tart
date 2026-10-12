@@ -63,7 +63,10 @@ module Tart
         @work_task = nil
         @tasks = []
         @animation_deadline = nil
-        @dirty = false
+        # Boot render: the first frame is dirty by definition (pi renders on
+        # start — tui.ts start() requestRender); after it, draw_frame's gate
+        # keeps static frames off the CPU (I01).
+        @dirty = true
         @draws = 0
         @wakes = 0
 
@@ -138,6 +141,16 @@ module Tart
         @animation_deadline && now < @animation_deadline
       end
 
+      # Requests exactly one redraw (pi requestRenderCallback): marks the
+      # next frame dirty and wakes an idle loop. Unlike {#animate} it opens
+      # no animation window — one frame, then the loop is event-driven
+      # again (the I20 scrollbar-hide timer's hide redraw). Reactor context
+      # only (the dirty flag is reactor state).
+      def request_draw
+        @dirty = true
+        signal(WAKE)
+      end
+
       # Spawns a task on the reactor. Reactor context only (call from the
       # work block or tasks it spawned).
       def async(&block)
@@ -177,6 +190,23 @@ module Tart
         @stop_mutex.synchronize { @stop }
       end
 
+      # Cancels the in-flight work (the work task, else the {#async} tasks)
+      # WITHOUT the Ctrl+C quit fallback — the editor's escape-interrupt path
+      # (pi app.interrupt, keybindings.ts:26 → onEscape aborts a streaming
+      # run, interactive-mode.ts:3070-3090): an idle loop stays alive. Same
+      # Task#stop mechanism as the Ctrl+C path — no second interrupt path.
+      # @return [Boolean] whether any live work was cancelled.
+      def interrupt_work!
+        work = @work_task
+        if work&.alive?
+          work.stop
+          true
+        elsif @tasks.any?(&:alive?)
+          @tasks.each(&:stop)
+          true
+        end
+      end
+
       # @return [Boolean] whether a Ctrl+C interrupt was seen this run.
       #   Thread-safe (I02 carry-in).
       def interrupted?
@@ -204,14 +234,7 @@ module Tart
       # interrupt stops the loop.
       def interrupt!
         @stop_mutex.synchronize { @interrupted = true }
-        work = @work_task
-        if work&.alive?
-          work.stop
-        elsif @tasks.any?(&:alive?)
-          @tasks.each(&:stop)
-        else
-          stop!
-        end
+        interrupt_work! || stop!
       end
 
       # Runs the work subtree; any exit path eventually stops the loop.
@@ -272,20 +295,26 @@ module Tart
         end
       end
 
-      # Handles one queue item or synthetic event: control sentinels,
-      # in-band Ctrl+C, or dispatch to the handler.
+      # Handles one queue item or synthetic event: control sentinels or
+      # dispatch to the handler. In-band Ctrl+C is NOT intercepted here —
+      # the key reaches the editor (pi's app.clear: clear, twice exits;
+      # keybindings.ts:27, handleCtrlC) and ESCAPE is the interrupt (the
+      # editor's onEscape path). The trap net keeps real SIGINTs
+      # (interrupt_work! || stop!) for non-raw contexts.
       def process(event, source)
         case event
         when STOP then request_stop
         when INTERRUPT then interrupt!
         when WAKE then nil # wake only; the synthetic drain does the work
         else
-          if TUI.ctrl_c?(event)
-            interrupt!
-          else
-            @on_event&.call(event, source)
-            @dirty = true
-          end
+          @on_event&.call(event, source)
+          # Mouse events dispatch to the surface (wheel scroll, selection);
+          # a bare pointer move carries no state change (the surface
+          # ignores it — pi tui-alt-screen.ts applyMouseDispatchResult
+          # renders on press/click/drag/wheel, not motion), and with
+          # all-motion capture on (gem init.rs:67) moves stream on every
+          # pointer step: redrawing per move would burn the idle CPU.
+          @dirty = true unless event.respond_to?(:moved?) && event.moved?
         end
       end
 

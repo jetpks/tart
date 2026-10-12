@@ -9,8 +9,10 @@
 #   tart -p "prompt"        # headless single-shot
 #   tart --resume           # continue the most recent session
 #
-# Keys: type + Enter to send (steers a running agent); y/n at approval
-# prompts; Ctrl+C interrupts a running turn / quits when idle.
+# Keys: type + Enter to send (steers a running agent); Escape
+# interrupts a running turn; Ctrl+C clears the input (twice within
+# half a second exits); "!cmd" runs whole-line bash without the model
+# ("!!cmd" also keeps it out of context).
 #
 # Run from a REAL terminal (raw mode / alt-screen need a tty).
 
@@ -19,9 +21,21 @@ require_relative "../lib/tart"
 
 module Tart
   module Executable
-    # The built-in defaults are Settings::DEFAULTS (the settings module's
-    # resolution bottoms out there); the loadout is its tool base.
-    SELECTED_TOOLS = Settings::DEFAULT_TOOLS
+    # async 2.46's reactor wrapper instantiates an IO::Buffer on the first
+    # in-reactor IO (once per process) and ruby 4.0.7 blames the outermost
+    # user frame with an experimental warning — on a quiet first turn it
+    # lands mid-UI at the session's first persist. Not any tart frame's
+    # fault; filter exactly that one message and let every other warning
+    # through (unit-proven in test/launcher_smoke_test.rb).
+    module QuietIOBufferWarning
+      IO_BUFFER_EXPERIMENTAL =
+        "IO::Buffer is experimental and both the Ruby and C interface may change in the future!"
+
+      def warn(message, **)
+        return if message.include?(IO_BUFFER_EXPERIMENTAL)
+        super
+      end
+    end
 
     module_function
 
@@ -49,10 +63,13 @@ module Tart
           JSON settings load from ~/.tart/settings.json (user) and
           <workdir>/.tart/settings.json (project, merged over user).
           Keys (camelCase): defaultModel, defaultProvider, apiBase, apiKey,
-          contextWindow, compaction {enabled, reserveTokens,
-          keepRecentTokens}, defaultTools (plain names replace the default
-          loadout; +name adds, -name removes). Environment overrides
-          settings for model/provider/apiBase/apiKey (TART_* above).
+          contextWindow, thinkingLevel (off/minimal/low/medium/high/xhigh/
+          max, default medium; /thinking overrides it for the session),
+          compaction {enabled, reserveTokens, keepRecentTokens},
+          defaultTools (plain names replace the default loadout; +name
+          adds, -name removes). Environment overrides settings for
+          model/provider/apiBase/apiKey — under the identity's namespace
+          (see Environment).
 
         Skills:
           Skills load from ~/.tart/skills (user) and <workdir>/.tart/skills
@@ -62,9 +79,42 @@ module Tart
           message; loaded skills are listed with /skills.
 
         Commands:
-          /new /compact /skills /settings /help /quit — /new starts a fresh
-          session, /compact compacts the context now, /quit exits (when
-          idle). Slash text matching no command goes to the model.
+          /new /compact /resume /model /skills /settings /thinking /help /
+          quit — /new starts a fresh session, /compact compacts the
+          context now, /resume opens the session picker (arrows navigate,
+          enter resumes, escape cancels), /model [provider/model] opens
+          the model selector (or switches directly on an exact match),
+          /thinking [level] opens the thinking-level selector (or sets
+          the level directly), /quit exits (when idle). Slash text
+          matching no command goes to the model.
+          Selector menus: fuzzy search filters, up/down navigate, enter
+          selects, ctrl+s selects and saves as the default, escape/
+          ctrl+c cancels. ctrl+l opens the model menu; shift+tab cycles
+          thinking levels in-session.
+          Autocomplete: type / to get a fuzzy list of commands, skills,
+          and prompt templates; up/down pick, tab (or enter) apply,
+          escape dismisses. PageUp/PageDown scroll the transcript when
+          the list is hidden.
+
+        Models:
+          The model catalog loads from ~/.tart/models.json (pi's shape,
+          JSON comments tolerated): {"providers": {"<provider>": {name,
+          baseUrl, apiKey, api, "models": [{id, name, reasoning,
+          contextWindow, maxTokens}]}}} plus an optional "default":
+          "<provider/model-id>" boot reference. The boot model resolves
+          the identity-namespaced MODEL/PROVIDER env (below) > the
+          models.json default > the settings defaultModel/defaultProvider;
+          a provider's baseUrl/apiKey feed the endpoint (the namespaced
+          API_KEY/API_BASE still override). ctrl+s in the model menu
+          persists defaultProvider + defaultModel to ~/.tart/settings.json.
+
+        Prompt templates:
+          Prompt templates load from ~/.tart/prompts and
+          <workdir>/.tart/prompts: a top-level .md file (optional YAML
+          frontmatter: description, argument-hint) invoked as /<name>
+          [args] — its body joins your message with the args substituted
+          ($1..$N, $@/$ARGUMENTS, ${N:-default}, ${@:N} slices); loaded
+          templates are listed in the startup [Prompts] section.
 
         MCP servers:
           MCP stdio servers are loaded from ~/.tart/mcp.json (shape:
@@ -72,17 +122,28 @@ module Tart
           the loadout as mcp__<server>__<tool>.
 
         Environment:
-          TART_MODEL         model id (default: #{Settings::DEFAULTS["defaultModel"]})
-          TART_PROVIDER      LLM provider (default: #{Settings::DEFAULTS["defaultProvider"]}, chat-completions protocol)
-          TART_API_KEY       provider API key (required; no default)
-          TART_API_BASE      OpenAI-compatible endpoint (default: #{Settings::DEFAULTS["apiBase"]})
-          TART_CONTEXT_WINDOW  context-window override in tokens (default: the model's
+          Every app variable speaks the resolved identity's namespace —
+          the face (below) uppercased: pi reads PI_MODEL, tart
+          TART_MODEL, foo FOO_MODEL. Shown here as <IDENTITY>_*. Only
+          TART_IDENTITY and TART_MCP_CONFIG are literal TART_ knobs
+          (bootstrap: the identity key cannot depend on its own output).
+
+          <IDENTITY>_MODEL         model id (default: #{Settings::DEFAULTS["defaultModel"]})
+          <IDENTITY>_PROVIDER      LLM provider (default: #{Settings::DEFAULTS["defaultProvider"]}, chat-completions protocol)
+          <IDENTITY>_API_KEY       provider API key (required; no default)
+          <IDENTITY>_API_BASE      OpenAI-compatible endpoint (default: #{Settings::DEFAULTS["apiBase"]})
+          <IDENTITY>_CONTEXT_WINDOW  context-window override in tokens (default: the model's
                              context window; the default fireworks model resolves to
                              #{Settings::MODEL_CONTEXT_WINDOWS[Settings::DEFAULTS["defaultModel"]]})
           TART_MCP_CONFIG    MCP config path (default: ~/.tart/mcp.json)
+          TART_IDENTITY      the face to show: any non-empty name — pi (default),
+                             tart, or your own (--identity overrides)
 
-        Keys: type + Enter to send (steers a running agent); y/n at approval
-        prompts; Ctrl+C interrupts a running turn / quits when idle.
+        Keys: type + Enter to send (steers a running agent); Escape
+        interrupts a running turn; Ctrl+C clears the input (twice exits);
+        ctrl+l opens the model menu; shift+tab cycles thinking levels;
+        "!cmd" runs whole-line bash without the model ("!!cmd" also
+        keeps it out of context).
 
         Surface: fullscreen three-area layout — transcript, bordered editor
         (its top border carries the working/tool status), footer (cwd, git
@@ -102,12 +163,20 @@ module Tart
           options[:resume] = id
           options[:resume_given] = true
         end
+        parser.on("--identity IDENTITY",
+          "the face to show: any non-empty name (default pi) — branding, prompt preamble and the app env namespace follow it") do |identity|
+          options[:identity] = identity
+        end
         parser.on("-h", "--help", "show this help") { $stdout.write(usage); exit 0 }
       end.parse!(argv)
       options
     end
 
     def run(argv)
+      # Once per process, before any reactor runs (print mode runs a reactor
+      # too): the first in-reactor IO draws async's IO::Buffer experimental
+      # warning onto the terminal.
+      Warning.extend(QuietIOBufferWarning)
       options = parse(argv)
       workdir = argv.shift || Dir.pwd
       return print_mode(options, workdir) if options[:print]
@@ -121,56 +190,88 @@ module Tart
       result = Settings.load(cwd: workdir)
       settings = result.settings
       report_diagnostics(result.diagnostics)
-      require_api_key(settings)
+      identity = resolve_identity(options, settings)
+      models = Models.load
+      warn "tart: #{models.error}" if models.error
+      require_api_key(settings, models, identity:)
       skills = Skills.load(cwd: workdir)
       abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
 
       exit Print.run(
         prompt: options[:print],
-        chat: build_chat(settings),
+        chat: build_chat(settings, models, Models.resolve_boot_model(models, settings, identity:), identity:),
         tools: build_tools(workdir, settings),
-        system_prompt: system_prompt(workdir, skills.skills)
+        system_prompt: system_prompt(workdir, settings, skills.skills, identity)
       )
     end
 
     def interactive(options, workdir)
       result = Settings.load(cwd: workdir)
       settings = result.settings
+      # The identity seam (I16, free-form since I32): CLI > TART_IDENTITY
+      # env > settings "identity" (Tart::Identity is the one resolution
+      # point). Resolved before any env-tier read so the namespace is
+      # settled (the load order: file → identity → env overrides).
+      identity = resolve_identity(options, settings)
       skills = Skills.load(cwd: workdir)
-      require_api_key(settings)
+      prompts = Prompts.load(cwd: workdir)
+      mcp_servers = Mcp::Config.load(mcp_config_path)
+      # The models.json catalog (I27): the /model menu's entries and the
+      # boot-model resolution's middle layer; a load/parse/schema
+      # failure sets its error (surfaced below, never a crash).
+      models = Models.load
+      require_api_key(settings, models, identity:)
+
+      # The resume path is known before the surface is built: a resumed
+      # boot skips the MOTD (item 3 — pi's chat container gets the
+      # session's entries only; the fresh header would be a boot shape).
+      resume_path = options[:resume_given] ? resolve_resume(options[:resume], workdir) : nil
+      # The exit resume hint's subject — the /new-swapped recorder (outer
+      # local: the TUI.run block updates it, the post-restore read below
+      # uses it).
+      current_recorder = nil
 
       TUI.run(viewport: :fullscreen, bracketed_paste: true) do |session|
         kernel = Core::Loop.new(session:)
-        surface = Render::Chat.new(session:, kernel:)
-        tools = build_tools(workdir, settings)
-        prompt = system_prompt(workdir, skills.skills)
+        surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
+          mcp_servers:, resume: resume_path, identity:, models:)
+        tools = build_tools(workdir, settings, mcp_servers:)
+        prompt = system_prompt(workdir, settings, skills.skills, identity)
 
         # /new's reset seam: a fresh session is a new recorder (new session
         # file, no parent) plus a fresh Agent::Loop on the same settings,
-        # system prompt, skills, and tools — the surface swaps its agent.
-        start_session = lambda do |resume_path|
-          recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
-          seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
-          chat = build_chat(settings)
-          # Footer facts (AC4): the I10 resolved window is the context-usage
-          # denominator; the model id is the settings-resolved one.
-          surface.footer_data = {
-            cwd: workdir,
-            model: Settings.resolve_setting("defaultModel", settings),
-            context_window: Settings.resolve_context_window(settings:, model: chat.model),
-            auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true)
-          }
+        # system prompt, skills, and tools. The surface then clears itself
+        # and re-renders the MOTD + accent line (Chat#new_session).
+        start_session = lambda do |resume_target|
+          recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_target)
+          current_recorder = recorder
+          seed_messages = resume_target ? Agent::Session.context_messages(resume_target) : []
+          # The boot model resolves per session (identity-namespaced env >
+          # models.json "default" > Settings — I27), so a ctrl+s persisted
+          # default is honored by the next /new too.
+          boot = Models.resolve_boot_model(models, settings, identity:)
+          chat = build_chat(settings, models, boot, identity:)
+          surface.footer_data = footer_data(workdir, settings, boot:, chat:, identity:)
           surface.agent = Agent::Loop.new(
             chat:,
             tools:,
             system_prompt: prompt,
             on_event: ->(event) { surface.on_agent_event(event) },
-            approval: ->(tool_call) { surface.approval(tool_call) },
             recorder:,
             seed_messages:,
-            context_window: Settings.resolve_context_window(settings:, model: chat.model),
-            compaction: Settings.compaction_kwargs(settings)
+            context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
+            compaction: Settings.compaction_kwargs(settings),
+            identity:
           )
+        end
+
+        # The resume seam (item 2/3): the picker's enter and the CLI
+        # --resume land here — a fresh recorder linked to the old file
+        # (pi switchSession), then the surface replays the recorded
+        # entries + the "Resumed session" status (Chat#resume_session).
+        resume = lambda do |path|
+          start_session.call(path)
+          surface.resume_session(path)
         end
 
         surface.commands = Commands::Handler.new(
@@ -179,21 +280,116 @@ module Tart
           output: ->(text) { surface.command_line(text) },
           spawn: ->(&block) { kernel.async(&block) },
           agent: -> { surface.agent },
-          reset: lambda { start_session.call(nil); surface.command_line("✓ New session started") },
+          reset: lambda { start_session.call(nil); surface.new_session },
+          thinking: ->(arg) { surface.set_thinking_level(arg) },
+          thinking_menu: -> { surface.open_thinking_menu },
+          models:,
+          model: ->(entry) { surface.switch_model(entry) },
+          model_menu: ->(seed) { surface.open_model_menu(seed) },
+          prompts: prompts.templates,
+          resume: lambda do
+            sessions = Agent::Session.list(cwd: workdir)
+            if sessions.empty?
+              surface.command_line("no sessions found")
+            else
+              surface.open_session_picker(sessions.map { |path| {path:, label: session_label(path)} })
+            end
+          end,
           quit: -> { kernel.stop! }
         )
-        start_session.call(options[:resume_given] && resolve_resume(options[:resume], workdir))
+        surface.on_resume = resume
+        resume.call(resume_path) if resume_path
+        start_session.call(nil) unless resume_path
         report_diagnostics(result.diagnostics, surface:)
+        surface.command_line(models.error) if models.error
         skills.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
+        prompts.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
 
         kernel.renderer = surface.renderer
         kernel.on_event = ->(event, source) { surface.on_event(event, source) }
         kernel.run
       end
+
+      # The exit resume hint (item 1, pi interactive-mode.ts:4324-4327 +
+      # formatResumeCommand :339-355): every interactive exit path —
+      # ctrl+d, the ctrl+c quit, /quit — prints the copy-paste resume
+      # command after the terminal restore, only when the session was
+      # persisted (pi gates on stdout TTY + isPersisted + the file
+      # existing; the port's interactive exit only ever runs on a
+      # terminal — the TTY gate is itemized). --print never reaches here.
+      hint = resume_hint(current_recorder, identity)
+      $stdout.write("#{hint}\n") if hint
     end
 
-    def require_api_key(settings)
-      abort "TART_API_KEY is not set (see --help)." if Settings.resolve_setting("apiKey", settings).nil?
+    # Identity.resolve's invalid value aborts the launch — pi's CLI prints
+    # its errors bare ("Error: <message>", cli.ts:333); the port's
+    # app-name prefix stays (no comparable pi prefix, itemized).
+    # The identity seam (I16, free-form since I32): CLI > TART_IDENTITY
+    # env > settings "identity" (Tart::Identity is the one resolution
+    # point). The resolved face is recorded for the one render path that
+    # cannot take it threaded (chat.rb's frozen Motd header call) — pi's
+    # CLI prints its errors bare ("Error: <message>", cli.ts:333); the
+    # port's app-name prefix stays (no comparable pi prefix, itemized).
+    def resolve_identity(options, settings)
+      identity = Identity.resolve(cli: options[:identity], settings:)
+      Identity.current = identity
+      identity
+    rescue Identity::Error => e
+      abort "tart: #{e.message}"
+    end
+
+    # pi formatResumeCommand :339-355, the port's flag shape (--resume
+    # [ID] IS the specific-id flag; pi's --session <id> is an itemized
+    # deviation): the id resolves through find_session_by_id. The command
+    # word follows the identity (pi-mode's hint reads `pi --resume <id>`).
+    def resume_hint(recorder, identity)
+      return nil unless recorder && recorder.persisted?
+
+      "\e[2mTo resume this session:\e[0m #{identity} --resume #{recorder.id}" # dim label, plain command
+    end
+
+    # The picker's one-line label: the session's first user message (pi
+    # renders session.firstMessage, session-selector.ts:453).
+    def session_label(path)
+      Agent::Session.preview(path) || File.basename(path)
+    end
+
+    # The boot provider's key (I27): identity-namespaced env > the
+    # models.json provider config > the Settings key.
+    def require_api_key(settings, models = nil, identity: Identity::DEFAULT)
+      boot = Models.resolve_boot_model(models, settings, identity:)
+      key = ENV[Identity.env_key(identity, "API_KEY")] || models&.provider(boot[:provider])&.fetch(:api_key, nil) ||
+        Settings.resolve_setting("apiKey", settings, identity:)
+      abort "#{Identity.env_prefix(identity)}API_KEY is not set (see --help)." if key.nil?
+    end
+
+    # Footer facts (AC4): the I10 resolved window is the context-usage
+    # denominator; the model id is the settings-resolved one; the model
+    # metadata (provider label + reasoning capability — the footer's model
+    # segment, pi footer.ts:226-258) resolves off the chat's registry
+    # model, stageable via <IDENTITY>_MODEL_REASONING (Settings); the
+    # thinking level rides the settings-resolved value.
+    def footer_data(workdir, settings, boot: nil, chat:, identity: Identity::DEFAULT)
+      # Optional +boot+: the in-launcher call sites resolve the boot pair
+      # per session; the legacy (settings, chat) shape resolves it from
+      # settings alone.
+      boot ||= {provider: Settings.resolve_setting("defaultProvider", settings),
+                id: Settings.resolve_setting("defaultModel", settings)}
+      # No provider label: pi prefixes the provider only when MORE THAN
+      # one provider is available (footer.ts:246-258) — the port resolves
+      # a single static provider, so the segment is the bare model (the
+      # owner's live "(openai) " finding). I27: the boot pair is threaded
+      # (the /model selector's default badge + degenerate catalog), the
+      # model id from the boot resolution (env > models.json > settings).
+      {
+        cwd: workdir,
+        model: boot[:id],
+        default_provider: boot[:provider],
+        reasoning: Settings.model_reasoning_capable(settings, chat.model, identity:),
+        context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
+        auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
+        thinking_level: Settings.resolve_thinking_level(settings)
+      }
     end
 
     def report_diagnostics(diagnostics, surface: nil)
@@ -203,33 +399,63 @@ module Tart
       end
     end
 
-    # The port's custom preamble plus the skills block (pi emits the
-    # <skills> section when a reader tool is available, system-prompt.ts:
-    # 175-182 — read/bash are always in the launcher's loadout).
-    def system_prompt(workdir, skills = [])
-      base = "You are a coding assistant working in #{workdir}. " \
-        "Inspect files with read/grep/find before editing; keep answers brief."
-      return base if skills.empty?
-
-      "#{base}\n\n#{Skills.format_skills_for_prompt(skills, Skills.skill_file_read_tool(SELECTED_TOOLS)).strip}"
+    # The composed harness prompt (pi's system-prompt.ts, wired I32): the
+    # full section stack — the identity-named preamble, <tools>, <rules>,
+    # <docs> (pi's own install paths, owner ruling 2026-10-12), the
+    # discovered context files, the loaded skills, <cwd> — replacing the
+    # I04-era terse string. The loadout is the settings-resolved one (the
+    # same list Tools::Registry builds from).
+    def system_prompt(workdir, settings, skills, identity)
+      Agent::SystemPrompt.build(
+        selected_tools: Settings.selected_tools(settings),
+        cwd: workdir,
+        context_files: Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root),
+        docs_paths: Agent::SystemPrompt.pi_docs_paths,
+        skills: skills,
+        identity: identity
+      )
     end
 
-    def build_chat(settings)
+    # The chat surface (I27): the launcher's construction seam — the
+    # models.json catalog is REQUIRED, not defaulted: forgetting to
+    # thread it fails loud at construction (the boot crash pin) instead
+    # of silently degenerating the /model menu to the boot model (the
+    # defect the post-integration probe caught: the launcher wired the
+    # catalog into build_chat/the handler/footer_data but not here).
+    def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:)
+      Render::Chat.new(
+        session:, kernel:,
+        # Autocomplete sources (AC1): the builtin slash commands + the
+        # loaded skills + the prompt templates (the same catalog the
+        # Commands::Handler routes).
+        autocomplete: Render::SlashSource.new(commands: Commands::BUILTINS, skills: skills,
+          prompts: prompts),
+        motd: resume.nil?,
+        identity:, prompts:, extensions: mcp_servers.keys,
+        models:
+      )
+    end
+
+    # The chat (I27): the boot model pair resolves identity-namespaced env
+    # > models.json "default" > Settings ({Models.resolve_boot_model});
+    # the resolved provider's models.json config (baseUrl/apiKey/api)
+    # slots between the env overrides and the Settings keys — the
+    # identity-namespaced API_KEY/API_BASE keep working against it.
+    def build_chat(settings, models, boot, identity: Identity::DEFAULT)
+      provider = models.provider(boot[:provider])
       context = RubyLLM.context do |config|
-        config.openai_api_key = Settings.resolve_setting("apiKey", settings)
-        config.openai_api_base = Settings.resolve_setting("apiBase", settings)
+        config.openai_api_key = ENV[Identity.env_key(identity, "API_KEY")] || provider&.fetch(:api_key, nil) || Settings.resolve_setting("apiKey", settings, identity:)
+        config.openai_api_base = ENV[Identity.env_key(identity, "API_BASE")] || provider&.fetch(:base_url, nil) || Settings.resolve_setting("apiBase", settings, identity:)
         config.request_timeout = 120
         config.max_retries = 1
       end
       context.chat(
-        model: Settings.resolve_setting("defaultModel", settings),
-        provider: Settings.resolve_setting("defaultProvider", settings),
+        model: boot[:id], provider: Models.wire_provider(boot[:provider]),
         protocol: :chat_completions, assume_model_exists: true
       )
     end
 
-    def build_tools(workdir, settings)
-      mcp_servers = Mcp::Config.load(mcp_config_path)
+    def build_tools(workdir, settings, mcp_servers: Mcp::Config.load(mcp_config_path))
       Tools::Registry.build(selected: Settings.selected_tools(settings), cwd: workdir, mcp_servers:)
     rescue Mcp::Config::ConfigError => e
       abort "tart: #{e.message}"
@@ -239,30 +465,19 @@ module Tart
       ENV.fetch("TART_MCP_CONFIG", Mcp::Config::DEFAULT_PATH)
     end
 
-    # --resume [ID]: no ID = the most recent session for the workdir (the
-    # port has no session-picker UI); an ID is a session-file path or a
-    # session id (the file name's trailing _<id> or the header id) in the
-    # workdir's session dir.
+    # --resume [ID]: no ID = the most recent session for the workdir; an
+    # ID is a session-file path or a session id (the file name's trailing
+    # _<id> or the header id) among the workdir's sessions.
     def resolve_resume(id, workdir)
-      return require_session(Agent::Session.find_most_recent(session_dir(workdir), cwd: workdir),
+      return require_session(Agent::Session.list(cwd: workdir).first,
         "for #{File.expand_path(workdir)}") if id.nil?
       return id if File.file?(id)
 
-      require_session(find_session_by_id(session_dir(workdir), id), "matching #{id}")
+      require_session(find_session_by_id(workdir, id), "matching #{id}")
     end
 
-    def session_dir(workdir)
-      Agent::Session.dir_path(workdir)
-    end
-
-    def find_session_by_id(dir, id)
-      return nil unless File.directory?(dir)
-
-      files = Dir.children(dir).select { |file| file.end_with?(".jsonl") }
-        .map { |file| File.join(dir, file) }
-        .sort_by { |path| File.mtime(path) }
-        .reverse
-      files.find do |path|
+    def find_session_by_id(workdir, id)
+      Agent::Session.list(cwd: workdir).find do |path|
         File.basename(path, ".jsonl").end_with?("_#{id}") ||
           Agent::Session.read_header(path)&.fetch("id", nil) == id
       end

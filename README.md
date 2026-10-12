@@ -49,6 +49,24 @@ a file that fails to parse counts as absent (defaults hold) with a warning.
 | `compaction.reserveTokens` | `16384` |
 | `compaction.keepRecentTokens` | `20000` |
 | `defaultTools` | all built-in tools (`read write edit bash find grep ls`) |
+| `identity` | `pi` |
+| `thinkingLevel` | `medium` (off/minimal/low/medium/high/xhigh/max) |
+| `modelReasoning` | — (the model's registry capability) |
+
+`identity` picks the face the port shows: `pi` (the default — the oracle's
+header bytes) or `tart` (the owner's art collection, `tart v<version>`, the
+port's hints line). The same choice reads from the `--identity` CLI flag and
+the `TART_IDENTITY` env var — flag > env > settings, anything else errors
+naming the valid values. Structural behavior (transcript padding, blank-line
+spacers, footer format) is identity-independent. `modelReasoning` stages the
+footer's reasoning capability (`model • <level>` only for
+reasoning-capable models — the env form is `TART_MODEL_REASONING`; unset,
+the fact resolves off the model's registry entry, RubyLLM's, then a
+known-models table for assumed models — the daily-driver fireworks glm is
+declared reasoning-capable). The footer's model segment never carries a
+provider prefix: pi prefixes only when its available-model snapshot spans
+>1 provider (footer.ts:246-258), and the port's snapshot is a single
+provider.
 
 `defaultTools` takes plain names (replacing the default loadout), `+name`
 (adds), and `-name` (removes), in list order; a project list of only
@@ -70,14 +88,28 @@ Invoke a skill with `/skill:<name> [args]` — the skill file's body joins
 your message as an expanded `<skill>` block (the model sees the expansion;
 the session records it). `/skills` lists what loaded.
 
+### Prompt templates
+
+Prompt templates load from `~/.tart/prompts` (user) and
+`<workdir>/.tart/prompts` (project): each is a top-level `.md` file (the
+filename stem is the name) with optional YAML frontmatter — `description`
+(falls back to the first body line) and `argument-hint`. Invoke one with
+`/<name> [args]` — the body joins your message with the args substituted
+(`$1..$N`, `$@`/`$ARGUMENTS`, `${N:-default}`, bash-style `${@:N}` slices).
+First-loaded wins on a name collision (user before project). Loaded
+templates appear in the startup `[Prompts]` section and the slash
+autocomplete.
+
 ### Slash commands
 
 | Command | Action |
 |---|---|
 | `/new` | start a fresh session (new session file, empty history, same settings/skills) |
 | `/compact` | compact the session context now |
+| `/resume` | open the session picker (arrows navigate, enter resumes, escape cancels) |
 | `/skills` | list loaded skills |
 | `/settings` | show the resolved settings |
+| `/thinking` | set the thinking level (`/thinking <level>`; bare cycles) — the level drives the footer segment and the editor border color |
 | `/help` | show the builtin commands |
 | `/quit` | quit (when idle) |
 
@@ -85,21 +117,24 @@ Slash text matching no command — including an unknown `/skill:x` — goes to
 the model as a plain message. While a turn is running, slash text steers
 like any message.
 
-Keys: type + Enter to send (steers a running agent); y/n at approval prompts;
-Ctrl+C interrupts a running turn / quits when idle.
+Keys: type + Enter to send (steers a running agent); Escape interrupts a
+running turn / cancels autocomplete / clears bash mode; Ctrl+C clears the
+input, twice within half a second exits; Ctrl+D exits on an empty input.
 
 ### The surface
 
 The fullscreen layout composes three areas (pi's chat viewport): the
 transcript on top (completed turns render into a scrollback buffer;
-assistant messages render as styled markdown at completion; the streaming
-message shows its raw source at the buffer's tail), a bordered editor area
-whose top border carries the status line (spinner + working/tool while a
-turn runs), and a two-line footer: the ~-contracted working directory with
-the git branch, then token counters (↑input ↓output R cache-read
-W cache-write CH cache-hit), context usage against the resolved context
-window (warning above 70%, error above 90%, `(auto)` when compaction is
-enabled), and the model id.
+assistant messages render as styled markdown — streaming shows the same
+shape live, so nothing shifts at completion), a bordered editor area whose
+top border carries the status line (spinner + working/tool while a turn
+runs; the border color follows the thinking level — pi's
+getThinkingBorderColor — and turns green in bash mode), and a two-line
+footer: the ~-contracted working directory with the git branch, then token
+counters (↑input ↓output R cache-read W cache-write CH cache-hit), context
+usage against the resolved context window (warning above 70%, error above
+90%, `(auto)` when compaction is enabled), and the model id with the
+thinking level for reasoning-capable models.
 
 Colors come from a theme token table (`Tart::Theme`) — pi's dark theme
 tokens mapped onto the terminal's ANSI palette. All surface rendering —
@@ -198,18 +233,19 @@ Word operations stop at whitespace, punctuation, and word boundaries (pi's
 `word-navigation.ts` semantics — on `hello world|`, Ctrl+W deletes `world`
 and keeps the separator space).
 
-## Parity rig: pty-tester
+## Parity rig: tui-split-rig
 
-`bin/pty-tester` is the scripted side-by-side parity instrument (BRIEF §1–§3,
-built in I02 from the I01 spike): it runs **pi** (installed oracle) and
+`gems/tui-split-rig/bin/tui-split-rig` is the scripted side-by-side parity
+instrument (BRIEF §1–§3, built in I02 from the I01 spike): it runs **pi**
+(installed oracle) and
 **tart** under identical scripted conditions — same mock LLM, same prompt,
 same 120x40 tmux geometry — captures each app's settled screen, and diffs the
 two captures with attribution.
 
 ```sh
-bin/pty-tester run parity/scenarios/s1_text_turn.yml   # full rig: pi + tart, diff, report
-bin/pty-tester run parity/scenarios/s2_tool_turn.yml --runs 3 --app pi
-bin/pty-tester diff a.capture b.capture --registry parity/registry.yml
+gems/tui-split-rig/bin/tui-split-rig run gems/tui-split-rig/scenarios/s1_text_turn.yml   # full rig: pi + tart, diff, report
+gems/tui-split-rig/bin/tui-split-rig run gems/tui-split-rig/scenarios/s2_tool_turn.yml --runs 3 --app pi
+gems/tui-split-rig/bin/tui-split-rig diff a.capture b.capture --registry gems/tui-split-rig/registry.yml
 ```
 
 `run` stages everything under the out dir (default `tmp/parity/<timestamp>`):
@@ -227,10 +263,11 @@ boot, settle timeout, request-count mismatch, teardown survivor).
 glyph classes. Today's known divergences (MOTD art, `❯` glyph, `⎿` tool
 transcript, footer model string) surface as `unknown-candidate` lines — that
 is correct behavior, not noise. The seed registry
-(`parity/registry.yml`) contains only per-run path/sandbox normalization.
+(`gems/tui-split-rig/registry.yml`) contains only per-run path/sandbox
+normalization.
 
 **Pinning a new class** (when the owner rules a difference out of scope): add
-a `classes:` entry to `parity/registry.yml` with a name and a regex
+a `classes:` entry to `gems/tui-split-rig/registry.yml` with a name and a regex
 `pattern` — first match wins; keep the class as narrow as the finding.
 Classes are data, never code, so a pin is reviewable in a one-line diff. The
 exact-parity direction is one-way: candidates shrink, classes only ever get
@@ -241,11 +278,17 @@ Isolation/teardown: every pane runs with a staged `HOME` (pi also gets a
 staged `PI_CODING_AGENT_DIR`), pane commands are exec-wrapped so the pane pid
 IS the app process, and teardown kills -9 the app and all descendants before
 dropping the session (tmux kill-session alone does not kill tart — I01).
-After any run: no surviving app process, no leftover `pty-tester-*` tmux
+After any run: no surviving app process, no leftover `tui-split-rig-*` tmux
 session, worktree clean.
 
+**Per-app env overrides:** a scenario may carry an optional `env:` mapping
+(app name → `{ENV_VAR => value}`, validated at load; unknown apps and
+non-mapping shapes are rig errors). The runner layers the overrides over its
+staged env for that app — the branding/staging seam (e.g. `s1_tart.yml` boots
+tart with `TART_IDENTITY=tart`).
+
 Live integration test (drives real pi + tart, tens of seconds):
-`PTY_TESTER_LIVE=1 bundle exec rake test`.
+`TUI_SPLIT_RIG_LIVE=1 bundle exec rake test`.
 
 ## Development
 

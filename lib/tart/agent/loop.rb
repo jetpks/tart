@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../compaction"
+require_relative "../settings"
 require_relative "bridge"
 require_relative "session"
 require_relative "status"
@@ -16,7 +17,8 @@ module Tart
     #   arrive after the agent would stop;
     # - inner loop: model turn, then tool-call batches (ruby_llm's
     #   pending-tool-call execution on #step), until the model answers
-    #   without tool calls;
+    #   without tool calls; tools execute unconditionally (pi's
+    #   agent-loop.ts:832 — no permissions system);
     # - an aborted turn emits turn_end/agent_end and stops.
     #
     # Kernel mapping: the loop runs as the work block (task subtree) on
@@ -41,14 +43,10 @@ module Tart
     class Loop
       # @param chat [RubyLLM::Chat] configured for the endpoint (model,
       #   provider, protocol).
-      # @param tools [Hash{String => RubyLLM::Tool}] the gated loadout
+      # @param tools [Hash{String => RubyLLM::Tool}] the selected loadout
       #   ({Tools::Registry.build}); disabled tools are never registered.
       # @param system_prompt [String, nil] set as the chat's instructions.
       # @param on_event [Proc, nil] called with each event Hash.
-      # @param approval [Proc, nil] the injectable approval callback: called
-      #   on the kernel fiber (interruptible) with each
-      #   +RubyLLM::ToolCall+ that requires approval; +true+ approves,
-      #   +false+ denies. Only consulted for tools that gate.
       # @param recorder [Session::Recorder, nil] the optional session
       #   recorder (pi's SessionManager, message subset): every message this
       #   run adds is appended to the session file in order; +nil+ = off.
@@ -57,19 +55,22 @@ module Tart
       #   Agent::Session.context_messages) — the model sees them on the
       #   wire, they are never re-recorded as new messages.
       # @param context_window [Integer, nil] the model's context window,
-      #   overriding the resolution order TART_CONTEXT_WINDOW →
+      #   overriding the resolution order <IDENTITY>_CONTEXT_WINDOW →
       #   chat.model.context_window → nil (nil/<= 0 disables the threshold
       #   trigger only; the overflow trigger always fires).
+      # @param identity [String] the resolved face (Tart::Identity) whose
+      #   env namespace the context-window env tier reads (AC4).
       # @param compaction [Hash, Compaction::Settings, nil] compaction
       #   settings ({enabled:, reserve_tokens:, keep_recent_tokens:});
       #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
-      def initialize(chat:, tools:, system_prompt: nil, on_event: nil, approval: nil,
-        recorder: nil, seed_messages: [], context_window: nil, compaction: nil)
+      def initialize(chat:, tools:, system_prompt: nil, on_event: nil,
+        recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
+        identity: Identity::DEFAULT)
         @chat = chat
         @tools = tools
         @on_event = on_event
-        @approval = approval
         @recorder = recorder
+        @identity = identity
         @context_window = context_window
         @compaction_settings = Compaction::Settings.resolve(compaction)
         @overflow_recovery_attempted = false
@@ -102,6 +103,38 @@ module Tart
       #   close the submit/stop race).
       def queued_messages?
         !@steering_queue.empty?
+      end
+
+      # The resolved context window (the compaction threshold's
+      # denominator) — the test/launcher readback for the switch seam.
+      attr_reader :context_window
+
+      # The model-switch seam (I27, /model + the selector menus): swaps
+      # the runtime chat model in place — ruby_llm Chat#with_model
+      # (live-verified, chat.rb:609: re-resolves provider + connection)
+      # — and re-resolves the context window the compaction math uses.
+      # The provider/protocol/assumption kwargs match the launcher's
+      # build_chat (+provider+ is the WIRE slug — Models.wire_provider;
+      # the openai provider would otherwise pick :responses; the port's
+      # models are assumed, not registry-resolved). Idle-only: the menus
+      # open when no turn runs.
+      def switch_model(model_id, provider:, context_window: nil)
+        @chat.with_model(model_id, provider:, protocol: :chat_completions, assume_model_exists: true)
+        # pi has no cached window to go stale: setModel swaps the Model
+        # object (agent-session.ts:2484) and every check reads
+        # model.contextWindow live (:2965). The port's cache re-resolves
+        # instead, through the boot chain's resolution (Settings
+        # .resolve_context_window, settings tier excluded — the loop holds
+        # no settings; bin/tart resolves them at boot): the catalog-
+        # declared window, else TART_CONTEXT_WINDOW, else the switched
+        # chat's model (the gem's registry resolution — under the boot
+        # path's assume_model_exists a mock lands on Model.default with no
+        # context_window), else the known-models table (I30: a table entry
+        # with no declared window keeps the threshold armed instead of
+        # nil-disabling it). nil still = threshold disabled, pi's
+        # `contextWindow ?? 0`.
+        @context_window = Settings.resolve_context_window(explicit: context_window, model: @chat.model)
+        self
       end
 
       # Runs the agent to completion of the prompt and every queued message.
@@ -156,6 +189,15 @@ module Tart
         run_compaction(reason: :manual)
       end
 
+      # The !-prefix bash execution record (pi recordBashResult
+      # agent-session.ts:3879): a bashExecution message entry on the same
+      # leaf chain — the chat surface calls this when the executor
+      # completes. +message+ is the pi-shaped hash
+      # ({Session.bash_execution_message}).
+      def record_bash_execution(message)
+        @recorder&.append_bash_execution(message)
+      end
+
       private
 
       # Session recording (pi SessionManager.appendMessage): the recorder
@@ -195,7 +237,6 @@ module Tart
       def inner_loop
         loop do
           message = step_via_bridge
-          next if handle_pause
           next if recover_overflow?
 
           # The error check precedes the nil-message break: a step the worker
@@ -210,7 +251,7 @@ module Tart
             # pi _handlePostAgentRun checks compaction after EVERY
             # completed turn, queued steering or not (agent-session.ts:
             # 1861-1885); the run then continues with the queued messages.
-            run_threshold_compaction
+            run_threshold_compaction(message)
             pending = steering_messages
             if pending.empty?
               emit(type: :turn_end, message:)
@@ -243,38 +284,38 @@ module Tart
         true
       end
 
-      # pi _checkCompaction Case 3 (agent-session.ts:3079-3083): after a
-      # completed turn, provider-reported usage vs the model's context
-      # window and the reserve.
-      def run_threshold_compaction
-        return unless threshold_exceeded?
+      # pi _checkCompaction Case 3 (agent-session.ts:3050-3090): after a
+      # completed turn, the direct usage of that turn's final assistant
+      # message vs the model's context window and the reserve; zero/absent
+      # usage falls back to the estimate (Compaction.trigger_tokens).
+      def run_threshold_compaction(message)
+        return unless threshold_exceeded?(message)
 
         run_compaction(reason: :threshold)
       end
 
-      def threshold_exceeded?
+      def threshold_exceeded?(message)
         window = resolved_context_window
         return false unless window.is_a?(Integer) && window.positive?
 
-        estimate = Compaction.estimate_context_tokens(@chat.messages)
-        # pi's stale pre-compaction usage guard (agent-session.ts:3063-3075):
-        # kept pre-compaction messages carry usage reflecting the old
-        # (larger) context and would falsely re-trigger right after a
-        # compaction — only a post-compaction usage message may fire it.
-        usage_message = estimate[:last_usage_index] && @chat.messages[estimate[:last_usage_index]]
-        return false if usage_message && @pre_compaction_messages.key?(usage_message)
+        tokens = Compaction.trigger_tokens(@chat.messages, message,
+          pre_compaction_messages: @pre_compaction_messages, tools: @chat.tools)
+        return false if tokens.nil?
 
-        Compaction.should_compact?(estimate[:tokens], window, @compaction_settings)
+        Compaction.should_compact?(tokens, window, @compaction_settings)
       end
 
-      # Explicit kwarg → TART_CONTEXT_WINDOW → chat.model.context_
+      # Explicit kwarg → <IDENTITY>_CONTEXT_WINDOW → chat.model.context_
       # window → nil. The gem's assume_model_exists resolution lands on
       # Model.default, which carries no context_window (models.rb:210,
-      # model.rb:65-75) — nil disables the threshold trigger only.
+      # model.rb:65-75) — nil disables the threshold trigger only. The env
+      # tier speaks the identity's namespace (AC4); +identity+ defaults to
+      # pi — the launcher threads the resolved face (print.rb's frozen
+      # construction cannot).
       def resolved_context_window
         return @context_window if @context_window
 
-        env = ENV["TART_CONTEXT_WINDOW"]
+        env = ENV[Identity.env_key(@identity, "CONTEXT_WINDOW")]
         return Integer(env, 10) if env&.match(/\A\d+\z/)
 
         @chat.model&.context_window
@@ -286,16 +327,26 @@ module Tart
       # compaction entry → emit the compaction event. Returns whether a
       # compaction happened.
       def run_compaction(reason:)
-        preparation = Compaction.prepare(@chat.messages, @compaction_settings)
+        preparation = Compaction.prepare(@chat.messages, @compaction_settings, tools: @chat.tools)
         return false unless preparation
 
-        summary = summarize(preparation)
-        return false unless summary
+        # pi emits compaction_start once per started compaction, after
+        # prepare returns truthy and before the summarization call
+        # (agent-session.ts:3119, the auto path's placement, unified across
+        # reasons) — the surface's "Compacting context..." border status
+        # keys off it; the completed-compaction event below clears it.
+        emit(type: :compaction_start, reason:)
+        summarized = summarize(preparation)
+        return false unless summarized
 
         lists = Compaction.compute_file_lists(
           Compaction.extract_file_ops(preparation.messages_to_summarize)
         )
-        summary += Compaction.format_file_operations(lists[:read_files], lists[:modified_files])
+        summary = summarized.content + Compaction.format_file_operations(lists[:read_files], lists[:modified_files])
+        # pi CompactionResult.usage — the summarization call's own usage
+        # (compaction.ts:1085, populated) — data only: the render is the
+        # compaction-panel fast-follow's.
+        preparation.usage = summarized.tokens
 
         keep_from = preparation.first_kept_index
         system_messages = @chat.messages.select { |message| message.role == :system }
@@ -303,15 +354,27 @@ module Tart
         summary_message = @chat.add_message(role: :user, content: compaction_summary_content(summary))
         @chat.messages = [*system_messages, summary_message, *kept]
 
+        # pi CompactionResult.estimatedTokensAfter (agent-session.ts:2850):
+        # the pure estimateMessagesTokens over the post-compaction history
+        # (:366-371 — chars/4, never usage-backed). Data only.
+        preparation.estimated_tokens_after = Compaction.full_estimate(@chat.messages, tools: @chat.tools)[:tokens]
         @recorder&.append_compaction(
           summary:,
           first_kept_entry_id: @entry_ids[kept.first],
           tokens_before: preparation.tokens_before,
           # pi CompactionDetails (compaction.ts:37-40).
           details: {"readFiles" => lists[:read_files], "modifiedFiles" => lists[:modified_files]},
+          usage: Session.compaction_usage(preparation.usage),
         )
         @pre_compaction_messages = @chat.messages.each_with_object({}.compare_by_identity) { |message, set| set[message] = true }
-        emit(type: :compaction, reason:, tokens_before: preparation.tokens_before, summary:)
+        # pi's rebuild source (interactive-mode.ts:3698-3705):
+        # buildContextEntries + renderSessionEntries(entries.slice(1)) —
+        # the recorder's context projection minus the leading compaction
+        # entry: the kept post-compaction replay entries, chronological,
+        # no system/summary message. No recorder, nothing recorded,
+        # nothing to replay.
+        entries = @recorder ? @recorder.context_entries.drop(1) : []
+        emit(type: :compaction, reason:, tokens_before: preparation.tokens_before, summary:, entries:)
         true
       end
 
@@ -327,7 +390,9 @@ module Tart
       # min(floor(0.8 * reserve_tokens), model max) (:683-686); the gem's
       # model.max_output_tokens is the model max (model.rb:36). Run through
       # the Bridge like every blocking LLM call so a kernel interrupt
-      # cancels it. nil (compaction aborted) when the call fails.
+      # cancels it. nil (compaction aborted) when the call fails. The full
+      # reply Message is returned — its usage is pi's CompactionResult.usage
+      # (compaction.ts:1085).
       def summarize(preparation)
         prompt = Compaction.summarization_prompt(preparation.messages_to_summarize,
           previous_summary: preparation.previous_summary)
@@ -341,7 +406,7 @@ module Tart
         }) { |_item| }
         return nil if terminal.is_a?(Hash) && terminal[:type] == :error
 
-        result.content
+        result
       end
 
       def build_summary_chat
@@ -366,7 +431,7 @@ module Tart
 
       # One ruby_llm #step on the worker thread. Returns the step's message
       # (assistant message or tool result), or nil when the step produced no
-      # message (approval pause, chat pause).
+      # message (chat pause).
       def step_via_bridge
         bridge = Bridge.new
         bridge.on_cancel { @chat.cancel }
@@ -386,18 +451,6 @@ module Tart
           end
           sink.call({type: :step, message:}) if message
         }
-      end
-
-      # @return [Boolean] whether the loop must pause for an approval
-      #   decision (recorded here, on the kernel fiber).
-      def handle_pause
-        return false unless @chat.waiting? && @chat.awaiting_approval?
-
-        @chat.pending_approvals.each do |tool_call|
-          decision = @approval ? @approval.call(tool_call) : false
-          decision ? @chat.approve(tool_call) : @chat.deny(tool_call)
-        end
-        true
       end
 
       def record_terminal_error(terminal)
@@ -445,11 +498,16 @@ module Tart
           # fiber/thread-local — before and after run in the same execution
           # context, per call, in both of ToolConcurrency's modes.
           Thread.current[:tart_tool_call] = tool_call
+          # I17: arm the per-execution clock (monotonic — pi's
+          # performance.now() delta, nested-tool-calls.ts:82).
+          Thread.current[:tart_tool_started_at] = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           @sink&.call({type: :tool_execution_start, tool_call:})
         end
         @chat.after_tool_result do |result|
+          duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) -
+                     Thread.current[:tart_tool_started_at]
           @sink&.call({type: :tool_execution_end,
-                       tool_call: Thread.current[:tart_tool_call], result:})
+                       tool_call: Thread.current[:tart_tool_call], result:, duration:})
         end
         @chat.after_message do |message|
           # Tool result messages appear atomically; streamed assistant
@@ -490,7 +548,8 @@ module Tart
         when :tool_execution_start
           emit(type: :tool_execution_start, tool_call: item[:tool_call])
         when :tool_execution_end
-          emit(type: :tool_execution_end, tool_call: item[:tool_call], result: item[:result])
+          emit(type: :tool_execution_end, tool_call: item[:tool_call], result: item[:result],
+               duration: item[:duration])
         end
       end
 

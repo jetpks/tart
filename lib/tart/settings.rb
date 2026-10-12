@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "fileutils"
 require_relative "agent/session"
 
 module Tart
@@ -35,28 +36,50 @@ module Tart
     CONFIG_DIR = ".tart"
 
     DEFAULTS = {
+      "identity" => Identity::DEFAULT,
       "defaultModel" => "accounts/fireworks/models/glm-5p3-flash",
       "defaultProvider" => "openai",
       "apiBase" => "https://api.fireworks.ai/inference/v1",
       "apiKey" => nil,
       "contextWindow" => nil,
-      "compaction" => {"enabled" => true, "reserveTokens" => 16_384, "keepRecentTokens" => 20_000}
+      "thinkingLevel" => "medium",
+      "compaction" => {"enabled" => true, "reserveTokens" => 16_384, "keepRecentTokens" => 20_000},
+      # Footer model-metadata staging (rarely set; nil = resolve from the
+      # model, see {model_reasoning_capable}).
+      "modelReasoning" => nil
     }.freeze
+
+    # pi's ThinkingLevel vocabulary (model-schema.ts:2-3, agent types.ts:349).
+    # The setting diverges from pi's schema key (defaultThinkingLevel,
+    # settings-schema.ts:212) — recorded divergence.
+    THINKING_LEVELS = %w[off minimal low medium high xhigh max].freeze
 
     # The port's built-in tool base (bin/tart's loadout; pi's
     # DEFAULT_TOOL_NAMES is its four core tools — recorded divergence).
     DEFAULT_TOOLS = %w[read write edit bash find grep ls].freeze
 
-    # env → settings → built-in default, per key (AC2).
+    # env → settings → built-in default, per key (AC2/AC4). The env KEY
+    # rides the resolved identity's namespace ({Identity.env_key}):
+    # pi mode reads PI_MODEL, tart TART_MODEL, foo FOO_MODEL — the SUFFIX
+    # column here, prefixed at read time.
     RESOLUTION_ENV = {
-      "defaultModel" => "TART_MODEL",
-      "defaultProvider" => "TART_PROVIDER",
-      "apiBase" => "TART_API_BASE",
-      "apiKey" => "TART_API_KEY"
+      "defaultModel" => "MODEL",
+      "defaultProvider" => "PROVIDER",
+      "apiBase" => "API_BASE",
+      "apiKey" => "API_KEY",
+      "modelReasoning" => "MODEL_REASONING"
     }.freeze
 
     MODEL_CONTEXT_WINDOWS = {
       "accounts/fireworks/models/glm-5p3-flash" => 1_048_573
+    }.freeze
+
+    # The known reasoning-capable models (same assumed-model class as
+    # {MODEL_CONTEXT_WINDOWS}: ids RubyLLM's registry has no entry for,
+    # but the owner's daily-driver catalog declares reasoning — pi's
+    # footer shows the level for them, so the port must too).
+    MODEL_REASONING = {
+      "accounts/fireworks/models/glm-5p3-flash" => true
     }.freeze
 
     Diagnostic = Struct.new(:type, :message, :path, keyword_init: true)
@@ -83,19 +106,22 @@ module Tart
     end
 
     # env → settings → built-in default for one carried key (bin/tart's
-    # model/provider/apiBase/apiKey resolution, AC2).
-    def resolve_setting(key, settings, env: ENV)
-      env[RESOLUTION_ENV.fetch(key)] || settings[key] || DEFAULTS[key]
+    # model/provider/apiBase/apiKey resolution, AC2). The env tier speaks
+    # the identity's namespace (AC4): resolve_setting("apiKey", settings,
+    # identity: "foo") reads FOO_API_KEY.
+    def resolve_setting(key, settings, identity: Identity::DEFAULT, env: ENV)
+      env[Identity.env_key(identity, RESOLUTION_ENV.fetch(key))] || settings[key] || DEFAULTS[key]
     end
 
-    # Explicit kwarg → TART_CONTEXT_WINDOW → settings.contextWindow →
-    # model context window → registry-default table → nil (AC2; pi has no
-    # contextWindow setting — the registry is its only source — recorded
-    # port extension).
-    def resolve_context_window(explicit: nil, settings: {}, model: nil, env: ENV)
+    # Explicit kwarg → <IDENTITY>_CONTEXT_WINDOW → settings.contextWindow →
+    # model context window → registry-default table → nil (AC2/AC4; pi has
+    # no contextWindow setting — the registry is its only source — recorded
+    # port extension). The env tier rides the identity's namespace, like
+    # every app env read.
+    def resolve_context_window(explicit: nil, settings: {}, model: nil, identity: Identity::DEFAULT, env: ENV)
       return explicit if explicit
 
-      env_value = env["TART_CONTEXT_WINDOW"]
+      env_value = env[Identity.env_key(identity, "CONTEXT_WINDOW")]
       return Integer(env_value, 10) if env_value&.match?(/\A\d+\z/)
 
       window = settings["contextWindow"]
@@ -105,6 +131,36 @@ module Tart
       return window if window.is_a?(Integer) && window.positive?
 
       MODEL_CONTEXT_WINDOWS[model&.id]
+    end
+
+    # The thinking level for the footer's "model • <level>" (pi footer.ts:
+    # 236-239): a settings value in pi's vocabulary passes through; anything
+    # else (missing, null, mistyped) falls back to pi's runtime default
+    # DEFAULT_THINKING_LEVEL "medium" (defaults.ts:3, model-resolver.ts:646).
+    # No env override — pi has none for it either.
+    def resolve_thinking_level(settings)
+      level = settings["thinkingLevel"]
+      THINKING_LEVELS.include?(level) ? level : DEFAULTS.fetch("thinkingLevel")
+    end
+
+    # The footer's model-metadata fact (pi footer.ts:233-244 reads
+    # state.model?.reasoning off the registry's model entry; the port's
+    # registry is RubyLLM's — a found entry answers .supports?(:reasoning)).
+    # The provider LABEL is never rendered: pi prefixes the model only
+    # when its available-model snapshot spans >1 provider (footer.ts:246
+    # -258) — the port's static snapshot is one provider, so the prefix
+    # never fires. Stageable for rigs/mocks: the modelReasoning setting
+    # (<IDENTITY>_MODEL_REASONING env) overrides everything; an assumed model
+    # (no registry entry) falls back to the known-models table — the
+    # owner's daily-driver glm declares reasoning in pi's book, and the
+    # footer/border parity dies without it.
+    def model_reasoning_capable(settings, model, identity: Identity::DEFAULT)
+      staged = resolve_setting("modelReasoning", settings, identity:)
+      return staged == true || staged == "true" unless staged.nil?
+
+      MODEL_REASONING.fetch(model&.id) do
+        model.respond_to?(:supports?) ? model.supports?(:reasoning) : false
+      end
     end
 
     # The compaction settings as Agent::Loop kwargs (camelCase JSON keys →
@@ -172,6 +228,22 @@ module Tart
           override_value
         end
       end
+    end
+
+    # The write surface (I27, pi settings-manager.ts setDefaultModel /
+    # setDefaultModelAndProvider → persistScopedSettings): merge the
+    # updates over the CURRENT file contents — unknown and unmodified
+    # keys survive verbatim (pi rewrites the whole scoped file, never a
+    # schema projection) — then pretty-print. An unparseable existing
+    # file counts as empty (the {read_file} idiom). +root+ is the user
+    # config dir (~/.tart); the path is returned.
+    def save(root, updates)
+      path = File.join(root, ROOT_KEY)
+      existing = File.file?(path) ? read_file(path).first : {}
+      merged = deep_merge(existing, updates)
+      FileUtils.mkdir_p(root)
+      File.write(path, "#{JSON.pretty_generate(merged)}\n")
+      path
     end
 
     # pi tryLoadFromStorage (:367-379): a file that fails to parse counts

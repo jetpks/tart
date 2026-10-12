@@ -1,0 +1,42 @@
+# S6 — long tool-call rows vs the viewport (I20): the mock scripts one
+# bash tool call with a >120-char command (the bold `$ <command>` call
+# row), one write tool call with a >100-char sandbox-relative staged
+# path (the write renderer's renderToolPath call row), then a fixed
+# final reply. Three mock requests per app.
+#
+# Measures the call-row wrap CUT (I18): pi's Text wraps call rows to
+# the viewport (120-col pane); the port renders the write call row as
+# one unwrapped TUI.line (chat.rb write_call_rows:1267-1270), which the
+# pane hard-clips. The bash call row is wrapped by both (chat.rb:1133
+# padded_fg_rows over renderers/bash.ts formatShellCall) — the baseline
+# decides whether the wrap points diverge. The write's content is short
+# (the write content preview is I18-landed); only the CALL rows are the
+# target. The long path is sandbox-relative (the tmux pane's cwd, the
+# s3 pattern), so the staged-sandbox-path / parity-run-path classes
+# cover it when the row wraps into the cwd.
+#
+# Both commands are shell-neutral (sh/bash/fish).
+#
+# Evidence-only baseline: no exit-0 requirement, no registry change —
+# the candidate list feeds the NEXT iteration's work list.
+name: s6_long_calls
+prompt: "run the long command and write the long-named file"
+expected_requests: 3
+responses:
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_s6_1
+        name: bash
+        arguments:
+          command: "echo s6-long-call && seq 1 3 && printf '%s\\n' \"s6-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-x\""
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_s6_2
+        name: write
+        arguments:
+          path: "s6-long-path-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad-pad.txt"
+          content: "parity s6 note"
+  - type: stream
+    content: "The long tool calls ran; fixed final reply for the spike."

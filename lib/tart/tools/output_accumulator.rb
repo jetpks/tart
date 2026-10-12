@@ -178,7 +178,11 @@ module Tart
       def ensure_temp_file
         return if @temp_file_path
 
-        @temp_file_path = File.join(Dir.tmpdir, "#{@temp_file_prefix}-#{Process.pid}-#{SecureRandom.hex(4)}.log")
+        # pi's createOutputFilePath (output-files.ts:15-17): a FIXED 16-hex
+        # random segment, no pid — the spill path's length shows through the
+        # rendered truncation notice's wrap point, so it must not vary run
+        # to run (the parity instrument diffs settled rows).
+        @temp_file_path = File.join(Dir.tmpdir, "#{@temp_file_prefix}-#{SecureRandom.hex(8)}.log")
         File.binwrite(@temp_file_path, @raw_chunks.join)
         @raw_chunks = []
       end

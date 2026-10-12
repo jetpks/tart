@@ -11,11 +11,7 @@ module Tart
   # No TUI anywhere on the path: the loop kernel runs on a {NullSession}
   # that never yields events (pi's print mode never opens a terminal; its
   # output goes through output-guard.ts writeRawStdout:85 — raw, unbuffered).
-  #
-  # Approval disposition (print-mode.ts has no gate; pi's agent-loop.ts:832
-  # executes tools unconditionally): print mode auto-approves every gated
-  # tool via an always-true callback — pi's exact behavior, itemized in the
-  # parity table.
+  # Tools execute unconditionally, as everywhere (agent-loop.ts:832).
   #
   # Exit codes (print-mode.ts:145-160): 0 on success, 1 when the agent
   # stopped on error/abort (message to stderr) or an error was raised
@@ -42,8 +38,7 @@ module Tart
     def run(prompt:, chat:, tools:, system_prompt: nil, on_event: nil,
             stdout: $stdout, stderr: $stderr)
       stdout.sync = true
-      agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,
-                              approval: ->(_tool_call) { true })
+      agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:)
       Core::Loop.new(session: NullSession.new).run { agent.run(prompt) }
       return error_exit(agent, stderr) if agent.last_error || agent.interrupted?
 

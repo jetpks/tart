@@ -143,6 +143,75 @@ module Tart
       assert_equal "and then?", entries[1]["message"]["content"]
     end
 
+    # The bashExecution record (pi recordBashResult agent-session.ts:3879)
+    # projects to a USER context message — pi convertToLlm's bashExecution
+    # case (messages.ts:149-160) with the bashExecutionToText bytes
+    # (messages.ts:82-97). The !!-prefixed execution (excludeFromContext)
+    # is skipped entirely.
+    def test_bash_execution_record_projects_to_user_context
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_bash_execution(Agent::Session.bash_execution_message(
+        command: "echo hi", output: "hi\n", exit_code: 0, cancelled: false,
+        truncated: false, full_output_path: nil))
+
+      entry = Agent::Session.load_entries(recorder.path).last
+      projected = Agent::Session.entry_to_context_message(entry)
+      assert_equal :user, projected[:role]
+      # pi's bytes: the raw output (its trailing newline included)
+      # fenced between the code markers.
+      assert_equal "Ran `echo hi`\n```\nhi\n\n```", projected[:content]
+    end
+
+    def test_bash_execution_context_text_variants
+      build = lambda do |overrides|
+        Agent::Session.bash_execution_message(command: "x", output: "out", exit_code: 0,
+          cancelled: false, truncated: false, full_output_path: nil, **overrides)
+      end
+      # The projection reads LOADED entries — the JSON round-trip (string
+      # keys), exactly what a resume reads.
+      text = lambda do |message|
+        entry = Agent::Session.message_entry(message, id: "e", parent_id: nil, timestamp: "t")
+        Agent::Session.entry_to_context_message(JSON.parse(JSON.generate(entry)))[:content]
+      end
+
+      assert_equal "Ran `x`\n(no output)", text.call(build.call(output: "")),
+        "empty output renders the placeholder (bashExecutionToText)"
+      assert_equal "Ran `x`\n```\nout\n```\n\nCommand exited with code 2",
+        text.call(build.call(exit_code: 2)), "the non-zero exit notice"
+      assert_equal "Ran `x`\n```\nout\n```\n\n(command cancelled)",
+        text.call(build.call(cancelled: true)), "the cancellation notice"
+      assert_equal "Ran `x`\n```\nout\n```\n\n[Output truncated. Full output: /tmp/x.log]",
+        text.call(build.call(truncated: true, full_output_path: "/tmp/x.log")),
+        "the truncation notice — pi's USER-bash wording, not the tool's"
+    end
+
+    def test_bang_bang_execution_is_skipped_from_context
+      message = Agent::Session.bash_execution_message(command: "echo secret", output: "s", exit_code: 0,
+        cancelled: false, truncated: false, full_output_path: nil, exclude_from_context: true)
+      entry = Agent::Session.message_entry(message, id: "e", parent_id: nil, timestamp: "t")
+      assert_nil Agent::Session.entry_to_context_message(JSON.parse(JSON.generate(entry)))
+    end
+
+    # The resumed run's model demonstrably sees the !-execution: the
+    # captured request payload carries the projected user message.
+    def test_resumed_run_sees_the_bash_execution_in_context
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_bash_execution(Agent::Session.bash_execution_message(
+        command: "echo hi", output: "hi\n", exit_code: 0, cancelled: false,
+        truncated: false, full_output_path: nil))
+
+      @server.script([{type: :message, content: "noted"}])
+      tools = Tools::Registry.build(selected: [], cwd: @dir)
+      seed = Agent::Session.context_messages(recorder.path)
+      resumed = Agent::Session::Recorder.new(cwd: @dir, root: @root, parent_session: recorder.path)
+      run_agent(agent_on_kernel(tools:, recorder: resumed, seed_messages: seed), "and then?")
+
+      payload = @server.captured_requests.last["messages"]
+        .reject { |m| %w[system developer].include?(m["role"]) }
+      assert_equal %w[user user], payload.map { |m| m["role"] }
+      assert_match(/\ARan `echo hi`/, payload[0]["content"])
+    end
+
     # AC4: the compaction entry shape (pi CompactionEntry session-manager.ts
     # :91-104, the port's field subset) and the null first-kept fallback
     # (appendCompaction's `firstKeptEntryId ?? id`).
@@ -161,6 +230,58 @@ module Tart
       assert_equal "the summary", compaction["summary"]
       assert_equal 42, compaction["tokensBefore"]
       assert_equal({"readFiles" => ["a.rb"], "modifiedFiles" => []}, compaction["details"])
+    end
+
+    # AC3 (I30): the summarization usage persists on the compaction entry
+    # (pi CompactionEntry.usage, session-manager.ts:99) — camelCase, the
+    # round-trip through the file; estimated_tokens_after is not a field
+    # (pi doesn't carry it); nil usage omits the key (pi's optional
+    # usage — JSON drops undefined).
+    def test_recorder_persists_the_summarization_usage_on_the_compaction_entry
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_message(RubyLLM::Message.new(role: :user, content: "hi"))
+      recorder.append_compaction(summary: "the summary", first_kept_entry_id: nil, tokens_before: 42,
+        details: {}, usage: {"input" => 10, "output" => 5, "totalTokens" => 15})
+      recorder.append_compaction(summary: "second", first_kept_entry_id: nil, tokens_before: 1, details: {})
+
+      entries = Agent::Session.load_entries(recorder.path)
+      assert_equal({"input" => 10, "output" => 5, "totalTokens" => 15}, entries[2]["usage"])
+      refute entries[2].key?("estimatedTokensAfter")
+      refute entries[3].key?("usage")
+    end
+
+    # AC3 (I30): the gem's Tokens readers map onto pi's Usage (types.ts
+    # :446) camelCase persisted shape — unreported counts drop,
+    # totalTokens is the component sum (the gem carries no total reader);
+    # nothing reported persists nothing (pi's usage-undefined entries).
+    def test_compaction_usage_maps_the_gem_tokens_to_pis_usage_shape
+      tokens = RubyLLM::Tokens.new(input: 10, output: 5, cache_read: 4, cache_write: 2,
+        thinking: 3, cache_write_by_ttl: {"5m" => 1, "1h" => 2})
+      assert_equal(
+        {"input" => 10, "output" => 5, "cacheRead" => 4, "cacheWrite" => 2,
+         "cacheWrite1h" => 2, "reasoning" => 3, "totalTokens" => 21},
+        Agent::Session.compaction_usage(tokens))
+
+      assert_nil Agent::Session.compaction_usage(RubyLLM::Tokens.new)
+      assert_nil Agent::Session.compaction_usage(nil)
+    end
+
+    # AC3 (I30): the recorder's context projection (pi buildContextEntries
+    # :475-513) — the compaction entry leading, the kept entries from
+    # firstKeptEntryId onward (system messages skipped), the as-loaded
+    # shape load_entries reads back.
+    def test_recorder_context_entries_projects_the_kept_tail
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_message(RubyLLM::Message.new(role: :user, content: "old question"))
+      recorder.append_message(RubyLLM::Message.new(role: :system, content: "prompt state"))
+      kept_id = recorder.append_message(RubyLLM::Message.new(role: :assistant, content: "kept answer"))
+      recorder.append_compaction(summary: "the summary", first_kept_entry_id: kept_id,
+        tokens_before: 1, details: {})
+
+      entries = recorder.context_entries
+      assert_equal "compaction", entries.first["type"]
+      assert_equal ["kept answer"], entries.drop(1).map { |e| e["message"]["content"] }
+      assert_equal Agent::Session.load_entries(recorder.path)[3, 1], entries.drop(1)
     end
 
     # AC4: compaction-aware context replay (pi buildContextEntries
@@ -242,6 +363,50 @@ module Tart
       assert_equal "ok", agent.new_messages.last.content
       assert_empty Dir.glob(File.join(@root, "sessions", "**", "*.jsonl")),
         "no recorder, no files anywhere under the root"
+    end
+
+    # Session.list (item 2/AC2, pi SessionManager.list's discovery shape):
+    # the cwd's valid-header sessions, mtime descending, fixture-rooted.
+    def test_lists_the_cwd_s_sessions_newest_first
+      dir = Agent::Session.ensure_dir(@dir, root: @root)
+      other_cwd = File.join(@dir, "elsewhere")
+      old = write_session_file(dir, cwd: @dir)
+      newest = write_session_file(dir, cwd: @dir)
+      foreign = write_session_file(dir, cwd: other_cwd)
+      broken = File.join(dir, "broken.jsonl")
+      File.write(broken, "not a session header\n")
+      FileUtils.touch(old, mtime: Time.at(1_000))
+      FileUtils.touch(newest, mtime: Time.at(2_000))
+      FileUtils.touch(foreign, mtime: Time.at(3_000))
+      FileUtils.touch(broken, mtime: Time.at(4_000))
+
+      assert_equal [newest, old], Agent::Session.list(cwd: @dir, root: @root),
+        "mtime descending, valid headers only, header cwd resolved to the requested cwd"
+      assert_empty Agent::Session.list(cwd: File.join(@dir, "nowhere"), root: @root)
+    end
+
+    def test_preview_carries_the_first_user_message
+      dir = Agent::Session.ensure_dir(@dir, root: @root)
+      path = File.join(dir, "#{Agent::Session.uuidv7}.jsonl")
+      header = Agent::Session.header(id: Agent::Session.uuidv7, cwd: @dir)
+      entry = Agent::Session.message_entry({role: "user", content: "  fix the\n  flaky test  "},
+        id: Agent::Session.generate_id(Set.new), parent_id: nil, timestamp: Agent::Session.now_iso)
+      File.write(path, "#{JSON.generate(header)}\n#{JSON.generate(entry)}\n")
+
+      assert_equal "fix the flaky test", Agent::Session.preview(path),
+        "squashed first user message (pi renders session.firstMessage)"
+      assert_nil Agent::Session.preview(File.join(dir, "absent.jsonl"))
+    end
+
+    # persisted? (item 1/AC1, pi isPersisted :1166): false until the first
+    # user/assistant message flushes the file; true after.
+    def test_persisted_tracks_the_first_flush
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      refute recorder.persisted?, "a setup-only session leaves no file"
+
+      message = RubyLLM::Message.new(role: :user, content: "hi")
+      recorder.append_message(message)
+      assert recorder.persisted?, "the file exists once a user message landed"
     end
 
     private

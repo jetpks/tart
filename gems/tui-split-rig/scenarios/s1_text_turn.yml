@@ -1,0 +1,17 @@
+# S1 — plain text turn (I01 spike): both apps get the same fixed reply.
+# One mock request per app.
+#
+# Footer note (I16): pi prefixes the model with its provider only when
+# its available-model snapshot spans >1 provider (footer.ts:246-258) —
+# the staged catalog carries the built-ins, so staged pi renders
+# `(mock) mock-1`; the port's static single-provider snapshot renders
+# bare `mock-1` (pi's own rule over its snapshot). Sanctioned in
+# registry.yml (footer-provider-prefix). Reasoning needs no staging: the
+# mock model declares reasoning: false and the port's fallback model is
+# not reasoning-capable either.
+name: s1_text_turn
+prompt: "hello"
+expected_requests: 1
+responses:
+  - type: stream
+    content: "The mock reply is fixed and short for the spike."

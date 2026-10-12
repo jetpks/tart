@@ -1,0 +1,26 @@
+# S7 — compaction turn (I26 rig expansion): the one turn where both apps
+# auto-compact. The rig cannot type a second prompt (/compact needs a
+# session above pi's too-small floor — verified live, I26 probe: both apps
+# refuse "Nothing to compact (session too small)" on one small turn), so
+# the trigger is THRESHOLD-BASED: context_window 10 makes the first
+# completed turn exceed window − reserve in both apps (pi: usage-backed,
+# agent-session.ts:3079-3100; tart: estimate-backed, loop.rb
+# threshold_exceeded?), and the zeroed compaction knobs
+# (reserveTokens/keepRecentTokens 0 — pi settings-manager.ts:822, tart
+# settings.rb compaction_kwargs) let the cut point split a two-message
+# history. The second scripted response is the summarization call.
+#
+# Baseline EXPECTED to exit 1: pi renders the compaction as a
+# customMessageBg panel ([compaction] Compacted from N tokens,
+# compaction-summary-message.ts) plus the compaction_cost item; the port
+# renders a dim "✻ compacted (reason, tokens)" scrollback line (chat.rb)
+# — the candidate list IS the compaction-summary-panel port's work list.
+name: s7_compaction
+prompt: "hello compact"
+expected_requests: 2
+context_window: 10
+responses:
+  - type: stream
+    content: "first turn reply for the compaction scenario."
+  - type: message
+    content: "## Goal\n\nProbe the compaction summary render.\n\n## Progress\n\n### Done\n- [x] first turn completed"

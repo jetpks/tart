@@ -58,6 +58,94 @@ module Tart
       assert_equal 2, Compaction.estimate_tokens(llm_message(:user, "x" * 5))
     end
 
+    # pi's system.toolsAdded arm (compaction.ts:302-311): the estimate
+    # covers the tool definitions the request carries — the port's wire
+    # definition JSON, pinned byte-exact.
+    def test_estimate_tools_tokens_counts_the_wire_definition_json
+      tools = {"read" => probe_tool("read", "Read a file", "path" => {"type" => "string"})}
+      json = '[{"name":"read","description":"Read a file","parameters":{"path":{"type":"string"}}}]'
+      assert_equal (json.length / 4.0).ceil, Compaction.estimate_tools_tokens(tools)
+      assert_equal 0, Compaction.estimate_tools_tokens(nil)
+      assert_equal 0, Compaction.estimate_tools_tokens({})
+    end
+
+    # AC2 (I31): the estimate arms cover the full wire context — text plus
+    # the tools component, counted ONCE, never per message; the
+    # usage-backed path stays byte-identical (the provider's report covers
+    # the standing context, pi's system arm included).
+    def test_estimate_arms_add_the_tools_component_once_not_per_message
+      messages = [llm_message(:system, "prompt"), llm_message(:user, "x" * 40), llm_message(:assistant, "y" * 8)]
+      tools = {"read" => probe_tool("read", "R" * 8, "path" => {"type" => "string"})}
+      tool_tokens = Compaction.estimate_tools_tokens(tools)
+
+      bare = Compaction.full_estimate(messages)[:tokens]
+      assert_equal bare + tool_tokens, Compaction.full_estimate(messages, tools: tools)[:tokens]
+      assert_equal bare + tool_tokens, Compaction.estimate_context_tokens(messages, tools: tools)[:tokens]
+
+      used = RubyLLM::Message.new(role: :assistant, content: "a", tokens: RubyLLM::Tokens.new(input: 50, output: 10))
+      history = [llm_message(:system, "prompt"), used, llm_message(:user, "x" * 40)]
+      estimate = Compaction.estimate_context_tokens(history, tools: tools)
+      assert_equal 60, estimate[:usage_tokens]
+      assert_equal 70, estimate[:tokens] # usage 60 + trailing ("x" * 40) => 10, no tools term
+    end
+
+    # tokens_before stays "the context the summarization replaces" — the
+    # full wire context once the chat's tools are threaded in.
+    def test_prepare_tokens_before_covers_the_wire_tools
+      settings = Compaction::Settings.resolve(keep_recent_tokens: 1)
+      messages = [llm_message(:system, "prompt"), llm_message(:user, "old"), tool_call_message("call"),
+                  llm_message(:tool, "result"), llm_message(:assistant, "final")]
+      tools = {"read" => probe_tool("read", "R" * 8, "path" => {"type" => "string"})}
+
+      preparation = Compaction.prepare(messages, settings, tools: tools)
+      assert_equal Compaction.full_estimate(messages)[:tokens] + Compaction.estimate_tools_tokens(tools),
+        preparation.tokens_before
+    end
+
+    # pi _checkCompaction Case 3's selection (agent-session.ts:3050-3090),
+    # the three paths: the direct usage first; the zero/absent-usage
+    # fallback to the estimate; the stale pre-compaction guard INSIDE the
+    # fallback only.
+    def test_trigger_tokens_reads_the_just_completed_messages_direct_usage_first
+      used = RubyLLM::Message.new(role: :assistant, content: "done",
+        tokens: RubyLLM::Tokens.new(input: 120, output: 10))
+      messages = [llm_message(:user, "x" * 40), used]
+
+      # The direct usage wins even when the same message sits in the stale
+      # set — it is the just-completed turn's own usage, fresh by
+      # construction (pi skips the timestamp guard on the direct branch).
+      assert_equal 130, Compaction.trigger_tokens(messages, used,
+        pre_compaction_messages: identity_set(used))
+    end
+
+    def test_trigger_tokens_zero_direct_usage_falls_back_to_the_estimate
+      used = RubyLLM::Message.new(role: :assistant, content: "a",
+        tokens: RubyLLM::Tokens.new(input: 100, output: 20))
+      fresh = RubyLLM::Message.new(role: :assistant, content: "y" * 8)
+      messages = [llm_message(:user, "x" * 40), used, fresh]
+
+      # The just-completed message carries no usage (pi's error stop-reason
+      # or all-zero usage; the port: tokens nil/all-nil) — the estimate:
+      # usage 120 + trailing ("y" * 8) => 2.
+      assert_equal 122, Compaction.trigger_tokens(messages, fresh,
+        pre_compaction_messages: identity_set)
+      assert_equal 122, Compaction.trigger_tokens(messages, fresh)
+    end
+
+    def test_trigger_tokens_stale_guard_trips_inside_the_fallback
+      used = RubyLLM::Message.new(role: :assistant, content: "a",
+        tokens: RubyLLM::Tokens.new(input: 100, output: 20))
+      fresh = RubyLLM::Message.new(role: :assistant, content: "y" * 8)
+      messages = [llm_message(:user, "x" * 40), used, fresh]
+
+      # The last usage message is a KEPT pre-compaction message — its usage
+      # reflects the old (larger) context and would falsely re-trigger
+      # right after a compaction: nil (pi's `return false`,
+      # agent-session.ts:3063-3075).
+      assert_nil Compaction.trigger_tokens(messages, fresh,
+        pre_compaction_messages: identity_set(used))
+    end
+
     def test_should_compact_boundaries
       settings = Compaction::Settings.resolve(nil)
       assert Compaction.should_compact?(16_386, 32_769, settings) # > window - reserve
@@ -189,11 +277,29 @@ module Tart
       RubyLLM::Message.new(role:, content:)
     end
 
+    # The loop's identity-keyed pre-compaction message set
+    # (@pre_compaction_messages's shape).
+    def identity_set(*messages)
+      set = {}.compare_by_identity
+      messages.each { |message| set[message] = true }
+      set
+    end
+
     # An assistant message making one tool call (tool results follow it in
     # the flat list, as ruby_llm builds them).
     def tool_call_message(content, name: "read", path: "x.rb")
       call = RubyLLM::ToolCall.new(id: "call_1", name:, arguments: {path:})
       RubyLLM::Message.new(role: :assistant, content:, tool_calls: {"call_1" => call})
+    end
+
+    # A registered-shape tool with known bytes: name/description/parameters,
+    # the fields the wire definition carries.
+    def probe_tool(name, description, schema)
+      Class.new(RubyLLM::Tool) do
+        description description
+        parameters schema
+        define_singleton_method(:tool_name) { name }
+      end.new
     end
   end
 end

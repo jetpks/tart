@@ -82,6 +82,12 @@ module Tart
         RatatuiRuby.get_cell_at(x, y).fg
       end
 
+      # Background color of the cell at (+x+, +y+) — the bg readback for the
+      # body-color spans (same readback vocabulary as {cell_fg}).
+      def cell_bg(x, y)
+        RatatuiRuby.get_cell_at(x, y).bg
+      end
+
       # Modifiers of the cell at (+x+, +y+) — modifier-style assertions on
       # the headless test terminal (e.g. the input line's fake cursor reads
       # back as [:reversed]).
@@ -175,6 +181,30 @@ module Tart
       RatatuiRuby::Layout::Constraint.min(n)
     end
 
+    # @return [Array<RatatuiRuby::Text::Line>] the transcript scrollbar's
+    #   glyph run — one line per viewport row (pi layout.ts:285-330
+    #   getScrollbarGeometry + paintScrollbar, ported exactly): a full-height
+    #   track of "│" (+track_fg+) with the thumb "┃" (+thumb_fg+) sized
+    #   max(min(2, track), min(track, round(track²/content))) and placed
+    #   round(scrollTop/maxScrollTop · maxThumbTop). Verified against the
+    #   gem's Widgets::Scrollbar (1.5.0, live) and rejected: it burns the
+    #   first/last track rows on begin/end glyphs and computes a different
+    #   thumb size — pi is the oracle.
+    def scrollbar_lines(content_length:, position:, viewport:, track_fg:, thumb_fg:)
+      content_length = [content_length, 1].max
+      thumb = [[2, viewport].min, [viewport, (viewport * viewport.to_f / content_length).round].min].max
+      max_scroll_top = [content_length - viewport, 0].max
+      max_thumb_top = viewport - thumb
+      thumb_top = max_scroll_top.zero? ? 0 : (position * max_thumb_top.to_f / max_scroll_top).round
+      (0...viewport).map do |row|
+        if row >= thumb_top && row < thumb_top + thumb
+          line("┃", fg: thumb_fg)
+        else
+          line("│", fg: track_fg)
+        end
+      end
+    end
+
     # @return [RatatuiRuby::Widgets::Block] a bordered container: +title+ on
     #   the top border (the editor area's status line, pi custom-editor.ts
     #   renderTopBorder), +border_style+/+title_style+ the border/title
@@ -211,16 +241,22 @@ module Tart
       RatatuiRuby::Widgets::Paragraph.new(text:, wrap:)
     end
 
-    # @return [RatatuiRuby::Style::Style] a style value (fg color + modifiers).
-    def style(fg: nil, modifiers: [])
-      RatatuiRuby::Style::Style.new(fg:, modifiers:)
+    # @return [RatatuiRuby::Style::Style] a style value (fg/bg colors +
+    #   modifiers). Colors are symbol names, hex strings ("#rrggbb" →
+    #   Color::Rgb, ext style.rs:20-33), or Xterm indexes (Integer, the
+    #   256-color downgrade) — whichever the gem's Style accepts
+    #   (style.rb:100-104).
+    def style(fg: nil, bg: nil, modifiers: [])
+      RatatuiRuby::Style::Style.new(fg:, bg:, modifiers:)
     end
 
     # @return [RatatuiRuby::Text::Span] one styled span — the seam's span
-    #   vocabulary (fg color name + modifiers, both optional; an unstyled
-    #   span carries no Style value at all).
-    def span(content, fg: nil, modifiers: [])
-      styled = (fg || modifiers.any?) ? style(fg:, modifiers:) : nil
+    #   vocabulary (fg/bg colors + modifiers, all optional; an unstyled
+    #   span carries no Style value at all). The retired :dim→modifier
+    #   mapping was the system-theme artifact (rig correction 2026-10-11:
+    #   dark has no dimTokens); {Theme} tokens now carry real colors.
+    def span(content, fg: nil, bg: nil, modifiers: [])
+      styled = (fg || bg || modifiers.any?) ? style(fg:, bg:, modifiers:) : nil
       RatatuiRuby::Text::Span.new(content:, style: styled)
     end
 
@@ -239,7 +275,7 @@ module Tart
     #   color symbol or nil, +modifiers+ modifier symbols). An empty row is
     #   a blank line.
     def markdown_line(row)
-      line(row.map { |s| span(s.text, fg: s.fg, modifiers: s.modifiers) })
+      line(row.map { |s| span(s.text, fg: s.fg, bg: s.respond_to?(:bg) ? s.bg : nil, modifiers: s.modifiers) })
     end
 
     # @return [Integer] the display width of +string+ in terminal cells
@@ -265,10 +301,42 @@ module Tart
       RatatuiRuby::Event::Paste.new(content:)
     end
 
+    # @return [RatatuiRuby::Event::Mouse] a mouse event with the given kind
+    #   ("down"/"up"/"drag"/"moved"/"scroll_up"/"scroll_down"), cell
+    #   position, button and modifiers — the shape the real terminal's
+    #   crossterm parse produces (gem ext events.rs:552-612; mouse capture
+    #   is enabled on every real init — init.rs:67). The chat surface's
+    #   wheel-scroll and selection tests drive events through the
+    #   synthetic seam in exactly this shape.
+    def mouse_event(kind:, x:, y:, button: "none", modifiers: [])
+      RatatuiRuby::Event::Mouse.new(kind:, x:, y:, button:, modifiers:)
+    end
+
+    # Copies +text+ to the system clipboard with an OSC 52 write — pi
+    # tui-alt-screen.ts copyTextToClipboard's fallback path (:1476-1487):
+    # the base64 payload under bell-terminated OSC 52, buffer "c". The
+    # host-injected native-clipboard write pi prefers (tui-renderer.ts:39-45)
+    # is cut (no platform tooling seam — itemized deviation). Invisible to
+    # the rendered buffer: straight to stdout, flushed so it cannot land
+    # after the gem's terminal restore.
+    def osc52_copy(text)
+      $stdout.write("\e]52;c;#{[text].pack("m0")}\a")
+      $stdout.flush
+    end
+
     # @return [Boolean] whether +event+ is the Ctrl+C key event (byte 0x03 in
     #   raw mode arrives as an in-band Key event, never as SIGINT).
     def ctrl_c?(event)
       event.key? && event.ctrl? && event.code == "c"
+    end
+
+    # @return [Boolean] whether +event+ is the bare escape key (pi's
+    #   app.interrupt binding, keybindings.ts:26 — the editor's onEscape
+    #   path, custom-editor.ts:103-111).
+    def escape?(event)
+      # The gem's canonical code is "esc" (event/key/system.rb:36) — a
+      # real tty never delivers "escape".
+      event.key? && event.code == "esc" && !(event.modifiers & %w[ctrl alt]).any?
     end
   end
 end

@@ -1,0 +1,54 @@
+# pty-tester difference registry (SEED, I02).
+#
+# Intentionally MINIMAL: only per-run path/sandbox normalization. There are
+# NO sanctioned MOTD/logo/version/glyph classes — today's known divergences
+# (MOTD art, `❯` glyph, `⎿` tool transcript, footer model string) must
+# surface as unknown-candidate lines. That candidate list IS the parity
+# program's work list; pin a new class here only when the OWNER has ruled
+# the difference out of scope (see README, "Pinning a new class").
+classes:
+  # Footer/status cwd lines: each app runs in its own staged sandbox
+  # (…/run-<n>/sandbox/<app>), so those lines differ per app and per run.
+  # Path noise, not a rendering difference.
+  - name: staged-sandbox-path
+    pattern: 'sandbox/(pi|tart)-run-\d+'
+  # Any reference to the per-run staging root (footer cwd lines). Truncation
+  # tolerant: a 120-col pane cuts the line anywhere in the tail, so the class
+  # anchors only on the stable per-run 'run-<n>/' segment.
+  - name: parity-run-path
+    pattern: 'run-\d+/'
+  # Truncation spill files: both apps spill full bash output to the OS
+  # temp dir with per-run random segments (pi output-files.ts — tmpdir(),
+  # port output_accumulator.rb — Dir.tmpdir), referenced by the bash
+  # truncation notice's "Full output: <path>". Path noise, not a
+  # rendering difference; the notice text/fg divergence still surfaces
+  # on the path-free notice lines (I20 s5 baseline evidence).
+  - name: truncation-spill-path
+    pattern: '/(pi|tart)-bash-[0-9a-f-]+\.log'
+  # The footer model segment's provider prefix (footer.ts:246-258): pi
+  # prefixes only when its available-model snapshot spans >1 provider.
+  # The port's snapshot is its single static provider — bare `mock-1`
+  # (the owner's live finding: their pi shows no prefix either). Staged
+  # pi's snapshot carries the built-in catalog, so it renders
+  # `(mock) mock-1`. Same rule, different snapshots — sanctioned; the
+  # class covers both spellings of the stats line's right segment.
+  - name: footer-provider-prefix
+    pattern: '\(mock\) mock-1$|mock-1$'
+  # The port's MOTD [Context] section lists the staged settings file by
+  # absolute path (I26 s7 stages HOME/.tart/settings.json for the zeroed
+  # compaction knobs; pi's staged agent-dir settings render no pi-motd
+  # line). The path fragments (full or wrapped mid-path) are path noise,
+  # not a rendering difference — the [Context] heading itself stays a
+  # candidate (a real port-only listing, left on the work list).
+  - name: staged-settings-path
+    pattern: 'settings\.json'
+  # The compaction panel's token row (I31): each app's estimate runs over
+  # its own deliberately different context — pi counts content + sections
+  # + toolsAdded (compaction.ts:296-311), the port message text + its wire
+  # tool schemas — so the number is each app's own honest measurement and
+  # differs by design (2026-10-12 owner direction). The panel bytes stay
+  # pinned by the chat tests; the class forgives only the number, at line
+  # level, exactly as footer-provider-prefix's `mock-1$` anchor forgives
+  # the footer's values.
+  - name: compaction-token-estimate
+    pattern: 'Compacted from [\d,]+ tokens'

@@ -8,7 +8,8 @@ require "fileutils"
 module Tart
   # The agent loop on the I02 kernel (AC1/AC3): multi-turn tool round-trip
   # against the real ruby_llm client over a local mock OpenAI-compatible
-  # endpoint, kernel-interrupt cancellation, schema gating, approval gating.
+  # endpoint, kernel-interrupt cancellation, schema gating, unconditional
+  # tool execution (pi's agent-loop.ts:832 — no permissions system).
   class AgentLoopTest < Test
     EVENTS = %i[agent_start turn_start message_start message_update message_end
                 tool_execution_start tool_execution_end turn_end agent_end].freeze
@@ -55,6 +56,15 @@ module Tart
       assert types.index(:tool_execution_end) < types.rindex(:agent_end)
       deltas = events.select { |e| e[:type] == :message_update }
       assert deltas.any? { |e| e[:chunk].content == "listing" }, "streamed text deltas must flow"
+
+      # I17 AC2: :tool_execution_end carries the execution's wall duration —
+      # Float seconds off the monotonic clock, always present, 0.0 legitimate
+      # (pi's durationMs; rendered as `Took 0.0s`). Session recording stays
+      # untouched — the replay gap is itemized, not closed.
+      durations = events.select { |e| e[:type] == :tool_execution_end }.map { |e| e[:duration] }
+      assert_equal 1, durations.size
+      assert durations.first.is_a?(Float) && durations.first >= 0.0,
+        "duration must be non-negative Float seconds, got #{durations.first.inspect}"
     end
 
     def test_schema_gating_disabled_tools_never_reach_the_model
@@ -71,45 +81,23 @@ module Tart
       assert request["tools"].all? { |t| t["function"]["parameters"].is_a?(Hash) }
     end
 
-    def test_denied_approval_produces_error_tool_result_and_model_continues
+    # The former destructive-tool gate is gone (owner ruling 2026-10-10,
+    # reversing I03): bash runs through the loop with no decision point —
+    # pi's shape, agent-loop.ts:832.
+    def test_bash_runs_through_the_loop_with_no_decision_point
       @server.script([
-        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo destructive"}}]},
-        {type: :message, content: "understood"},
-      ])
-      approval_fibers = Queue.new
-      agent, events = agent_on_kernel(
-        tools: Tools::Registry.build(selected: %w[bash], cwd: @dir),
-        approval: ->(tool_call) { approval_fibers << Fiber.current; false }
-      )
-      result = run_agent(agent, "run it")
-
-      assert_equal "understood", result.last.content
-      requests = @server.captured_requests
-      tool_message = requests.last["messages"].find { |m| m["role"] == "tool" }
-      assert_includes tool_message["content"], "The user denied the bash tool call."
-
-      # The approval callback ran on the kernel reactor fiber (interruptible).
-      decided_on = approval_fibers.pop
-      refute_equal Fiber.current, decided_on
-
-      types = events.map { |e| e[:type] }
-      refute_includes types, :tool_execution_start, "a denied call must never execute"
-    end
-
-    def test_approved_tool_executes
-      @server.script([
-        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo approved-output"}}]},
+        {type: :stream, tool_calls: [{id: "call_1", name: "bash", arguments: {command: "echo straight-through"}}]},
         {type: :message, content: "done"},
       ])
-      agent, events = agent_on_kernel(
-        tools: Tools::Registry.build(selected: %w[bash], cwd: @dir),
-        approval: ->(_tool_call) { true }
-      )
+      agent, events = agent_on_kernel(tools: Tools::Registry.build(selected: %w[bash], cwd: @dir))
       run_agent(agent, "run it")
 
       requests = @server.captured_requests
       tool_message = requests.last["messages"].find { |m| m["role"] == "tool" }
-      assert_includes tool_message["content"], "approved-output"
+      assert_includes tool_message["content"], "straight-through"
+      types = events.map { |e| e[:type] }
+      assert types.index(:tool_execution_start) < types.index(:tool_execution_end),
+        "the call executes — no pause, no decision"
     end
 
     # I05 defect 1 (live repro tmp/repro_tool_hang.rb): a worker exception
@@ -180,14 +168,23 @@ module Tart
       assert_equal "second", requests.last["messages"].select { |m| m["role"] == "user" }.last["content"]
     end
 
+    # The kernel-level interrupt (the trap-net sentinel — the non-raw
+    # SIGINT path): the in-flight turn cancels through Task#stop and
+    # surfaces through the agent_end event. (Backlog C: the EDITOR-side
+    # interrupt is escape — the surface's interrupt_work! call, pinned in
+    # loop_test; ctrl+c is app.clear. The kernel's trap net keeps the
+    # interrupted?-or-stop contract for real signals.)
     def test_kernel_interrupt_cancels_in_flight_turn
       @server.script([{type: :slow_stream, content: "x" * 40}])
-      session = ScriptedSession.new
-      session.push_native(TUI.key_event("c", modifiers: ["ctrl"]))
-      agent, events = agent_on_kernel(session:)
+      agent, events = agent_on_kernel
 
-      kernel = Core::Loop.new(session:)
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      th = Thread.new do
+        sleep 0.3 # the turn is streaming (40 chars × 0.1 s pauses)
+        Process.kill("INT", Process.pid)
+      end
       kernel.run { agent.run("long stream") }
+      th.join
 
       assert kernel.interrupted?
       types = events.map { |e| e[:type] }
@@ -198,7 +195,7 @@ module Tart
       refute kernel.poller&.thread&.alive?, "no orphan poller after interrupt"
     end
 
-    def agent_on_kernel(session: ScriptedSession.new, tools: empty_tools, approval: nil,
+    def agent_on_kernel(session: ScriptedSession.new, tools: empty_tools,
                         on_event: nil, script_enabled: true, **loop_kwargs)
       events = []
       events_mutex = Mutex.new
@@ -206,7 +203,7 @@ module Tart
         events_mutex.synchronize { events << event }
       end
       chat = TestChat.build(@server, tools: tools.values, system_prompt: "test prompt")
-      [Agent::Loop.new(chat:, tools:, on_event: on_event || sink, approval:, **loop_kwargs), events]
+      [Agent::Loop.new(chat:, tools:, on_event: on_event || sink, **loop_kwargs), events]
     end
 
     def empty_tools
@@ -224,6 +221,52 @@ module Tart
 
     def agent_newly_complete?(agent)
       agent.new_messages.last.role == :assistant
+    end
+
+    # The model-switch seam (I27 AC3): the same chat object re-resolves
+    # model + provider in place (ruby_llm Chat#with_model — live-verified
+    # chat.rb:609), and the context window re-resolves (the compaction
+    # threshold's denominator follows the switched model).
+    def test_switch_model_swaps_the_runtime_chat_and_re_resolves_the_window
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      agent = Agent::Loop.new(chat:, tools: empty_tools, context_window: 1000)
+
+      assert_equal "tart-test-model", chat.model.id
+      assert_equal 1000, agent.context_window
+
+      agent.switch_model("glm-5.3", provider: "openai", context_window: 200_000)
+
+      assert_equal "glm-5.3", chat.model.id, "the runtime chat model swapped in place"
+      assert_equal 200_000, agent.context_window, "the window re-resolved for the compaction math"
+
+      # I29 (the I27 residual): a catalog entry that declares NO window —
+      # the kwarg is nil and the loop re-resolves from the switched chat's
+      # model instead of keeping the stale 200_000. Under the boot path's
+      # assume_model_exists the mock lands on Model.default (no
+      # context_window) — nil = threshold disabled, pi's `contextWindow ??
+      # 0` (agent-session.ts:2965; pi itself has no cached window:
+      # setModel swaps the Model object, :2484).
+      agent.switch_model("mock-2", provider: "openai")
+      assert_equal "mock-2", chat.model.id
+      assert_nil agent.context_window, "no stale window after a no-window switch"
+      assert_nil chat.model.context_window, "the re-resolve reads the chat's model"
+
+      # I30 (the I29 residual): a known-models-table entry with no declared
+      # window resolves the table's window (Settings::MODEL_CONTEXT_WINDOWS
+      # — the boot chain's known-models tier) — the compaction denominator
+      # refreshes instead of nil-disabling the threshold trigger.
+      agent.switch_model("accounts/fireworks/models/glm-5p3-flash", provider: "openai")
+      assert_equal "accounts/fireworks/models/glm-5p3-flash", chat.model.id
+      assert_equal Settings::MODEL_CONTEXT_WINDOWS.fetch(chat.model.id), agent.context_window,
+        "the table window resolved; the footer denominator readback refreshes"
+
+      # The switched chat still talks to the endpoint (the seam does not
+      # strand the connection) — a real request round-trips.
+      @server.script([{type: :message, content: "switched"}])
+      result = nil
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      kernel.run { result = agent.run("hi") }
+      assert_equal "switched", result.last.content
     end
 
     # AC2: threshold compaction after a completed turn — usage (the mock
@@ -270,6 +313,166 @@ module Tart
       assert_equal :threshold, compaction[:reason]
     end
 
+    # AC3 (I30, the frozen payload): the :compaction event carries exactly
+    # reason/tokens_before/summary/entries — entries the kept
+    # post-compaction replay entries, chronological, no system/summary
+    # message, the same as-loaded shape load_entries reads back (pi's
+    # rebuild source, interactive-mode.ts:3698-3705 — buildContextEntries
+    # + renderSessionEntries(entries.slice(1))). The summarization call's
+    # usage (the mock's fixed 10+5) persists on the compaction entry in
+    # pi's Usage shape; estimated_tokens_after does not.
+    def test_compaction_event_carries_the_kept_replay_entries
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :error, status: 400, message: "This model's maximum context length is 8 tokens"},
+        {type: :message, content: "a summary of the first turn"},
+        {type: :stream, content: "recovered"},
+      ])
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: File.join(@dir, "root"))
+      agent, events = agent_on_kernel(compaction: {keep_recent_tokens: 5}, recorder:)
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      # Turn 1, the overflowing turn-2 step, the summarization one-shot,
+      # the retry.
+      assert_equal 4, @server.captured_requests.size
+
+      compaction = events.find { |e| e[:type] == :compaction }
+      assert_equal %i[type reason tokens_before summary entries], compaction.keys
+      assert_equal :overflow, compaction[:reason]
+      assert_includes compaction[:summary], "a summary of the first turn"
+
+      # The kept tail [first answer, second question] — chronological,
+      # no summarized-away turn, no summary message, the recorded
+      # (as-loaded) entry hashes exactly.
+      entries = compaction[:entries]
+      assert_equal %w[assistant user], entries.map { |e| e["message"]["role"] }
+      assert_equal ["first answer", "second question"], entries.map { |e| e["message"]["content"] }
+      recorded = Agent::Session.load_entries(recorder.path)
+      assert_equal recorded[2, 2], entries, "the payload IS the recorded kept slice"
+
+      persisted = recorded.find { |e| e["type"] == "compaction" }
+      # The gem's chat_completions mapping reports an unexplained cache
+      # write as 0 (protocols/chat_completions/chat.rb:191-195) — the
+      # reader's value persists as-is.
+      assert_equal({"input" => 10, "output" => 5, "cacheWrite" => 0, "totalTokens" => 15},
+        persisted["usage"])
+      refute persisted.key?("estimatedTokensAfter")
+    end
+
+    # AC1 (I29): the zero-usage fallback — the knob strips the usage
+    # payload, so the just-completed message's direct usage is 0 and the
+    # trigger fires on the estimate over the messages (pi Case 3,
+    # agent-session.ts:3058-3083).
+    def test_threshold_compaction_fires_on_the_estimate_under_zero_usage
+      @server.suppress_usage!
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 9
+      )
+      run_agent(agent, "first question")
+
+      # Turn + summarization: the second request IS the compaction proof.
+      requests = @server.captured_requests
+      assert_equal 2, requests.size
+      assert_includes requests[1]["messages"].last["content"], "[User]: first question"
+      compaction = events.find { |e| e[:type] == :compaction }
+      assert_equal :threshold, compaction[:reason]
+    end
+
+    # AC2 (I31): the zero-usage estimate covers the WIRE context — the
+    # message text AND the registered tool schemas (pi's system.toolsAdded
+    # arm, compaction.ts:302-311), counted once. The window sits between
+    # the text-only estimate (10) and the tools-inclusive estimate
+    # (10 + the ls definition component): without the threading the
+    # trigger never fires and the run stops at 1 request.
+    def test_zero_usage_threshold_estimate_covers_the_wire_tools
+      @server.suppress_usage!
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+      ])
+      tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
+      agent, events = agent_on_kernel(
+        tools:, compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 50
+      )
+      run_agent(agent, "first question")
+
+      # Turn + summarization: the second request proves the tools component
+      # pushed the estimate over the window.
+      assert_equal 2, @server.captured_requests.size
+      compaction = events.find { |e| e[:type] == :compaction }
+      assert_equal :threshold, compaction[:reason]
+      assert_operator compaction[:tokens_before], :>, 49
+    end
+
+    # AC3 (I12): compaction_start fires once per started compaction, with
+    # the reason, BEFORE the completed-compaction event (pi
+    # agent-session.ts:3119 — after prepare, before the summary call).
+    def test_compaction_start_precedes_compaction_on_threshold
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+        {type: :stream, content: "second answer"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14
+      )
+      run_agent(agent, "first question")
+
+      starts = events.each_index.select { |i| events[i][:type] == :compaction_start }
+      dones = events.each_index.select { |i| events[i][:type] == :compaction }
+      assert_equal 1, starts.size
+      assert_equal 1, dones.size
+      assert_operator starts.first, :<, dones.first, "compaction_start before compaction"
+      assert_equal :threshold, events[starts.first][:reason]
+      assert_equal :threshold, events[dones.first][:reason]
+    end
+
+    # The start event marks the ATTEMPT: a failed summarization call never
+    # emits the completed-compaction event — pinning the emission point
+    # before the summarize call (pi: the status indicator is cleared by
+    # compaction_end/error, agent-session.ts:3119's placement).
+    def test_compaction_start_without_completion_when_the_summary_call_fails
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :error, status: 500, message: "summary endpoint down"},
+        {type: :stream, content: "second answer"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14
+      )
+      run_agent(agent, "first question")
+
+      starts = events.select { |e| e[:type] == :compaction_start }
+      assert_equal 1, starts.size
+      assert_equal :threshold, starts.first[:reason]
+      assert_empty events.select { |e| e[:type] == :compaction }
+      refute agent.last_error, "a failed compaction never stops the run"
+    end
+
+    # Nothing to compact (prepare returns nil — the keep-recent tail is the
+    # whole history): no start event, no compaction (pi: no compaction_start
+    # when prepareCompaction returns falsy, agent-session.ts:3113-3116).
+    def test_no_compaction_start_when_nothing_to_compact
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :stream, content: "second answer"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 10_000}, context_window: 14
+      )
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      assert_equal 2, @server.captured_requests.size, "no summarization call"
+      assert_empty events.select { |e| e[:type] == :compaction_start }
+      assert_empty events.select { |e| e[:type] == :compaction }
+    end
+
     def test_compaction_disabled_performs_no_compaction
       @server.script([
         {type: :stream, content: "first answer"},
@@ -283,6 +486,7 @@ module Tart
 
       assert_equal 2, @server.captured_requests.size, "no summarization call"
       assert_empty events.select { |e| e[:type] == :compaction }
+      assert_empty events.select { |e| e[:type] == :compaction_start }
     end
 
     # AC3: a context-overflow step failure compacts and retries the turn
@@ -294,11 +498,18 @@ module Tart
         {type: :message, content: "a summary of the prior turns"},
         {type: :stream, content: "recovered"},
       ])
-      agent, _events = agent_on_kernel_with_seeds
+      agent, events = agent_on_kernel_with_seeds
       result = run_agent(agent, "new question")
 
       assert_equal "recovered", result.last.content
       refute agent.last_error
+
+      starts = events.each_index.select { |i| events[i][:type] == :compaction_start }
+      dones = events.each_index.select { |i| events[i][:type] == :compaction }
+      assert_equal 1, starts.size
+      assert_equal 1, dones.size
+      assert_operator starts.first, :<, dones.first
+      assert_equal :overflow, events[starts.first][:reason]
 
       requests = @server.captured_requests
       assert_equal 3, requests.size

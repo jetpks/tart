@@ -55,6 +55,42 @@ module Tart
       end
     end
 
+    # The transcript scrollbar's glyph run (I12 AC2): pi layout.ts:285-330
+    # geometry — full-height "│" track, the "┃" thumb sized
+    # max(min(2, track), min(track, round(track²/content))) and placed
+    # round(scrollTop/maxScrollTop · maxThumbTop), themed per glyph.
+    def test_scrollbar_lines_ports_pi_s_geometry
+      lines = TUI.scrollbar_lines(content_length: 22, position: 15, viewport: 7, track_fg: :dark_gray, thumb_fg: :gray)
+      assert_equal 7, lines.size, "one line per viewport row — a full-height track"
+      assert_equal ["│", "│", "│", "│", "│", "┃", "┃"], lines.map { |line| line.spans.map(&:content).join }
+      assert_equal :dark_gray, lines.first.spans.first.style.fg, "the track routes its theme color"
+      assert_equal :gray, lines[5].spans.first.style.fg, "the thumb routes its theme color"
+
+      # The thumb slides up with the offset (round(8/15 · 5) = 3 → rows 3-4).
+      slid = TUI.scrollbar_lines(content_length: 22, position: 8, viewport: 7, track_fg: nil, thumb_fg: nil)
+      assert_equal ["│", "│", "│", "┃", "┃", "│", "│"], slid.map { |line| line.spans.map(&:content).join }
+
+      # A barely-overflowing view grows a near-full-height thumb (6 of 7 —
+      # round(track²/content)); the caller hides the bar when the view
+      # fits, so the helper never sees content ≤ viewport.
+      tiny = TUI.scrollbar_lines(content_length: 8, position: 1, viewport: 7, track_fg: nil, thumb_fg: nil)
+      assert_equal %w[│ ┃ ┃ ┃ ┃ ┃ ┃], tiny.map { |line| line.spans.map(&:content).join }
+    end
+
+    def test_scrollbar_lines_render_in_a_layout_gutter
+      TUI.run(headless: true, width: 10, screen_height: 6) do |session|
+        bar = TUI.scrollbar_lines(content_length: 12, position: 6, viewport: 6, track_fg: :dark_gray, thumb_fg: :gray)
+        session.draw(TUI.layout(
+          direction: :horizontal,
+          children: [TUI.paragraph(text: "abcdef", wrap: false), TUI.paragraph(text: bar, wrap: false)],
+          constraints: [TUI.constraint_min(1), TUI.constraint_length(1)]
+        ))
+        assert_equal "┃", session.cell_symbol(9, 3), "the thumb renders in the carved right-gutter column"
+        assert_equal :gray, session.cell_fg(9, 3)
+        assert_equal "│", session.cell_symbol(9, 0)
+      end
+    end
+
     # --- fullscreen seam surface (AC1): layout splits, bordered blocks,
     # widget-tree readback, resize — all on the headless test terminal. ---
 
@@ -149,6 +185,55 @@ module Tart
       refute TUI.ctrl_c?(TUI.key_event("c"))
       refute TUI.ctrl_c?(TUI.key_event("q", modifiers: ["ctrl"]))
       refute TUI.ctrl_c?(TUI.sync_event)
+    end
+
+    # The escape predicate (item 5, pi app.interrupt = escape,
+    # keybindings.ts:26): bare escape only — modified escapes are edits.
+    def test_escape_predicate
+      assert TUI.escape?(TUI.key_event("esc"))
+      refute TUI.escape?(TUI.key_event("esc", modifiers: ["ctrl"])), "ctrl+escape is not the interrupt"
+      refute TUI.escape?(TUI.key_event("esc", modifiers: ["alt"]))
+      refute TUI.escape?(TUI.key_event("q"))
+      refute TUI.escape?(TUI.sync_event)
+    end
+
+    # Hex fg+bg through the seam (item 4/AC4, PHASE 0 — verified live
+    # before implementing): the gem parses "#rrggbb" into Color::Rgb (ext
+    # style.rs:20-33) and the test terminal reads both slots back verbatim.
+    def test_hex_fg_and_bg_render_and_read_back
+      TUI.run(headless: true, width: 20, screen_height: 4) do |session|
+        line = TUI.line([TUI.span("ab", fg: "#dee0e1", bg: "#213b49")])
+        session.draw(TUI.paragraph(text: [line]))
+        assert_equal "#dee0e1", session.cell_fg(0, 0), "hex fg reads back as the hex string"
+        assert_equal "#213b49", session.cell_bg(0, 0), "hex bg reads back as the hex string"
+        assert_nil session.cell_bg(1, 1), "untouched cells carry no background"
+      end
+    end
+
+    # The gem mouse-event shape (I14 items 6/10): kind/x/y/button/modifiers
+    # — what the real terminal's crossterm parse produces (ext events.rs:552).
+    def test_mouse_event_seam_builds_the_gem_shape
+      scroll = TUI.mouse_event(kind: "scroll_down", x: 3, y: 4, modifiers: ["alt"])
+      assert scroll.mouse?
+      assert scroll.scroll?
+      assert_equal "scroll_down", scroll.kind
+      assert_equal 3, scroll.x
+      assert_equal 4, scroll.y
+      assert_equal ["alt"], scroll.modifiers
+      press = TUI.mouse_event(kind: "down", x: 1, y: 2, button: "left")
+      assert press.down? && press.left?
+    end
+
+    # Copy-on-select's clipboard write (item 10): pi tui-alt-screen.ts:1483
+    # — base64 payload under a bell-terminated OSC 52, buffer "c".
+    def test_osc52_copy_writes_the_base64_payload
+      captured = StringIO.new
+      previous = $stdout
+      $stdout = captured
+      TUI.osc52_copy("hi")
+    ensure
+      $stdout = previous
+      assert_equal "\e]52;c;#{["hi"].pack("m0")}\a", captured.string
     end
   end
 end

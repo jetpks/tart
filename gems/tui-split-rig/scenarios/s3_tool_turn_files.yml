@@ -1,0 +1,29 @@
+# S3 — non-bash file tool turn (I17): the mock scripts a write tool call
+# (a small file into the app's sandbox cwd), then a read of that same file,
+# then a fixed final reply. Three mock requests per app.
+#
+# The sandbox starts empty (the rig only mkdir_p's it) and both apps resolve
+# tool paths relative to their cwd — the tmux pane's staged sandbox — so the
+# sandbox-relative write/read completes identically in pi and the port.
+#
+name: s3_tool_turn_files
+prompt: "write then read the file"
+expected_requests: 3
+responses:
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_s3_1
+        name: write
+        arguments:
+          path: "s3-tool-turn-note.txt"
+          content: "parity s3 sandbox note"
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_s3_2
+        name: read
+        arguments:
+          path: "s3-tool-turn-note.txt"
+  - type: stream
+    content: "The file tools ran; fixed final reply for the spike."

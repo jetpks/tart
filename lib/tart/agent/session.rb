@@ -2,6 +2,7 @@
 
 require_relative "../compaction"
 
+require "fast/uuid"
 require "json"
 require "securerandom"
 require "fileutils"
@@ -51,11 +52,7 @@ module Tart
 
       # Time-ordered session id (pi createSessionId :264 uses uuidv7).
       def uuidv7(time: Time.now)
-        hex = ((time.to_f * 1000).round & 0xFFFFFFFFFFFF).to_s(16).rjust(12, "0")
-        hex << format("%04x", rand(1 << 12) | 0x7000) # version 7
-        hex << format("%04x", rand(1 << 14) | 0x8000) # variant 10
-        hex << format("%012x", rand(1 << 48))
-        [hex[0, 8], hex[8, 4], hex[12, 4], hex[16, 4], hex[20, 12]].join("-")
+        Fast::UUID.uuid_v7(time:)
       end
 
       # 8-hex entry id, collision-checked (pi generateId :275; falls back to
@@ -65,7 +62,7 @@ module Tart
           id = SecureRandom.hex(4)
           return id unless taken.include?(id)
         end
-        SecureRandom.uuid
+        Fast::UUID.uuid_v4
       end
 
       # The port's agent root (~/.tart; pi's is ~/.pi/agent, config.ts
@@ -124,16 +121,45 @@ module Tart
       end
 
       # Compaction entry factory (pi CompactionEntry :91-104 /
-      # appendCompaction :1260-1285), the port's entry subset (no usage,
-      # fromHook, or systemMessage field). A null first-kept entry falls
-      # back to the compaction entry's own id (pi's
-      # `firstKeptEntryId ?? id`).
-      def compaction_entry(summary:, first_kept_entry_id:, tokens_before:, details:,
+      # appendCompaction :1260-1285), the port's field subset (no fromHook
+      # or systemMessage field). +usage+ is the summarization call's pi
+      # Usage hash ({compaction_usage}); nil omits the key (pi's optional
+      # usage — JSON drops undefined). A null first-kept entry falls back
+      # to the compaction entry's own id (pi's `firstKeptEntryId ?? id`).
+      def compaction_entry(summary:, first_kept_entry_id:, tokens_before:, details:, usage: nil,
                            id:, parent_id:, timestamp:)
-        {
+        entry = {
           type: "compaction", id:, parentId: parent_id, timestamp:,
           summary:, firstKeptEntryId: first_kept_entry_id || id, tokensBefore: tokens_before, details:
         }
+        entry[:usage] = usage if usage
+        entry
+      end
+
+      # The summarization call's persisted usage (pi Usage, types.ts:446 —
+      # the CompactionEntry.usage field, session-manager.ts:99) from the
+      # gem's Tokens readers (tokens.rb:35-37): camelCase keys, unreported
+      # counts omitted; totalTokens is the component sum (pi
+      # calculateContextTokens's fallback — the gem carries no total
+      # reader). Nothing reported persists nothing (pi's usage-undefined
+      # entries). The cost object is cut: the port carries no pricing
+      # layer and no endpoint that reports one, and a fabricated zero
+      # would lie (the gem's own false-zero doctrine, cost.rb:19-20).
+      def compaction_usage(tokens)
+        return nil unless tokens
+
+        usage = {
+          "input" => tokens.input,
+          "output" => tokens.output,
+          "cacheRead" => tokens.cache_read,
+          "cacheWrite" => tokens.cache_write
+        }
+        return nil unless usage.values.compact.any?
+
+        usage["cacheWrite1h"] = tokens.cache_write_by_ttl["1h"] if tokens.cache_write_by_ttl&.key?("1h")
+        usage["reasoning"] = tokens.thinking if tokens.thinking
+        usage["totalTokens"] = Compaction.calculate_context_tokens(tokens)
+        usage.compact
       end
 
       # pi sessionEntryToContextMessages :439 for the message subset: message
@@ -149,10 +175,38 @@ module Tart
         message = entry["message"]
         return nil unless message.is_a?(Hash) && message["role"].is_a?(String)
 
+        return bash_execution_context_message(message) if message["role"] == "bashExecution"
+
         message = message.transform_keys(&:to_sym)
         message[:role] = message[:role].to_sym
         message[:content] = "" if !message.key?(:content) || message[:content].nil?
         message
+      end
+
+      # pi convertToLlm's bashExecution case (messages.ts:149-160): the
+      # !!-prefixed execution is SKIPPED from context; a plain ! execution
+      # rides as a USER message ("Ran `<cmd>`" + the fenced output, the
+      # bashExecutionToText bytes — messages.ts:82-97; ruby_llm supports
+      # no bashExecution role).
+      def bash_execution_context_message(message)
+        return nil if message["excludeFromContext"]
+
+        text = +"Ran `#{message["command"]}`\n"
+        if message["output"].is_a?(String) && !message["output"].empty?
+          text << "```\n#{message["output"]}\n```"
+        else
+          text << "(no output)"
+        end
+        exit_code = message["exitCode"]
+        if message["cancelled"]
+          text << "\n\n(command cancelled)"
+        elsif exit_code.is_a?(Integer) && exit_code != 0
+          text << "\n\nCommand exited with code #{exit_code}"
+        end
+        if message["truncated"] && message["fullOutputPath"].is_a?(String) && !message["fullOutputPath"].empty?
+          text << "\n\n[Output truncated. Full output: #{message["fullOutputPath"]}]"
+        end
+        {role: :user, content: text}
       end
 
       # pi's compactionSummary projection (messages.ts:109-121 + :176-184):
@@ -175,10 +229,14 @@ module Tart
       # everything after the compaction entry; the pre-compaction summarized
       # messages are gone. Files without compaction entries replay exactly
       # as before.
-      def context_messages(path)
-        entries = load_entries(path)
+      # pi buildContextEntries :475-513 over a flat chronological entry
+      # list: the latest compaction entry, the kept entries from its
+      # firstKeptEntryId up to the compaction (system messages skipped),
+      # and everything after the compaction entry; without a compaction
+      # entry, the list unchanged.
+      def context_entries(entries)
         compaction_index = entries.rindex { |entry| entry.is_a?(Hash) && entry["type"] == "compaction" }
-        return entries.filter_map { |entry| entry_to_context_message(entry) } unless compaction_index
+        return entries unless compaction_index
 
         compaction = entries[compaction_index]
         context_entries = [compaction]
@@ -191,7 +249,11 @@ module Tart
           context_entries << entry
         end
         context_entries.concat(entries[(compaction_index + 1)..] || [])
-        context_entries.filter_map { |entry| entry_to_context_message(entry) }
+        context_entries
+      end
+
+      def context_messages(path)
+        context_entries(load_entries(path)).filter_map { |entry| entry_to_context_message(entry) }
       end
 
       def message_entry_with_role?(entry, role)
@@ -199,19 +261,22 @@ module Tart
           entry["message"].is_a?(Hash) && entry["message"]["role"] == role
       end
 
+      # The bashExecution message factory (pi BashExecutionMessage,
+      # messages.ts:28-42 — pi's exact keys: the record format, not the
+      # port's ruby_llm serialization).
+      def bash_execution_message(command:, output:, exit_code:, cancelled:, truncated:,
+                                 full_output_path:, timestamp: now_iso, exclude_from_context: false)
+        {
+          role: "bashExecution", command:, output:, exitCode: exit_code, cancelled:, truncated:,
+          fullOutputPath: full_output_path, timestamp:, excludeFromContext: exclude_from_context
+        }
+      end
+
       # pi findMostRecentSession :749: *.jsonl by mtime descending; the first
       # with a valid header whose resolved cwd matches (+cwd+ nil = any).
       # Unreadable/racy paths are skipped; nothing found is nil.
       def find_most_recent(dir, cwd: nil)
-        return nil unless File.directory?(dir)
-
-        files = Dir.children(dir)
-          .select { |file| file.end_with?(".jsonl") }
-          .map { |file| File.join(dir, file) }
-          .sort_by { |path| File.mtime(path) }
-          .reverse
-
-        files.each do |path|
+        session_files(dir).each do |path|
           header = read_header(path)
           next unless header
           next if cwd && !cwd_matches?(header["cwd"], cwd)
@@ -219,6 +284,48 @@ module Tart
           return path
         end
         nil
+      end
+
+      # pi SessionManager.list (session-manager.ts, the discovery shape the
+      # /resume SessionSelectorComponent loads): the cwd's sessions, *.jsonl
+      # by mtime descending, valid headers only, header cwd resolved to
+      # +cwd+ (pi listCurrentSessions over getDefaultSessionDirPath).
+      def list(cwd:, root: default_root)
+        dir = dir_path(cwd, root:)
+        session_files(dir).filter_map do |path|
+          header = read_header(path)
+          next unless header && cwd_matches?(header["cwd"], cwd)
+
+          path
+        end
+      end
+
+      # The picker's one-line label (pi SessionSelectorComponent renders
+      # session.firstMessage): the first user message's text, squashed.
+      # nil when the session holds none (setup-only files).
+      def preview(path)
+        first = load_entries(path).find do |entry|
+          message_entry_with_role?(entry, "user")
+        end
+        return nil unless first
+
+        content = first["message"]["content"].to_s
+        squashed = content.strip.gsub(/\s+/, " ")
+        squashed.empty? ? nil : squashed
+      end
+
+      # *.jsonl paths under +dir+, mtime descending (the shared discovery
+      # enumeration; unreadable/racy mtimes skipped).
+      def session_files(dir)
+        return [] unless File.directory?(dir)
+
+        Dir.children(dir)
+          .select { |file| file.end_with?(".jsonl") }
+          .map { |file| File.join(dir, file) }
+          .sort_by { |path| File.mtime(path) }
+          .reverse
+      rescue StandardError
+        []
       end
 
       # First parsed entry, or nil unless it is a valid session header
@@ -270,6 +377,13 @@ module Tart
           @flushed = false
         end
 
+        # @return [Boolean] whether the session file exists on disk yet (pi
+        #   isPersisted :1166 — setup-only sessions leave no file; the exit
+        #   resume hint gates on this).
+        def persisted?
+          @flushed
+        end
+
         # Appends one message entry, chained to the current leaf (pi
         # appendMessage :1197). Returns the entry id.
         def append_message(message)
@@ -284,15 +398,43 @@ module Tart
           entry[:id]
         end
 
+        # Appends a bashExecution message entry (pi recordBashResult
+        # agent-session.ts:3879 — the executor's BashResult as a message
+        # entry, same leaf chain). +message+ is the pi-shaped hash
+        # ({Session.bash_execution_message}). Returns the entry id.
+        def append_bash_execution(message)
+          entry = Session.message_entry(message,
+            id: Session.generate_id(@ids),
+            parent_id: @leaf_id,
+            timestamp: Session.now_iso)
+          @ids << entry[:id]
+          @leaf_id = entry[:id]
+          @entries << entry
+          persist(message)
+          entry[:id]
+        end
+
+        # The session's context projection (pi SessionManager
+        # .buildContextEntries :475-513): the latest compaction entry, the
+        # kept entries from its firstKeptEntryId onward (system messages
+        # skipped), and everything after it — the as-loaded entry shape
+        # (what load_entries reads back), so a live consumer reads exactly
+        # the resume replay's shape.
+        def context_entries
+          Session.context_entries(JSON.parse(JSON.generate(@entries)))
+        end
+
         # Appends a compaction entry as a child of the current leaf and
         # advances the leaf (pi SessionManager.appendCompaction :1260-1285,
-        # the port's field subset). Returns the entry id.
-        def append_compaction(summary:, first_kept_entry_id:, tokens_before:, details:)
+        # the port's field subset). +usage+ is the summarization call's pi
+        # Usage hash ({Session.compaction_usage}). Returns the entry id.
+        def append_compaction(summary:, first_kept_entry_id:, tokens_before:, details:, usage: nil)
           entry = Session.compaction_entry(
             summary:,
             first_kept_entry_id:,
             tokens_before:,
             details:,
+            usage:,
             id: Session.generate_id(@ids),
             parent_id: @leaf_id,
             timestamp: Session.now_iso,
@@ -314,11 +456,22 @@ module Tart
         def persist(message = nil)
           if @flushed
             File.write(@path, entry_line(@entries.last), mode: "a")
-          elsif message.nil? || %i[user assistant].include?(message.role)
+          elsif message.nil? || conversation_bearing?(message)
             File.open(@path, "wx") do |file|
               @entries.each { |entry| file.write(entry_line(entry)) }
             end
             @flushed = true
+          end
+        end
+
+        # The file-creation gate (pi _persist's _hasConversation): user
+        # and assistant messages open the file — and the bashExecution
+        # record does too (pi recordBashResult → appendMessage); tool
+        # results and other roles ride later appends.
+        def conversation_bearing?(message)
+          case message
+          when Hash then message[:role] == "bashExecution"
+          else %i[user assistant].include?(message.role)
           end
         end
 

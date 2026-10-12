@@ -1,0 +1,112 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# model-menu-probe — the I27 selector-menu capture probe (NOT a parity gate;
+# evidence for the scratch report only).
+#
+# Drives EACH app through the same keystrokes — typing "/model" + Enter,
+# then "/thinking" + Enter — and captures the mid-menu frames (plain +
+# styled) and the post-selection settled screen. Opening keystrokes: the
+# slash paths, the common denominator across both apps' editors (pi
+# interactive-mode.ts:5196/5145 — no-arg /model → showModelSelector,
+# /thinking → showThinkingSelector; tart's chat.rb:556-558 apply-then-
+# submit). pi's ctrl+l (app.model.select, keybindings.ts:49) is pi-only —
+# the port has no model binding. Semantics differ by design: pi Enter on
+# the menu SELECTS the highlighted row; tart's /model is no builtin
+# (commands.rb BUILTINS) so Enter SUBMITS it as text (consumes one mock
+# response), and bare /thinking CYCLES the level — the port's fallback.
+#
+#   model-menu-probe [--out DIR]
+#
+# Output: per app, <app>-<menu>-menu.txt/.styled and
+# <app>-<menu>-selected.txt/.styled, plus on stdout the per-menu candidate
+# table (pi's menu bytes vs tart's — a plain line diff; the settled-screen
+# comparator/registry does not apply to transient menus).
+#
+# At the pre-model-lane base tart renders no menu — its side of the table
+# is a PRE-MODEL-LANE SNAPSHOT; re-run the probe after the model lane
+# lands. Stdlib only — runs without Bundler.
+
+require "optparse"
+require_relative "../lib/tui_split_rig"
+
+options = {out: "tmp/model-menu-probe-#{Time.now.to_i}"}
+parser = OptionParser.new do |p|
+  p.on("--out DIR", "output directory (default tmp/model-menu-probe-<ts>)") { |d| options[:out] = d }
+end
+parser.parse!(ARGV)
+
+MENUS = {
+  "model" => "/model",
+  "thinking" => "/thinking"
+}.freeze
+
+def capture_pair(runner, session, stage, app, menu, phase)
+  plain = runner.capture(session)
+  styled = runner.capture_styled(session)
+  File.write(File.join(stage, "#{app}-#{menu}-#{phase}.txt"), plain)
+  File.write(File.join(stage, "#{app}-#{menu}-#{phase}.styled"), styled)
+  plain
+end
+
+# The candidate table: pi's menu bytes vs tart's, line-diffed raw (no
+# registry — transient menus are outside the settled-screen comparator's
+# jurisdiction). LCS over whole lines via the Differ's ops, unclassified.
+def table(pi_text, tart_text)
+  ops = TuiSplitRig::Differ.ops(pi_text.lines(chomp: true), tart_text.lines(chomp: true))
+  rows = ops.map do |op|
+    case op.kind
+    when :same then format("  %s", op.line)
+    when :del then format("- %s", op.line)
+    else format("+ %s", op.line)
+    end
+  end
+  diffs = ops.count { |op| op.kind != :same }
+  ["diff-lines=#{diffs}"] + rows
+end
+
+scenario = TuiSplitRig::Scenario.load(File.expand_path("../scenarios/probe_model_menus.yml", __dir__))
+runner = TuiSplitRig::Runner.new(scenario:, runs: 1, app: "both", out: File.join(options[:out], "unused"))
+stage = File.expand_path(options[:out])
+FileUtils.mkdir_p(stage)
+
+mock = MockLLMServer.new.script(scenario.responses).start
+tables = {}
+begin
+  %w[pi tart].each do |app|
+    mock.rearm!
+    boot = runner.boot_session(app, mock, 1, stage)
+    session = boot.fetch(:session)
+    runner.settle(session, "boot")
+
+    MENUS.each do |menu, keys|
+      system("tmux", "send-keys", "-t", session, keys, "Enter")
+      menu_text = runner.settle(session, "#{app}-#{menu}-open").fetch(:timed_out) ? nil :
+        capture_pair(runner, session, stage, app, menu, "menu")
+
+      # Enter on the highlighted row (pi selects; tart's fallback submits/
+      # cycles) — then the post-selection settled screen.
+      system("tmux", "send-keys", "-t", session, "Enter")
+      selected_text = runner.settle(session, "#{app}-#{menu}-select").fetch(:timed_out) ? nil :
+        capture_pair(runner, session, stage, app, menu, "selected")
+
+      (tables[menu] ||= {})[app] = {menu: menu_text, selected: selected_text}
+      puts format("%s %s: menu=%s selected=%s",
+        app, menu, menu_text ? "captured" : "TIMEOUT", selected_text ? "captured" : "TIMEOUT")
+    end
+    runner.teardown(session)
+  end
+ensure
+  mock.stop
+end
+
+MENUS.each_key do |menu|
+  pi = tables.fetch(menu).fetch("pi")
+  tart = tables.fetch(menu).fetch("tart")
+  puts "\n== #{menu} menu: pi vs tart (tart side: PRE-MODEL-LANE SNAPSHOT) =="
+  puts table(pi[:menu], tart[:menu]).join("\n")
+  puts "\n== #{menu} post-selection: pi vs tart =="
+  puts table(pi[:selected], tart[:selected]).join("\n")
+end
+
+puts "\nframes at #{stage}"

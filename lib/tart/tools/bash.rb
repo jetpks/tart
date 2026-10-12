@@ -33,7 +33,19 @@ module Tart
       # raised as a parity deviation).
       TERM_GRACE_SECONDS = 5.0
 
+      # Cadence of the coordinator's deadline/cancellation checkpoints while a
+      # command runs. Exit detection is evented (see spawn_and_stream); this
+      # bounds only how fast a timeout -TERM fires and an interrupt is
+      # observed (pi checks signal.aborted between events).
+      CHECKPOINT_INTERVAL = 0.05
+
       attr_reader :cwd, :details
+
+      # The raw execution outcome (pi bash-executor.ts BashResult shape —
+      # the fields the !-prefix executor reports; the tool's contract is
+      # the model-facing text on top of the same core).
+      BashOutcome = Struct.new(:content, :exit_code, :cancelled, :truncation, :full_output_path,
+                               keyword_init: true)
 
       def initialize(cwd:)
         @cwd = cwd
@@ -44,6 +56,40 @@ module Tart
 
       parameters PARAMETERS_SCHEMA.dup
 
+      # The user-bash executor (pi bash-executor.ts executeBashWithOperations
+      # — the !-prefix executor over the same spawn core as the tool):
+      # pi's BashResult assembly — sanitized (the port strips \r; pi also
+      # strips ANSI, cut — no ansi utility, itemized), exit code,
+      # cancellation — NO model-facing notice, NO error wrapping (a
+      # non-zero exit REPORTS, it does not raise into an error result;
+      # bash-executor.ts:146-158). No timeout: pi's user bash runs until
+      # done or esc-cancelled. An aborted command still returns the
+      # output it produced so far (bash-executor.ts:135-141).
+      def run_user(command)
+        raise Errno::ENOENT, "Working directory does not exist: #{@cwd}\nCannot execute bash commands." unless
+          File.exist?(@cwd)
+
+        # The accumulator is owned HERE (not inside the spawn helper) so a
+        # cancellation — the raise arrives while the helper's frame is
+        # live — still leaves the partial output reachable: the aborted
+        # command returns the output it produced so far
+        # (bash-executor.ts:135-141). The spawn core's rescue has already
+        # killed the process group on the way out.
+        output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
+        cancelled = false
+        outcome =
+          begin
+            spawn_and_stream(command, output, nil)
+          rescue RubyLLM::CancelledError, Async::Cancel
+            cancelled = true
+            {exit_code: nil}
+          end
+        snapshot = finish_output(output)
+        BashOutcome.new(content: snapshot.content.to_s.gsub("\r", ""), exit_code: outcome[:exit_code],
+                        cancelled:, truncation: snapshot.truncation,
+                        full_output_path: snapshot.full_output_path)
+      end
+
       # @return [String] combined output (pi's model-facing text), or
       #   {error:} on failure — including timeout and non-zero exit, which pi
       #   reports as error results with a status line appended.
@@ -53,9 +99,8 @@ module Tart
           raise Errno::ENOENT, "Working directory does not exist: #{@cwd}\nCannot execute bash commands." unless
             File.exist?(@cwd)
 
-          output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
           started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          outcome = spawn_and_stream(command, output, timeout_seconds)
+          output, outcome = spawn_and_accumulate(command, timeout_seconds)
           wall_time_seconds = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at).round(1)
           snapshot = finish_output(output)
 
@@ -87,6 +132,16 @@ module Tart
 
       private
 
+      # Spawns, streams to completion (or cancellation/timeout), and
+      # returns the accumulator with the raw outcome — the caller finishes
+      # and snapshots (the tool's model-facing assembly and the user-bash
+      # executor's BashResult assembly differ).
+      def spawn_and_accumulate(command, timeout_seconds)
+        output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
+        outcome = spawn_and_stream(command, output, timeout_seconds)
+        [output, outcome]
+      end
+
       def resolve_timeout(timeout)
         return if timeout.nil?
         raise ArgumentError, "Invalid timeout: must be a finite number of seconds" unless
@@ -99,6 +154,7 @@ module Tart
         out_rd, out_wr = IO.pipe
         err_rd, err_wr = IO.pipe
         pid = nil
+        reaper = nil
         timed_out = false
 
         begin
@@ -111,40 +167,58 @@ module Tart
           readers = [Thread.new { drain_pipe(out_rd, output) }, Thread.new { drain_pipe(err_rd, output) }]
 
           deadline = timeout_seconds && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
+
+          # Evented exit detection (pi's child "exit" event, bash.ts:112 —
+          # Node learns of exit without polling). Ruby has no evented child
+          # exit, so the idiomatic analog: a dedicated reaper thread does a
+          # BLOCKING Process.waitpid2 and hands the status over a Queue — the
+          # pop below returns the moment the child exits, so fast commands pay
+          # no poll quantum. The bounded pop keeps the deadline and
+          # cancellation checkpoints ticking while the command runs
+          # (cancellation is cooperative: the checkpoint raises in this
+          # thread, so the wait must yield).
+          completed = Queue.new
+          reaper = Thread.new { completed << Process.waitpid2(pid)[1] }
           status = nil
           term_sent = false
+          killed = false
           loop do
             # Cancellation checkpoint: an interrupted turn kills the whole
             # process group (pi checks signal.aborted between events).
             RubyLLM::Support::Cancellation.check
-            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-            if deadline && now >= deadline
-              timed_out = true
-              # I03 backlog carry-in: -TERM exactly once, then a single -KILL
-              # once the grace elapses (re-signaling every poll iteration is
-              # dead weight; the escalation is what ends the command).
-              unless term_sent
-                term_sent = true
-                kill_process_group(pid, "TERM")
-              end
-              kill_process_group(pid, "KILL") if now > deadline + TERM_GRACE_SECONDS
-            end
-            _, status = Process.waitpid2(pid, Process::WNOHANG)
+            status = completed.pop(timeout: CHECKPOINT_INTERVAL)
             break if status
 
-            sleep 0.05
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            next unless deadline && now >= deadline
+            unless term_sent
+              timed_out = true
+              term_sent = true
+              # I03 backlog carry-in: -TERM exactly once, then a single -KILL
+              # once the grace elapses (the escalation is what ends the
+              # command).
+              kill_process_group(pid, "TERM")
+            end
+            next if killed || now <= deadline + TERM_GRACE_SECONDS
+
+            killed = true
+            kill_process_group(pid, "KILL")
           end
           readers.each(&:join)
           RubyLLM::Support::Cancellation.check
 
           exit_code = status.termsig ? 128 + status.termsig : status.exitstatus
           {exit_code:, timed_out:, cancelled: false}
-        rescue RubyLLM::CancelledError
+        rescue RubyLLM::CancelledError, Async::Cancel
           # Interrupted mid-command: kill the whole group with a single -KILL
-          # (I03 backlog carry-in: the preceding -TERM was dead code — the
-          # rescue kills immediately), reap, and let cancellation propagate.
+          # and let cancellation propagate. The reaper thread reaps — this
+          # thread must not waitpid2 the pid itself (the reaper owns it; a
+          # second wait would raise ECHILD). Both cancellation classes:
+          # the agent-loop cancel rides RubyLLM's checkpoint error; the
+          # user-bash escape cancels the reactor task itself (Task#stop —
+          # Async::Cancel at the fiber's next yield), same group kill.
           kill_process_group(pid, "KILL") if pid
-          Process.waitpid2(pid) if pid
+          reaper&.join(TERM_GRACE_SECONDS)
           raise
         ensure
           readers&.each { |t| t.join(1) rescue nil }

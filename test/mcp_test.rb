@@ -184,7 +184,6 @@ module Tart
       assert_equal "mcp__echo__echo", tool.name
       assert_equal "Echo the message back", tool.description
       assert_equal "echo", tool.remote_name
-      refute tool.requires_approval?, "MCP tools declare direct exposure, no approval gate"
       assert_equal(
         {"type" => "object", "properties" => {"message" => {"type" => "string", "description" => "the message"}},
          "required" => ["message"]},

@@ -1,0 +1,13 @@
+# S1 in tart-mode (I16 AC3): the s1 plain-text turn with tart's own
+# identity staged — the settled capture must show the tart header (tart
+# version line present, pi's onboarding line absent) while the structural
+# items (padding, spacers, footer format) hold.
+name: s1_tart
+prompt: "hello"
+expected_requests: 1
+responses:
+  - type: stream
+    content: "The mock reply is fixed and short for the spike."
+env:
+  tart:
+    TART_IDENTITY: tart

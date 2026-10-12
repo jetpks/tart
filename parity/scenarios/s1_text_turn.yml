@@ -1,8 +1,0 @@
-# S1 — plain text turn (I01 spike): both apps get the same fixed reply.
-# One mock request per app.
-name: s1_text_turn
-prompt: "hello"
-expected_requests: 1
-responses:
-  - type: stream
-    content: "The mock reply is fixed and short for the spike."

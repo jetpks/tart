@@ -30,8 +30,5 @@ module Tart
 
     # Tool names in pi's canonical order.
     ALL = %w[read edit write bash find grep ls].freeze
-
-    # Classes that mutate their target and gate behind approval.
-    DESTRUCTIVE = %w[edit write bash].freeze
   end
 end

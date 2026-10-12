@@ -15,7 +15,8 @@ module Tart
       @cwd = Dir.mktmpdir("tart-settings-project-")
       @user_path = File.join(@root, "settings.json")
       @project_path = File.join(@cwd, ".tart", "settings.json")
-      @saved_env = %w[TART_MODEL TART_PROVIDER TART_API_KEY TART_API_BASE TART_CONTEXT_WINDOW]
+      @saved_env = %w[PI_MODEL PI_PROVIDER PI_API_KEY PI_API_BASE PI_CONTEXT_WINDOW PI_MODEL_REASONING
+                      TART_MODEL TART_PROVIDER TART_API_KEY TART_API_BASE TART_CONTEXT_WINDOW TART_MODEL_REASONING]
         .to_h { |key| [key, ENV[key]] }
       @saved_env.each_key { |key| ENV.delete(key) }
     end
@@ -75,6 +76,43 @@ module Tart
       assert result.diagnostics.first.message.include?("invalid settings JSON")
     end
 
+    # --- the write surface (I27, the ctrl+s set-as-default path) ---
+
+    def test_save_writes_the_updates_and_the_file_round_trips
+      path = Settings.save(@root, "defaultProvider" => "glm", "defaultModel" => "glm-5.3")
+
+      assert_equal @user_path, path
+      settings = load_settings.settings
+      assert_equal "glm-5.3", settings["defaultModel"]
+      assert_equal "glm", settings["defaultProvider"]
+    end
+
+    def test_save_preserves_unknown_and_unmodified_keys
+      write_settings(@user_path, '{"defaultModel": "m", "notARealKey": {"deep": [1]}, "compaction": {"reserveTokens": 1000}}')
+
+      Settings.save(@root, "defaultProvider" => "glm")
+      saved = JSON.parse(File.read(@user_path))
+
+      assert_equal "m", saved["defaultModel"], "unmodified keys survive"
+      assert_equal ({"deep" => [1]}), saved["notARealKey"], "unknown keys are preserved verbatim (never clobbered)"
+      assert_equal 1000, saved.dig("compaction", "reserveTokens"), "nested blocks survive"
+      assert_equal "glm", saved["defaultProvider"]
+      refute saved.key?("thinkingLevel"), "only the asked-for keys are written"
+    end
+
+    def test_save_creates_the_dir_and_over_an_unparseable_file_starts_fresh
+      path = Settings.save(File.join(@root, "nested"), "thinkingLevel" => "high")
+
+      assert_equal File.join(@root, "nested", "settings.json"), path
+      assert_equal "high", JSON.parse(File.read(path))["thinkingLevel"]
+
+      FileUtils.rm_rf(@root)
+      FileUtils.mkpath(@root)
+      File.write(@user_path, "{not json")
+      Settings.save(@root, "thinkingLevel" => "low")
+      assert_equal "low", JSON.parse(File.read(@user_path))["thinkingLevel"]
+    end
+
     # --- env → settings → built-in default, per key ---
 
     def test_model_provider_api_base_and_api_key_resolve_env_over_settings_over_default
@@ -82,20 +120,106 @@ module Tart
         '{"defaultModel": "m-file", "defaultProvider": "p-file", "apiBase": "https://file.example", "apiKey": "file-key"}')
 
       assert_equal "m-file", Settings.resolve_setting("defaultModel", load_settings.settings)
-      ENV["TART_MODEL"] = "m-env"
+      ENV["PI_MODEL"] = "m-env"
       assert_equal "m-env", Settings.resolve_setting("defaultModel", load_settings.settings)
 
       assert_equal "p-file", Settings.resolve_setting("defaultProvider", load_settings.settings)
-      ENV["TART_PROVIDER"] = "p-env"
+      ENV["PI_PROVIDER"] = "p-env"
       assert_equal "p-env", Settings.resolve_setting("defaultProvider", load_settings.settings)
 
       assert_equal "https://file.example", Settings.resolve_setting("apiBase", load_settings.settings)
-      ENV["TART_API_BASE"] = "https://env.example"
+      ENV["PI_API_BASE"] = "https://env.example"
       assert_equal "https://env.example", Settings.resolve_setting("apiBase", load_settings.settings)
 
       assert_equal "file-key", Settings.resolve_setting("apiKey", load_settings.settings)
-      ENV["TART_API_KEY"] = "env-key"
+      ENV["PI_API_KEY"] = "env-key"
       assert_equal "env-key", Settings.resolve_setting("apiKey", load_settings.settings)
+    end
+
+    # The namespace follows the identity (owner ruling 3): pi reads PI_,
+    # tart TART_, any other name its own uppercased prefix.
+    def test_env_namespace_follows_the_identity
+      ENV["PI_API_KEY"] = "pi-key"
+      ENV["TART_API_KEY"] = "tart-key"
+      ENV["FOO_MODEL"] = "foo-model"
+      assert_equal "pi-key", Settings.resolve_setting("apiKey", {}, identity: "pi")
+      assert_equal "tart-key", Settings.resolve_setting("apiKey", {}, identity: "tart")
+      assert_equal "foo-model", Settings.resolve_setting("defaultModel", {}, identity: "foo")
+      assert_equal 99, Settings.resolve_context_window(identity: "foo", env: {"FOO_CONTEXT_WINDOW" => "99"})
+    end
+
+    # --- the identity seam (I16, free-form since I32): CLI > TART_IDENTITY
+    # env > settings identity > default "pi" — the resolution precedence
+    # table; any non-empty value names a face ---
+
+    def test_identity_resolves_cli_over_env_over_settings_over_default
+      assert_equal "pi", Identity.resolve(settings: {}, env: {}), "no config → the default"
+      assert_equal "tart", Identity.resolve(settings: {"identity" => "tart"}, env: {}), "settings row"
+      assert_equal "tart", Identity.resolve(settings: {"identity" => "pi"}, env: {"TART_IDENTITY" => "tart"}),
+        "env over settings"
+      assert_equal "pi", Identity.resolve(cli: "pi", settings: {"identity" => "tart"}, env: {"TART_IDENTITY" => "tart"}),
+        "CLI over everything"
+    end
+
+    # Owner ruling 1 (2026-10-12): white-labelable out of the box — any
+    # non-empty value resolves and names its env namespace.
+    def test_identity_is_free_form
+      assert_equal "foo", Identity.resolve(settings: {"identity" => "foo"}, env: {})
+      assert_equal "my-agent", Identity.resolve(cli: "my-agent", settings: {}, env: {})
+      assert_equal "FOO_", Identity.env_prefix("foo")
+      assert_equal "TART_", Identity.env_prefix("tart")
+      assert_equal "FOO_API_KEY", Identity.env_key("foo", "API_KEY")
+      assert_equal "PI_CONTEXT_WINDOW", Identity.env_key("pi", "CONTEXT_WINDOW")
+    end
+
+    def test_settings_layer_defaults_the_identity_key
+      assert_equal Identity::DEFAULT, load_settings.settings["identity"],
+        "the identity key rides Settings::DEFAULTS (no unknown-key warning, the pi default)"
+      write_settings(@user_path, '{"identity": "tart"}')
+      assert_equal "tart", load_settings.settings["identity"]
+      assert load_settings.diagnostics.none? { |d| d.message.include?("identity") },
+        "identity is a known key — no warning"
+    end
+
+    def test_empty_or_whitespace_identity_is_the_clean_abort_path
+      ["", "   ", "\t\n"].each do |blank|
+        assert_raises(Identity::Error) { Identity.resolve(cli: blank, settings: {}, env: {}) }
+        assert_raises(Identity::Error) { Identity.resolve(settings: {"identity" => blank}, env: {}) }
+        assert_raises(Identity::Error) { Identity.resolve(env: {"TART_IDENTITY" => blank}, settings: {}) }
+      end
+    end
+
+    # --- footer model metadata (I16): staged env/settings over the model ---
+
+    # The provider label is RETIRED: pi prefixes the model only when its
+    # available-model snapshot spans >1 provider (footer.ts:246-258) —
+    # the port's static snapshot is one, the prefix never fires.
+    def test_reasoning_resolves_staged_over_model
+      model = RubyLLM::Model.default("mock-1", "openai") # an assumed model: no reasoning
+      refute Settings.model_reasoning_capable({}, model)
+
+      assert Settings.model_reasoning_capable({"modelReasoning" => true}, model)
+      refute Settings.model_reasoning_capable({"modelReasoning" => false}, model)
+      assert Settings.model_reasoning_capable({"modelReasoning" => "true"}, model), "the env layer stages strings"
+    end
+
+    # An assumed model falls back to the known-models table (the owner's
+    # daily-driver glm — pi's footer shows its level, so the port's must).
+    def test_assumed_model_reasoning_reads_the_known_table
+      model = RubyLLM::Model.default("accounts/fireworks/models/glm-5p3-flash", "openai")
+      assert Settings.model_reasoning_capable({}, model), "the daily-driver model is reasoning-capable"
+
+      unknown = RubyLLM::Model.default("totally-unknown", "openai")
+      refute Settings.model_reasoning_capable({}, unknown)
+    end
+
+    def test_reasoning_reads_the_registry_model
+      # A registry entry (real model) — when the entry lists reasoning —
+      # carries the reasoning capability (pi reads state.model?.reasoning,
+      # footer.ts:233-244).
+      model = RubyLLM.models.find("gpt-5.6")
+      assert_equal model.supports?(:reasoning), Settings.model_reasoning_capable({}, model)
+      refute Settings.model_reasoning_capable({}, nil)
     end
 
     # --- context window: kwarg → env → settings → model → registry table ---
@@ -107,9 +231,9 @@ module Tart
       windowless = RubyLLM::Model.new(id: "accounts/fireworks/models/glm-5p3-flash", context_window: nil)
 
       assert_equal 9, Settings.resolve_context_window(explicit: 9, model:)
-      ENV["TART_CONTEXT_WINDOW"] = "99"
+      ENV["PI_CONTEXT_WINDOW"] = "99"
       assert_equal 99, Settings.resolve_context_window(model:)
-      ENV.delete("TART_CONTEXT_WINDOW")
+      ENV.delete("PI_CONTEXT_WINDOW")
       assert_equal 5000, Settings.resolve_context_window(model:)
       assert_equal 1_048_573, Settings.resolve_context_window(model: windowless)
       assert_nil Settings.resolve_context_window(model: RubyLLM::Model.new(id: "unknown-model"))
@@ -128,6 +252,27 @@ module Tart
 
       assert_equal 1_048_573,
         Settings.resolve_context_window(settings: load_settings.settings, model: chat.model)
+    end
+
+    # --- thinking level (pi's vocabulary + default; the footer's right side) ---
+
+    def test_thinking_level_resolves_settings_over_pi_s_default
+      # Out of the box: pi's DEFAULT_THINKING_LEVEL (defaults.ts:3), and the
+      # key is known (no unknown-key warning).
+      result = load_settings
+      assert_equal "medium", Settings.resolve_thinking_level(result.settings)
+      assert_empty result.diagnostics
+
+      # Any vocabulary value passes through (user over project).
+      write_settings(@user_path, '{"thinkingLevel": "low"}')
+      write_settings(@project_path, '{"thinkingLevel": "high"}')
+      assert_equal "high", Settings.resolve_thinking_level(load_settings.settings)
+
+      # Off-vocabulary or null values fall back to the default.
+      write_settings(@project_path, '{"thinkingLevel": "loud"}')
+      assert_equal "medium", Settings.resolve_thinking_level(load_settings.settings)
+      write_settings(@project_path, '{"thinkingLevel": null}')
+      assert_equal "medium", Settings.resolve_thinking_level(load_settings.settings)
     end
 
     # --- defaultTools ---

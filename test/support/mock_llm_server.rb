@@ -55,6 +55,19 @@ class MockLLMServer
     @script = []
     @template = []
     @accept_thread = nil
+    @suppress_usage = false
+  end
+
+  # The Case-3 compaction instrument (I29): every response is served
+  # WITHOUT the usage payload — non-streaming JSON carries no `usage` key,
+  # the stream carries no trailing usage chunk — so both apps' compaction
+  # triggers must fall back to the chars/4 estimate (pi Case 3's zero-usage
+  # branch, agent-session.ts:3058-3083; tart Compaction.trigger_tokens).
+  # Scenario-level: set before start, survives rearm!, applies to every
+  # scripted response.
+  def suppress_usage!
+    @suppress_usage = true
+    self
   end
 
   def script(response_specs)
@@ -113,6 +126,12 @@ class MockLLMServer
 
   def serve(io)
     request_line = io.gets
+    # A connection that sends no request line (empty TCP connect, prober,
+    # port scan) consumes nothing: no script shift, no log entry, no response
+    # — the next real request still gets the next spec (I17 rig defect:
+    # method=None entries shifted every later response by one).
+    return if request_line.nil? || request_line.strip.empty?
+
     headers = {}
     while (line = io.gets) && line != "\r\n"
       name, value = line.split(":", 2)
@@ -150,8 +169,8 @@ class MockLLMServer
   def respond_message(io, spec)
     payload = {
       choices: [{message: {role: "assistant", content: spec[:content]}, finish_reason: "stop"}],
-      usage: {prompt_tokens: 10, completion_tokens: 5, total_tokens: 15},
     }
+    payload[:usage] = {prompt_tokens: 10, completion_tokens: 5, total_tokens: 15} unless @suppress_usage
     out = JSON.generate(payload)
     io.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: #{out.bytesize}\r\n\r\n#{out}")
   end
@@ -172,7 +191,7 @@ class MockLLMServer
     deltas.each do |delta|
       write_sse(io, delta)
     end
-    write_sse(io, {usage: {prompt_tokens: 10, completion_tokens: 5, total_tokens: 15}})
+    write_sse(io, {usage: {prompt_tokens: 10, completion_tokens: 5, total_tokens: 15}}) unless @suppress_usage
     done = "data: [DONE]\n\n"
     io.write(format("%x\r\n%s\r\n", done.bytesize, done))
     io.write("0\r\n\r\n")

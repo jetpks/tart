@@ -34,9 +34,10 @@ module Tart
     # always taken).
     class Markdown
       # One styled run within a row: +text+, +fg+ (+TUI.style+ color symbol
-      # or nil), +modifiers+ (+TUI.style+ modifier symbols).
-      Span = Struct.new(:text, :fg, :modifiers, keyword_init: true) do
-        def initialize(text:, fg: nil, modifiers: [])
+      # or nil), +modifiers+ (+TUI.style+ modifier symbols), +bg+ (the
+      # panel bg the tool-block call rows ride — nil off-panel).
+      Span = Struct.new(:text, :fg, :modifiers, :bg, keyword_init: true) do
+        def initialize(text:, fg: nil, modifiers: [], bg: nil)
           super
         end
       end

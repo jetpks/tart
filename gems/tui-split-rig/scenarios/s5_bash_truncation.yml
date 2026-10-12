@@ -1,0 +1,42 @@
+# S5 — bash model-facing truncation (I20): the mock scripts a bash tool
+# call whose output crosses pi's model-facing tail cap (2000 lines,
+# pi truncate.ts / port lib/tart/tools/support/truncate.rb:11 — `seq 1
+# 2100` yields 2100), then a fixed final reply. Two mock requests per
+# app (the rig's scripting is one response per mock request — the s2
+# pattern: tool-call response + final reply; a third would need a
+# second turn, and a turn with no tool call ENDS the run at request
+# two).
+#
+# Measures, over a 2000-line tail: the collapsed preview (I19 — the last
+# 5 rows plus the "... (N earlier lines, <key> to expand)" hint,
+# chat.rb collapse_bash_preview over renderers/bash.ts:14
+# BASH_PREVIEW_LINES), the truncation notice composing AFTER the
+# collapsed block (the model-facing "[Showing lines <start>-<end> of
+# <total>. Full output: <path>]" — pi bash.ts:348-352, port bash.rb
+# format_output), and the spill-file path inside that notice. Both apps
+# spill to the OS temp dir with per-run random segments (port
+# output_accumulator.rb:181, pi utils/output-files.ts:12-14) — NOT under
+# the per-run staging root, so the parity-run-path class cannot cover
+# the paths; expect path-shaped candidates (the I20 work list).
+#
+# The known notice fg divergence (pi renders the notice warning fg,
+# renderers/bash.ts; the port tool_output, chat.rb) is invisible to
+# capture-pane -p (attributes stripped); what surfaces is the notice
+# TEXT divergence (pi composes "[Full output: … . Truncated: showing N
+# of M lines]", the port renders the "[Showing lines …]" notice as-is).
+#
+# Evidence-only baseline: no exit-0 requirement, no registry change —
+# the candidate list feeds the NEXT iteration's work list.
+name: s5_bash_truncation
+prompt: "run the long seq"
+expected_requests: 2
+responses:
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_s5_1
+        name: bash
+        arguments:
+          command: "seq 1 2100"
+  - type: stream
+    content: "The truncated bash output was captured; fixed final reply for the spike."
