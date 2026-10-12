@@ -239,6 +239,18 @@ module Tart
       assert_equal "glm-5.3", chat.model.id, "the runtime chat model swapped in place"
       assert_equal 200_000, agent.context_window, "the window re-resolved for the compaction math"
 
+      # I29 (the I27 residual): a catalog entry that declares NO window —
+      # the kwarg is nil and the loop re-resolves from the switched chat's
+      # model instead of keeping the stale 200_000. Under the boot path's
+      # assume_model_exists the mock lands on Model.default (no
+      # context_window) — nil = threshold disabled, pi's `contextWindow ??
+      # 0` (agent-session.ts:2965; pi itself has no cached window:
+      # setModel swaps the Model object, :2484).
+      agent.switch_model("mock-2", provider: "openai")
+      assert_equal "mock-2", chat.model.id
+      assert_nil agent.context_window, "no stale window after a no-window switch"
+      assert_nil chat.model.context_window, "the re-resolve reads the chat's model"
+
       # The switched chat still talks to the endpoint (the seam does not
       # strand the connection) — a real request round-trips.
       @server.script([{type: :message, content: "switched"}])
@@ -288,6 +300,29 @@ module Tart
       assert_equal "second question", payload[2]["content"]
 
       assert_includes events.map { |e| e[:type] }, :compaction
+      compaction = events.find { |e| e[:type] == :compaction }
+      assert_equal :threshold, compaction[:reason]
+    end
+
+    # AC1 (I29): the zero-usage fallback — the knob strips the usage
+    # payload, so the just-completed message's direct usage is 0 and the
+    # trigger fires on the estimate over the messages (pi Case 3,
+    # agent-session.ts:3058-3083).
+    def test_threshold_compaction_fires_on_the_estimate_under_zero_usage
+      @server.suppress_usage!
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+      ])
+      agent, events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 9
+      )
+      run_agent(agent, "first question")
+
+      # Turn + summarization: the second request IS the compaction proof.
+      requests = @server.captured_requests
+      assert_equal 2, requests.size
+      assert_includes requests[1]["messages"].last["content"], "[User]: first question"
       compaction = events.find { |e| e[:type] == :compaction }
       assert_equal :threshold, compaction[:reason]
     end

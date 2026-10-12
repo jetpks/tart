@@ -147,9 +147,13 @@ module Tart
       Only summarize information explicitly present above. Do not infer or recreate later messages.
     PROMPT
 
-    # The cut decision over the flat message list.
+    # The cut decision over the flat message list. +usage+ and
+    # +estimated_tokens_after+ stay nil through #prepare — the loop
+    # populates them at the pi-equivalent points (the summarization call's
+    # own usage; the post-compaction re-estimate — pi's CompactionResult,
+    # compaction.ts:103-113, populated in agent-session.ts:2848-2871).
     Preparation = Struct.new(:first_kept_index, :messages_to_summarize, :tokens_before, :previous_summary,
-      keyword_init: true)
+      :usage, :estimated_tokens_after, keyword_init: true)
 
     module_function
 
@@ -178,7 +182,13 @@ module Tart
     end
 
     # pi getAssistantUsage (compaction.ts:144-158): skips messages without
-    # valid (non-nil, non-all-zero) usage.
+    # valid (non-nil, non-all-zero) usage. pi's aborted/error stop-reason
+    # skip is unobservable here and itemized as cut: the gem raises instead
+    # of appending failed/aborted responses (chat.rb provider_completion →
+    # record_generated_message only runs on success, chat.rb:1006/:1213;
+    # cancel raises CancelledError at raise_if_cancelled! inside it :1221),
+    # and Message#finish_reason (message.rb:63, :115) never carries
+    # :aborted/:error — a skip on those values would guard nothing.
     def assistant_usage(message)
       return nil unless message.respond_to?(:role) && message.role == :assistant
 
@@ -191,6 +201,28 @@ module Tart
     def full_estimate(messages)
       estimated = messages.sum { |message| estimate_tokens(message) }
       {tokens: estimated, usage_tokens: 0, trailing_tokens: estimated, last_usage_index: nil}
+    end
+
+    # pi _checkCompaction Case 3's context-token selection (agent-session.ts:
+    # 3050-3090): the just-completed assistant message's DIRECT usage first;
+    # zero/absent usage falls back to the estimate over the messages (pi's
+    # other fallback condition — an error stop-reason — is unreachable on
+    # the port: the gem raises instead of appending a failed response, see
+    # assistant_usage). +pre_compaction_messages+ (the loop's identity set —
+    # the standing equivalent of pi's timestamp-vs-compaction-entry check,
+    # agent-session.ts:3063-3075) is consulted ONLY inside the fallback: a
+    # direct usage is the just-completed message's own, fresh by
+    # construction. Returns nil when the stale guard trips (pi's
+    # `return false` — no compaction this turn).
+    def trigger_tokens(messages, message, pre_compaction_messages: nil)
+      direct = message&.tokens ? calculate_context_tokens(message.tokens) : 0
+      return direct if direct.positive?
+
+      estimate = estimate_context_tokens(messages)
+      usage_message = estimate[:last_usage_index] && messages[estimate[:last_usage_index]]
+      return nil if usage_message && pre_compaction_messages&.key?(usage_message)
+
+      estimate[:tokens]
     end
 
     # pi shouldCompact (compaction.ts:292-296), plus the caller-side
