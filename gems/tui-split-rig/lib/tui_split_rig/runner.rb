@@ -207,7 +207,12 @@ module TuiSplitRig
     # models.json shape (providers → {baseUrl, apiKey, api, models}) with
     # TWO mock models, so the /model menu has something to select. Inert
     # for tart at the pre-model-lane base (no reader); the model lane's
-    # reader contract must match this shape.
+    # reader contract must match this shape. I36 staging symmetry: mock-2
+    # (reasoning:true) also carries the owner's full-string
+    # thinkingLevelMap — the same catalog shape both sides' thinking
+    # resolution reads; mock-1 (reasoning:false) stays map-less. Inert for
+    # the pinned scenarios (mock-2 never boots; the menu renders id/name
+    # only) — no new scenario, no registry change.
     def stage_tart_home(home, port)
       dir = File.join(home, ".tart")
       FileUtils.mkdir_p(dir)
@@ -219,7 +224,9 @@ module TuiSplitRig
             api: "openai-completions",
             models: [
               {id: "mock-1", name: "Mock 1", reasoning: false, contextWindow: (@scenario.context_window || 32_768), maxTokens: 512},
-              {id: "mock-2", name: "Mock 2", reasoning: true, contextWindow: (@scenario.context_window || 32_768), maxTokens: 512},
+              {id: "mock-2", name: "Mock 2", reasoning: true, contextWindow: (@scenario.context_window || 32_768), maxTokens: 512,
+               thinkingLevelMap: {"off" => "low", "minimal" => "low", "low" => "low", "medium" => "medium",
+                                  "high" => "high", "xhigh" => "xhigh", "max" => "max"}},
             ],
           },
         },

@@ -82,6 +82,19 @@ module Tart
       "accounts/fireworks/models/glm-5p3-flash" => true
     }.freeze
 
+    # The known thinkingLevelMaps (the same known-models tier, I36): the
+    # owner's daily-driver glm — the owner's effective pi map (the pi
+    # override maps every level onto a String; off floors to "low"), so
+    # the port's wire matches the live pi sessions. Symbol keys — the
+    # parsed :thinking_level_map shape. Unknown model ids resolve to nil
+    # (pi's map-less rule, {Models.supported_thinking_levels}).
+    THINKING_LEVEL_MAPS = {
+      "accounts/fireworks/models/glm-5p3-flash" => {
+        off: "low", minimal: "low", low: "low", medium: "medium",
+        high: "high", xhigh: "xhigh", max: "max"
+      }.freeze
+    }.freeze
+
     Diagnostic = Struct.new(:type, :message, :path, keyword_init: true)
 
     Result = Struct.new(:settings, :diagnostics, keyword_init: true)
@@ -207,6 +220,27 @@ module Tart
         end
       end
       tools
+    end
+
+    # The known thinkingLevelMap for one model id (the boot/switch map
+    # tier beside {MODEL_CONTEXT_WINDOWS}/{MODEL_REASONING}). nil = no
+    # known map (pi's map-less rule).
+    def known_thinking_level_map(model_id)
+      THINKING_LEVEL_MAPS[model_id]
+    end
+
+    # The thinking facts for one model (I36), composed catalog-entry-first,
+    # known-tables-second — ONE helper for the interactive boot, print
+    # mode, and the switch path: reasoning = the entry's flag when a
+    # catalog entry exists, else {model_reasoning_capable}; the level map
+    # = the entry's map when present, else the known table (keyed by
+    # +model_id+). +entry+ nil (no catalog match) and +settings+ nil (the
+    # switch path — the entry always decides) are both legal.
+    def thinking_facts(entry, settings = nil, model_id: nil, model: nil, identity: Identity::DEFAULT)
+      {
+        reasoning: entry ? entry.fetch(:reasoning, false) : model_reasoning_capable(settings, model, identity:),
+        thinking_level_map: (entry && entry[:thinking_level_map]) || known_thinking_level_map(model_id)
+      }
     end
 
     # pi mergeDefaultTools (:119-125): overrides win wholesale unless it is

@@ -2,6 +2,7 @@
 
 require_relative "test_helper"
 require_relative "support/mock_llm_server"
+require "stringio"
 require "tmpdir"
 require "fileutils"
 
@@ -120,14 +121,15 @@ module Tart
       assert_equal %i[user], agent.new_messages.map(&:role)
     end
 
-    # I05 defect 2 (live repro: GLM-5.3-flash thinking reply): ruby_llm
-    # stores reasoning_content deltas as Message#thinking and replays it as
-    # `reasoning` + `reasoning_content` on every later request (chat.rb
-    # format_thinking), which fireworks rejects with a schema 400. The port
-    # strips it at the step boundary: the captured follow-up payload must
-    # carry no reasoning field on any assistant message, and the
-    # tool-result continuation must stream to completion.
-    def test_thinking_replay_is_suppressed_on_followup_requests
+    # I36 (the replay protocol — pi :1340-1352, the delta-carried field):
+    # a thinking reply's assistant message KEEPS its thinking (the I05
+    # strip_thinking_replay deviation is gone), and follow-up request
+    # bodies replay it under `reasoning_content` — the field the provider's
+    # deltas carried (live-verified for fireworks) — with ruby_llm's
+    # duplicate `reasoning` field ABSENT (the request-seam normalization).
+    # The tool-result continuation completes (the I05 400 class cannot
+    # recur through the port's own payload shape).
+    def test_followup_requests_replay_the_assistant_reasoning_content
       @server.script([
         {type: :stream, content: "listing", reasoning_content: "I should list the files",
          tool_calls: [{id: "call_1", name: "ls", arguments: {path: "."}}]},
@@ -142,15 +144,170 @@ module Tart
       assert_equal 2, requests.size
       assistants = requests.last["messages"].select { |m| m["role"] == "assistant" }
       assert assistants.any?
+      replayed = assistants.find { |message| message["reasoning_content"] }
+      assert_equal "I should list the files", replayed["reasoning_content"],
+        "the thinking replays under the delta-carried signature (pi's assistantMsg[signature])"
       assistants.each do |message|
-        refute message.key?("reasoning"), "replayed `reasoning` must be stripped"
-        refute message.key?("reasoning_content"), "replayed `reasoning_content` must be stripped"
+        refute message.key?("reasoning"), "ruby_llm's duplicate `reasoning` field must be absent"
       end
       assert_equal "done", result.last.content
       types = events.map { |e| e[:type] }
       assert_includes types, :turn_end
       error_ends = events.select { |e| e[:type] == :agent_end && e[:error] }
       assert_empty error_ends, "the continuation must complete without an error"
+    end
+
+    # I36 AC1: the resolved level reaches the wire — reasoning_effort =
+    # Models.resolve_reasoning_effort (the map's value for the clamped
+    # level), read at request time so a mid-session set_thinking_level
+    # changes the NEXT request with no gem state to reset.
+    def test_reasoning_effort_rides_the_wire_and_follows_the_session_level
+      @server.script([
+        {type: :message, content: "one"},
+        {type: :message, content: "two"},
+      ])
+      agent, _events = agent_on_kernel(
+        model_reasoning: true,
+        thinking_level_map: {off: "low", low: "low", medium: "medium", high: "high"}
+      )
+      run_agent(agent, "first")
+      assert_equal "medium", @server.captured_requests.first["reasoning_effort"],
+        "pi's DEFAULT_THINKING_LEVEL medium resolves through the map"
+
+      agent.set_thinking_level("high")
+      run_agent(agent, "second")
+      assert_equal "high", @server.captured_requests.first["reasoning_effort"],
+        "the mid-session level applies to the next request"
+      assert_equal "high", agent.thinking_level
+    end
+
+    # The off-floor shapes: a null-off map clamps upward (off → low); an
+    # owner-override String off value floors directly; a map-less off
+    # sends NO reasoning_effort key.
+    def test_reasoning_effort_off_floor_shapes
+      @server.script([
+        {type: :message, content: "a"},
+        {type: :message, content: "b"},
+      ])
+
+      agent, _events = agent_on_kernel(
+        thinking_level: "off", model_reasoning: true,
+        thinking_level_map: {off: nil, minimal: nil, low: "low", medium: nil, high: "high", xhigh: nil, max: "max"}
+      )
+      run_agent(agent, "first")
+      assert_equal "low", @server.captured_requests.first["reasoning_effort"],
+        "the null-off floor clamps upward (the live-catalog shape)"
+
+      agent2, _events2 = agent_on_kernel(
+        thinking_level: "off", model_reasoning: true,
+        thinking_level_map: {off: "low", low: "low", high: "high"}
+      )
+      run_agent(agent2, "second")
+      assert_equal "low", @server.captured_requests.last["reasoning_effort"],
+        "the owner-override String off value floors directly"
+
+      agent3, _events3 = agent_on_kernel(thinking_level: "off", model_reasoning: true)
+      run_agent(agent3, "third")
+      refute @server.captured_requests.last.key?("reasoning_effort"),
+        "map-less off sends nothing"
+    end
+
+    # A non-reasoning model never sends reasoning_effort, whatever the
+    # level and map (pi: the generic branch gates on model.reasoning).
+    def test_non_reasoning_model_never_sends_reasoning_effort
+      @server.script([{type: :message, content: "ok"}])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: false,
+        thinking_level_map: {high: "high"})
+      run_agent(agent, "hi")
+
+      refute @server.captured_requests.first.key?("reasoning_effort")
+    end
+
+    # The switch seam re-resolves the reasoning facts alongside the window
+    # (pi setModel swaps the Model object): the switched entry's flag/map
+    # govern the following requests.
+    def test_switch_model_re_resolves_the_reasoning_facts
+      @server.script([
+        {type: :message, content: "before"},
+        {type: :message, content: "after"},
+        {type: :message, content: "muted"},
+      ])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: false)
+      run_agent(agent, "first")
+      refute @server.captured_requests.first.key?("reasoning_effort"), "non-reasoning boot sends nothing"
+
+      agent.switch_model("glm-5.3", provider: "openai", model_reasoning: true,
+        thinking_level_map: {high: "high"})
+      run_agent(agent, "second")
+      assert_equal "high", @server.captured_requests.first["reasoning_effort"],
+        "the switched entry's facts govern (the map's value for the level)"
+
+      agent.switch_model("mock-2", provider: "openai", model_reasoning: true, thinking_level_map: nil)
+      run_agent(agent, "third")
+      assert_equal "high", @server.captured_requests.first["reasoning_effort"],
+        "the map-less rule falls back to the level itself"
+    end
+
+    # The map re-resolve is TOTAL (pi setModel swaps the Model object — no
+    # stale facts survive the switch): switching to a map-less entry DROPS
+    # the previous map. A leaked map would keep flooring "off" to its
+    # String value where the map-less rule sends nothing.
+    def test_switch_to_a_mapless_entry_drops_the_previous_map
+      @server.script([
+        {type: :message, content: "one"},
+        {type: :message, content: "two"},
+      ])
+      agent, _events = agent_on_kernel(thinking_level: "off", model_reasoning: true,
+        thinking_level_map: {off: "low", high: "high"})
+      run_agent(agent, "first")
+      assert_equal "low", @server.captured_requests.first["reasoning_effort"],
+        "the String off map value floors off"
+
+      agent.switch_model("mock-2", provider: "openai", model_reasoning: true, thinking_level_map: nil)
+      run_agent(agent, "second")
+      refute @server.captured_requests.last.key?("reasoning_effort"),
+        "the map-less entry re-resolves: off sends nothing (a stale map would still floor to low)"
+    end
+
+    # Print mode (AC1's third wire site): the launcher-threaded thinking
+    # facts ride Print.run into the loop's request seam — reasoning_effort
+    # on the wire when the model reasons, no key when it doesn't (the
+    # defaults keep the legacy shape).
+    def test_print_mode_wires_the_thinking_facts_into_the_request
+      @server.script([
+        {type: :message, content: "reasoned"},
+        {type: :message, content: "plain"},
+      ])
+      stdout, stderr = StringIO.new, StringIO.new
+      code = Print.run(prompt: "think", chat: TestChat.build(@server, tools: [], system_prompt: "test prompt"),
+        tools: {}, stdout:, stderr:, thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high", off: "low"})
+
+      assert_equal Print::EXIT_OK, code
+      assert_equal "high", @server.captured_requests.first["reasoning_effort"]
+
+      code = Print.run(prompt: "plain", chat: TestChat.build(@server, tools: [], system_prompt: "test prompt"),
+        tools: {}, stdout:, stderr:)
+      assert_equal Print::EXIT_OK, code
+      refute @server.captured_requests.last.key?("reasoning_effort"),
+        "the default facts (non-reasoning) send no reasoning_effort"
+    end
+
+    # The session file (pi's persistence): a thinking reply's recorded
+    # entry carries the thinking text — resume replay regains it (the
+    # transcript's replay_assistant renders message["thinking"]).
+    def test_thinking_reply_persists_to_the_session_file
+      @server.script([
+        {type: :stream, content: "the answer", reasoning_content: "pondering hard"},
+      ])
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: File.join(@dir, "root"))
+      agent, _events = agent_on_kernel(recorder:)
+      run_agent(agent, "question")
+
+      entries = Agent::Session.load_entries(recorder.path)
+      assistant = entries.find { |entry| entry.dig("message", "role") == "assistant" }
+      assert_equal "pondering hard", assistant.dig("message", "thinking"),
+        "no strip: the recorded entry keeps the thinking"
     end
 
     def test_queued_message_continues_the_outer_loop

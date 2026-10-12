@@ -2,6 +2,7 @@
 
 require "json"
 require_relative "agent/session"
+require_relative "settings"
 
 module Tart
   module Models
@@ -152,8 +153,80 @@ module Tart
         name: model["name"] || model["id"],
         reasoning: model["reasoning"] == true,
         context_window: model["contextWindow"],
-        max_tokens: model["maxTokens"]
+        max_tokens: model["maxTokens"],
+        thinking_level_map: build_thinking_level_map(model["thinkingLevelMap"])
       }
+    end
+
+    # pi ThinkingLevelMap (model-schema.ts:14-15 — Partial Record<level,
+    # String|null>): a String value rides the wire verbatim, null marks the
+    # level unsupported. Keys symbolized for the resolution functions
+    # ({supported_thinking_levels} family). undeclared → nil (the map-less
+    # rule: pi's ladder without xhigh/max).
+    def build_thinking_level_map(raw)
+      return nil unless raw.is_a?(Hash)
+
+      raw.transform_keys(&:to_sym)
+    end
+
+    # pi getSupportedThinkingLevels (models.ts:1224-1233): a non-reasoning
+    # model supports ["off"] alone; a reasoning model offers the
+    # {Settings::THINKING_LEVELS} ladder filtered through the map — a null
+    # value marks the level unsupported, xhigh/max need a PRESENT entry
+    # (a missing map key excludes them; the map-less rule is off..high).
+    # The map is the parsed :thinking_level_map shape (symbol keys); the
+    # level speaks the Settings vocabulary (Strings).
+    def supported_thinking_levels(map:, reasoning:)
+      return ["off"] unless reasoning
+
+      Settings::THINKING_LEVELS.filter do |level|
+        key = level.to_sym
+        present = map&.key?(key)
+        next false if present && map[key].nil? # null marks the level unsupported
+        next false if (level == "xhigh" || level == "max") && !present # a PRESENT entry is required
+
+        true
+      end
+    end
+
+    # pi clampThinkingLevel (models.ts:1235-1254): an exactly-supported
+    # level passes; otherwise pi's scan — forward from the requested rung
+    # to the ladder's top, then backward from just below it, first
+    # supported candidate wins; an unknown level lands on the first
+    # supported one (the JS `indexOf → -1` early return).
+    def clamp_thinking_level(level, map:, reasoning:)
+      available = supported_thinking_levels(map:, reasoning:)
+      return level if available.include?(level)
+
+      ladder = Settings::THINKING_LEVELS
+      requested = ladder.index(level)
+      return available.first || "off" if requested.nil?
+
+      forward = ladder[requested..] || []
+      backward = ladder[0...requested].reverse
+      (forward + backward).find { |candidate| available.include?(candidate) } || available.first || "off"
+    end
+
+    # The reasoning_effort for the wire (pi openai-completions.ts:745-755
+    # + :969-976, the generic openai-completions branch — the port's single
+    # chat-completions seam is that class): nil sends NO reasoning_effort —
+    # a non-reasoning model, or a level clamping to "off" with no String
+    # `off` map value (map-less off). Otherwise the clamped level's map
+    # value, falling back to the level itself (`map[clamped] || clamped`,
+    # pi's `??` — equivalent for String|nil values); the "off" clamp sends
+    # the map's String `off` value only (the owner's override floors
+    # off→"low" directly; a null-off map clamps upward through the clamp
+    # before this sees "off").
+    def resolve_reasoning_effort(level, map:, reasoning:)
+      return nil unless reasoning
+
+      clamped = clamp_thinking_level(level, map:, reasoning:)
+      if clamped == "off"
+        off = map&.[](:off)
+        off.is_a?(String) ? off : nil
+      else
+        map&.[](clamped.to_sym) || clamped
+      end
     end
 
     # The schema subset, validated by hand (pi TypeBox compile reduced):
@@ -217,11 +290,30 @@ module Tart
     def validate_model_fields(key, index, model, errors)
       errors << "  - providers.#{key}.models[#{index}].name: expected a string" if !model["name"].nil? && !model["name"].is_a?(String)
       errors << "  - providers.#{key}.models[#{index}].reasoning: expected a boolean" if !model["reasoning"].nil? && ![true, false].include?(model["reasoning"])
+      validate_thinking_level_map(key, index, model["thinkingLevelMap"], errors)
       %w[contextWindow maxTokens].each do |field|
         value = model[field]
         next if value.nil? || (value.is_a?(Integer) && value.positive?)
 
         errors << "  - providers.#{key}.models[#{index}].#{field}: expected a positive integer"
+      end
+    end
+
+    # pi ThinkingLevelMapSchema (model-schema.ts:14-15 — Partial
+    # Record<level, String|null>): a hash of level-name → String|null;
+    # unknown level keys are tolerated (pi's TypeBox default — the same
+    # additional-properties stance as every other object here).
+    def validate_thinking_level_map(key, index, map, errors)
+      return if map.nil?
+      unless map.is_a?(Hash)
+        errors << "  - providers.#{key}.models[#{index}].thinkingLevelMap: expected an object"
+        return
+      end
+
+      map.each do |level, value|
+        next if value.nil? || value.is_a?(String)
+
+        errors << "  - providers.#{key}.models[#{index}].thinkingLevelMap.#{level}: expected a string or null"
       end
     end
   end

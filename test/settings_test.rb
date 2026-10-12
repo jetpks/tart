@@ -275,6 +275,44 @@ module Tart
       assert_equal "medium", Settings.resolve_thinking_level(load_settings.settings)
     end
 
+    # --- the known-models thinkingLevelMap tier + the fact composition (I36) ---
+
+    def test_known_thinking_level_map_reads_the_daily_driver
+      map = Settings.known_thinking_level_map("accounts/fireworks/models/glm-5p3-flash")
+      assert_equal "low", map.fetch(:off), "the owner's override floors off to low"
+      assert_equal "medium", map.fetch(:medium)
+      assert_equal "max", map.fetch(:max)
+      assert_nil Settings.known_thinking_level_map("mock-1"), "unknown ids have no known map"
+      assert_nil Settings.known_thinking_level_map(nil)
+    end
+
+    def test_thinking_facts_catalog_entry_wins
+      entry = {id: "m", reasoning: false, thinking_level_map: {low: "low"}}
+      facts = Settings.thinking_facts(entry, {"modelReasoning" => true}, model_id: "m")
+      assert_equal false, facts[:reasoning], "the entry's flag decides over the staged env"
+      assert_equal ({low: "low"}), facts[:thinking_level_map]
+    end
+
+    def test_thinking_facts_known_tables_when_the_entry_declares_none
+      entry = {id: "accounts/fireworks/models/glm-5p3-flash", reasoning: true, thinking_level_map: nil}
+      facts = Settings.thinking_facts(entry, nil, model_id: entry[:id])
+      assert_equal true, facts[:reasoning]
+      assert_equal Settings.known_thinking_level_map(entry[:id]), facts[:thinking_level_map],
+        "a map-less entry falls back to the known table (catalog-entry-first, known-tables-second)"
+    end
+
+    def test_thinking_facts_without_a_catalog_entry
+      model = RubyLLM::Model.default("mock-1", "openai")
+      facts = Settings.thinking_facts(nil, {}, model_id: "mock-1", model: model)
+      assert_equal false, facts[:reasoning], "model_reasoning_capable decides (an assumed mock: not reasoning)"
+      assert_nil facts[:thinking_level_map], "no known map for the unknown id"
+
+      glm = Settings.thinking_facts(nil, {}, model_id: "accounts/fireworks/models/glm-5p3-flash",
+        model: RubyLLM::Model.default("accounts/fireworks/models/glm-5p3-flash", "openai"))
+      assert glm[:reasoning], "the known-models table declares the daily driver reasoning-capable"
+      assert_equal Settings.known_thinking_level_map("accounts/fireworks/models/glm-5p3-flash"), glm[:thinking_level_map]
+    end
+
     # --- defaultTools ---
 
     def test_default_tools_plain_names_replace_the_base
