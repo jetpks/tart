@@ -58,6 +58,50 @@ module Tart
       assert_equal 2, Compaction.estimate_tokens(llm_message(:user, "x" * 5))
     end
 
+    # pi's system.toolsAdded arm (compaction.ts:302-311): the estimate
+    # covers the tool definitions the request carries — the port's wire
+    # definition JSON, pinned byte-exact.
+    def test_estimate_tools_tokens_counts_the_wire_definition_json
+      tools = {"read" => probe_tool("read", "Read a file", "path" => {"type" => "string"})}
+      json = '[{"name":"read","description":"Read a file","parameters":{"path":{"type":"string"}}}]'
+      assert_equal (json.length / 4.0).ceil, Compaction.estimate_tools_tokens(tools)
+      assert_equal 0, Compaction.estimate_tools_tokens(nil)
+      assert_equal 0, Compaction.estimate_tools_tokens({})
+    end
+
+    # AC2 (I31): the estimate arms cover the full wire context — text plus
+    # the tools component, counted ONCE, never per message; the
+    # usage-backed path stays byte-identical (the provider's report covers
+    # the standing context, pi's system arm included).
+    def test_estimate_arms_add_the_tools_component_once_not_per_message
+      messages = [llm_message(:system, "prompt"), llm_message(:user, "x" * 40), llm_message(:assistant, "y" * 8)]
+      tools = {"read" => probe_tool("read", "R" * 8, "path" => {"type" => "string"})}
+      tool_tokens = Compaction.estimate_tools_tokens(tools)
+
+      bare = Compaction.full_estimate(messages)[:tokens]
+      assert_equal bare + tool_tokens, Compaction.full_estimate(messages, tools: tools)[:tokens]
+      assert_equal bare + tool_tokens, Compaction.estimate_context_tokens(messages, tools: tools)[:tokens]
+
+      used = RubyLLM::Message.new(role: :assistant, content: "a", tokens: RubyLLM::Tokens.new(input: 50, output: 10))
+      history = [llm_message(:system, "prompt"), used, llm_message(:user, "x" * 40)]
+      estimate = Compaction.estimate_context_tokens(history, tools: tools)
+      assert_equal 60, estimate[:usage_tokens]
+      assert_equal 70, estimate[:tokens] # usage 60 + trailing ("x" * 40) => 10, no tools term
+    end
+
+    # tokens_before stays "the context the summarization replaces" — the
+    # full wire context once the chat's tools are threaded in.
+    def test_prepare_tokens_before_covers_the_wire_tools
+      settings = Compaction::Settings.resolve(keep_recent_tokens: 1)
+      messages = [llm_message(:system, "prompt"), llm_message(:user, "old"), tool_call_message("call"),
+                  llm_message(:tool, "result"), llm_message(:assistant, "final")]
+      tools = {"read" => probe_tool("read", "R" * 8, "path" => {"type" => "string"})}
+
+      preparation = Compaction.prepare(messages, settings, tools: tools)
+      assert_equal Compaction.full_estimate(messages)[:tokens] + Compaction.estimate_tools_tokens(tools),
+        preparation.tokens_before
+    end
+
     # pi _checkCompaction Case 3's selection (agent-session.ts:3050-3090),
     # the three paths: the direct usage first; the zero/absent-usage
     # fallback to the estimate; the stale pre-compaction guard INSIDE the
@@ -246,6 +290,16 @@ module Tart
     def tool_call_message(content, name: "read", path: "x.rb")
       call = RubyLLM::ToolCall.new(id: "call_1", name:, arguments: {path:})
       RubyLLM::Message.new(role: :assistant, content:, tool_calls: {"call_1" => call})
+    end
+
+    # A registered-shape tool with known bytes: name/description/parameters,
+    # the fields the wire definition carries.
+    def probe_tool(name, description, schema)
+      Class.new(RubyLLM::Tool) do
+        description description
+        parameters schema
+        define_singleton_method(:tool_name) { name }
+      end.new
     end
   end
 end

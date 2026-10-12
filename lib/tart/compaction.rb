@@ -172,9 +172,12 @@ module Tart
     # pi estimateContextTokens (compaction.ts:196-225): provider-usage-backed
     # through the last valid assistant usage, chars/4 estimates for the
     # messages after it; all-estimate when no usage is in the history.
-    def estimate_context_tokens(messages)
+    # +tools+ (the chat's registered tools, ruby_llm Chat#tools) feeds the
+    # all-estimate arm only: on the usage-backed path the provider's report
+    # covers the standing context, pi's system arm included.
+    def estimate_context_tokens(messages, tools: nil)
       usage_index = messages.rindex { |message| assistant_usage(message) }
-      return full_estimate(messages) unless usage_index
+      return full_estimate(messages, tools:) unless usage_index
 
       usage_tokens = calculate_context_tokens(assistant_usage(messages[usage_index]))
       trailing = messages[(usage_index + 1)..].to_a.sum { |message| estimate_tokens(message) }
@@ -198,9 +201,31 @@ module Tart
       tokens
     end
 
-    def full_estimate(messages)
-      estimated = messages.sum { |message| estimate_tokens(message) }
+    # The all-estimate arm grows the tools component (pi estimateTokens'
+    # system arm, #estimate_tools_tokens), counted once per context.
+    def full_estimate(messages, tools: nil)
+      estimated = messages.sum { |message| estimate_tokens(message) } + estimate_tools_tokens(tools)
       {tokens: estimated, usage_tokens: 0, trailing_tokens: estimated, last_usage_index: nil}
+    end
+
+    # pi counts the tool definitions on the estimate's system arm
+    # (compaction.ts:302-311): the context's system message carries
+    # toolsAdded — the tool definitions (createInitialSystemMessage,
+    # normalizeContext) — and its estimate is content + sections +
+    # JSON.stringify(toolsAdded).length, so pi's chars/4 estimate covers
+    # the full wire request. The port's tools live on the chat, not in a
+    # message (ruby_llm Chat#with_tools): the estimate arms add the same
+    # component from the chat's tools — one component per context, never
+    # per message — over the definitions the request sends ({name,
+    # description, parameters}: the chat_completions function payload
+    # minus the framing wrapper, pi's toolsAdded shape).
+    def estimate_tools_tokens(tools)
+      return 0 if tools.nil? || tools.empty?
+
+      definitions = tools.map do |_, tool|
+        {name: tool.name, description: tool.description, parameters: tool.parameters_schema}
+      end
+      (JSON.generate(definitions).length / 4.0).ceil
     end
 
     # pi _checkCompaction Case 3's context-token selection (agent-session.ts:
@@ -214,11 +239,11 @@ module Tart
     # direct usage is the just-completed message's own, fresh by
     # construction. Returns nil when the stale guard trips (pi's
     # `return false` — no compaction this turn).
-    def trigger_tokens(messages, message, pre_compaction_messages: nil)
+    def trigger_tokens(messages, message, pre_compaction_messages: nil, tools: nil)
       direct = message&.tokens ? calculate_context_tokens(message.tokens) : 0
       return direct if direct.positive?
 
-      estimate = estimate_context_tokens(messages)
+      estimate = estimate_context_tokens(messages, tools:)
       usage_message = estimate[:last_usage_index] && messages[estimate[:last_usage_index]]
       return nil if usage_message && pre_compaction_messages&.key?(usage_message)
 
@@ -433,8 +458,10 @@ module Tart
     # the messages to summarize (system messages are prompt state, not
     # conversation — pi's getMessagesFromProjectedEntryForCompaction skips
     # them, compaction.ts:117-122). nil when there is nothing to summarize
-    # (pi's "messagesToSummarize.length === 0 → undefined").
-    def prepare(messages, settings, previous_summary: nil)
+    # (pi's "messagesToSummarize.length === 0 → undefined"). +tools+ is
+    # the chat's registered tools — tokens_before stays "the context the
+    # summarization replaces" (the full wire context, tools included).
+    def prepare(messages, settings, previous_summary: nil, tools: nil)
       first_kept_index = find_cut_point(messages, settings.keep_recent_tokens)
       return nil if first_kept_index.nil? || first_kept_index.zero?
 
@@ -444,7 +471,7 @@ module Tart
       Preparation.new(
         first_kept_index:,
         messages_to_summarize: summarize,
-        tokens_before: estimate_context_tokens(messages)[:tokens],
+        tokens_before: estimate_context_tokens(messages, tools:)[:tokens],
         previous_summary:,
       )
     end
