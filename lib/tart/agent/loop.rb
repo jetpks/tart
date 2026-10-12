@@ -55,18 +55,22 @@ module Tart
       #   Agent::Session.context_messages) — the model sees them on the
       #   wire, they are never re-recorded as new messages.
       # @param context_window [Integer, nil] the model's context window,
-      #   overriding the resolution order TART_CONTEXT_WINDOW →
+      #   overriding the resolution order <IDENTITY>_CONTEXT_WINDOW →
       #   chat.model.context_window → nil (nil/<= 0 disables the threshold
       #   trigger only; the overflow trigger always fires).
+      # @param identity [String] the resolved face (Tart::Identity) whose
+      #   env namespace the context-window env tier reads (AC4).
       # @param compaction [Hash, Compaction::Settings, nil] compaction
       #   settings ({enabled:, reserve_tokens:, keep_recent_tokens:});
       #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
       def initialize(chat:, tools:, system_prompt: nil, on_event: nil,
-        recorder: nil, seed_messages: [], context_window: nil, compaction: nil)
+        recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
+        identity: Identity::DEFAULT)
         @chat = chat
         @tools = tools
         @on_event = on_event
         @recorder = recorder
+        @identity = identity
         @context_window = context_window
         @compaction_settings = Compaction::Settings.resolve(compaction)
         @overflow_recovery_attempted = false
@@ -301,14 +305,17 @@ module Tart
         Compaction.should_compact?(tokens, window, @compaction_settings)
       end
 
-      # Explicit kwarg → TART_CONTEXT_WINDOW → chat.model.context_
+      # Explicit kwarg → <IDENTITY>_CONTEXT_WINDOW → chat.model.context_
       # window → nil. The gem's assume_model_exists resolution lands on
       # Model.default, which carries no context_window (models.rb:210,
-      # model.rb:65-75) — nil disables the threshold trigger only.
+      # model.rb:65-75) — nil disables the threshold trigger only. The env
+      # tier speaks the identity's namespace (AC4); +identity+ defaults to
+      # pi — the launcher threads the resolved face (print.rb's frozen
+      # construction cannot).
       def resolved_context_window
         return @context_window if @context_window
 
-        env = ENV["TART_CONTEXT_WINDOW"]
+        env = ENV[Identity.env_key(@identity, "CONTEXT_WINDOW")]
         return Integer(env, 10) if env&.match(/\A\d+\z/)
 
         @chat.model&.context_window

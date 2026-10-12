@@ -13,7 +13,7 @@ module Tart
     def setup
       @root = Dir.mktmpdir("tart-models-")
       @path = File.join(@root, "models.json")
-      @saved_env = %w[TART_MODEL TART_PROVIDER].to_h { |key| [key, ENV[key]] }
+      @saved_env = %w[PI_MODEL PI_PROVIDER TART_MODEL TART_PROVIDER FOO_MODEL FOO_PROVIDER].to_h { |key| [key, ENV[key]] }
       @saved_env.each_key { |key| ENV.delete(key) }
     end
 
@@ -153,18 +153,31 @@ module Tart
     end
 
     def test_boot_resolves_env_over_all
-      boot = Models.resolve_boot_model(catalog, settings, env: {"TART_MODEL" => "m-env", "TART_PROVIDER" => "p-env"})
+      boot = Models.resolve_boot_model(catalog, settings, env: {"PI_MODEL" => "m-env", "PI_PROVIDER" => "p-env"})
       assert_equal ({provider: "p-env", id: "m-env"}), boot
     end
 
     def test_boot_env_model_alone_keeps_the_settings_provider
-      boot = Models.resolve_boot_model(catalog, settings, env: {"TART_MODEL" => "m-env"})
+      boot = Models.resolve_boot_model(catalog, settings, env: {"PI_MODEL" => "m-env"})
       assert_equal ({provider: "settings-provider", id: "m-env"}), boot
     end
 
     def test_boot_env_provider_alone_keeps_the_settings_model
-      boot = Models.resolve_boot_model(catalog, settings, env: {"TART_PROVIDER" => "p-env"})
+      boot = Models.resolve_boot_model(catalog, settings, env: {"PI_PROVIDER" => "p-env"})
       assert_equal ({provider: "p-env", id: "settings-model"}), boot
+    end
+
+    # The env keys ride the identity's namespace (I32 AC4).
+    def test_boot_env_keys_follow_the_identity
+      tart = Models.resolve_boot_model(catalog, settings, identity: "tart",
+        env: {"TART_MODEL" => "m-env", "TART_PROVIDER" => "p-env"})
+      assert_equal ({provider: "p-env", id: "m-env"}), tart
+      foo = Models.resolve_boot_model(catalog, settings, identity: "foo", env: {"FOO_MODEL" => "m-foo"})
+      assert_equal ({provider: "settings-provider", id: "m-foo"}), foo
+      # A pi-key boot under identity tart is NOT read — the namespaces
+      # don't bleed.
+      assert_equal ({provider: "settings-provider", id: "settings-model"}),
+        Models.resolve_boot_model(catalog, settings, identity: "tart", env: {"PI_MODEL" => "m-env"})
     end
 
     def test_boot_resolves_the_models_json_default_over_settings

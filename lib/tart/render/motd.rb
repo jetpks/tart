@@ -55,14 +55,17 @@ module Tart
         file ? File.readlines(file, chomp: true) : []
       end
 
-      # tart-mode's header: the owner's art collection, the tart version
-      # line, the port's hints line — every content row through the
-      # {Panel::OUTPUT_PAD} rule. The resource sections render below for
-      # both identities ({sections}).
-      def tart_header_lines(width)
+      # The tart FAMILY's header: the owner's art collection, the identity
+      # name + version line, the port's hints line — every content row
+      # through the {Panel::OUTPUT_PAD} rule. The resource sections render
+      # below for both identities ({sections}). The wordmark is the
+      # boot-resolved face (Identity.current — chat.rb's frozen call
+      # carries no identity argument): tart renders "tart", foo "foo",
+      # always with Tart::VERSION.
+      def tart_header_lines(width, name = Identity.current)
         content_width = width - Panel::OUTPUT_PAD.length * 2
         lines = motd_logo_lines.map { |line| TUI.line("#{Panel::OUTPUT_PAD}#{line}") }
-        lines << TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span("tart"), TUI.span(" v#{Tart::VERSION}", fg: Theme[:dim])])
+        lines << TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(name), TUI.span(" v#{Tart::VERSION}", fg: Theme[:dim])])
         lines.concat(Text.wrap(HINTS_LINE, content_width).map { |row| TUI.line("#{Panel::OUTPUT_PAD}#{row}", fg: Theme[:dim]) })
         lines
       end

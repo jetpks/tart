@@ -177,12 +177,66 @@ module Tart
       end
     end
 
+    # AC2, the wiring proof: the real launcher composes the full harness
+    # prompt onto the request — the I04-era terse string is gone from the
+    # print path (the interactive path shares the seam; the s-rig runs
+    # both). The system message carries every section: preamble, rules,
+    # docs (pi's install paths), cwd.
+    def test_print_boot_wires_the_composed_harness_prompt
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "wired"}])
+      home = Dir.mktmpdir("tart-prompt-home-")
+      stdout, stderr, status = Open3.capture3(smoke_env(home, server),
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "hello",
+        chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "boot + run exit 0 (stderr: #{stderr})"
+      system_message = server.captured_request_logs.first.fetch(:body)
+        .fetch("messages").first.fetch("content")
+      refute_includes system_message, "You are a coding assistant working in",
+        "the terse prompt is gone"
+      assert_includes system_message, "You are an expert coding assistant operating inside pi"
+      assert_includes system_message, "<rules>"
+      assert_includes system_message, "<docs>"
+      assert_includes system_message, "<cwd>"
+      refute_includes system_message, "<project_context>",
+        "no context files in the staged home → no section (AC3, pi parity)"
+    ensure
+      server.stop
+      FileUtils.rm_rf(home)
+    end
+
+    # AC1's foo smoke, end to end: the free-form identity boots print mode
+    # through its OWN namespace (FOO_API_KEY/FOO_API_BASE) and the request
+    # carries the foo-named preamble and the FOO_* env-rule bullet.
+    def test_foo_identity_boots_through_its_own_env_namespace
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "foo answer"}])
+      home = Dir.mktmpdir("tart-foo-home-")
+      stdout, stderr, status = Open3.capture3(
+        {"PATH" => ENV.fetch("PATH", nil), "HOME" => home,
+         "FOO_API_KEY" => "foo-key", "FOO_API_BASE" => server.url,
+         "TART_MCP_CONFIG" => File.join(home, "absent-mcp.json")},
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "--identity", "foo",
+        "-p", "hello", chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "foo boots (stderr: #{stderr})"
+      assert_includes stdout, "foo answer"
+      system_message = server.captured_request_logs.first.fetch(:body)
+        .fetch("messages").first.fetch("content")
+      assert_includes system_message, "operating inside foo, a coding agent harness"
+      assert_includes system_message, "You can inspect FOO_* environment variables"
+    ensure
+      server.stop
+      FileUtils.rm_rf(home)
+    end
+
     def smoke_env(home, server)
       {
         "PATH" => ENV.fetch("PATH", nil),
         "HOME" => home,
-        "TART_API_KEY" => "smoke-key",
-        "TART_API_BASE" => server.url,
+        "PI_API_KEY" => "smoke-key",
+        "PI_API_BASE" => server.url,
         "TART_MCP_CONFIG" => File.join(home, "absent-mcp.json")
       }
     end
