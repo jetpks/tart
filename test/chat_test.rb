@@ -3399,6 +3399,55 @@ module Tart
       end
     end
 
+    # --- undo (I39, pi keybindings.ts:142 tui.editor.undo = ctrl+-):
+    # the arm fires with the list open (pi matches undo BEFORE the
+    # autocomplete block, editor.ts:751-755); bare - types; submit
+    # clears the stack (pi submitValue editor.ts:1373).
+
+    def test_ctrl_minus_undoes_the_last_edit_through_the_key_surface
+      with_headless_chat do |chat|
+        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("-", modifiers: ["ctrl"]))
+        assert_equal "hello", chat.input, "ctrl+- undoes the ' world' unit (the space captured pre-space)"
+        chat.on_event(TUI.key_event("-", modifiers: ["ctrl"]))
+        assert_equal "", chat.input, "'hello' is one typing unit"
+      end
+    end
+
+    def test_bare_minus_still_types
+      with_headless_chat do |chat|
+        "a-b".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        assert_equal "a-b", chat.input, "bare - inserts (the arm's printable fall-through)"
+      end
+    end
+
+    def test_alt_minus_stays_a_no_op
+      with_headless_chat do |chat|
+        "ab".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("-", modifiers: ["alt"]))
+        assert_equal "ab", chat.input, "alt+- is the modifier-guard no-op"
+      end
+    end
+
+    def test_ctrl_minus_with_the_list_open_leaves_the_list_open
+      with_headless_chat(autocomplete: slash_source("new", "help")) do |chat|
+        chat.on_event(TUI.key_event("/"))
+        assert_equal ["new", "help"], chat.suggestions.map { |item| item[:value] }
+        chat.on_event(TUI.key_event("-", modifiers: ["ctrl"]))
+        assert_equal "", chat.input, "undo fires with the list open (pi editor.ts:751-755)"
+        assert chat.suggestions, "the list is neither cancelled nor re-filtered by undo"
+      end
+    end
+
+    def test_submit_clears_the_undo_stack
+      with_headless_chat do |chat|
+        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+        chat.on_event(TUI.key_event("-", modifiers: ["ctrl"]))
+        assert_equal "", chat.input, "after submit, ctrl+- is a no-op (pi submitValue clears the stack)"
+      end
+    end
+
     # Regression pins (I26): ctrl+a/ctrl+e are settled surface (base) —
     # the kill-ring wiring must not have shifted them.
     def test_ctrl_a_and_ctrl_e_still_move_to_line_start_and_end

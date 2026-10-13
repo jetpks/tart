@@ -905,6 +905,12 @@ module Tart
         when "u" then ctrl ? @editor.delete_to_line_start : @editor.insert_printable(event)
         when "k" then ctrl ? @editor.delete_to_line_end : @editor.insert_printable(event)
         when "y" then ctrl ? @editor.yank : (alt ? @editor.yank_pop : @editor.insert_printable(event))
+        # tui.editor.undo (I39, pi keybindings.ts:142, default ctrl+-):
+        # pi matches undo BEFORE the autocomplete-mode block (editor.ts
+        # :751-755) — it fires with the list open, neither cancelled nor
+        # re-filtered (the printable re-filter below stays off ctrl+-).
+        # Bare - types; alt+- is the modifier-guard no-op.
+        when "-" then ctrl ? @editor.undo : @editor.insert_printable(event)
         else @editor.insert_printable(event)
         end
         # pi editor.ts:1228-1251 — the list re-filters on every printable
@@ -930,6 +936,7 @@ module Tart
 
         @editor.add_to_history(text)
         @editor.clear
+        @editor.clear_undo_stack # pi submitValue editor.ts:1373 — the submit surface clears the stack
         @editor.exit_history_browsing
         @footer.invalidate_branch # per-turn branch invalidation
         if @commands && text.start_with?("/")
