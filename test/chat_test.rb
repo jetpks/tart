@@ -3023,6 +3023,313 @@ module Tart
       end
     end
 
+    # ---- the user-bash live stream (I38 — pi's BashExecutionComponent:
+    # the running block exists from BEFORE execution, appendOutput +
+    # requestRender per chunk, setComplete in place; handleBashCommand
+    # :6987-7062). Mid-flight drives the manual-reactor idiom (the
+    # escape-cancel test's shape): the IdleKernel task block runs in a
+    # side reactor thread while the test thread draws. ----
+
+    # Runs the queued user-bash task block in a side reactor thread (the
+    # bridge's queue pop needs a real reactor); returns the thread.
+    def run_user_bash_task(chat)
+      workers = chat.kernel.submitted.slice!(0..)
+      Thread.new do
+        Async do |root|
+          workers.each { |block| root.async { block.call } }
+        end
+      end
+    end
+
+    def row_texts(lines)
+      lines.map { |line| line.spans.map(&:content).join }
+    end
+
+    # The live loader row's spans (nil when no running block is on screen).
+    def loader_row_spans(chat)
+      chat.display_lines.map(&:spans).find { |spans| spans.map(&:content).join.include?("Running...") }
+    end
+
+    # AC1: mid-flight the live region renders the running family below the
+    # transcript content while the transcript itself has NO block. The
+    # settled-flush pins live in the main-thread tests below — the side
+    # reactor thread owns no terminal (the escape-cancel idiom's known
+    # artifact: the task's finish dies at the block_sink viewport read;
+    # the explicit stream_end clear has already run).
+    def test_running_user_bash_renders_the_streaming_block_midflight
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!printf 'alpha\\n'; sleep 0.5; printf 'beta\\n'")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2 # the first chunk has landed; the second has not
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert chat.user_bash_streaming?, "the run is in flight"
+        assert rows.any? { |row| row == " $ printf 'alpha\\n'; sleep 0.5; printf 'beta\\n'" },
+          "the running block's header renders (the block exists before execution, :7000-7012)"
+        assert rows.any? { |row| row == " alpha" }, "the landed chunk renders mid-flight"
+        refute rows.any? { |row| row == " beta" }, "only the accumulated text renders"
+        assert rows.any? { |row| row.include?("Running... (escape/ctrl+c to cancel)") },
+          "the loader row renders pi's bytes"
+        refute chat.transcript_lines.any? { |row| row.include?("$ printf") },
+          "the transcript has NO block mid-flight (the live rows are transient)"
+
+        reactor.join(5)
+        draw(chat, session)
+        refute chat.user_bash_streaming?, "the terminal path cleared the live rows"
+        refute row_texts(chat.display_lines).any? { |row| row.include?("Running...") },
+          "zero live rows after the run (AC2)"
+      end
+    end
+
+    # AC2: the completed block flushes byte-identical (rows + position) to
+    # a control chat that received only the enqueue with the same fields.
+    def test_completed_block_flush_is_byte_identical_to_a_control_enqueue
+      settled = nil
+      with_chat(width: 60) do |chat, session|
+        send_message(chat, "!echo settle-check")
+        drain_runs(chat)
+        draw(chat, session)
+        settled = chat.transcript_lines
+        refute chat.user_bash_streaming?
+        assert_equal settled, row_texts(chat.display_lines), "zero live rows at the outcome terminal (AC2)"
+      end
+
+      with_chat(width: 60) do |chat, session|
+        chat.instance_variable_get(:@transcript_state).enqueue_user_bash_block(
+          "echo settle-check", content: "settle-check\n", exit_code: 0, cancelled: false,
+          truncated: false, full_output_path: nil, excluded: false)
+        draw(chat, session)
+        assert_equal settled, chat.transcript_lines,
+          "the flushed block is byte-identical in rows and position (AC2)"
+      end
+    end
+
+    # AC3 mid-flight: the appendOutput join, string-buffer equivalent — an
+    # unterminated trailing line renders as its own row and the next
+    # chunk's first piece continues it. The settled bytes re-run through
+    # the main-thread drain (the side reactor owns no terminal).
+    def test_user_bash_chunks_join_through_the_string_buffer
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!printf 'par'; sleep 0.3; printf 'tial\\r\\nline2'; sleep 0.3; printf 'tail'")
+        reactor = run_user_bash_task(chat)
+        sleep 0.45 # chunks 1-2 have landed ("par" + "tial\nline2")
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert rows.any? { |row| row == " partial" }, "the unterminated first line joined across chunks"
+        assert rows.any? { |row| row == " line2" }, "the chunk's newline opened the second row"
+        refute rows.any? { |row| row == " tial" }, "no split fragment row (the appendOutput join)"
+
+        reactor.join(5)
+        send_message(chat, "!printf 'par'; printf 'tial\\r\\nline2'; printf 'tail'")
+        drain_runs(chat)
+        draw(chat, session)
+        assert chat.transcript_lines.any? { |row| row == " line2tail" },
+          "the trailing chunk continued the unterminated row (settled bytes agree)"
+      end
+    end
+
+    # AC3: CR-only chunk text vanishes — CR is REMOVED, never mapped.
+    def test_user_bash_cr_only_chunks_vanish
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!printf 'x\\ry'; sleep 0.4; printf ' end'")
+        reactor = run_user_bash_task(chat)
+        sleep 0.15
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert rows.any? { |row| row == " xy" }, "the CR-only piece vanished; the line joins through"
+        refute rows.any? { |row| row.include?("\r") }, "no CR anywhere mid-flight"
+
+        reactor.join(5)
+        send_message(chat, "!printf 'x\\ry'; sleep 0.3; printf ' end'")
+        drain_runs(chat)
+        draw(chat, session)
+        assert chat.transcript_lines.any? { |row| row == " xy end" },
+          "the settled block carries the same joined bytes (the trailing chunk continues the row)"
+      end
+    end
+
+    # AC2: the worker-error terminal (the ENOENT arm) clears the live rows
+    # too — the error line renders, no block, zero live rows.
+    def test_worker_error_clears_the_live_rows
+      Dir.chdir(@dir) do
+        # footer_data pins the cwd: the deleted-cwd trick must not trip the
+        # footer's Dir.pwd fallback mid-test.
+        with_chat(width: 60, screen_height: 24, footer_data: {cwd: @dir}) do |chat, session|
+          send_message(chat, "!echo boom") # the tool captured the (still-live) cwd
+          FileUtils.rmdir(@dir) # the cwd dies before the worker runs — the ENOENT arm
+          drain_runs(chat)
+          draw(chat, session)
+
+          refute chat.user_bash_streaming?, "the worker-error terminal cleared the live rows"
+          refute row_texts(chat.display_lines).any? { |row| row.include?("Running...") },
+            "zero Running... anywhere (AC2)"
+          assert chat.transcript_lines.any? { |row| row.include?("bash: No such file or directory") },
+            "the worker error surfaced as the error line (the ENOENT arm)"
+          refute chat.transcript_lines.any? { |row| row.include?("$ echo boom") },
+            "no block renders on a worker error"
+        end
+      end
+    end
+
+    # AC2: the escape-cancel terminal clears the live rows; the cancelled
+    # block keeps its partial output (existing behavior).
+    def test_escape_cancel_clears_the_live_rows_and_keeps_partial_output
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!printf 'kept\\n'; sleep 5")
+        reactor = run_user_bash_task(chat)
+        sleep 0.3
+        draw(chat, session)
+        assert chat.user_bash_streaming?, "the run is mid-flight"
+
+        chat.on_event(TUI.key_event("esc"))
+        reactor.join(5)
+        draw(chat, session)
+
+        refute chat.user_bash_streaming?, "the cancel terminal cleared the live rows"
+        refute row_texts(chat.display_lines).any? { |row| row.include?("Running...") },
+          "zero Running... anywhere (AC2)"
+        assert chat.transcript_lines.any? { |row| row.include?("kept") },
+          "the cancelled block keeps its partial output"
+        assert chat.transcript_lines.any? { |row| row.include?("cancelled") },
+          "the cancelled status row renders"
+      end
+    end
+
+    # AC4: the glyph advances across draws with NO chunk between (the
+    # animation window is open for the run) while @busy stays false — no
+    # border Working status renders from a bash run.
+    def test_bash_loader_glyph_advances_across_draws_without_busy
+      t = 0.0
+      clock = -> { t }
+      kernel = RecordingKernel.new
+      with_chat(width: 60, screen_height: 24, clock:, kernel:) do |chat, session|
+        send_message(chat, "!sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2
+
+        refute chat.busy?, "@busy stays false — a bash run is no agent turn"
+        draw(chat, session)
+        assert_equal "⠋", loader_row_spans(chat)[1].content, "frame 0 at the run-start anchor"
+        animate_after_first_draw = kernel.animate_calls.length
+        assert_operator animate_after_first_draw, :>=, 1, "the animation window is open for the run"
+
+        t += Render::Chat::SPINNER_INTERVAL_SECONDS
+        draw(chat, session) # no chunk between the draws — the glyph advances on TIME
+        assert_equal "⠙", loader_row_spans(chat)[1].content
+
+        t += Render::Chat::SPINNER_INTERVAL_SECONDS
+        draw(chat, session)
+        assert_equal "⠹", loader_row_spans(chat)[1].content
+
+        assert_operator kernel.animate_calls.length, :>, animate_after_first_draw,
+          "frames keep pacing while the run is in flight"
+        refute chat.busy?, "still no agent turn"
+        draw(chat, session)
+        refute session.buffer_content.any? { |row| row.include?("Working") },
+          "no border Working status renders from a bash run (mid-flight)"
+        reactor.join(5)
+      end
+    end
+
+    # AC4: the bash loader's anchor resets at each run start (pi: one
+    # Loader per component) and is independent of the border status's
+    # anchor — no bash run ever re-anchors the border spinner.
+    def test_bash_loader_anchor_resets_at_run_start_independent_of_the_border_anchor
+      t = 0.0
+      clock = -> { t }
+      with_chat(width: 60, screen_height: 24, clock:) do |chat, session|
+        send_message(chat, "!sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2
+        draw(chat, session)
+        assert_equal "⠋", loader_row_spans(chat)[1].content
+        reactor.join(5)
+
+        # The second run starts with the clock advanced one dwell: a stale
+        # anchor (the first run's) would show ⠙; the reset shows ⠋.
+        t += Render::Chat::SPINNER_INTERVAL_SECONDS
+        send_message(chat, "!sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2
+        draw(chat, session)
+        assert_equal "⠋", loader_row_spans(chat)[1].content,
+          "the anchor resets at each run start (pi: one Loader per component)"
+        assert_nil chat.instance_variable_get(:@spinner_started_at),
+          "the border-status anchor is untouched by bash runs"
+        reactor.join(5)
+      end
+    end
+
+    # The colorKey: "!!" marks the excluded execution — the RUNNING
+    # block's border and spinner ride dim (Grounds 6, the component's
+    # constructor colorKey).
+    def test_bang_bang_running_block_rides_dim_midflight
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!!sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2
+        draw(chat, session)
+
+        buffer = session.buffer_content
+        border_row = buffer.index { |row| row.include?("─" * 60) }
+        assert_equal Theme[:dim], session.cell_fg(0, border_row),
+          "the running block's border renders dim (excludeFromContext colorKey)"
+        loader = buffer.index { |row| row.include?("Running...") }
+        assert loader, "the loader row is on screen"
+        assert_equal Theme[:dim], session.cell_fg(1, loader), "the spinner rides dim too"
+        reactor.join(5)
+      end
+    end
+
+    # Grounds 6f: mid-run ctrl+o reaches the RUNNING component — the
+    # preview toggles (collapsed last-20 ↔ whole), and NO hidden-lines
+    # hint renders in either state (pi's running branch replaces the
+    # status block).
+    def test_ctrl_o_toggles_the_running_preview_without_a_hint
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!seq 1 25; sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2 # seq has printed all 25 lines; the run is mid-flight
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert rows.any? { |row| row == " 25" }, "the output tail renders mid-flight"
+        refute rows.any? { |row| row == " 1" }, "collapsed: the last-20 preview (AC1)"
+        refute rows.any? { |row| row.include?("more lines") }, "NO hidden-lines hint mid-flight"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert row_texts(chat.display_lines).any? { |row| row == " 1" },
+          "expanded mid-run: the whole output (pi setToolsExpanded reaches the running component)"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        refute row_texts(chat.display_lines).any? { |row| row == " 1" }, "collapsed again mid-run"
+        reactor.join(5)
+      end
+    end
+
+    # AC2: the replay path never sees mid-flight state — a recorded
+    # bashExecution entry renders zero loader rows.
+    def test_replay_renders_no_loader_rows
+      recorded = File.join(@dir, "bash-replay-i38.jsonl")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"i38","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"bashExecution","command":"echo hi","output":"hi","exitCode":0,"cancelled":false,"truncated":false,"fullOutputPath":null,"timestamp":"2026-01-01T00:00:02.000Z","excludeFromContext":false}}
+      JSONL
+      with_chat(width: 60) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert rows.any? { |row| row.include?("$ echo hi") }, "the replayed block renders"
+        refute rows.any? { |row| row.include?("Running...") }, "replay renders zero loader rows (AC2)"
+      end
+    end
+
     # (A byte-identical duplicate of the bash-mode border test above
     # shadowed it at HEAD — the second definition won, the first never
     # ran; dropped, the suite's run count reconciles with its source.)
@@ -4411,10 +4718,12 @@ module Tart
     # Render-only tests: the real headless fullscreen test terminal (buffer
     # readback). Width 9 makes wrapping observable ("aaaa bbbb" is exactly 9
     # cells). motd: false — the MOTD block is pinned by its own tests.
+    # kernel: injectable (the I38 animation-window pins record animate
+    # calls; default IdleKernel unchanged).
     def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false,
-      models: nil, settings_root: nil, clock: nil)
+      models: nil, settings_root: nil, clock: nil, kernel: nil)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
-        kernel = IdleKernel.new
+        kernel ||= IdleKernel.new
         kwargs = {session:, kernel:, footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
           models:, settings_root: settings_root || @dir}
         kwargs[:clock] = clock if clock # the spinner's fake-time seam (pi's 80ms dwell pinned, zero sleeps)
@@ -4734,6 +5043,22 @@ module Tart
 
       # The task role (async returns self).
       def stop = nil
+    end
+
+    # The idle kernel plus an animation-window recording (the I38
+    # frame-pacing pins: the bash loader's window opens without busy?).
+    class RecordingKernel < IdleKernel
+      attr_reader :animate_calls
+
+      def initialize
+        super
+        @animate_calls = []
+      end
+
+      def animate(duration:)
+        @animate_calls << duration
+        nil
+      end
     end
   end
 end

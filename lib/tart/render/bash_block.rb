@@ -152,6 +152,50 @@ module Tart
       def user_bash_block_rows(command, width, content:, exit_code:, cancelled:, truncated:,
                                full_output_path:, excluded:, expanded:)
         color = excluded ? Theme[:dim] : Theme[:bashMode]
+        region = user_bash_block_head(command, width, content:, color:, expanded:)
+        available = content.empty? ? [] : content.split("\n", -1)
+        hidden_logical = available.length - available.last(USER_BASH_PREVIEW_LINES).length
+        status = user_bash_status_rows(width, exit_code:, cancelled:, truncated:,
+                                       full_output_path:, hidden_logical:, expanded:)
+        unless status.empty?
+          region << Panel.blank_line
+          region.concat(status)
+        end
+        region << TUI.line([TUI.span("─" * width, fg: color)])
+        region
+      end
+
+      # The RUNNING !-prefix block (I38 — pi's component exists from BEFORE
+      # execution: handleBashCommand :7000-7012 adds it to the chat/pending
+      # container, then appendOutput + ui.requestRender per chunk :7050-7057).
+      # The completed family's head bytes exactly (the prefix property), then
+      # the loader row where the status block sits — pi's running branch
+      # REPLACES the whole statusParts block (bash-execution.ts:147-165):
+      # no hidden-lines hint, no exit/cancelled/truncation rows mid-flight.
+      # The loader row is pi's Loader bytes (loader.ts): the one-space pad
+      # (Text padX 1), the spinner span in the block's colorKey, the message
+      # span muted with pi's literal text — keyText("tui.select.cancel")
+      # resolves the default pair ["escape", "ctrl+c"] (keybindings.ts
+      # :155-158), a pi quirk copied byte-for-byte (OQ-2).
+      USER_BASH_LOADER_MESSAGE = "Running... (escape/ctrl+c to cancel)".freeze
+
+      def running_user_bash_rows(command, width, content:, excluded:, spinner_glyph:, expanded:)
+        color = excluded ? Theme[:dim] : Theme[:bashMode]
+        region = user_bash_block_head(command, width, content:, color:, expanded:)
+        region << Panel.blank_line
+        region << TUI.line([TUI.span(Panel::OUTPUT_PAD),
+                            TUI.span(spinner_glyph, fg: color),
+                            TUI.span(" #{USER_BASH_LOADER_MESSAGE}", fg: Theme[:muted])])
+        region << TUI.line([TUI.span("─" * width, fg: color)])
+        region
+      end
+
+      # The two !-block families' shared head (the prefix property by
+      # construction): the leading blank, the colorKey border, the bold
+      # `$ command` header, then the output rows when any — the same
+      # last-20-of-last-20 discipline (last 20 logical lines, then last
+      # 20 visual rows; expanded renders whole).
+      def user_bash_block_head(command, width, content:, color:, expanded:)
         region = [Panel.blank_line, TUI.line([TUI.span("─" * width, fg: color)])]
         region.concat(Panel.padded_fg_rows("$ #{command}", width, fg: color, modifiers: [:bold]))
         available = content.empty? ? [] : content.split("\n", -1)
@@ -161,14 +205,6 @@ module Tart
           visual = Panel.padded_fg_rows(shown.join("\n"), width, fg: Theme[:muted])
           region.concat(expanded ? visual : visual.last(USER_BASH_PREVIEW_LINES))
         end
-        hidden_logical = available.length - available.last(USER_BASH_PREVIEW_LINES).length
-        status = user_bash_status_rows(width, exit_code:, cancelled:, truncated:,
-                                       full_output_path:, hidden_logical:, expanded:)
-        unless status.empty?
-          region << Panel.blank_line
-          region.concat(status)
-        end
-        region << TUI.line([TUI.span("─" * width, fg: color)])
         region
       end
 

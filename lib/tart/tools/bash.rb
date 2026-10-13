@@ -65,7 +65,18 @@ module Tart
       # bash-executor.ts:146-158). No timeout: pi's user bash runs until
       # done or esc-cancelled. An aborted command still returns the
       # output it produced so far (bash-executor.ts:135-141).
-      def run_user(command)
+      #
+      # @param on_chunk [Proc, nil] +call(text)+ per pipe read, the text
+      #   CR-REMOVED — the same rule the returned content applies, applied
+      #   per chunk (pi executeBashWithOperations fires onChunk with the
+      #   sanitized text, bash-executor.ts:96-98; the port's sanitize is
+      #   the CR strip alone — ANSI stays the itemized cut, so mid-flight
+      #   bytes agree with the settled ones). pi's executor skips empty
+      #   sanitized text; the port's strip-only rule makes an empty call a
+      #   no-op downstream, so the seam fires per read unconditionally.
+      #   Fires from the reader threads — push-only work (the bridge
+      #   queue), never render state.
+      def run_user(command, on_chunk: nil)
         raise Errno::ENOENT, "Working directory does not exist: #{@cwd}\nCannot execute bash commands." unless
           File.exist?(@cwd)
 
@@ -79,7 +90,7 @@ module Tart
         cancelled = false
         outcome =
           begin
-            spawn_and_stream(command, output, nil)
+            spawn_and_stream(command, output, nil, on_chunk:)
           rescue RubyLLM::CancelledError, Async::Cancel
             cancelled = true
             {exit_code: nil}
@@ -138,6 +149,8 @@ module Tart
       # executor's BashResult assembly differ).
       def spawn_and_accumulate(command, timeout_seconds)
         output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
+        # No on_chunk: the model-facing execute render is the I34 pending
+        # block — pi's tool path streams no chunk callback either.
         outcome = spawn_and_stream(command, output, timeout_seconds)
         [output, outcome]
       end
@@ -150,7 +163,7 @@ module Tart
         timeout
       end
 
-      def spawn_and_stream(command, output, timeout_seconds)
+      def spawn_and_stream(command, output, timeout_seconds, on_chunk: nil)
         out_rd, out_wr = IO.pipe
         err_rd, err_wr = IO.pipe
         pid = nil
@@ -164,7 +177,8 @@ module Tart
           err_wr.close
 
           # One reader per output pipe (pi: one fiber per pipe).
-          readers = [Thread.new { drain_pipe(out_rd, output) }, Thread.new { drain_pipe(err_rd, output) }]
+          readers = [Thread.new { drain_pipe(out_rd, output, on_chunk) },
+                     Thread.new { drain_pipe(err_rd, output, on_chunk) }]
 
           deadline = timeout_seconds && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
 
@@ -239,13 +253,17 @@ module Tart
         end
       end
 
-      def drain_pipe(io, output)
+      def drain_pipe(io, output, on_chunk)
         loop do
           io.wait_readable(0.1) or next
           data = io.read_nonblock(65_536, exception: false)
           break if data.nil? # EOF
 
           output.append(data)
+          # The chunk seam (pi onChunk per pipe data event): CR-REMOVED —
+          # commutes with the string-buffer join and with tail-truncation's
+          # line accounting, so mid-flight rows agree with the settled block.
+          on_chunk&.call(data.gsub("\r", ""))
         end
       rescue StandardError
         nil
