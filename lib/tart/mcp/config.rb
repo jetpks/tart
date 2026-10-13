@@ -2,6 +2,8 @@
 
 require "json"
 
+require_relative "../schemas/mcp"
+
 module Tart
   module Mcp
     # mcp.json-shaped server configuration: the `{"mcpServers": {name: {...}}}`
@@ -37,37 +39,34 @@ module Tart
           raise ConfigError, "#{path}: expected an object with an \"mcpServers\" object"
         end
 
-        parsed.fetch("mcpServers", {}).each_with_object({}) do |(name, raw), servers|
-          begin
-            servers[name] = validate_server!(name, raw)
-          rescue ConfigError => e
-            raise ConfigError, "#{path}: #{e.message}"
-          end
+        servers = parsed.fetch("mcpServers", {})
+        # Fail-fast preserved (OQ-3): the contract evaluates servers in
+        # parsed insertion order with pi's check order, so the FIRST failure
+        # is exactly today's raise; the error-as-raise surface and the
+        # "#{path}: " prefix stay here.
+        result = Schemas::Mcp.call(servers)
+        raise ConfigError, "#{path}: #{Schemas::Mcp.first_failure_text(result)}" if result.failure?
+
+        servers.each_with_object({}) do |(name, raw), config|
+          config[name] = normalize_server(raw)
         end
       end
 
-      # Validates one server entry. Raises ConfigError with pi's exact string
-      # on failure; returns the normalized stdio config on success.
+      # Validates one server entry (kept public — the per-server hook):
+      # raises ConfigError with pi's exact string on failure via the
+      # {Schemas::Mcp} contract; returns the normalized stdio config on
+      # success.
       def validate_server!(name, raw)
-        raise ConfigError, %(server "#{name}" must be an object) unless raw.is_a?(Hash)
+        result = Schemas::Mcp.call(name => raw)
+        raise ConfigError, Schemas::Mcp.first_failure_text(result) if result.failure?
 
-        unless raw["args"].nil? || (raw["args"].is_a?(Array) && raw["args"].all?(String))
-          raise ConfigError, %(server "#{name}": args must be an array of strings)
-        end
-        unless raw["env"].nil? || (raw["env"].is_a?(Hash) && raw["env"].all? { |k, v| k.is_a?(String) && v.is_a?(String) })
-          raise ConfigError, %(server "#{name}": env must map names to strings)
-        end
-        unless raw["cwd"].nil? || raw["cwd"].is_a?(String)
-          raise ConfigError, %(server "#{name}": cwd must be a string)
-        end
-        raise ConfigError, %(server "#{name}": streamable HTTP transport is not supported (stdio only)) if
-          raw.key?("url")
+        normalize_server(raw)
+      end
 
-        if raw["command"].is_a?(String)
-          {command: raw["command"], args: raw["args"] || [], env: raw["env"], cwd: raw["cwd"]}
-        else
-          raise ConfigError, %(server "#{name}" needs either "command" (stdio) or "url" (streamable HTTP))
-        end
+      # The normalized stdio config (pi's shape), contract-validated by the
+      # callers.
+      def normalize_server(raw)
+        {command: raw["command"], args: raw["args"] || [], env: raw["env"], cwd: raw["cwd"]}
       end
     end
   end

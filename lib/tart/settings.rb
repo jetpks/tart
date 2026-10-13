@@ -124,7 +124,10 @@ module Tart
     # env → settings → built-in default for one carried key (bin/tart's
     # model/provider/apiBase/apiKey resolution, AC2). The env tier speaks
     # the identity's namespace (AC4): resolve_setting("apiKey", settings,
-    # identity: "foo") reads FOO_API_KEY.
+    # identity: "foo") reads FOO_API_KEY. The tier VALUES are documented by
+    # the {Schemas::Settings} string-key contracts; the three-source `||`
+    # precedence arithmetic itself stays here (a schema cannot express it
+    # honestly — pi's semantics).
     def resolve_setting(key, settings, identity: Identity::DEFAULT, env: ENV)
       env[Identity.env_key(identity, RESOLUTION_ENV.fetch(key))] || settings[key] || DEFAULTS[key]
     end
@@ -133,18 +136,22 @@ module Tart
     # model context window → registry-default table → nil (AC2/AC4; pi has
     # no contextWindow setting — the registry is its only source — recorded
     # port extension). The env tier rides the identity's namespace, like
-    # every app env read.
+    # every app env read. The tiers' accept/reject arithmetic rides the
+    # {Schemas::Settings} contracts: the env tier's digit-string coercion
+    # and the file/model tiers' positive-integer guards — a value failing
+    # its contract tier reads as absent and the ladder falls through
+    # (today's regex/guard outcomes, never new rejections).
     def resolve_context_window(explicit: nil, settings: {}, model: nil, identity: Identity::DEFAULT, env: ENV)
       return explicit if explicit
 
-      env_value = env[Identity.env_key(identity, "CONTEXT_WINDOW")]
-      return Integer(env_value, 10) if env_value&.match?(/\A\d+\z/)
+      env_window = Schemas::Settings.context_window_env(env[Identity.env_key(identity, "CONTEXT_WINDOW")])
+      return env_window if env_window
 
-      window = settings["contextWindow"]
-      return window if window.is_a?(Integer) && window.positive?
+      window = Schemas::Settings.context_window_value(settings["contextWindow"])
+      return window if window
 
-      window = model&.context_window
-      return window if window.is_a?(Integer) && window.positive?
+      window = Schemas::Settings.context_window_value(model&.context_window)
+      return window if window
 
       MODEL_CONTEXT_WINDOWS[model&.id]
     end
@@ -157,10 +164,10 @@ module Tart
     # boot composition clamps a copy for the session level (bin/tart, pi
     # createSdk sdk.ts:271-279) while this stays the · default badge's raw
     # source (pi badges getDefaultThinkingLevel() ?? DEFAULT unclamped —
-    # thinking-selector.ts:71-72).
+    # thinking-selector.ts:71-72). The vocabulary check rides the view's
+    # thinkingLevel contract ({Schemas::Settings.thinking_level}).
     def resolve_thinking_level(settings)
-      level = settings["thinkingLevel"]
-      THINKING_LEVELS.include?(level) ? level : DEFAULTS.fetch("thinkingLevel")
+      Schemas::Settings.thinking_level(settings["thinkingLevel"]) || DEFAULTS.fetch("thinkingLevel")
     end
 
     # The FILE-declared thinking-level default (I40, pi settings-manager.ts
@@ -174,11 +181,12 @@ module Tart
     # The switch path's default tier ({Render::Chat#apply_model_selection} —
     # pi _getThinkingLevelForModelSwitch, agent-session.ts:2670-2679); the
     # per-model override tier is a cut (itemized, no scoped-models surface).
+    # The vocabulary check rides the view's thinkingLevel contract, like
+    # {resolve_thinking_level}.
     def declared_thinking_level(root:, cwd:)
       user, = read_file(File.join(root, ROOT_KEY))
       project, = read_file(File.join(cwd, CONFIG_DIR, ROOT_KEY))
-      level = deep_merge(user, project)["thinkingLevel"]
-      THINKING_LEVELS.include?(level) ? level : nil
+      Schemas::Settings.thinking_level(deep_merge(user, project)["thinkingLevel"])
     end
 
     # The footer's model-metadata fact (pi footer.ts:233-244 reads
@@ -188,13 +196,18 @@ module Tart
     # when its available-model snapshot spans >1 provider (footer.ts:246
     # -258) — the port's static snapshot is one provider, so the prefix
     # never fires. Stageable for rigs/mocks: the modelReasoning setting
-    # (<IDENTITY>_MODEL_REASONING env) overrides everything; an assumed model
+    # (<IDENTITY>_MODEL_REASONING env) overrides everything; the staged
+    # truthiness rides the modelReasoning contract
+    # ({Schemas::Settings.model_reasoning} — nil = unstaged, the staged
+    # vocabulary passes, anything else answers false: today's
+    # `staged == true || staged == "true"` table); an assumed model
     # (no registry entry) falls back to the known-models table — the
     # owner's daily-driver glm declares reasoning in pi's book, and the
     # footer/border parity dies without it.
     def model_reasoning_capable(settings, model, identity: Identity::DEFAULT)
       staged = resolve_setting("modelReasoning", settings, identity:)
-      return staged == true || staged == "true" unless staged.nil?
+      outcome = Schemas::Settings.model_reasoning(staged)
+      return outcome unless outcome.nil?
 
       MODEL_REASONING.fetch(model&.id) do
         model.respond_to?(:supports?) ? model.supports?(:reasoning) : false

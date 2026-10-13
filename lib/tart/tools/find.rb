@@ -46,6 +46,9 @@ module Tart
       # @return [String] newline-joined relative paths, or {error:} on failure.
       def execute(pattern:, path: nil, limit: nil)
         safe_execute do
+          failure = validate_input(pattern:, path:, limit:)
+          return failure if failure
+
           RubyLLM::Support::Cancellation.check
           fd_path = fd_binary
           raise ArgumentError, "fd is not available and could not be downloaded" unless fd_path

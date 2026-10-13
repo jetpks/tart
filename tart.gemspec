@@ -29,6 +29,10 @@ Gem::Specification.new do |spec|
   spec.add_dependency "async", "~> 2.46"
   # Line diffs for the edit tool's details (pi uses the jsdiff package).
   spec.add_dependency "diff-lcs", "~> 1.6"
+  # Parsing-boundary validation (I43 dry-rb-boundaries: the lib/tart/schemas
+  # family — settings resolution, models.json, mcp.json, tool inputs).
+  spec.add_dependency "dry-schema", "~> 1.16"
+  spec.add_dependency "dry-validation", "~> 1.11"
   # RFC 9562 uuid generation (pi createSessionId :264 / generateId :275).
   spec.add_dependency "fast-uuid", "~> 0.1.0"
   # LLM conversation loop (BRIEF §2: >= 2.1.0).

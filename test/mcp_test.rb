@@ -165,6 +165,16 @@ module Tart
       assert_equal %(#{path}: server "x": streamable HTTP transport is not supported (stdio only)), error.message
     end
 
+    # I43: fail-fast preserved through the contract — with BOTH servers
+    # invalid, the FIRST server in parsed insertion order wins (not a
+    # collect-all).
+    def test_first_invalid_server_in_insertion_order_wins
+      path = write_config("mcpServers" => {"z" => "nope", "a" => {"cwd" => 3}})
+      error = assert_raises(Mcp::Config::ConfigError) { Mcp::Config.load(path) }
+
+      assert_equal %(#{path}: server "z" must be an object), error.message
+    end
+
     def test_malformed_config_json_names_the_file
       path = File.join(@dir, "mcp.json")
       File.write(path, "{not json")
