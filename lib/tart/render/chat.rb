@@ -436,8 +436,18 @@ module Tart
             restart_spinner!
             @footer.invalidate_branch # per-turn branch invalidation (pi's provider cache, reduced)
           when :message_start
-            @live = +""
-            @reasoning = +""
+            message = event[:message]
+            if message.respond_to?(:role) && message.role == :custom
+              # The custom-message arm (I47 — pi message_start case custom,
+              # interactive-mode.ts:3498-3502: the component is added at
+              # message_start, display-gated). The :message_end custom case
+              # needs no arm — the assistant guard below already no-ops it
+              # (pi renders the block ONCE).
+              @transcript_state.enqueue_custom_block(message.custom_type, message.content) if message.display
+            else
+              @live = +""
+              @reasoning = +""
+            end
           when :message_update
             chunk = event[:chunk]
             @live << chunk.content if chunk.content.is_a?(String) && !chunk.content.empty?

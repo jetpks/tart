@@ -5,6 +5,7 @@ require_relative "support/mock_llm_server"
 require "stringio"
 require "tmpdir"
 require "fileutils"
+require "json"
 
 module Tart
   # The agent loop on the I02 kernel (AC1/AC3): multi-turn tool round-trip
@@ -1044,6 +1045,111 @@ module Tart
       assert_kind_of Faraday::ConnectionFailed, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
       assert_kind_of Faraday::ConnectionFailed, end_event[:error]
+    end
+
+    # --- I47 seam pins (the hooks-semantics gate drives the same surface) ---
+
+    # The nextTurn drain: the pending queue injects AFTER the user message
+    # — wire order [user, custom-as-user], the :message_start/:message_end
+    # events carry the Hooks::CustomMessage, and the session records the
+    # custom_message entry between them (pi _handleUserPrompt :2086-2095 +
+    # messages.ts:161-170).
+    def test_next_turn_drain_injects_after_the_user_message
+      recorder_root = File.join(@dir, "agent")
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: recorder_root)
+      # The production shape: Hooks HOLDS the surface sink (the loop's emit
+      # routes through the seam, which forwards to the base sink).
+      events = []
+      events_mutex = Mutex.new
+      sink = ->(event) { events_mutex.synchronize { events << event } }
+      hooks = Hooks.new(on_event: sink)
+      hooks.send_next_turn(custom_type: "memory-recall", content: "RECALL-TEXT", display: true)
+      @server.script([{type: :message, content: "ok"}])
+
+      agent = Agent::Loop.new(chat: TestChat.build(@server, system_prompt: "test prompt"), tools: empty_tools,
+        hooks:, recorder:)
+      result = run_agent(agent, "hi")
+
+      request = @server.captured_requests.last
+      assert_equal %w[user user], request["messages"].map { |m| m["role"] }.last(2),
+        "the recall rides the wire as a user-role message after the prompt"
+      assert_includes request["messages"].last["content"], "RECALL-TEXT"
+      assert_equal %i[user user assistant], result.map(&:role)
+
+      custom_events = events.select { |event| event[:message].respond_to?(:role) && event[:message].role == :custom }
+      assert_equal %i[message_start message_end], custom_events.map { |event| event[:type] }.uniq
+      custom = custom_events.first[:message]
+      assert_equal :custom, custom.role
+      assert_equal "memory-recall", custom.custom_type
+      assert_equal "RECALL-TEXT", custom.content
+      assert_equal true, custom.display
+
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      assert_equal ["session", "user", "custom_message", "assistant"],
+        entries.map { |entry| entry["type"] == "message" ? entry.dig("message", "role") : entry["type"] }
+      assert_equal({"type" => "custom_message", "customType" => "memory-recall", "content" => "RECALL-TEXT",
+                    "display" => true}, entries[2].slice("type", "customType", "content", "display"))
+    end
+
+    # The terminate consult: a batch whose every tool call was a
+    # terminate-marked block stops the INNER loop — one request total (pi
+    # shouldTerminateToolBatch, agent-loop.ts:690-691).
+    def test_all_terminate_batch_breaks_the_inner_loop
+      File.write(File.join(@dir, "fixture.txt"), "x")
+      hooks = Hooks.new
+      hooks.on_tool_call { |_event, _ctx| {block: true, reason: "t", terminate: true} }
+      @server.script([
+        {type: :stream, content: "working", tool_calls: [
+          {id: "call_1", name: "ls", arguments: {path: "."}},
+          {id: "call_2", name: "read", arguments: {path: "fixture.txt"}}
+        ]},
+        {type: :message, content: "unreachable"},
+      ])
+
+      tools = Tools::Registry.build(selected: %w[ls read], cwd: @dir, hooks: hooks)
+      agent, = agent_on_kernel(tools:, hooks:)
+      result = run_agent(agent, "go")
+
+      assert_equal 1, @server.captured_requests.size, "the terminated batch never reaches a second request"
+      assert_equal %i[user assistant tool tool], result.map(&:role),
+        "one blocked tool result per call, then the inner loop breaks"
+      assert_equal "t", result.last.content, "the blocked result is the plain reason string"
+    end
+
+    # A partial terminate (some call unblocked) keeps the loop running —
+    # the model answers on the next step.
+    def test_partial_terminate_batch_continues_the_loop
+      File.write(File.join(@dir, "fixture.txt"), "x")
+      hooks = Hooks.new
+      hooks.on_tool_call do |event, _ctx|
+        {block: true, reason: "t", terminate: true} if event["tool_call_id"] == "call_1"
+      end
+      @server.script([
+        {type: :stream, content: "working", tool_calls: [
+          {id: "call_1", name: "ls", arguments: {path: "."}},
+          {id: "call_2", name: "read", arguments: {path: "fixture.txt"}}
+        ]},
+        {type: :message, content: "the reply after the batch"},
+      ])
+
+      tools = Tools::Registry.build(selected: %w[ls read], cwd: @dir, hooks: hooks)
+      agent, = agent_on_kernel(tools:, hooks:)
+      result = run_agent(agent, "go")
+
+      assert_equal 2, @server.captured_requests.size, "the loop continues after a non-all-terminate batch"
+      assert_equal "the reply after the batch", result.last.content
+    end
+
+    # hooks: nil = today's path, byte-identical: events flow through
+    # on_event and no pending queue drains.
+    def test_hooks_nil_keeps_the_on_event_path
+      @server.script([{type: :message, content: "ok"}])
+      agent, events = agent_on_kernel
+      result = run_agent(agent, "hi")
+
+      assert_equal "ok", result.last.content
+      assert events.any? { |event| event[:type] == :agent_start }, "the direct sink still receives events"
+      assert_nil agent.instance_variable_get(:@hooks), "no hooks object is constructed"
     end
 
     private

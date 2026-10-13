@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
 require_relative "../compaction"
+require_relative "../hooks"
+require_relative "../herdr"
+require_relative "../memory"
 require_relative "../models"
 require_relative "../settings"
 require_relative "bridge"
@@ -30,10 +33,14 @@ module Tart
     # cancelled (tools kill their subprocess groups at the next checkpoint),
     # and the cancel propagates.
     #
-    # Events (minimal surface, pi's AgentEvent vocabulary plus a compaction
-    # event): :agent_start, :turn_start, :message_start, :message_update
-    # (streamed chunks), :message_end, :tool_execution_start,
-    # :tool_execution_end, :turn_end, :compaction, :agent_end.
+    # Events (minimal surface, pi's AgentEvent vocabulary plus the
+    # compaction events): :agent_start, :turn_start, :message_start,
+    # :message_update (streamed chunks), :message_end,
+    # :tool_execution_start, :tool_execution_end, :turn_end,
+    # :compaction_start, :compaction, :agent_end — ELEVEN emitted types
+    # (Grounds §2 count correction: the :compaction_start border-status
+    # event landed with the I30-era compaction work; this comment listed
+    # ten until I47).
     #
     # Compaction (pi's auto-compaction, agent-session.ts:3007-3219): after
     # a completed turn, provider-reported context usage over the model's
@@ -85,13 +92,26 @@ module Tart
       #   wiring, no thinking object/tool_stream/role rewrite/rename).
       #   {switch_model} swaps it mid-session — the hook reads it at
       #   request time, same idiom as the level.
+      # @param hooks [Tart::Hooks, nil] the extension seam (I47): when
+      #   present every emitted event routes through {Hooks#emit}
+      #   (registration-order handlers, then the surface sink the Hooks
+      #   holds), the tool batch consults the terminate ledger, and the
+      #   pending nextTurn queue drains after every user message; nil =
+      #   today's direct on_event path, byte-identical.
+      # @param hooks_context [Proc, Hash, nil] the emission context the
+      #   loop hands {Hooks#emit} ({cwd:, mode:, session:, identity:} —
+      #   pi's ctx); a Proc re-reads per event (the boot wiring's seam —
+      #   /new swaps the recorder). nil = the loop's own view.
       def initialize(chat:, tools:, system_prompt: nil, on_event: nil,
         recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
         identity: Identity::DEFAULT, thinking_level: "medium",
-        model_reasoning: false, thinking_level_map: nil, compat: nil)
+        model_reasoning: false, thinking_level_map: nil, compat: nil,
+        hooks: nil, hooks_context: nil)
         @chat = chat
         @tools = tools
         @on_event = on_event
+        @hooks = hooks
+        @hooks_context = hooks_context
         @recorder = recorder
         @identity = identity
         @context_window = context_window
@@ -311,6 +331,15 @@ module Tart
           break if message.nil?
 
           if message.role == :tool
+            # The batch's terminate consult (I47 — pi
+            # shouldTerminateToolBatch, agent-loop.ts:690-691: non-empty AND
+            # every): an all-terminate blocked batch stops the INNER loop;
+            # the outer steering loop is untouched. The ledger clears per
+            # batch (stale ids never leak into the next consult).
+            if @hooks && batch_terminated?
+              @hooks.clear_terminate_ledger
+              return
+            end
             next # tool batch executed; the model responds on the next step
           elsif @chat.complete?
             # pi _handlePostAgentRun checks compaction after EVERY
@@ -596,7 +625,46 @@ module Tart
         emit(type: :message_start, message:)
         emit(type: :message_end, message:)
         record(message)
+        drain_next_turn_messages
         message
+      end
+
+      # The nextTurn drain (I47 — pi _handleUserPrompt, agent-session.ts
+      # :2086-2095): AFTER the user message is added/emitted/recorded, the
+      # pending queue drains FIFO — each message is a user-role chat
+      # message carrying the text (pi convertToLlm, messages.ts:161-170),
+      # emits :message_start/:message_end carrying a Hooks::CustomMessage
+      # (pi agent-loop.ts:105-126, message_start/end per initial message),
+      # and records a custom_message session entry. Wire order
+      # [system…, user prompt, *customs-as-user].
+      def drain_next_turn_messages
+        return unless @hooks
+
+        @hooks.pending_next_turn.each do |pending|
+          content = pending[:content]
+          chat_message = @chat.add_message(role: :user, content:)
+          @new_messages << chat_message
+          custom = Hooks::CustomMessage.new(role: :custom, custom_type: pending[:custom_type],
+            content:, display: pending[:display])
+          emit(type: :message_start, message: custom)
+          emit(type: :message_end, message: custom)
+          @recorder&.append_custom_message(custom_type: pending[:custom_type], content:, display: pending[:display])
+        end
+      end
+
+      # The batch consult (pi shouldTerminateToolBatch, agent-loop.ts
+      # :690-691): the ids are the PRECEDING assistant message's tool_call
+      # ids; TRUE iff the batch is non-empty AND every call was a
+      # terminate-marked block.
+      def batch_terminated?
+        messages = @chat.messages
+        tool_index = messages.rindex { |message| message.role == :tool }
+        return false unless tool_index
+
+        assistant = messages[0...tool_index].reverse.find { |message| message.role == :assistant }
+        return false unless assistant&.tool_calls.is_a?(Hash)
+
+        @hooks.batch_terminate?(assistant.tool_calls.keys.map(&:to_s))
       end
 
       def install_chat_callbacks
@@ -774,8 +842,26 @@ module Tart
         end
       end
 
+      # The event sink: hooks present → the seam (registration-order
+      # handlers, then the surface sink the Hooks holds — the loop never
+      # double-delivers through its own on_event); nil → today's direct
+      # path, byte-identical.
       def emit(event)
-        @on_event&.call(event)
+        if @hooks
+          @hooks.emit(event, context: hooks_context)
+        else
+          @on_event&.call(event)
+        end
+      end
+
+      # The emission context (pi's ctx, {cwd:, mode:, session:, identity:}):
+      # built by the boot wiring (a Proc re-read per event — /new swaps the
+      # recorder), defaulting to the loop's own view (the tests/gates).
+      def hooks_context
+        return @hooks_context.call if @hooks_context.is_a?(Proc)
+
+        session = @recorder ? {path: @recorder.path, id: @recorder.id} : nil
+        {cwd: Dir.pwd, mode: nil, session:, identity: @identity}
       end
     end
   end

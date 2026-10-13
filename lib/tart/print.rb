@@ -62,14 +62,18 @@ module Tart
     # @param compat [Shapes::ModelCompat, nil] the boot model's pi-compat
     #   dialect subset (I46), forwarded to the loop's request seam; nil =
     #   the default arm.
+    # @param hooks [Tart::Hooks, nil] the extension seam (I47) — forwarded
+    #   to the loop (the print boot's session_start emission happens in
+    #   the launcher; nil = today's direct path).
     # @return [Integer] the exit code (pi's runPrintMode return).
     def run(prompt:, chat:, tools:, system_prompt: nil, on_event: nil,
             recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
             stdout: $stdout, stderr: $stderr, thinking_level: Settings::DEFAULT_THINKING_LEVEL,
-            model_reasoning: false, thinking_level_map: nil, compat: nil, identity: Identity::DEFAULT)
+            model_reasoning: false, thinking_level_map: nil, compat: nil, identity: Identity::DEFAULT,
+            hooks: nil)
       stdout.sync = true
       agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,
-        recorder:, seed_messages:, context_window:, compaction:,
+        recorder:, seed_messages:, context_window:, compaction:, hooks:,
         thinking_level:, model_reasoning:, thinking_level_map:, compat:, identity:)
       Core::Loop.new(session: NullSession.new).run { agent.run(prompt) }
       return error_exit(agent, stderr) if agent.last_error || agent.interrupted?

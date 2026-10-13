@@ -67,8 +67,13 @@ module Tart
       # +docs_paths+ carries pi's getReadmePath/getDocsPath/getExamplesPath
       # triple ({pi_docs_paths}); nil (pi's install not found — pi itself
       # can never be in that state) emits no `<docs>` section.
+      # +prompt_guidelines+ (I47 — pi system-prompt.ts:121, the custom
+      # tools' promptGuidelines bullets) joins <rules> AFTER the per-tool
+      # guideline bullets and BEFORE "Be concise…"; empty (the default) =
+      # today's bytes.
       def sections(selected_tools: DEFAULT_SELECTED_TOOLS, append_system_prompt: "", cwd:,
-                   context_files: [], docs_paths: nil, skills: [], identity: Identity::DEFAULT)
+                   context_files: [], docs_paths: nil, skills: [], identity: Identity::DEFAULT,
+                   prompt_guidelines: [])
         declared = selected_tools
 
         result = {}
@@ -77,7 +82,7 @@ module Tart
         tools = visible_tools.empty? ? "(none)" : visible_tools.map { |name| "- #{name}: #{TOOL_SNIPPETS[name]}" }.join("\n")
         result[:tools] = "#{tools}\n\nIn addition to the tools above, you may have access to other custom tools " \
           "depending on the project."
-        result[:rules] = build_rules(declared, identity)
+        result[:rules] = build_rules(declared, identity, prompt_guidelines:)
         if docs_paths
           readme, docs, examples = docs_paths
         result[:docs] = "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, " \
@@ -120,8 +125,11 @@ module Tart
 
       # The rule bullets (pi's buildRules): trimmed, deduped, order kept.
       # Tool guideline bullets format their %s holes with the identity's
-      # env namespace (pi mode → PI_*).
-      def build_rules(selected_tools, identity = Identity::DEFAULT)
+      # env namespace (pi mode → PI_*). +prompt_guidelines+ (I47 — the
+      # memory module's two bullets) appends after the per-tool bullets
+      # and before "Be concise…" (pi system-prompt.ts:121); the same
+      # trim/dedup discipline rides the +add+ lambda.
+      def build_rules(selected_tools, identity = Identity::DEFAULT, prompt_guidelines: [])
         rules = []
         seen = []
         add = lambda do |rule|
@@ -142,6 +150,7 @@ module Tart
         selected_tools.each do |name|
           (TOOL_GUIDELINES[name] || []).each { |rule| add.call(format(rule, Identity.env_prefix(identity))) }
         end
+        prompt_guidelines.each { |rule| add.call(rule) }
         add.call("Be concise in your responses")
         add.call("Show file paths clearly when working with files")
         rules.map { |rule| "- #{rule}" }.join("\n")
@@ -152,9 +161,9 @@ module Tart
       # by a blank line, empty parts dropped. Sections wraps each
       # non-preamble section in its tag exactly once.
       def build(selected_tools: DEFAULT_SELECTED_TOOLS, append_system_prompt: "", cwd:, context_files: [],
-                docs_paths: nil, skills: [], identity: Identity::DEFAULT)
+                docs_paths: nil, skills: [], identity: Identity::DEFAULT, prompt_guidelines: [])
         ordered = sections(selected_tools:, append_system_prompt:, cwd:, context_files:, docs_paths:,
-                           skills:, identity:)
+                           skills:, identity:, prompt_guidelines:)
         ordered.values.reject { |content| content.nil? || content.empty? }.join("\n\n")
       end
 

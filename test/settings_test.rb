@@ -48,6 +48,28 @@ module Tart
       assert result.settings.dig("compaction", "enabled")
     end
 
+    # --- I47: the memory gate rows (OQ-1) ---
+
+    def test_memory_gate_rows_default_off_with_the_identity_env_suffix
+      assert_equal false, Settings::DEFAULTS["memory"]
+      assert_equal "MEMORY", Settings::RESOLUTION_ENV["memory"]
+      assert_equal "PI_MEMORY", Identity.env_key("pi", Settings::RESOLUTION_ENV["memory"])
+      assert_equal "TART_MEMORY", Identity.env_key("tart", Settings::RESOLUTION_ENV["memory"])
+    end
+
+    def test_memory_is_a_known_key_and_resolves_env_over_file_over_default
+      result = load_settings
+      assert_empty result.diagnostics, "the memory row is known — no unknown-key warning"
+      assert_equal false, result.settings["memory"]
+
+      write_settings(@user_path, '{"memory": true}')
+      assert_equal true, load_settings.settings["memory"]
+
+      assert_equal "1", Settings.resolve_setting("memory", {}, identity: "pi", env: {"PI_MEMORY" => "1"})
+      assert_equal false, Settings.resolve_setting("memory", {}, identity: "tart", env: {}),
+        "the DEFAULTS tier is false"
+    end
+
     def test_project_deep_merges_over_user
       write_settings(@user_path, '{"compaction": {"reserveTokens": 1000, "keepRecentTokens": 500}}')
       write_settings(@project_path, '{"compaction": {"reserveTokens": 2000}, "defaultModel": "m-project"}')

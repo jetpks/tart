@@ -296,5 +296,41 @@ module Tart
       refute_includes bare, "project_context"
       assert_equal [], Agent::ContextFiles.load(cwd: Dir.mktmpdir("tart-ctx-bare-"), agent_dir: Dir.mktmpdir("tart-ctx-bare2-"))
     end
+    # --- I47: the prompt_guidelines seam (pi system-prompt.ts:121) ---
+
+    def test_prompt_guidelines_sit_after_the_tool_bullets_and_before_be_concise
+      built = Agent::SystemPrompt.build(
+        selected_tools: %w[read bash edit write],
+        cwd: "/tmp/p",
+        prompt_guidelines: [
+          "Use the memory tool to save durable facts, user preferences, and corrections worth carrying to " \
+            "future sessions \u2014 never secrets and never one-off task state.",
+          "Use the memory tool list/read actions to recall saved topics on demand instead of guessing what was " \
+            "remembered."
+        ]
+      )
+      rules = built[/.*<rules>\n(.*?)\n<\/rules>/m, 1].lines.map(&:strip)
+
+      first = rules.index { |line| line.start_with?("- Use the memory tool to save durable facts") }
+      refute_nil first, "the first guideline bullet is present"
+      assert rules[first + 1].start_with?("- Use the memory tool list/read actions"), "the second bullet follows"
+      assert_equal "- Be concise in your responses", rules[first + 2], "before the conciseness bullet"
+
+      plain = Agent::SystemPrompt.build(selected_tools: %w[read bash edit write], cwd: "/tmp/p")
+      refute_includes plain, "memory", "empty guidelines = today's bytes (the no-memory prompt never says memory)"
+    end
+
+    def test_prompt_guidelines_dedup_and_trim_like_the_other_rules
+      built = Agent::SystemPrompt.build(
+        selected_tools: %w[read],
+        cwd: "/tmp/p",
+        prompt_guidelines: ["  twice  ", "twice", "Use read to examine files instead of cat or sed."]
+      )
+      rules = built[/.*<rules>\n(.*?)\n<\/rules>/m, 1].lines.map(&:strip)
+
+      assert_equal 1, rules.count("- twice"), "the duplicate trims and dedups"
+      assert_equal 1, rules.count("- Use read to examine files instead of cat or sed."),
+        "a per-tool bullet repeated as a guideline dedups"
+    end
   end
 end

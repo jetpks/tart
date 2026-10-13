@@ -289,6 +289,30 @@ module Tart
         push_expandable(->(expanded) { compaction_panel_rows(summary, tokens_before, expanded) })
       end
 
+      # The custom-message block (I47 — pi CustomMessageComponent,
+      # custom-message.ts:41-115, default rendering — memory.ts registers
+      # no custom renderer): the component's own Spacer(1), then the Box
+      # (customMessageBg, paddingX = outputPad, paddingY 1): the bold
+      # [<customType>] label row in customMessageLabel, the Box's inner
+      # blank row, the content through the existing markdown path in
+      # customMessageText (one-column padded, links render `text (href)`),
+      # the Box's bottom blank row. A plain region — the default path
+      # never reads the expand state. The Grounds §6 staged-pi capture is
+      # the row-shape oracle; the s11 gate is the byte judge.
+      def enqueue_custom_block(custom_type, content)
+        content = "" unless content.is_a?(String) # malformed-entry tolerance
+        @chat_started = true
+        bg = Theme[:custom_message_bg]
+        label = TUI.span("[#{custom_type}]", fg: Theme[:custom_message_label], modifiers: [:bold], bg: bg)
+        rows = [Panel.panel_blank_line(viewport_width, bg), # Box paddingY top
+                Panel.padded_spans_row([label], viewport_width, bg),
+                Panel.panel_blank_line(viewport_width, bg)] # the Box's inner Spacer(1)
+        rows.concat(Transcript.markdown_lines(content, viewport_width,
+          prose_fg: Theme[:custom_message_text], bg: bg))
+        rows << Panel.panel_blank_line(viewport_width, bg) # Box paddingY bottom
+        @scrollback << [Panel.blank_line, *rows]
+      end
+
       # The resume replay (item 3, pi renderSessionEntries, interactive-
       # mode.ts :3900-3975): the recorded entries through the live-turn
       # shapes — user echoes, assistant thinking-then-content markdown,
@@ -604,6 +628,11 @@ module Tart
           # chronological position (renderSessionEntries case
           # compactionSummary, riding the global expand state).
           enqueue_compaction_panel(entry["summary"], entry["tokensBefore"])
+        when "custom_message"
+          # pi renderSessionEntries' custom_message case (the resume
+          # replay renders the recorded recall — pi renders it from the
+          # session entries; display-gated like the live path).
+          enqueue_custom_block(entry["customType"], entry["content"]) if entry["display"]
         end
       end
 

@@ -501,5 +501,47 @@ module Tart
       File.write(path, "#{JSON.generate(header)}\n#{JSON.generate(entry)}\n")
       path
     end
+
+    # --- I47: the custom_message entry (pi CustomMessageEntry,
+    # session-manager.ts:1339-1360) ---
+
+    def test_append_custom_message_writes_the_pi_entry_shape_on_the_leaf_chain
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      user_id = recorder.append_message(OpenStruct.new(role: :user, content: "hi", to_h: {role: "user", content: "hi"}))
+      custom_id = recorder.append_custom_message(custom_type: "memory-recall", content: "RECALL", display: true)
+
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      custom = entries[2]
+      assert_equal({"type" => "custom_message", "customType" => "memory-recall", "content" => "RECALL",
+                    "display" => true}, custom.slice("type", "customType", "content", "display"))
+      assert_equal user_id, custom["parentId"], "the entry chains from the leaf"
+      assert_equal custom_id, custom["id"]
+      assert custom["timestamp"]
+      refute custom.key?("details"), "pi's details-undefined is omitted"
+    end
+
+    def test_a_custom_message_never_opens_the_session_file
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_custom_message(custom_type: "memory-recall", content: "RECALL", display: true)
+
+      refute recorder.persisted?, "a recall never creates a session file alone"
+      refute File.exist?(recorder.path)
+
+      recorder.append_message(OpenStruct.new(role: :user, content: "hi", to_h: {role: "user", content: "hi"}))
+      assert recorder.persisted?
+      types = File.readlines(recorder.path).map { |line| JSON.parse(line)["type"] }
+      assert_equal %w[session custom_message message], types, "the held entry rides the first flush in order"
+    end
+
+    def test_custom_message_replays_as_a_user_role_context_message
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_message(OpenStruct.new(role: :user, content: "hi", to_h: {role: "user", content: "hi"}))
+      recorder.append_custom_message(custom_type: "memory-recall", content: "RECALL", display: true)
+
+      messages = Agent::Session.context_messages(recorder.path)
+
+      assert_equal [%i[user user], ["hi", "RECALL"]], messages.map { |message| [message[:role], message[:content]] },
+        "pi sessionEntryToContextMessages: the recall text rides the wire again on resume"
+    end
   end
 end

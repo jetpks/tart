@@ -260,5 +260,52 @@ module Tart
         refute_includes bgs, Theme[:tool_pending_bg], "zero pending-bg spans on the replay path"
       end
     end
+    # --- I47: the custom-message block (pi CustomMessageComponent's
+    # default rendering — the Grounds section-6 staged-pi capture is the
+    # row-shape oracle) ---
+
+    def test_custom_block_renders_the_label_and_the_markdown_content
+      @transcript.enqueue_custom_block("memory-recall",
+        "[project memory] index loaded at session start; use the memory tool (read/list) for topic files:\n" \
+        "- deploy (deploy.md): deploys via herdr pipeline, stage first")
+      flush
+
+      rows = texts
+      assert_equal "", rows[0], "the component's own Spacer(1) opens the block"
+      bg = Theme[:custom_message_bg]
+      assert_equal bg, @transcript.lines[1].spans[0].style.bg, "the Box paddingY top"
+      label = @transcript.lines[2].spans
+      assert_equal "[memory-recall]", label[1].content, "the bold label row (one-column padded)"
+      assert_equal Theme[:custom_message_label], label[1].style.fg
+      assert_includes label[1].style.modifiers, :bold
+      assert_equal bg, label[1].style.bg
+      assert_equal "", rows[3], "the Box's inner Spacer"
+      body = rows[4]
+      assert_includes body, "index loaded at session start", "the content rides the markdown path"
+      assert_includes rows[5], "deploy (deploy.md)", "the link renders text (href)"
+      assert_equal bg, @transcript.lines[4].spans[1].style.bg, "the content rows carry customMessageText's bg"
+      assert_equal Theme[:custom_message_text], @transcript.lines[4].spans[1].style.fg
+      assert_equal "", rows[-1], "the Box paddingY bottom closes the block"
+    end
+
+    def test_custom_block_replay_renders_the_same_rows
+      @transcript.replay_entry({"type" => "custom_message", "customType" => "memory-recall",
+                                "content" => "- [a](a.md): one", "display" => true},
+        {}, update_footer: false, populate_history: false)
+      flush
+
+      rows = texts
+      assert_includes rows, "[memory-recall]"
+      assert_includes rows[4], "- [a](a.md): one"
+    end
+
+    def test_custom_block_replay_skips_undisplayed_entries
+      @transcript.replay_entry({"type" => "custom_message", "customType" => "quiet", "content" => "x",
+                                "display" => false},
+        {}, update_footer: false, populate_history: false)
+      flush
+
+      assert_empty @transcript.lines, "display false renders nothing (pi's display gate)"
+    end
   end
 end
