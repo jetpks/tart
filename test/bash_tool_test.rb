@@ -73,6 +73,23 @@ module Tart
       assert_includes result[:error], "Invalid timeout: must be a finite number of seconds"
     end
 
+    # I43: the timeout gate is the contract rule now — same pinned message
+    # for the non-finite/zero cases, pi's loop wrapper for wrong types.
+    def test_non_finite_and_zero_timeouts_reject_with_the_pinned_message
+      pinned = {error: "Invalid timeout: must be a finite number of seconds"}
+      assert_equal pinned, tool.execute(command: "true", timeout: Float::INFINITY)
+      assert_equal pinned, tool.execute(command: "true", timeout: 0)
+    end
+
+    def test_wrong_typed_timeout_rejects_with_the_wrapper_vocabulary
+      result = tool.execute(command: "true", timeout: "5")
+
+      assert result.is_a?(Hash) && result.key?(:error)
+      assert result[:error].start_with?("Validation failed for tool \"bash\":\n  - timeout: "),
+        result[:error].inspect
+      assert_includes result[:error], "Received arguments:"
+    end
+
     def test_cancellation_kills_process_group_and_propagates
       marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
       cancelled = false

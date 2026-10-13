@@ -102,8 +102,8 @@ module Tart
       # @return [String] pi's success text, or {error:} on failure.
       def execute(path:, edits:)
         safe_execute do
-          raise ArgumentError, "Edit tool input is invalid. edits must contain at least one replacement." unless
-            edits.is_a?(Array) && !edits.empty?
+          failure = validate_input(path:, edits:)
+          return failure if failure
 
           edits = normalize_edit_shapes(edits)
           absolute_path = PathUtils.resolve_to_cwd(path, @cwd)

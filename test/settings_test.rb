@@ -464,5 +464,98 @@ module Tart
     ensure
       FileUtils.rm_rf(dir)
     end
+
+    # --- I43: the resolution precedence matrix + the contract corners ---
+
+    # Every carried resolution key × every tier combination × every identity:
+    # env-only / file-only / default-only (none) / env+file (all) — the
+    # env+default and file+default outcomes are the env-only / file-only
+    # rows (the default tier only ever fires with both others empty), so
+    # this table covers the full eight-combination matrix. The resolved
+    # values are today's, exactly (AC2: schema contracts changed no outcome).
+    def test_resolution_precedence_matrix_across_tiers_and_identities
+      Settings::RESOLUTION_ENV.each do |key, suffix|
+        file_value = "file-#{key}"
+        env_value = "env-#{key}"
+        default_value = Settings::DEFAULTS.fetch(key)
+        {
+          {env: false, file: false} => default_value,
+          {env: true, file: false} => env_value,
+          {env: false, file: true} => file_value,
+          {env: true, file: true} => env_value
+        }.each do |tiers, expected|
+          %w[pi tart foo].each do |identity|
+            env_hash = tiers[:env] ? {"#{identity.upcase}_#{suffix}" => env_value} : {}
+            settings = tiers[:file] ? {key => file_value} : {}
+            resolved = Settings.resolve_setting(key, settings, identity:, env: env_hash)
+            if expected.nil?
+              assert_nil resolved, "#{key} env=#{tiers[:env]} file=#{tiers[:file]} under #{identity}"
+            else
+              assert_equal expected, resolved, "#{key} env=#{tiers[:env]} file=#{tiers[:file]} under #{identity}"
+            end
+          end
+        end
+      end
+    end
+
+    # The context-window ladder's fall-through corners: a non-digit env
+    # value (incl. "+5"/"-5"/whitespace — the digit-string contract is
+    # today's /\A\d+\z/) and a non-positive file value read as absent and
+    # the next tier decides.
+    def test_context_window_ladder_falls_through_non_digit_env_and_non_positive_file
+      model = RubyLLM::Model.new(id: "m-1", context_window: 5000)
+
+      ["abc", "-5", "+5", " 5", "5.5", ""].each do |junk|
+        ENV["PI_CONTEXT_WINDOW"] = junk
+        assert_equal 5000, Settings.resolve_context_window(model:), "env #{junk.inspect} falls through"
+      end
+
+      ENV["PI_CONTEXT_WINDOW"] = "007"
+      assert_equal 7, Settings.resolve_context_window(model:), "a digit-string coerces (leading zeros included)"
+      ENV.delete("PI_CONTEXT_WINDOW")
+
+      [0, -1, "5", 5.5].each do |junk|
+        write_settings(@project_path, %({"contextWindow": #{JSON.generate(junk)}}))
+        assert_equal 5000, Settings.resolve_context_window(settings: load_settings.settings, model:),
+          "file #{junk.inspect} falls through to the model"
+      end
+    end
+
+    # The thinking vocabulary: only pi's levels pass; a mistyped value (a
+    # number, not just an off-vocabulary string) falls back / reads as nil.
+    def test_thinking_level_out_of_vocabulary_values
+      assert_equal "medium", Settings.resolve_thinking_level({"thinkingLevel" => 5})
+      assert_equal "medium", Settings.resolve_thinking_level({"thinkingLevel" => nil})
+      write_settings(@user_path, '{"thinkingLevel": 5}')
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd)
+    end
+
+    # A staged modelReasoning value outside the true|false|"true"|"false"
+    # vocabulary answers false — today's `staged == true || staged ==
+    # "true"` short-circuit, never the registry/table fallback (AC2's
+    # outcome table).
+    def test_model_reasoning_out_of_vocabulary_staged_value_answers_false
+      model = RubyLLM::Model.default("accounts/fireworks/models/glm-5p3-flash", "openai")
+
+      assert_equal false, Settings.model_reasoning_capable({"modelReasoning" => "junk"}, model),
+        "out-of-vocabulary staged short-circuits to false (not the known table's true)"
+      assert_equal false, Settings.model_reasoning_capable({"modelReasoning" => 5}, model)
+    end
+
+    # pi settings-manager.ts:126: settings files are NOT validated — a
+    # malformed value replaces instead of throwing. The schemas are a typed
+    # view, never a gate: type-invalid file values land in Result#settings
+    # verbatim with NO new diagnostics (the diagnostic set is observable).
+    def test_type_invalid_file_values_flow_through_unfiltered
+      write_settings(@user_path,
+        '{"contextWindow": "abc", "thinkingLevel": 5, "apiKey": 7, "compaction": {"enabled": "yes"}, "identity": "pi"}')
+
+      result = load_settings
+      assert_equal "abc", result.settings["contextWindow"]
+      assert_equal 5, result.settings["thinkingLevel"]
+      assert_equal 7, result.settings["apiKey"]
+      assert_equal "yes", result.settings.dig("compaction", "enabled")
+      assert_empty result.diagnostics, "no new diagnostics — the schema is a view, not a gate"
+    end
   end
 end

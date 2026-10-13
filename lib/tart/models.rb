@@ -3,6 +3,7 @@
 require "json"
 require_relative "agent/session"
 require_relative "settings"
+require_relative "schemas/models"
 
 module Tart
   module Models
@@ -80,7 +81,7 @@ module Tart
           error: "Failed to parse models.json (#{path})")
       end
 
-      errors = validate(parsed)
+      errors = Schemas::Models.validate(parsed)
       unless errors.empty?
         return Config.new(providers: {}, default: nil,
           error: "Invalid models.json schema:\n#{errors.join("\n")}\n(#{path})")
@@ -162,7 +163,9 @@ module Tart
     # String|null>): a String value rides the wire verbatim, null marks the
     # level unsupported. Keys symbolized for the resolution functions
     # ({supported_thinking_levels} family). undeclared → nil (the map-less
-    # rule: pi's ladder without xhigh/max).
+    # rule: pi's ladder without xhigh/max). The schema-side check for the
+    # same field lives in {Schemas::Models} (exact error lines, same
+    # Partial-Record tolerance); this builder is the VALID path only.
     def build_thinking_level_map(raw)
       return nil unless raw.is_a?(Hash)
 
@@ -226,94 +229,6 @@ module Tart
         off.is_a?(String) ? off : nil
       else
         map&.[](clamped.to_sym) || clamped
-      end
-    end
-
-    # The schema subset, validated by hand (pi TypeBox compile reduced):
-    # the named keys type-check, unknown keys are tolerated (pi's
-    # TypeBox default), "id" is required on every model.
-    def validate(parsed)
-      return ["  - root: expected a JSON object"] unless parsed.is_a?(Hash)
-
-      errors = []
-      validate_default(parsed["default"], errors)
-      validate_providers(parsed["providers"], errors)
-      errors
-    end
-
-    def validate_default(default, errors)
-      return if default.nil? || default.is_a?(String)
-
-      errors << "  - default: expected a \"provider/model-id\" string"
-    end
-
-    def validate_providers(providers, errors)
-      unless providers.is_a?(Hash)
-        errors << "  - providers: expected an object of providers"
-        return
-      end
-
-      providers.each do |key, provider|
-        unless provider.is_a?(Hash)
-          errors << "  - providers.#{key}: expected an object"
-          next
-        end
-        validate_provider_fields(key, provider, errors)
-        validate_models(key, provider["models"], errors)
-      end
-    end
-
-    def validate_provider_fields(key, provider, errors)
-      %w[name baseUrl apiKey api].each do |field|
-        value = provider[field]
-        errors << "  - providers.#{key}.#{field}: expected a string" if !value.nil? && !value.is_a?(String)
-      end
-    end
-
-    def validate_models(key, models, errors)
-      return if models.nil?
-      unless models.is_a?(Array)
-        errors << "  - providers.#{key}.models: expected an array"
-        return
-      end
-
-      models.each_with_index do |model, i|
-        unless model.is_a?(Hash)
-          errors << "  - providers.#{key}.models[#{i}]: expected an object"
-          next
-        end
-        errors << "  - providers.#{key}.models[#{i}].id: required non-empty string" unless model["id"].is_a?(String) && !model["id"].empty?
-        validate_model_fields(key, i, model, errors)
-      end
-    end
-
-    def validate_model_fields(key, index, model, errors)
-      errors << "  - providers.#{key}.models[#{index}].name: expected a string" if !model["name"].nil? && !model["name"].is_a?(String)
-      errors << "  - providers.#{key}.models[#{index}].reasoning: expected a boolean" if !model["reasoning"].nil? && ![true, false].include?(model["reasoning"])
-      validate_thinking_level_map(key, index, model["thinkingLevelMap"], errors)
-      %w[contextWindow maxTokens].each do |field|
-        value = model[field]
-        next if value.nil? || (value.is_a?(Integer) && value.positive?)
-
-        errors << "  - providers.#{key}.models[#{index}].#{field}: expected a positive integer"
-      end
-    end
-
-    # pi ThinkingLevelMapSchema (model-schema.ts:14-15 — Partial
-    # Record<level, String|null>): a hash of level-name → String|null;
-    # unknown level keys are tolerated (pi's TypeBox default — the same
-    # additional-properties stance as every other object here).
-    def validate_thinking_level_map(key, index, map, errors)
-      return if map.nil?
-      unless map.is_a?(Hash)
-        errors << "  - providers.#{key}.models[#{index}].thinkingLevelMap: expected an object"
-        return
-      end
-
-      map.each do |level, value|
-        next if value.nil? || value.is_a?(String)
-
-        errors << "  - providers.#{key}.models[#{index}].thinkingLevelMap.#{level}: expected a string or null"
       end
     end
   end

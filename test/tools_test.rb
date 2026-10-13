@@ -183,5 +183,30 @@ module Tart
       # the space before \r is untouched (lines split on "\n" — spec-literal).
       assert_equal "A  \r\nb  \r\n", File.binread(path)
     end
+
+    # ---- I43: the input-validation seam (wrong-typed args come back as
+    # pi's loop-level wrapper vocabulary; runtime raises stay raises) ----
+
+    def assert_wrapper_error(result, pi_name)
+      assert result.is_a?(Hash) && result.key?(:error), "expected an {error:} result, got #{result.inspect}"
+      assert result[:error].start_with?("Validation failed for tool \"#{pi_name}\":\n  - "),
+        "#{result[:error].inspect} lacks the wrapper vocabulary"
+      assert_includes result[:error], "Received arguments:", "the wrapper carries the received arguments"
+    end
+
+    def test_wrong_typed_args_reject_with_the_wrapper_vocabulary
+      assert_wrapper_error Tools::Ls.new(cwd: @dir).execute(limit: "x"), "ls"
+      assert_wrapper_error Tools::Grep.new(cwd: @dir).execute(pattern: 5), "grep"
+      assert_wrapper_error Tools::Grep.new(cwd: @dir).execute(pattern: "hello", ignore_case: "yes"), "grep"
+      assert_wrapper_error Tools::Find.new(cwd: @dir).execute(pattern: "*.rb", limit: {}), "find"
+      assert_wrapper_error Tools::Write.new(cwd: @dir).execute(path: "w.txt", content: 5), "write"
+      assert_wrapper_error Tools::Read.new(cwd: @dir).execute(path: "apple.txt", offset: "x"), "read"
+    end
+
+    def test_valid_args_still_execute_through_the_seam
+      assert Tools::Ls.new(cwd: @dir).execute
+      assert_includes Tools::Grep.new(cwd: @dir).execute(pattern: "hello", ignore_case: true), "hello world"
+      assert_includes Tools::Read.new(cwd: @dir).execute(path: "apple.txt", offset: 1), "one"
+    end
   end
 end

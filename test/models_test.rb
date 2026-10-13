@@ -313,5 +313,42 @@ module Tart
       assert_equal "high", Models.clamp_thinking_level("high", map: catalog_map, reasoning: true),
         "an exactly-supported level passes through"
     end
+
+    # --- I43: the schema-path pins (the contract replaced the hand-rolled
+    # validate* family — same strings, same order, same entry shape) ---
+
+    # The multi-error interleave: default, then provider fields, then the
+    # models in order — the frozen Grounds §5 golden.
+    def test_multi_error_interleave_order_is_frozen
+      write_models('{"default": 5, "providers": {"a": {"name": 5, "models": [{"id": ""}, {"id": "m", "thinkingLevelMap": {"low": 5}}]}}}')
+
+      assert_equal(
+        "Invalid models.json schema:\n" \
+        "  - default: expected a \"provider/model-id\" string\n" \
+        "  - providers.a.name: expected a string\n" \
+        "  - providers.a.models[0].id: required non-empty string\n" \
+        "  - providers.a.models[1].thinkingLevelMap.low: expected a string or null\n" \
+        "(#{@path})",
+        load_models.error
+      )
+    end
+
+    # The thinkingLevelMap symbolization through the schema-checked load:
+    # a full-ladder catalog fixture (every level a String; off floors to
+    # "low" — the owner's override shape) parses to the symbol-keyed map
+    # the resolution functions consume.
+    def test_full_ladder_map_catalog_fixture_symbolizes_through_the_schema_path
+      write_models(<<~JSON)
+        {"providers": {"glm": {"models": [{"id": "glm-5.3", "reasoning": true,
+          "thinkingLevelMap": {"off": "low", "minimal": "low", "low": "low", "medium": "medium",
+                               "high": "high", "xhigh": "xhigh", "max": "max"}}]}}}
+      JSON
+
+      config = load_models
+      assert_nil config.error
+      assert_equal Settings::THINKING_LEVEL_MAPS.fetch("accounts/fireworks/models/glm-5p3-flash"),
+        config.model_entries.first[:thinking_level_map],
+        "the owner's override map round-trips symbolized through the contract path"
+    end
   end
 end

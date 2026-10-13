@@ -121,12 +121,14 @@ module Tart
       #   reports as error results with a status line appended.
       def execute(command:, timeout: nil)
         safe_execute do
-          timeout_seconds = resolve_timeout(timeout)
+          failure = validate_input(command:, timeout:)
+          return failure if failure
+
           raise Errno::ENOENT, "Working directory does not exist: #{@cwd}\nCannot execute bash commands." unless
             File.exist?(@cwd)
 
           started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          output, outcome = spawn_and_accumulate(command, timeout_seconds)
+          output, outcome = spawn_and_accumulate(command, timeout)
           wall_time_seconds = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at).round(1)
           snapshot = finish_output(output)
 
@@ -162,20 +164,12 @@ module Tart
       # returns the accumulator with the raw outcome — the caller finishes
       # and snapshots (the tool's model-facing assembly and the user-bash
       # executor's BashResult assembly differ).
-      def spawn_and_accumulate(command, timeout_seconds)
+      def spawn_and_accumulate(command, timeout)
         output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
         # No on_chunk: the model-facing execute render is the I34 pending
         # block — pi's tool path streams no chunk callback either.
-        outcome = spawn_and_stream(command, output, timeout_seconds, env: session_env_for_spawn)
+        outcome = spawn_and_stream(command, output, timeout, env: session_env_for_spawn)
         [output, outcome]
-      end
-
-      def resolve_timeout(timeout)
-        return if timeout.nil?
-        raise ArgumentError, "Invalid timeout: must be a finite number of seconds" unless
-          timeout.is_a?(Numeric) && timeout.finite? && timeout.positive?
-
-        timeout
       end
 
       # pi resolveSpawnContext (bash.ts:186-208): a COPY of the parent env
