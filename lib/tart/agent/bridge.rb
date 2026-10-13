@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "dry/monads"
+
 module Tart
   module Agent
     # Worker-thread bridge between the reactor fiber and blocking LLM work
@@ -14,25 +16,27 @@ module Tart
     #
     # Everything the worker produces crosses the queue in order: streamed
     # chunks, event payloads, and one terminal item.
+    #
+    # I45: the terminal is a Dry::Monads::Result — Success() for a completed
+    # worker, Failure(error instance) when the worker raised (the payload
+    # class is the discriminator: RubyLLM::CancelledError is the cancelled
+    # terminal). Streamed items stay plain values on the same queue.
     class Bridge
+      include Dry::Monads::Result::Mixin
+
       # Bounded join on interrupt so a hung HTTP response (bounded by the
       # request timeout) cannot wedge teardown.
       JOIN_TIMEOUT = 5.0
 
-      # The terminal item types the worker sends.
-      DONE = :done
-      CANCELLED = :cancelled
-      ERROR = :error
-
       # Runs +work+ (a callable taking the +sink+ proc) on a worker thread.
       # Yields every item the worker sinks, in order, to this method's block.
-      # The worker signals completion by calling +sink.({type: :done})+ (or
-      # +{type: :cancelled}+).
+      # Returns the terminal Result: Success() when the worker completed,
+      # Failure(instance) when it raised.
       #
-      # A worker exception is terminal too: the worker pushes {type: :error,
-      # error:} and dies, so the wait must end with the worker instead of
-      # blocking on the queue forever. The error item is returned (not
-      # yielded) — the caller's error path owns it.
+      # A worker exception is terminal too: the worker pushes the Failure and
+      # dies, so the wait must end with the worker instead of blocking on the
+      # queue forever. The Failure is returned (not yielded) — the caller's
+      # error path owns it.
       #
       # On interrupt (Async::Cancel at the queue wait), calls the on_cancel
       # callback, joins the worker bounded, and re-raises.
@@ -40,18 +44,18 @@ module Tart
         queue = Async::Queue.new
         thread = Thread.new do
           work.call(->(item) { queue << item })
-          queue << {type: DONE}
-        rescue RubyLLM::CancelledError
-          queue << {type: CANCELLED}
+          queue << Success()
+        rescue RubyLLM::CancelledError => e
+          queue << Failure(e)
         rescue StandardError => e
-          queue << {type: :error, error: e}
+          queue << Failure(e)
         end
         thread.report_on_exception = false
 
         begin
           loop do
             item = queue.pop # interruptible: Task#stop raises here
-            return item if [DONE, CANCELLED, ERROR].include?(item[:type])
+            return item if item.is_a?(Dry::Monads::Result)
 
             yield item
           end

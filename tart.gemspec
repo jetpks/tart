@@ -33,6 +33,9 @@ Gem::Specification.new do |spec|
   # family — settings resolution, models.json, mcp.json, tool inputs).
   spec.add_dependency "dry-schema", "~> 1.16"
   spec.add_dependency "dry-validation", "~> 1.11"
+  # Result-monad control flow (I45 dry-rb-flow: the agent loop's step
+  # boundary and the MCP client's call surface).
+  spec.add_dependency "dry-monads", "~> 1.11"
   # Typed internal shapes (I44 dry-rb-shapes: the lib/tart/shapes family —
   # the Model catalog, the resolved-settings view, the session-entry read
   # path). dry-types is declared directly: the shapes files require it.

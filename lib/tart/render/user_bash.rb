@@ -180,8 +180,8 @@ module Tart
         if (outcome = @slot[:outcome])
           @block_sink.call(@command, fields(outcome), @excluded)
           record(build_record(@command, outcome, excluded: @excluded))
-        elsif terminal&.dig(:type) == :error
-          @line_sink.call("bash: #{terminal[:error].message}", fg: Theme[:error])
+        elsif terminal&.failure? && !terminal.failure.is_a?(RubyLLM::CancelledError)
+          @line_sink.call("bash: #{terminal.failure.message}", fg: Theme[:error])
         end
         @kernel.request_draw
       end

@@ -1,12 +1,24 @@
 # frozen_string_literal: true
 
+require "dry/monads"
+
 module Tart
   module Mcp
     # The MCP JSON-RPC client (port of pi's packages/mcp/src/client.ts):
     # state machine (idle/connecting/connected/closed), initialize handshake,
     # tools/list with pagination, tools/call — each request deadline-bounded
     # by the 30 s default timeout.
+    #
+    # I45: the call surface (connect/list_tools/call_tool) returns a
+    # Dry::Monads::Result instead of raising — Failure carries the error
+    # INSTANCE of today's taxonomy (Mcp::Error, Mcp::TimeoutError,
+    # Mcp::ConnectionClosedError, or RuntimeError for the
+    # state/protocol-misuse strings; message bytes unchanged), Success
+    # carries today's return value. Non-StandardError exceptions keep
+    # raising after cleanup; a failed connect still closes the transport.
     class Client
+      include Dry::Monads::Result::Mixin
+
       LATEST_PROTOCOL_VERSION = "2025-11-25"
       # Versions the client accepts from a server (pi's SUPPORTED_PROTOCOL_VERSIONS).
       SUPPORTED_PROTOCOL_VERSIONS = [LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"].freeze
@@ -39,44 +51,26 @@ module Tart
       # Runs the initialize handshake on +transport+, then announces
       # notifications/initialized.
       #
-      # @raise [Mcp::Error] "Invalid MCP initialize result" when the server's
-      #   result fails validation; "MCP server selected unsupported protocol
-      #   version X" when it answers with a version the client doesn't speak.
+      # @return [Dry::Monads::Result] Success(initialize result) or
+      #   Failure(instance): Mcp::Error "Invalid MCP initialize result" when
+      #   the server's result fails validation; RuntimeError "MCP server
+      #   selected unsupported protocol version X"; anything the transport
+      #   raises for the StandardError family.
       def connect(transport)
-        raise "Cannot connect MCP client in #{@state} state" unless @state == "idle"
-
-        @state = "connecting"
-        @transport = transport
-        @pending_transport = transport
-        transport.on_message = ->(message) { handle_message(message) }
-        transport.on_error = ->(error) { emit_error(error) }
-        transport.on_close = -> { handle_transport_close }
-        transport.start
-        result = request("initialize", {
-          "protocolVersion" => LATEST_PROTOCOL_VERSION,
-          "capabilities" => {},
-          "clientInfo" => {"name" => @name, "version" => @version}
-        })
-        validate_initialize_result(result)
-        unless SUPPORTED_PROTOCOL_VERSIONS.include?(result["protocolVersion"])
-          raise "MCP server selected unsupported protocol version #{result['protocolVersion']}"
+        unless @state == "idle"
+          failure = RuntimeError.new("Cannot connect MCP client in #{@state} state")
+          abort_connect(transport)
+          return Failure(failure)
         end
 
-        @protocol_version = result["protocolVersion"]
-        @server_info = result["serverInfo"]
-        @server_capabilities = result["capabilities"]
-        @instructions = result["instructions"]
-        notify("notifications/initialized")
-        @state = "connected"
+        result = run_handshake(transport)
+        abort_connect(transport) if result.failure?
         result
+      rescue StandardError => e
+        abort_connect(transport)
+        Failure(e)
       rescue Exception
-        @transport = nil
-        begin
-          transport.close
-        rescue StandardError
-          nil
-        end
-        @state = "closed"
+        abort_connect(transport)
         raise
       end
 
@@ -85,27 +79,37 @@ module Tart
         cursors = []
         cursor = nil
         MAX_LIST_PAGES.times do
-          page = request("tools/list", cursor ? {"cursor" => cursor} : nil, timeout_ms:)
-          items.concat(validate_list_page("tools/list", "tools", page) { |item| tool?(item) })
+          result = request("tools/list", cursor ? {"cursor" => cursor} : nil, timeout_ms:)
+          return result if result.failure?
+
+          page = result.value!
+          checked = validate_list_page("tools/list", "tools", page) { |item| tool?(item) }
+          return checked if checked.failure?
+
+          items.concat(checked.value!)
           next_cursor = page.is_a?(Hash) ? page["nextCursor"] : nil
           next_cursor = nil if next_cursor.nil? || next_cursor == ""
           unless next_cursor.nil?
-            raise "MCP tools/list returned duplicate cursor: #{next_cursor}" if cursors.include?(next_cursor)
+            if cursors.include?(next_cursor)
+              return Failure(RuntimeError.new("MCP tools/list returned duplicate cursor: #{next_cursor}"))
+            end
 
             cursors << next_cursor
           end
-          return items if next_cursor.nil?
+          return Success(items) if next_cursor.nil?
 
           cursor = next_cursor
         end
-        raise "MCP tools/list exceeded #{MAX_LIST_PAGES} pages"
+        Failure(RuntimeError.new("MCP tools/list exceeded #{MAX_LIST_PAGES} pages"))
       end
 
       def call_tool(name, args = nil, timeout_ms: nil)
         params = {"name" => name}
         params["arguments"] = args if args
         result = request("tools/call", params, timeout_ms:)
-        validate_call_tool_result(result)
+        return result if result.failure?
+
+        validate_call_tool_result(result.value!)
       end
 
       def close
@@ -123,54 +127,63 @@ module Tart
 
       private
 
-      # @raise [ConnectionClosedError] "MCP client is <state>" when no usable
-      #   transport (pi's requireTransport).
+      # pi's requireTransport: the usable transport, or a Failure carrying
+      # the closed-client state error.
       def require_transport
         transport = @transport
-        return transport if transport && (@state == "connected" || @state == "connecting")
+        return Success(transport) if transport && (@state == "connected" || @state == "connecting")
 
-        raise ConnectionClosedError, "MCP client is #{@state}"
+        Failure(ConnectionClosedError.new("MCP client is #{@state}"))
       end
 
       def request(method, params = nil, timeout_ms: nil)
-        transport = require_transport
-        id = @next_request_id
-        @next_request_id += 1
-        queue = Queue.new
-        @pending_mutex.synchronize { @pending[id] = queue }
-        message = {"jsonrpc" => "2.0", "id" => id, "method" => method}
-        message["params"] = params if params
-        timeout_ms ||= @request_timeout_ms
-        begin
-          transport.send(message)
-        rescue StandardError => e
-          @pending_mutex.synchronize { @pending.delete(id) }
-          raise e
+        case require_transport
+        in Failure(err)
+          Failure(err)
+        in Success(transport)
+          id = @next_request_id
+          @next_request_id += 1
+          queue = Queue.new
+          @pending_mutex.synchronize { @pending[id] = queue }
+          message = {"jsonrpc" => "2.0", "id" => id, "method" => method}
+          message["params"] = params if params
+          timeout_ms ||= @request_timeout_ms
+          begin
+            transport.send(message)
+          rescue StandardError => e
+            @pending_mutex.synchronize { @pending.delete(id) }
+            return Failure(e) # today's send-failure wall, converted in place
+          end
+          await_response(id, queue, timeout_ms)
         end
-        await_response(id, queue, timeout_ms)
       end
 
       def notify(method, params = nil)
-        transport = require_transport
-        message = {"jsonrpc" => "2.0", "method" => method}
-        message["params"] = params if params
-        transport.send(message)
+        case require_transport
+        in Failure(err)
+          Failure(err)
+        in Success(transport)
+          message = {"jsonrpc" => "2.0", "method" => method}
+          message["params"] = params if params
+          transport.send(message)
+          Success()
+        end
       end
 
       def await_response(id, queue, timeout_ms)
         deadline = clock_ms + timeout_ms
         loop do
           remaining = (deadline - clock_ms) / 1000.0
-          raise TimeoutError.new(timeout_ms) if remaining <= 0
+          return Failure(TimeoutError.new(timeout_ms)) if remaining <= 0
 
           delivery = queue.pop(timeout: remaining)
-          raise TimeoutError.new(timeout_ms) if delivery.nil?
+          return Failure(TimeoutError.new(timeout_ms)) if delivery.nil?
 
-          return delivery[:result] if delivery.key?(:result)
-          raise delivery[:closed] if delivery.key?(:closed)
+          return Success(delivery[:result]) if delivery.key?(:result)
+          return Failure(delivery[:closed]) if delivery.key?(:closed)
 
           error = delivery[:error]
-          raise Mcp::Error.new(error["code"], error["message"], error["data"])
+          return Failure(Mcp::Error.new(error["code"], error["message"], error["data"]))
         end
       ensure
         @pending_mutex.synchronize { @pending.delete(id) }
@@ -209,7 +222,12 @@ module Tart
           result["error"] = {"code" => JsonRpc::ERROR_CODES[:method_not_found],
                              "message" => "Method not found: #{message['method']}"}
         end
-        require_transport.send(result)
+        case require_transport
+        in Success(transport)
+          transport.send(result)
+        in Failure(err)
+          emit_error(err)
+        end
       rescue StandardError => e
         emit_error(e)
       end
@@ -229,46 +247,97 @@ module Tart
         end
       end
 
+      # pi: a failed connect closes the transport (client.ts catch -> close)
+      # and the client lands closed — shared by every connect failure path.
+      def abort_connect(transport)
+        @transport = nil
+        begin
+          transport.close
+        rescue StandardError
+          nil
+        end
+        @state = "closed"
+      end
+
+      # The handshake proper — every checkable taxonomy row constructs its
+      # Failure directly (no raise, no bare Try: checkable conditions only).
+      def run_handshake(transport)
+        @state = "connecting"
+        @transport = transport
+        @pending_transport = transport
+        transport.on_message = ->(message) { handle_message(message) }
+        transport.on_error = ->(error) { emit_error(error) }
+        transport.on_close = -> { handle_transport_close }
+        transport.start
+        handshake = request("initialize", {
+          "protocolVersion" => LATEST_PROTOCOL_VERSION,
+          "capabilities" => {},
+          "clientInfo" => {"name" => @name, "version" => @version}
+        })
+        return handshake if handshake.failure?
+
+        result = handshake.value!
+        checked = validate_initialize_result(result)
+        return checked if checked.failure?
+
+        unless SUPPORTED_PROTOCOL_VERSIONS.include?(result["protocolVersion"])
+          return Failure(RuntimeError.new(
+            "MCP server selected unsupported protocol version #{result['protocolVersion']}"
+          ))
+        end
+
+        @protocol_version = result["protocolVersion"]
+        @server_info = result["serverInfo"]
+        @server_capabilities = result["capabilities"]
+        @instructions = result["instructions"]
+        notified = notify("notifications/initialized")
+        return notified if notified.failure?
+
+        @state = "connected"
+        Success(result)
+      end
+
       def validate_initialize_result(result)
         invalid = JsonRpc.object?(result) && JsonRpc.object?(result["serverInfo"]) &&
           result["serverInfo"]["name"].is_a?(String) && result["serverInfo"]["version"].is_a?(String) &&
           JsonRpc.object?(result["capabilities"]) && result["protocolVersion"].is_a?(String)
-        return result if invalid
+        return Success(result) if invalid
 
-        raise Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP initialize result")
+        Failure(Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP initialize result"))
       end
 
-      # @return [Array] the page's items under +key+, each checked by the
-      #   block (pi's validateListPage).
+      # @return [Result] Success of the page's items under +key+, each checked
+      #   by the block (pi's validateListPage), or a Failure.
       def validate_list_page(method, key, value)
         items = JsonRpc.object?(value) ? value[key] : nil
-        raise Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP #{method} result") unless
-          JsonRpc.object?(value) && items.is_a?(Array)
+        unless JsonRpc.object?(value) && items.is_a?(Array)
+          return Failure(Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP #{method} result"))
+        end
 
         items.each do |item|
           unless JsonRpc.object?(item) && yield(item)
-            raise Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid entry in MCP #{method} result")
+            return Failure(Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid entry in MCP #{method} result"))
           end
         end
         # Some servers end pagination with `null` or "" instead of omitting the cursor.
         next_cursor = value["nextCursor"]
         next_cursor = nil if next_cursor == ""
-        if !next_cursor.nil? && !next_cursor.is_a?(String)
-          raise Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP #{method} cursor")
+        unless next_cursor.nil? || next_cursor.is_a?(String)
+          return Failure(Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP #{method} cursor"))
         end
-        items
+        Success(items)
       end
 
       def validate_call_tool_result(result)
         unless JsonRpc.object?(result) && (result["content"].nil? || result["content"].is_a?(Array))
-          raise Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP tools/call result")
+          return Failure(Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP tools/call result"))
         end
         if result.key?("structuredContent") && !JsonRpc.object?(result["structuredContent"])
-          raise Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP tools/call structured content")
+          return Failure(Mcp::Error.new(JsonRpc::ERROR_CODES[:invalid_request], "Invalid MCP tools/call structured content"))
         end
 
         result["content"] ||= []
-        result
+        Success(result)
       end
 
       def tool?(tool)
