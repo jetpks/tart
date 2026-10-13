@@ -59,15 +59,18 @@ module Tart
     # @param compaction [Hash, Compaction::Settings, nil] compaction
     #   settings ({enabled:, reserve_tokens:, keep_recent_tokens:});
     #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
+    # @param compat [Shapes::ModelCompat, nil] the boot model's pi-compat
+    #   dialect subset (I46), forwarded to the loop's request seam; nil =
+    #   the default arm.
     # @return [Integer] the exit code (pi's runPrintMode return).
     def run(prompt:, chat:, tools:, system_prompt: nil, on_event: nil,
             recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
             stdout: $stdout, stderr: $stderr, thinking_level: Settings::DEFAULT_THINKING_LEVEL,
-            model_reasoning: false, thinking_level_map: nil, identity: Identity::DEFAULT)
+            model_reasoning: false, thinking_level_map: nil, compat: nil, identity: Identity::DEFAULT)
       stdout.sync = true
       agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,
         recorder:, seed_messages:, context_window:, compaction:,
-        thinking_level:, model_reasoning:, thinking_level_map:, identity:)
+        thinking_level:, model_reasoning:, thinking_level_map:, compat:, identity:)
       Core::Loop.new(session: NullSession.new).run { agent.run(prompt) }
       return error_exit(agent, stderr) if agent.last_error || agent.interrupted?
 

@@ -70,8 +70,81 @@ module Tart
 
       assert_nil config.error
       assert_equal({provider: "glm", id: "m", name: "m", reasoning: true, context_window: 200_000, max_tokens: nil,
-                    thinking_level_map: {off: nil, low: "low", madeup: "x"}}, config.model_entries.first.to_h,
+                    thinking_level_map: {off: nil, low: "low", madeup: "x"}, compat: nil}, config.model_entries.first.to_h,
         "the entry hash shape and the I36 symbolization ride the schema path unchanged")
+    end
+
+    # --- I46: the per-model compat subset --------------------------------------
+
+    # The owner's live zai catalog object (Grounds §3, verbatim compat —
+    # supportsStore/supportsStrictMode are UNKNOWN keys: tolerated, no
+    # error — pi additionalProperties:true).
+    OWNER_COMPAT = {"supportsStore" => false, "supportsDeveloperRole" => false,
+                    "supportsReasoningEffort" => true, "maxTokensField" => "max_tokens",
+                    "thinkingFormat" => "zai", "supportsStrictMode" => true,
+                    "zaiToolStream" => true}.freeze
+
+    def compat_model_json(compat)
+      JSON.generate({"providers" => {"a" => {"models" => [{"id" => "m", "compat" => compat}]}}})
+    end
+
+    def test_models_compat_reject_table_matches_the_enumerated_lines
+      suffix = "(#{@dir}/models.json)"
+      cases = {
+        compat_model_json(5) => "  - providers.a.models[0].compat: expected an object",
+        compat_model_json(["zai"]) => "  - providers.a.models[0].compat: expected an object",
+        compat_model_json({"thinkingFormat" => "nope"}) =>
+          "  - providers.a.models[0].compat.thinkingFormat: expected a thinking format",
+        compat_model_json({"maxTokensField" => "tokens"}) =>
+          %(  - providers.a.models[0].compat.maxTokensField: expected "max_tokens" or "max_completion_tokens"),
+        compat_model_json({"supportsDeveloperRole" => "yes"}) =>
+          "  - providers.a.models[0].compat.supportsDeveloperRole: expected a boolean",
+        compat_model_json({"supportsReasoningEffort" => 1}) =>
+          "  - providers.a.models[0].compat.supportsReasoningEffort: expected a boolean",
+        compat_model_json({"zaiToolStream" => "true"}) =>
+          "  - providers.a.models[0].compat.zaiToolStream: expected a boolean",
+        # Several bad keys in one object: the five-key rule order
+        # (thinkingFormat, maxTokensField, then the booleans).
+        compat_model_json({"thinkingFormat" => "nope", "zaiToolStream" => "yes"}) =>
+          "  - providers.a.models[0].compat.thinkingFormat: expected a thinking format\n" \
+          "  - providers.a.models[0].compat.zaiToolStream: expected a boolean"
+      }
+      cases.each do |body, lines|
+        assert_equal "Invalid models.json schema:\n#{lines}\n#{suffix}", load_models_error(body), body
+      end
+    end
+
+    def test_models_compat_accept_table_and_interleave
+      # Each of the five keys alone; all five; the owner's verbatim object
+      # with its unknown keys — every row loads clean.
+      rows = [
+        {"thinkingFormat" => "zai"},
+        {"maxTokensField" => "max_tokens"},
+        {"maxTokensField" => "max_completion_tokens"},
+        {"supportsDeveloperRole" => true},
+        {"supportsReasoningEffort" => false},
+        {"zaiToolStream" => true},
+        {"thinkingFormat" => "zai", "maxTokensField" => "max_tokens", "supportsDeveloperRole" => false,
+         "supportsReasoningEffort" => true, "zaiToolStream" => true},
+        OWNER_COMPAT
+      ]
+      rows.each do |compat|
+        assert_nil load_models_error(compat_model_json(compat)), compat.inspect
+      end
+
+      # The interleave: compat errors ride AFTER the model's existing
+      # fields in parsed order (id, name, reasoning, thinkingLevelMap,
+      # contextWindow/maxTokens, THEN compat).
+      body = JSON.generate({"providers" => {"a" => {"models" => [
+        {"id" => "", "compat" => 5},
+        {"id" => "m", "contextWindow" => 0, "compat" => {"thinkingFormat" => "nope"}}
+      ]}}})
+      assert_equal "Invalid models.json schema:\n" \
+        "  - providers.a.models[0].id: required non-empty string\n" \
+        "  - providers.a.models[0].compat: expected an object\n" \
+        "  - providers.a.models[1].contextWindow: expected a positive integer\n" \
+        "  - providers.a.models[1].compat.thinkingFormat: expected a thinking format\n" \
+        "(#{@dir}/models.json)", load_models_error(body)
     end
 
     # --- B3: mcp.json accept/reject (exact strings, fail-fast) --------------

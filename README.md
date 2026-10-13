@@ -98,6 +98,37 @@ in the session and replayed on follow-up requests under
 `reasoning_content` (the field the provider's deltas carried), so later
 turns do not re-think from scratch.
 
+A model entry may also carry `compat` — pi's per-model dialect subset,
+which retargets the request shape for non-standard chat-completions
+endpoints. The carried keys: `thinkingFormat` (pi's eleven-literal
+vocabulary; `"zai"` switches the model to z.ai's dialect — a top-level
+`thinking` object on every request, `reasoning_effort` when the entry
+also sets `"supportsReasoningEffort": true`, `"tool_stream": true` when
+`"zaiToolStream": true` and the request carries tools, `system`
+instruction role unless `"supportsDeveloperRole": true`); and
+`maxTokensField` (`"max_tokens"` renames the summarization request's
+max-token field for endpoints that only accept the deprecated name).
+Unknown compat keys are tolerated and ignored (pi's schema keeps them
+`additionalProperties: true`), so a catalog copied from pi loads clean.
+The fireworks default boot is unchanged: a model without `compat` (or
+with a non-`zai` `thinkingFormat`) wires exactly as before. Note that
+`apiKey` values are passed through verbatim — `$ENV` references are NOT
+expanded; use a literal key or the `<IDENTITY>_API_KEY` environment
+override. A zai provider block looks like:
+
+```json
+{"providers": {"zai": {"name": "Z.AI",
+   "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+   "apiKey": "<key>",
+   "models": [{"id": "glm-5.3", "reasoning": true,
+     "contextWindow": 1000000, "maxTokens": 131072,
+     "thinkingLevelMap": {"off": null, "minimal": null, "low": "low",
+                          "medium": null, "high": "high", "xhigh": null, "max": "max"},
+     "compat": {"supportsDeveloperRole": false, "supportsReasoningEffort": true,
+                "maxTokensField": "max_tokens", "thinkingFormat": "zai",
+                "zaiToolStream": true}}]}}}
+```
+
 ### Skills
 
 Skills load from `~/.tart/skills` (user) and `<workdir>/.tart/skills`
