@@ -150,10 +150,32 @@ module Tart
     # 236-239): a settings value in pi's vocabulary passes through; anything
     # else (missing, null, mistyped) falls back to pi's runtime default
     # DEFAULT_THINKING_LEVEL "medium" (defaults.ts:3, model-resolver.ts:646).
-    # No env override — pi has none for it either.
+    # No env override — pi has none for it either. UNCLAMPED by design: the
+    # boot composition clamps a copy for the session level (bin/tart, pi
+    # createSdk sdk.ts:271-279) while this stays the · default badge's raw
+    # source (pi badges getDefaultThinkingLevel() ?? DEFAULT unclamped —
+    # thinking-selector.ts:71-72).
     def resolve_thinking_level(settings)
       level = settings["thinkingLevel"]
       THINKING_LEVELS.include?(level) ? level : DEFAULTS.fetch("thinkingLevel")
+    end
+
+    # The FILE-declared thinking-level default (I40, pi settings-manager.ts
+    # getDefaultThinkingLevel :758-760 — `settings.defaultThinkingLevel`,
+    # undefined unless a settings FILE declares it): the {load} precedence
+    # (project deep-merges over user) minus the DEFAULTS tier — the baked
+    # built-in never counts, only a file's key. Re-read from disk per call,
+    # so a mid-session {save} write is live (pi's settingsManager view).
+    # A declared value outside {THINKING_LEVELS} reads as nil (pi's settings
+    # schema cannot declare it). No env tier — pi has none for it either.
+    # The switch path's default tier ({Render::Chat#apply_model_selection} —
+    # pi _getThinkingLevelForModelSwitch, agent-session.ts:2670-2679); the
+    # per-model override tier is a cut (itemized, no scoped-models surface).
+    def declared_thinking_level(root:, cwd:)
+      user, = read_file(File.join(root, ROOT_KEY))
+      project, = read_file(File.join(cwd, CONFIG_DIR, ROOT_KEY))
+      level = deep_merge(user, project)["thinkingLevel"]
+      THINKING_LEVELS.include?(level) ? level : nil
     end
 
     # The footer's model-metadata fact (pi footer.ts:233-244 reads

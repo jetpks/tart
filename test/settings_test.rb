@@ -275,6 +275,58 @@ module Tart
       assert_equal "medium", Settings.resolve_thinking_level(load_settings.settings)
     end
 
+    # The FILE-declared default (I40, pi settings-manager.ts:758-760 —
+    # getDefaultThinkingLevel is undefined unless a settings FILE declares
+    # the key; the baked built-in never counts). The switch path's default
+    # tier (chat.rb apply_model_selection — pi
+    # _getThinkingLevelForModelSwitch agent-session.ts:2670-2679).
+    def test_declared_thinking_level_reads_the_user_file
+      write_settings(@user_path, '{"thinkingLevel": "xhigh"}')
+
+      assert_equal "xhigh", Settings.declared_thinking_level(root: @root, cwd: @cwd)
+    end
+
+    def test_declared_thinking_level_project_overrides_user
+      write_settings(@user_path, '{"thinkingLevel": "xhigh"}')
+      write_settings(@project_path, '{"thinkingLevel": "low"}')
+
+      assert_equal "low", Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "project over user (the {load} precedence)"
+    end
+
+    def test_declared_thinking_level_user_value_survives_a_keyless_project_file
+      write_settings(@user_path, '{"thinkingLevel": "xhigh"}')
+      write_settings(@project_path, '{"defaultModel": "m-project"}')
+
+      assert_equal "xhigh", Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "per-key deep merge: an unrelated project key never clobbers the user's declaration"
+    end
+
+    def test_declared_thinking_level_is_nil_when_no_file_declares_the_key
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "no files at all — the baked DEFAULTS[thinkingLevel] never counts"
+
+      write_settings(@user_path, '{"defaultModel": "m"}')
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "files without the key — still undeclared (pi's defaultThinkingLevel is undefined)"
+    end
+
+    def test_declared_thinking_level_off_vocabulary_value_reads_as_nil
+      write_settings(@user_path, '{"thinkingLevel": "loud"}')
+
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "pi's settings schema cannot declare an off-vocabulary level"
+    end
+
+    def test_declared_thinking_level_re_reads_across_a_save
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd)
+
+      Settings.save(@root, "thinkingLevel" => "high")
+
+      assert_equal "high", Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "re-read from disk per call — a mid-session persist is live"
+    end
+
     # --- the known-models thinkingLevelMap tier + the fact composition (I36) ---
 
     def test_known_thinking_level_map_reads_the_daily_driver

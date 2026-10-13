@@ -2289,6 +2289,10 @@ module Tart
                                                            model_reasoning: nil, thinking_level_map: nil|
             switched << {model_id:, provider:, context_window:, model_reasoning:, thinking_level_map:}
           end
+          # The I40 switch seam also re-clamps the stored level onto the
+          # loop (pi setModel → setThinkingLevel); inert for this pin,
+          # which asserts the switch_model kwargs alone.
+          agent.define_singleton_method(:set_thinking_level) do |_level| end
         end
 
         chat.open_model_menu
@@ -2427,9 +2431,11 @@ module Tart
 
     # pi getAvailableThinkingLevels (agent-session.ts:2657 →
     # getSupportedThinkingLevels, models.ts:1224): a non-reasoning model
-    # offers [off] alone — the menu gates, the ✓ clamps onto the gate's
-    # floor (pi setModel's _clampThinkingLevel), and the /thinking arg
-    # error lists the GATED set (handleThinkingCommand :5153-5155).
+    # offers [off] alone — the menu gates, and the /thinking arg error
+    # lists the GATED set (handleThinkingCommand :5153-5155). The ✓ rides
+    # EXACT equality (thinking-selector.ts:69-73, I40): the fixture's
+    # stored "medium" is outside the gated set, so NO row is marked (the
+    # preselect falls to index 0 — buildSelectList :101-107).
     def test_thinking_menu_gates_to_off_for_a_non_reasoning_runtime_model
       with_chat(width: 40, screen_height: 16,
         footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: false}) do |chat, session|
@@ -2439,9 +2445,9 @@ module Tart
         menu = chat.instance_variable_get(:@menu)
         assert_equal %w[off], menu.instance_variable_get(:@items).map { |item| item[:value] },
           "the gated set is [off] alone"
-        assert_equal "off", chat.menu_selection&.fetch(:value), "the gate's floor preselects"
+        assert_equal "off", chat.menu_selection&.fetch(:value), "the preselect lands on index 0"
         rows = TUI.widget_lines(chat.renderer.call).join("\n")
-        assert_includes rows, "✓ off", "the ✓ clamps onto the gated set"
+        refute_includes rows, "✓", "exact equality: the out-of-set stored level marks NO row (I40)"
         refute_includes rows, "minimal", "no ungated levels render"
       end
     end
@@ -2493,6 +2499,177 @@ module Tart
         menu = chat.instance_variable_get(:@menu)
         assert_equal %w[off minimal low medium high], menu.instance_variable_get(:@items).map { |item| item[:value] },
           "the switched entry's map-less shape re-gates (the overlay replaces the boot map)"
+      end
+    end
+
+    # --- I40: the stored level re-clamps on the switch (pi setModel,
+    # the named I28 residual) ---
+
+    # The loop-seam spy: records the switch call ORDER (pi setModel swaps
+    # the model first, agent-session.ts:2484-2494, then setThinkingLevel
+    # :2610) and the levels the seam received.
+    def switching_agent(levels)
+      calls = []
+      spy = Object.new.tap do |agent|
+        agent.define_singleton_method(:switch_model) do |*|
+          calls << :switch_model
+        end
+        agent.define_singleton_method(:set_thinking_level) do |level|
+          calls << :set_thinking_level
+          levels << level
+        end
+      end
+      [spy, calls]
+    end
+
+    # pi setModel (agent-session.ts:2477-2496) resolves a level FOR THE
+    # SWITCH — _getThinkingLevelForModelSwitch (:2670-2679, the session
+    # level when no settings FILE declares a default) — and
+    # setThinkingLevel (:2610-2634) re-clamps it through the SWITCHED
+    # model's supported set: a stored xhigh no longer survives a switch
+    # to a map-less reasoning model (the map-less rule tops out at high,
+    # models.ts:1224-1231). The clamped level rides the loop seam AFTER
+    # switch_model (pi's order) and re-renders the footer.
+    def test_switch_re_clamps_a_stored_level_through_the_switched_model
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "xhigh", reasoning: false}) do |chat, session|
+        levels = []
+        agent, calls = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "high", chat.instance_variable_get(:@thinking_level),
+          "the stored xhigh re-clamps through the map-less rule (pi _clampThinkingLevel)"
+        assert_equal ["high"], levels, "the loop seam carries the clamped level"
+        assert_equal %i[switch_model set_thinking_level], calls,
+          "pi swaps the model first, then sets the level (agent-session.ts:2484-2494)"
+        draw(chat, session)
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("glm-5.3 • high"),
+          "the footer renders the clamped level (the overlay view)"
+      end
+    end
+
+    # A non-reasoning switch re-clamps to off (pi: ["off"] is the whole
+    # supported set when reasoning is false, models.ts:1225).
+    def test_switch_to_a_non_reasoning_model_clamps_the_level_to_off
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "high", reasoning: true}) do |chat|
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "zai", id: "glm-5-air", name: "Air", reasoning: false,
+          context_window: 130_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "off", chat.instance_variable_get(:@thinking_level),
+          "the stored high re-clamps to the non-reasoning floor"
+        assert_equal ["off"], levels
+      end
+    end
+
+    # The declared-default tier (pi _getThinkingLevelForModelSwitch
+    # :2676-2677 — getDefaultThinkingLevel() ?? this.thinkingLevel): a
+    # FILE-declared default re-applies on EVERY switch and wins over the
+    # session level (settings-manager.ts:758-760 — only a file declares
+    # it; the baked DEFAULTS never counts).
+    def test_switch_prefers_the_declared_default_over_the_session_level
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "high", reasoning: true}) do |chat|
+        FileUtils.mkpath(@dir)
+        File.write(File.join(@dir, "settings.json"), '{"thinkingLevel": "low"}')
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "low", chat.instance_variable_get(:@thinking_level),
+          "the declared default wins over the session level (pi getDefaultThinkingLevel)"
+        assert_equal ["low"], levels
+      end
+    end
+
+    # No file default: an in-set session level carries across the switch
+    # unchanged (pi's ?? this.thinkingLevel tier).
+    def test_switch_keeps_an_in_set_session_level_without_a_declared_default
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "medium", reasoning: false}) do |chat|
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "medium", chat.instance_variable_get(:@thinking_level),
+          "the in-set session level survives (the clamp's exact-pass branch)"
+        assert_equal ["medium"], levels
+      end
+    end
+
+    # The clamp applies to whatever the resolution yields: an out-of-set
+    # DECLARED default clamps through the new model too (pi setThinkingLevel
+    # runs on the composed level, not only on the stored one).
+    def test_switch_clamps_an_out_of_set_declared_default
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "low", reasoning: true}) do |chat|
+        FileUtils.mkpath(@dir)
+        File.write(File.join(@dir, "settings.json"), '{"thinkingLevel": "xhigh"}')
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "high", chat.instance_variable_get(:@thinking_level),
+          "the declared xhigh clamps to the map-less ceiling"
+        assert_equal ["high"], levels
+      end
+    end
+
+    # pi setModel shows ONLY the model status (interactive-mode.ts
+    # :5347-5351); the level change rides thinking_level_changed, which
+    # refreshes footer + border without a status row (:3495-3498).
+    def test_switch_enqueues_no_thinking_status_row
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "xhigh", reasoning: false}) do |chat, session|
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+        draw(chat, session)
+
+        tail = chat.transcript_lines.join
+        assert_includes tail, "Model: glm-5.3", "the switch reports pi's showStatus text"
+        refute_includes tail, "Thinking level:", "no level status on the switch path"
+        refute_includes tail, "Default thinking level:"
+      end
+    end
+
+    # The ✓ letter (pi thinking-selector.ts:69-73): EXACT equality — a
+    # stored level OUTSIDE the gated set marks NO row; the sealed
+    # constructor's preselect falls to index 0 (buildSelectList :101-107).
+    def test_thinking_menu_marks_no_row_for_an_out_of_set_stored_level
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "xhigh", reasoning: true}) do |chat|
+        chat.open_thinking_menu
+
+        menu = chat.instance_variable_get(:@menu)
+        refute menu.instance_variable_get(:@items).any? { |item| item[:current] },
+          "no ✓ row: the map-less ladder has no xhigh (exact equality, no display floor)"
+        assert_equal "off", chat.menu_selection&.fetch(:value), "the preselect lands on index 0"
       end
     end
 

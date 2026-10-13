@@ -92,6 +92,36 @@ module Tart
       FileUtils.rm_rf(home)
     end
 
+    # I40 AC2, the boot clamp (pi createSdk sdk.ts:271-279 — createSdk
+    # clamps the boot level through the boot model for EVERY mode): the
+    # session level fact (:thinking_level — the surface reader's fallback
+    # AND the interactive loop ctor's level) is the settings value
+    # CLAMPED through the boot model's composed facts, while the ·
+    # default badge source (:default_thinking_level) stays UNCLAMPED (pi
+    # badges getDefaultThinkingLevel() ?? DEFAULT raw —
+    # thinking-selector.ts:71-72; an out-of-set default marks NO row).
+    # Staged xhigh + a map-less reasoning boot model: the map-less rule
+    # tops out at high (models.ts:1224-1231).
+    def test_footer_data_clamps_the_boot_level_but_keeps_the_badge_source_raw
+      launcher
+      home = Dir.mktmpdir("tart-footer-home-")
+      FileUtils.mkpath(home)
+      File.write(File.join(home, "settings.json"), JSON.generate("thinkingLevel" => "xhigh"))
+      settings = Settings.load(cwd: home, root: home).settings.merge("modelReasoning" => true)
+      chat = RubyLLM.context do |config|
+        config.openai_api_key = "k"
+        config.openai_api_base = "http://localhost:1/v1"
+      end.chat(model: "assumed-mapless-reasoner", provider: "openai",
+               protocol: :chat_completions, assume_model_exists: true)
+
+      data = Executable.footer_data("/somewhere", settings, chat: chat)
+      assert_equal "high", data[:thinking_level],
+        "the boot level clamps through the map-less rule (no known map for the id)"
+      assert_equal "xhigh", data[:default_thinking_level], "the badge source stays unclamped"
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
     # bin/tart launches the agent on load, so it cannot be required — eval
     # its source minus the final run line to reach the module (the
     # launcher boot itself is covered by the child-process smoke above).
