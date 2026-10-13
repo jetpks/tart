@@ -102,11 +102,20 @@ module Tart
       #   loop hands {Hooks#emit} ({cwd:, mode:, session:, identity:} —
       #   pi's ctx); a Proc re-reads per event (the boot wiring's seam —
       #   /new swaps the recorder). nil = the loop's own view.
+      # @param steer_inbox [String, nil] the steering FILE inbox (I48 —
+      #   the async child's `--steer-inbox` dir): drained at the SAME
+      #   consumption points as the in-memory queue (§5.1). Steer request
+      #   files join the queue + log their correlated consumption
+      #   ({requestId, consumedAt} in steer-log.jsonl) + unlink
+      #   (at-least-once); a stop request file interrupts the run exactly
+      #   like a kernel interrupt (:agent_end interrupted: true); a file
+      #   that fails to parse is unlinked and skipped (poison-pill
+      #   safety). nil (interactive parents, tests) = today's behavior.
       def initialize(chat:, tools:, system_prompt: nil, on_event: nil,
         recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
         identity: Identity::DEFAULT, thinking_level: "medium",
         model_reasoning: false, thinking_level_map: nil, compat: nil,
-        hooks: nil, hooks_context: nil)
+        hooks: nil, hooks_context: nil, steer_inbox: nil)
         @chat = chat
         @tools = tools
         @on_event = on_event
@@ -127,6 +136,9 @@ module Tart
         @sink = nil
         @stream_started = false
         @steering_queue = Queue.new
+        @steer_inbox = steer_inbox
+        @wake_opening = false
+        @in_run = false
         @last_error = nil
         @interrupted = false
 
@@ -151,6 +163,47 @@ module Tart
       #   close the submit/stop race).
       def queued_messages?
         !@steering_queue.empty?
+      end
+
+      # @return [Boolean] whether a run is in flight (I48 — one Loop one
+      #   fiber: #wake no-ops while true, so the completion kick that
+      #   lands mid-run is dropped and the queued notification rides the
+      #   in-flight run's next add_user_message drain instead).
+      def running?
+        @in_run
+      end
+
+      # The subagents completion wake (I48 §5.3 — pi triggerTurn on the
+      # port's existing seams): run-shaped with NO prompt — when no
+      # steering message opens the run, the hooks' pending_next_turn
+      # queue drains AS the turn's opening messages (the §I47 drain path:
+      # user-role wire text, :message_start/:message_end with the
+      # CustomMessage, the session custom_message entry). Empty queue +
+      # empty steering (memory queue AND the file inbox) → returns
+      # immediately with NO model call. NO-OP when a run is in flight
+      # (race-safe: the loop's own running flag guards it — never two
+      # fibers driving one Loop). Must be called on the kernel reactor
+      # fiber, like #run. Returns whether a run was started.
+      def wake
+        return false if @in_run
+
+        pending = @hooks ? @hooks.pending_next_turn : []
+        if pending.empty? && !queued_messages? && !steer_inbox_pending?
+          return false
+        end
+
+        # The peek drained the hooks queue atomically (the seam's only
+        # read is a drain); restore it verbatim so the run's own §I47
+        # drain delivers the messages in order.
+        pending.reverse_each { |item| @hooks.send_next_turn(**item) } if @hooks && !pending.empty?
+
+        @wake_opening = true
+        begin
+          run(nil)
+        ensure
+          @wake_opening = false
+        end
+        true
       end
 
       # The resolved context window (the compaction threshold's
@@ -232,6 +285,7 @@ module Tart
         @new_messages = []
         @last_error = nil
         @interrupted = false
+        @in_run = true
         emit(type: :agent_start)
 
         begin
@@ -241,6 +295,8 @@ module Tart
           emit(type: :turn_end, interrupted: true)
           emit(type: :agent_end, interrupted: true, messages: new_messages)
           raise
+        ensure
+          @in_run = false
         end
 
         emit(type: :agent_end, interrupted: false, messages: new_messages) unless @last_error
@@ -309,7 +365,14 @@ module Tart
           if first && prompt
             add_user_message(prompt)
           else
+            before = @new_messages.size
             steering_messages.each { |text| add_user_message(text) }
+            # I48 wake: with no prompt and no steering opening the run, the
+            # pending nextTurn queue IS the opening turn (each pending
+            # rides the §I47 drain path). Nothing added (the queue raced
+            # empty between #wake's check and here) → no model call.
+            drain_next_turn_messages if first && @wake_opening
+            break if first && @wake_opening && @new_messages.size == before
           end
           first = false
           inner_loop
@@ -606,8 +669,13 @@ module Tart
         true
       end
 
-      # Drains queued steering messages (thread-safe consumer side).
+      # Drains queued steering messages (thread-safe consumer side). The
+      # I48 file inbox (steer_inbox:) folds into the SAME seam: drained at
+      # every consumption point (the outer-loop boundary, the inner loop's
+      # complete branch, and this outer break condition) — a stop request
+      # found here interrupts the run exactly like a kernel interrupt.
       def steering_messages
+        drain_steer_inbox
         messages = []
         loop do
           begin
@@ -617,6 +685,80 @@ module Tart
           end
         end
         messages
+      end
+
+      # @return [Boolean] whether any request file waits in the steer
+      #   inbox or the stop-requests inbox (the wake's emptiness check
+      #   reads it).
+      def steer_inbox_pending?
+        return false unless @steer_inbox
+
+        steer_inbox_files(@steer_inbox).any? || steer_inbox_files(stop_inbox_dir).any?
+      end
+
+      # The file inbox drain (I48 §5.1 — pi's control-channel discipline,
+      # consumed child-side): sorted (the ts-padded names make
+      # lexicographic = temporal); each steer file → queue + steer-log
+      # entry + unlink (read → queue → log → unlink: a crash before the
+      # unlink re-delivers — at-least-once, never lost); a stop request
+      # (written to the SIBLING control/stop-requests/ dir per §2.4 —
+      # read at the same consumption points) interrupts the run exactly
+      # like a kernel interrupt (Async::Cancel — run() turns it into the
+      # interrupted :agent_end, the child exits non-zero with the abort
+      # message); a file that fails JSON parse is unlinked and skipped
+      # (poison-pill safety).
+      def drain_steer_inbox
+        return unless @steer_inbox
+
+        steer_inbox_files(@steer_inbox).each do |path|
+          request = parse_request_file(path)
+          if request.nil?
+            File.unlink(path) rescue nil # poison: unlink + skip, never crash the run
+            next
+          end
+          next unless request["type"] == "steer"
+
+          @steering_queue << request["message"].to_s
+          append_steer_consumption(request)
+          File.unlink(path) rescue nil # LAST — a crash before this re-delivers
+        end
+        steer_inbox_files(stop_inbox_dir).each do |path|
+          request = parse_request_file(path)
+          File.unlink(path) rescue nil # the interrupt must not re-fire
+          next unless request.is_a?(Hash) && request["type"] == "stop"
+
+          raise Async::Cancel, "stop request"
+        end
+      end
+
+      # The stop-requests inbox: the SIBLING of the steer-requests dir
+      # (the §2.4 write path), read at the same consumption points.
+      def stop_inbox_dir
+        File.expand_path("../stop-requests", @steer_inbox)
+      end
+
+      def steer_inbox_files(dir)
+        Dir.glob(File.join(dir, "*.json")).sort
+      end
+
+      def parse_request_file(path)
+        JSON.parse(File.read(path))
+      rescue StandardError
+        nil
+      end
+
+      # The correlated-consumption log (T1): {requestId, consumedAt} per
+      # consumed request — the receipt source the parent's steer call
+      # polls for THAT request id (never mere inbox acceptance).
+      def append_steer_consumption(request)
+        log = File.join(File.dirname(@steer_inbox), "steer-log.jsonl")
+        File.open(log, "a") do |io|
+          io.write(JSON.generate({"requestId" => request["id"], "consumedAt" =>
+            (Process.clock_gettime(Process::CLOCK_REALTIME) * 1000).round}))
+          io.write("\n")
+        end
+      rescue StandardError
+        nil # the log never blocks delivery (the message is already queued)
       end
 
       def add_user_message(text)

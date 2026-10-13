@@ -58,7 +58,12 @@ module Tart
       # The native memory module's gate (I47 — OQ-1): opt-in, default off —
       # ZERO observable change for every existing config (no tool, no
       # injection, no MOTD row). The env tier reads <IDENTITY>_MEMORY.
-      "memory" => false
+      "memory" => false,
+      # The native subagents module's gate (I48 — OQ-1): the memory row's
+      # opt-in pattern again — off = no subagent tool, no watcher, no run
+      # dirs, every existing byte unchanged (the frozen wire digests are
+      # the zero-behavior bar). The env tier reads <IDENTITY>_SUBAGENTS.
+      "subagents" => false
     }.freeze
 
     # pi's ThinkingLevel vocabulary (model-schema.ts:2-3, agent types.ts:349).
@@ -83,7 +88,12 @@ module Tart
       "apiBase" => "API_BASE",
       "apiKey" => "API_KEY",
       "modelReasoning" => "MODEL_REASONING",
-      "memory" => "MEMORY"
+      "memory" => "MEMORY",
+      # I48: the subagents gate's env tier, plus the thinkingLevel tier —
+      # an ADDITIVE boot knob (the child spawn reads the routed level
+      # through it; unset = today's resolution, no boot path calls it).
+      "subagents" => "SUBAGENTS",
+      "thinkingLevel" => "THINKING_LEVEL"
     }.freeze
 
     # The known-models tables (I08/I36), typed at load via the Shapes map

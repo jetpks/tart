@@ -2,6 +2,7 @@
 
 require_relative "agent/loop"
 require_relative "core/loop"
+require_relative "subagents"
 
 module Tart
   # Print mode (port of pi's modes/print-mode.ts, text mode): headless
@@ -65,17 +66,31 @@ module Tart
     # @param hooks [Tart::Hooks, nil] the extension seam (I47) — forwarded
     #   to the loop (the print boot's session_start emission happens in
     #   the launcher; nil = today's direct path).
+    # @param steer_inbox [String, nil] the steering FILE inbox (I48 §5.1 —
+    #   the async child's `--steer-inbox`): forwarded to the loop, which
+    #   consumes steer/stop requests at its turn boundaries mid-run.
+    #   nil = today's behavior.
+    # @param selected_tools [Array<String>, nil] tool names override (I48
+    #   §5.2 — the child harness's `--tools`): when set, the loadout is
+    #   built from EXACTLY this list (validated by the Registry; order =
+    #   the wire order). nil = the caller-built +tools+ (today).
     # @return [Integer] the exit code (pi's runPrintMode return).
     def run(prompt:, chat:, tools:, system_prompt: nil, on_event: nil,
             recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
             stdout: $stdout, stderr: $stderr, thinking_level: Settings::DEFAULT_THINKING_LEVEL,
             model_reasoning: false, thinking_level_map: nil, compat: nil, identity: Identity::DEFAULT,
-            hooks: nil)
+            hooks: nil, steer_inbox: nil, selected_tools: nil)
       stdout.sync = true
+      tools = Tools::Registry.build(selected: selected_tools, cwd: Dir.pwd, identity:, hooks:) if selected_tools
       agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,
-        recorder:, seed_messages:, context_window:, compaction:, hooks:,
+        recorder:, seed_messages:, context_window:, compaction:, hooks:, steer_inbox:,
         thinking_level:, model_reasoning:, thinking_level_map:, compat:, identity:)
-      Core::Loop.new(session: NullSession.new).run { agent.run(prompt) }
+      deadline = arm_run_deadline(identity)
+      begin
+        Core::Loop.new(session: NullSession.new).run { agent.run(prompt) }
+      ensure
+        disarm_run_deadline(deadline)
+      end
       return error_exit(agent, stderr) if agent.last_error || agent.interrupted?
 
       final_response(agent, stdout)
@@ -83,6 +98,39 @@ module Tart
     rescue StandardError => e
       stderr.write("#{e.message}\n")
       EXIT_ERROR
+    end
+
+    # The child self-deadline (I48 §6 — T2 both-sides): the child spawn
+    # env carries <IDENTITY>_RUN_DEADLINE_MS (the deadline EPOCH); when
+    # present, a thread sleeps the remainder and TERMs the child's own
+    # process group — the deadline holds even when the parent process is
+    # gone. Unset (every normal boot) = today's behavior, no thread.
+    def arm_run_deadline(identity, env: ENV)
+      raw = env[Identity.env_key(identity, "RUN_DEADLINE_MS")]
+      epoch = raw&.match(/\A\d+\z/) ? Integer(raw, 10) : nil
+      return nil unless epoch
+
+      fired = false
+      mutex = Mutex.new
+      thread = Thread.new do
+        remaining = (epoch - Process.clock_gettime(Process::CLOCK_REALTIME) * 1000) / 1000.0
+        sleep(remaining) if remaining.positive?
+        mutex.synchronize { fired = true }
+        Process.kill("-TERM", 0) # pid 0 = this process's whole group (pgroup leader per the spawn)
+      end
+      thread.name = "tart-run-deadline" if thread.respond_to?(:name=)
+      {thread:, fired?: -> { mutex.synchronize { fired } },
+       cancel: -> { mutex.synchronize { fired = true } }}
+    end
+
+    def disarm_run_deadline(deadline)
+      return unless deadline
+
+      deadline[:cancel].call
+      deadline[:thread].join(0.1)
+      deadline[:thread].kill if deadline[:thread].alive?
+    rescue StandardError
+      nil
     end
 
     # pi's text-mode tail (print-mode.ts:143-158): the last message decides —

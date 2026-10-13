@@ -53,6 +53,18 @@ module Tart
                               final response to stdout, exit 0 (1 on error)
           -r, --resume [ID]   resume a session in WORKDIR: ID is a session id
                               or session-file path; default: the most recent
+          --identity IDENTITY the face to show: any non-empty name (default
+                              pi) — branding, prompt preamble and the app
+                              env namespace follow it
+          --steer-inbox DIR   print mode only: consume steering/stop request
+                              files from DIR at this run's turn boundaries
+          --tools A,B,C       print mode only: the exact tool allowlist for
+                              this run (replaces the settings selection)
+          --system-prompt-file PATH
+                              print mode only: replace the composed system
+                              prompt with PATH's bytes
+          --session-root DIR  print mode only: record this run's session
+                              under DIR instead of ~/.tart/sessions
           -h, --help          show this help
 
         Sessions:
@@ -174,6 +186,26 @@ module Tart
           "the face to show: any non-empty name (default pi) — branding, prompt preamble and the app env namespace follow it") do |identity|
           options[:identity] = identity
         end
+        # The print-child harness flags (I48 §5.2) — print mode ONLY:
+        # they thread to their Print.run seams (steer_inbox:,
+        # selected_tools:, system_prompt: file bytes, the Recorder's
+        # root:); absent = exactly today.
+        parser.on("--steer-inbox DIR",
+          "print mode only: consume steering/stop request files from DIR at turn boundaries") do |dir|
+          options[:steer_inbox] = dir
+        end
+        parser.on("--tools A,B,C",
+          "print mode only: the exact tool allowlist for this run") do |tools|
+          options[:tools] = tools
+        end
+        parser.on("--system-prompt-file PATH",
+          "print mode only: replace the composed system prompt with PATH's bytes") do |path|
+          options[:system_prompt_file] = path
+        end
+        parser.on("--session-root DIR",
+          "print mode only: record this run's session under DIR") do |dir|
+          options[:session_root] = dir
+        end
         parser.on("-h", "--help", "show this help") { $stdout.write(usage); exit 0 }
       end.parse!(argv)
       options
@@ -186,6 +218,11 @@ module Tart
       Warning.extend(QuietIOBufferWarning)
       options = parse(argv)
       workdir = argv.shift || Dir.pwd
+      # The I48 child-harness flags are print-mode only (the interactive
+      # parent steers through its editor, never a file inbox).
+      if %i[steer_inbox tools system_prompt_file session_root].any? { |key| options[key] } && !options[:print]
+        abort "tart: --steer-inbox/--tools/--system-prompt-file/--session-root are print mode only (see --help)."
+      end
       return print_mode(options, workdir) if options[:print]
 
       interactive(options, workdir)
@@ -217,8 +254,11 @@ module Tart
       # Every print run records (pi's print path rides the same
       # SessionManager.create default, main.ts:447-448): a fresh run opens
       # its own file; a resumed one records into a fork linked to the old
-      # one (the port's fork resume model everywhere).
-      recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
+      # one (the port's fork resume model everywhere). --session-root
+      # (I48 §5.2) overrides the Recorder root — the child harness pins
+      # the run dir's sessions/ here.
+      recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path,
+                                              **(options[:session_root] ? {root: options[:session_root]} : {}))
       seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
 
       boot = Models.resolve_boot_model(models, settings, identity:)
@@ -227,21 +267,37 @@ module Tart
       # The seam boots in print mode too (pi loads the modules regardless of
       # mode): one Hooks per boot (no base sink — text mode prints nothing
       # but the final response), the settings-gated memory register, the
-      # herdr register, then the session_start emission (pi's default
-      # reason "startup"); the TUI-only gate roots nothing here.
+      # herdr register, the settings-gated subagents register (I48 — the
+      # tool merges LAST via the hooks seam), then the session_start
+      # emission (pi's default reason "startup"); the TUI-only gate roots
+      # nothing here.
       hooks = Hooks.new
       memory_on = memory_enabled?(settings, identity)
       Memory.register(hooks:, identity:) if memory_on
       Herdr.register(hooks:)
+      # The subagents gate (I48 — OQ-1): register ONLY when on — no tool,
+      # no watcher, no run dirs when off (the frozen digests hold). The
+      # returned Manager owns the agent-end drain below (pi's auto-drain).
+      manager = subagents_enabled?(settings, identity) ?
+        Subagents.register(hooks:, cwd: workdir, env: ENV, identity:) : nil
       hooks.emit({"type" => "session_start", "reason" => "startup"},
         context: {cwd: workdir, mode: "print", session: session_ref(recorder), identity:})
-      exit Print.run(
+      # --system-prompt-file (I48 §5.2): the file bytes REPLACE the
+      # composed harness prompt (systemPromptMode: replace).
+      prompt = options[:system_prompt_file] ? read_system_prompt_file(options[:system_prompt_file]) :
+        system_prompt(workdir, settings, skills.skills, identity, context_files:,
+          prompt_guidelines: memory_on ? Memory::PROMPT_GUIDELINES : [])
+      # --tools (I48 §5.2): the exact allowlist rides selected_tools: —
+      # Print.run builds the loadout from exactly that list.
+      selected_tools = parse_tools_flag(options[:tools])
+      code = Print.run(
         prompt: options[:print],
         chat:,
-        tools: build_tools(workdir, settings,
+        tools: selected_tools ? nil : build_tools(workdir, settings,
           identity:, session_env: print_session_env(recorder, boot, thinking.fetch(:thinking_level)), hooks:),
-        system_prompt: system_prompt(workdir, settings, skills.skills, identity, context_files:,
-          prompt_guidelines: memory_on ? Memory::PROMPT_GUIDELINES : []),
+        selected_tools:,
+        steer_inbox: options[:steer_inbox],
+        system_prompt: prompt,
         recorder:,
         seed_messages:,
         # The compaction knobs MUST reach the loop (the interactive path
@@ -252,6 +308,21 @@ module Tart
         hooks:,
         **thinking
       )
+      # The print drain (I48 §5.4 — pi's agent_end auto-drain): AFTER the
+      # final response prints (the parent's answer is never delayed), the
+      # parent waits for its outstanding async children; each completion
+      # notification records as a custom_message entry on THIS session
+      # (no model turn, no extra stdout). The child artifacts stay on
+      # disk (result.json).
+      if manager&.outstanding?
+        manager.drain
+        hooks.pending_next_turn.each do |pending|
+          recorder.append_custom_message(custom_type: pending[:custom_type], content: pending[:content],
+                                         display: pending[:display])
+        end
+      end
+      manager&.shutdown
+      exit code
     end
 
     def interactive(options, workdir)
@@ -306,6 +377,18 @@ module Tart
           mcp_servers:, resume: resume_path, identity:, models:, context_files:, extensions:, hooks:)
         Memory.register(hooks:, identity:) if memory_on
         Herdr.register(hooks:)
+        # The subagents gate (I48 — OQ-1): registered BEFORE build_tools so
+        # the tool merges into the loadout (declared LAST). The kernel is
+        # the WAKE BRIDGE (the Manager's kick ferries onto the reactor
+        # through the synthetic-event channel) and the agent is a callable
+        # because /new and resume swap it. NO MOTD row: subagents is a
+        # tool, not an extension-module row (pi-subagents' config lives
+        # outside the [Extensions] list).
+        if subagents_enabled?(settings, identity)
+          Subagents.register(hooks:,
+            kernel: Subagents::KernelBridge.new(->(block) { TUI.push_event(block) }),
+            agent: -> { surface.agent }, cwd: workdir, env: ENV, identity:)
+        end
         tools = build_tools(workdir, settings, mcp_servers:,
           identity:, session_env: session_env_readers(surface), hooks:)
         prompt = system_prompt(workdir, settings, skills.skills, identity, context_files:,
@@ -394,7 +477,17 @@ module Tart
         prompts.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
 
         kernel.renderer = surface.renderer
-        kernel.on_event = ->(event, source) { surface.on_event(event, source) }
+        # I48: the subagents completion wake arrives as a synthetic Proc
+        # (the KernelBridge ferry — the Manager's exact block); land it on
+        # the reactor (kernel.async is reactor-context-only). Loop#wake
+        # no-ops when a run is in flight, so the kick is race-safe.
+        kernel.on_event = lambda do |event, source|
+          if event.is_a?(Proc) && source == :synthetic
+            kernel.async(&event)
+          else
+            surface.on_event(event, source)
+          end
+        end
         kernel.run
       end
 
@@ -451,6 +544,31 @@ module Tart
     def memory_enabled?(settings, identity)
       resolved = Settings.resolve_setting("memory", settings, identity:)
       resolved == true || resolved == "true" || resolved == "1"
+    end
+
+    # The subagents gate (I48 — OQ-1): the memory gate's idiom — the
+    # resolved settings row or the <IDENTITY>_SUBAGENTS env tier, default
+    # off.
+    def subagents_enabled?(settings, identity)
+      resolved = Settings.resolve_setting("subagents", settings, identity:)
+      resolved == true || resolved == "true" || resolved == "1"
+    end
+
+    # --tools A,B,C (I48 §5.2): the comma list; empty/absent = nil (the
+    # settings selection holds).
+    def parse_tools_flag(value)
+      return nil if value.nil?
+
+      list = value.split(",").map(&:strip).reject(&:empty?)
+      list.empty? ? nil : list
+    end
+
+    # --system-prompt-file (I48 §5.2): the file bytes replace the
+    # composed harness prompt; a missing file is a clean abort.
+    def read_system_prompt_file(path)
+      abort "tart: system prompt file not found: #{path}" unless File.file?(path)
+
+      File.read(path)
     end
 
     # The session ref herdr carries on every request (pi's sessionManager

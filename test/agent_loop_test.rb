@@ -609,6 +609,42 @@ module Tart
       [Agent::Loop.new(chat:, tools:, on_event: on_event || sink, **loop_kwargs), events]
     end
 
+    # Runs the agent on a BACKGROUND-thread reactor (the I48 inbox tests
+    # write files mid-run; the run must proceed while the test thread
+    # works). A bare Async reactor — Core::Loop's trap net is main-thread-
+    # only; the loop machinery needs a reactor fiber, not the kernel.
+    def run_in_background(agent, prompt)
+      Thread.new do
+        Thread.current.report_on_exception = false
+        begin
+          Async do |root|
+            root.async { agent.run(prompt) }.wait
+          end
+        rescue Async::Cancel
+          nil # the stop-file path: run() re-raises after the interrupted agent_end
+        end
+      end
+    end
+
+    # The bounded join: a wedged run fails the test instead of hanging it.
+    def join_run(thread)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
+      until !thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        sleep 0.02
+      end
+      flunk "the run never finished" if thread.alive?
+      thread.join
+    end
+
+    # Runs #wake on the kernel (the reactor fiber — the documented
+    # contract for run-shaped calls). Returns wake's return value.
+    def run_wake(agent)
+      result = nil
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      kernel.run { result = agent.wake }
+      result
+    end
+
     def empty_tools
       {}
     end
@@ -1150,6 +1186,140 @@ module Tart
       assert_equal "ok", result.last.content
       assert events.any? { |event| event[:type] == :agent_start }, "the direct sink still receives events"
       assert_nil agent.instance_variable_get(:@hooks), "no hooks object is constructed"
+    end
+
+    # --- I48 steering-inbox pins (the async child's file inbox, §5.1) ---
+
+    # A steer request file written mid-stream is consumed at the turn
+    # boundary: the message joins the queue (the child's next request
+    # carries it as a user message), the consumption log names the
+    # requestId, and the file is unlinked (at-least-once).
+    def test_steer_inbox_file_is_consumed_at_the_turn_boundary
+      inbox = File.join(@dir, "control", "steer-requests")
+      FileUtils.mkdir_p(inbox)
+      @server.script([
+        {type: :slow_stream, content: "x" * 80, chunk_every: 0.1},
+        {type: :message, content: "steered reply"},
+      ])
+      agent, = agent_on_kernel(steer_inbox: inbox)
+      thread = run_in_background(agent, "start the work")
+
+      # Mid-stream: the request file lands while the turn runs.
+      sleep 0.4
+      request_id = "req-#{object_id}"
+      File.write(File.join(inbox, "0001700000000000-#{request_id}.json"),
+                 JSON.generate({"type" => "steer", "id" => request_id, "ts" => 1_700_000_000_000,
+                                "message" => "STEER-INBOX-MARKER", "mode" => "steer", "source" => "tool"}))
+      join_run(thread)
+      request = @server.captured_requests.last
+      users = request["messages"].select { |m| m["role"] == "user" }
+      assert users.any? { |m| m["content"].to_s.include?("STEER-INBOX-MARKER") },
+             "the steer rides the child's next request as a user message"
+      log = File.join(File.dirname(inbox), "steer-log.jsonl")
+      entries = File.readlines(log).map { |line| JSON.parse(line) }
+      entry = entries.find { |e| e["requestId"] == request_id }
+      refute_nil entry, "the consumption log correlates by requestId"
+      assert entry["consumedAt"].is_a?(Integer)
+      assert_empty Dir.glob(File.join(inbox, "*.json")), "the consumed file is unlinked"
+    end
+
+    # A stop request file interrupts the run exactly like a kernel
+    # interrupt: Async::Cancel through run() → the interrupted agent_end,
+    # the child exits non-zero with the abort message (print's error_exit).
+    def test_stop_file_interrupts_the_run_at_the_boundary
+      stop_dir = File.join(@dir, "control", "stop-requests")
+      FileUtils.mkdir_p(stop_dir)
+      @server.script([{type: :slow_stream, content: "x" * 80, chunk_every: 0.1}])
+      agent, events = agent_on_kernel(steer_inbox: File.join(@dir, "control", "steer-requests"))
+      thread = run_in_background(agent, "long stream")
+
+      sleep 0.4
+      File.write(File.join(stop_dir, "0001700000000000-stop.json"),
+                 JSON.generate({"type" => "stop", "ts" => 1_700_000_000_000}))
+      join_run(thread)
+      assert agent.interrupted?, "the stop file interrupted the run"
+      agent_end = events.find { |event| event[:type] == :agent_end }
+      assert agent_end[:interrupted], "the interrupted flag rides agent_end"
+      assert_empty Dir.glob(File.join(stop_dir, "*.json")), "the consumed stop file is unlinked"
+    end
+
+    # A file that fails JSON parse is unlinked and skipped (poison-pill
+    # safety) — a valid steer beside it still delivers.
+    def test_poison_inbox_file_is_skipped
+      inbox = File.join(@dir, "control", "steer-requests")
+      FileUtils.mkdir_p(inbox)
+      @server.script([
+        {type: :slow_stream, content: "x" * 80, chunk_every: 0.1},
+        {type: :message, content: "steered reply"},
+      ])
+      agent, = agent_on_kernel(steer_inbox: inbox)
+      thread = run_in_background(agent, "start the work")
+
+      sleep 0.4
+      File.write(File.join(inbox, "0001700000000001-garbage.json"), "{not json")
+      File.write(File.join(inbox, "0001700000000002-ok.json"),
+                 JSON.generate({"type" => "steer", "id" => "req-ok", "ts" => 1_700_000_000_002,
+                                "message" => "POISON-NEIGHBOR-MARKER", "mode" => "steer"}))
+      join_run(thread)
+      request = @server.captured_requests.last
+      assert request["messages"].any? { |m| m["role"] == "user" && m["content"].to_s.include?("POISON-NEIGHBOR-MARKER") }
+      assert_empty Dir.glob(File.join(inbox, "*.json")), "the poison file is unlinked too"
+    end
+
+    # --- I48 wake pins (§5.3 — pi triggerTurn on the port's seams) ---
+
+    # The wake drains the hooks' pending queue AS the run's opening
+    # messages: wire [custom-as-user] first (the §I47 drain path), the
+    # CustomMessage events, and the session custom_message entry.
+    def test_wake_drains_the_pending_notification_as_the_opening_turn
+      recorder_root = File.join(@dir, "agent")
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: recorder_root)
+      events = []
+      events_mutex = Mutex.new
+      sink = ->(event) { events_mutex.synchronize { events << event } }
+      hooks = Hooks.new(on_event: sink)
+      hooks.send_next_turn(custom_type: "subagent-notify", content: "Background task completed: **worker**", display: false)
+      @server.script([{type: :message, content: "post-notify reply"}])
+
+      agent = Agent::Loop.new(chat: TestChat.build(@server, system_prompt: "test prompt"), tools: {},
+                              hooks:, recorder:)
+      refute agent.running?
+      assert run_wake(agent), "the wake ran a turn"
+
+      request = @server.captured_requests.last
+      non_system = request["messages"].reject { |m| %w[system developer].include?(m["role"]) }
+      assert_equal %w[user], non_system.map { |m| m["role"] }
+      assert_includes non_system.first["content"], "Background task completed: **worker**"
+
+      custom_events = events.select { |event| event[:message].respond_to?(:role) && event[:message].role == :custom }
+      assert_equal %i[message_start message_end], custom_events.map { |event| event[:type] }.uniq
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      assert_equal ["session", "custom_message", "message"], entries.map { |entry| entry["type"] }
+      assert_equal "subagent-notify", entries[1]["customType"]
+      assert_equal "post-notify reply", agent.new_messages.last.content
+    end
+
+    # Empty queue + empty steering → NO model call, nothing recorded.
+    def test_wake_with_nothing_pending_makes_no_request
+      hooks = Hooks.new
+      agent = Agent::Loop.new(chat: TestChat.build(@server), tools: {}, hooks:)
+      assert_equal false, run_wake(agent), "the empty wake is a no-op"
+      assert_empty @server.captured_requests, "no model call"
+    end
+
+    # A wake landing mid-run no-ops (race-safe: one Loop one fiber).
+    def test_wake_noops_while_a_run_is_in_flight
+      @server.script([{type: :slow_stream, content: "x" * 40, chunk_every: 0.1}])
+      agent, = agent_on_kernel
+      thread = run_in_background(agent, "long stream")
+      sleep 0.3
+      assert agent.running?, "the run is in flight"
+
+      result = nil
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      kernel.run { result = agent.wake }
+      assert_equal false, result, "the mid-run wake is a no-op"
+      join_run(thread)
     end
 
     private

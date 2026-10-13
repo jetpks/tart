@@ -60,11 +60,26 @@ module Tart
       #   switch or level change reaches the next command); a nil reader
       #   value leaves its var unset. The launcher wires the live readers
       #   ({Tools::Registry.build} threads it here).
-      def initialize(cwd:, identity: Identity::DEFAULT, session_env: {})
+      def initialize(cwd:, identity: Identity::DEFAULT, session_env: {}, env: ENV)
         @cwd = cwd
         @identity = identity
         @session_env = session_env
         @details = nil
+        # I48 (OQ-8): the subagents child spawn carries
+        # <IDENTITY>_TOOL_TIMEOUT_MS (T2's second kind); when set to a
+        # positive integer it is the DEFAULT timeout for calls that omit
+        # one (explicit call values always win; unset = today, no
+        # default). The env speaks MILLISECONDS, the bash timeout param
+        # SECONDS — converted here. Read ONCE per construction; an
+        # invalid value is ignored with a warn — the env never crashes a
+        # child boot.
+        raw = env[Identity.env_key(identity, "TOOL_TIMEOUT_MS")]
+        millis = raw&.match(/\A\d+\z/) ? Integer(raw, 10) : nil
+        unless millis.nil? || millis.positive?
+          warn "tart: ignoring invalid #{Identity.env_key(identity, "TOOL_TIMEOUT_MS")}=#{raw.inspect}"
+          millis = nil
+        end
+        @env_default_timeout = millis && millis / 1000.0
       end
 
       description DESCRIPTION
@@ -121,6 +136,11 @@ module Tart
       #   reports as error results with a status line appended.
       def execute(command:, timeout: nil)
         safe_execute do
+          # I48 (OQ-8): an omitted call timeout falls back to the
+          # <IDENTITY>_TOOL_TIMEOUT_MS default (read at construction);
+          # an explicit value — including an invalid one, which the
+          # schema validation rejects below — always wins.
+          timeout = @env_default_timeout if timeout.nil? && @env_default_timeout
           failure = validate_input(command:, timeout:)
           return failure if failure
 
