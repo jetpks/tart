@@ -426,6 +426,48 @@ module Tart
       assert_equal "switched", result.last.content
     end
 
+    # I41 (AC4, the tier readback): the loop's env tier speaks the
+    # identity's namespace — the resolved face decides which CONTEXT_WINDOW
+    # var the compaction denominator reads (tart → TART_, default pi →
+    # PI_). Direct readback on the private resolver (the mcp_test send
+    # precedent); the print path's forwarding is pinned in print_test.
+    def test_env_tier_reads_the_identity_namespaced_context_window
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      tart_agent = Agent::Loop.new(chat:, tools: empty_tools, identity: "tart")
+      pi_agent = Agent::Loop.new(chat:, tools: empty_tools)
+      saved_tart = ENV["TART_CONTEXT_WINDOW"]
+      saved_pi = ENV["PI_CONTEXT_WINDOW"]
+      begin
+        ENV["TART_CONTEXT_WINDOW"] = "4242"
+        ENV.delete("PI_CONTEXT_WINDOW")
+        assert_equal 4242, tart_agent.send(:resolved_context_window),
+          "the tart face reads TART_CONTEXT_WINDOW"
+        assert_nil pi_agent.send(:resolved_context_window),
+          "the pi face ignores TART_CONTEXT_WINDOW (namespace isolation)"
+
+        ENV["PI_CONTEXT_WINDOW"] = "77"
+        assert_equal 77, pi_agent.send(:resolved_context_window), "the pi face reads PI_CONTEXT_WINDOW"
+      ensure
+        saved_tart ? ENV["TART_CONTEXT_WINDOW"] = saved_tart : ENV.delete("TART_CONTEXT_WINDOW")
+        saved_pi ? ENV["PI_CONTEXT_WINDOW"] = saved_pi : ENV.delete("PI_CONTEXT_WINDOW")
+      end
+    end
+
+    # I41 (spec item 5): the recorder reader — the launcher's session-env
+    # readers expose the current session's id + file through it (a /new or
+    # resume swap re-points surface.agent; the reader re-resolves at every
+    # spawn).
+    def test_recorder_reader_exposes_the_session_recorder
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      assert_nil Agent::Loop.new(chat:, tools: empty_tools).recorder, "no recorder wired, nil"
+
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: File.join(@dir, "root"))
+      agent = Agent::Loop.new(chat:, tools: empty_tools, recorder:)
+      assert_same recorder, agent.recorder
+      assert recorder.id, "the SESSION_ID reader's source is present"
+      assert recorder.path, "the SESSION_FILE reader's source is present"
+    end
+
     # AC2: threshold compaction after a completed turn — usage (the mock
     # reports 10+5 tokens) over context_window - reserve compacts; the next
     # request carries [summary message, kept tail, queued message] and none

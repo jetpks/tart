@@ -1942,7 +1942,7 @@ module Tart
           Settings::DEFAULTS.fetch("thinkingLevel")
       end
 
-      public :set_thinking_level, :cycle_thinking_level
+      public :set_thinking_level, :cycle_thinking_level, :current_model_ref
 
       # app.tools.expand (pi setToolsExpanded :6810-6826): the GLOBAL
       # toggle — every expandable block rebuilds collapsed↔expanded in

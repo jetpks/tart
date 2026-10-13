@@ -39,6 +39,11 @@ module Tart
       # observed (pi checks signal.aborted between events).
       CHECKPOINT_INTERVAL = 0.05
 
+      # The session-env suffixes the TOOL path scrubs + exposes (pi's five,
+      # docs/environment-variables.md "Shell Tool Session Environment");
+      # the child keys are <IDENTITY>_<SUFFIX> under the resolved face.
+      SESSION_ENV_SUFFIXES = %w[SESSION_ID SESSION_FILE PROVIDER MODEL REASONING_LEVEL].freeze
+
       attr_reader :cwd, :details
 
       # The raw execution outcome (pi bash-executor.ts BashResult shape —
@@ -47,8 +52,18 @@ module Tart
       BashOutcome = Struct.new(:content, :exit_code, :cancelled, :truncation, :full_output_path,
                                keyword_init: true)
 
-      def initialize(cwd:)
+      # @param cwd [String] working directory.
+      # @param identity [String] the resolved face — the child env keys ride
+      #   its namespace (pi PI_*, tart TART_*, foo FOO_*).
+      # @param session_env [Hash{String => Proc}] SUFFIX → reader, resolved
+      #   AT SPAWN (pi resolves per command start — a mid-session model
+      #   switch or level change reaches the next command); a nil reader
+      #   value leaves its var unset. The launcher wires the live readers
+      #   ({Tools::Registry.build} threads it here).
+      def initialize(cwd:, identity: Identity::DEFAULT, session_env: {})
         @cwd = cwd
+        @identity = identity
+        @session_env = session_env
         @details = nil
       end
 
@@ -151,7 +166,7 @@ module Tart
         output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
         # No on_chunk: the model-facing execute render is the I34 pending
         # block — pi's tool path streams no chunk callback either.
-        outcome = spawn_and_stream(command, output, timeout_seconds)
+        outcome = spawn_and_stream(command, output, timeout_seconds, env: session_env_for_spawn)
         [output, outcome]
       end
 
@@ -163,7 +178,24 @@ module Tart
         timeout
       end
 
-      def spawn_and_stream(command, output, timeout_seconds, on_chunk: nil)
+      # pi resolveSpawnContext (bash.ts:186-208): a COPY of the parent env
+      # with THIS identity's five keys scrubbed FIRST — inherited parent
+      # values never leak, even when a reader nils; the scrub is
+      # prefix-scoped (pi deletes only its own five PI_*, so a port nested
+      # in a real pi parent still sees the parent's PI_*). Then each truthy
+      # reader value sets <IDENTITY>_<SUFFIX>. run_user never calls this
+      # (pi's user-bash executor passes no env and never scrubs).
+      def session_env_for_spawn
+        env = ENV.to_h
+        SESSION_ENV_SUFFIXES.each { |suffix| env.delete(Identity.env_key(@identity, suffix)) }
+        @session_env.each do |suffix, reader|
+          value = reader.call
+          env[Identity.env_key(@identity, suffix)] = value if value
+        end
+        env
+      end
+
+      def spawn_and_stream(command, output, timeout_seconds, on_chunk: nil, env: nil)
         out_rd, out_wr = IO.pipe
         err_rd, err_wr = IO.pipe
         pid = nil
@@ -171,8 +203,17 @@ module Tart
         timed_out = false
 
         begin
-          pid = Process.spawn("/bin/bash", "-c", command, chdir: @cwd, pgroup: true,
-                              in: File::NULL, out: out_wr, err: out_wr)
+          if env
+            # The tool path: the composed hash IS the child env —
+            # unsetenv_others makes the scrub real (no inherited copy
+            # bleeds through).
+            pid = Process.spawn(env, "/bin/bash", "-c", command, chdir: @cwd, pgroup: true,
+                                in: File::NULL, out: out_wr, err: out_wr, unsetenv_others: true)
+          else
+            # Plain inheritance: run_user (pi's user-bash executor, no env).
+            pid = Process.spawn("/bin/bash", "-c", command, chdir: @cwd, pgroup: true,
+                                in: File::NULL, out: out_wr, err: out_wr)
+          end
           out_wr.close
           err_wr.close
 

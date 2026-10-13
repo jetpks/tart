@@ -375,9 +375,9 @@ module Tart
     end
 
     def test_default_tools_modifiers_apply_in_order_onto_the_base
-      assert_equal %w[read write edit bash find grep ls mcp],
+      assert_equal %w[read bash edit write mcp],
         Settings.selected_tools({"defaultTools" => ["+mcp"]})
-      assert_equal %w[read write edit find grep ls],
+      assert_equal %w[read edit write],
         Settings.selected_tools({"defaultTools" => ["-bash"]})
       # A mixed list: plain names form the selection, modifiers then apply.
       assert_equal %w[grep read], Settings.selected_tools({"defaultTools" => ["grep", "+read", "-bash"]})

@@ -39,13 +39,16 @@ module Tart
     # @param model_reasoning [Boolean] the boot model's reasoning capability.
     # @param thinking_level_map [Hash, nil] the boot model's thinkingLevelMap
     #   (nil = the map-less rule).
+    # @param identity [String] the resolved face (Tart::Identity) — forwarded
+    #   to the loop, whose env tier (<IDENTITY>_CONTEXT_WINDOW) follows it
+    #   (I41 AC4; the interactive path already threads it).
     # @return [Integer] the exit code (pi's runPrintMode return).
     def run(prompt:, chat:, tools:, system_prompt: nil, on_event: nil,
             stdout: $stdout, stderr: $stderr, thinking_level: Settings::DEFAULTS.fetch("thinkingLevel"),
-            model_reasoning: false, thinking_level_map: nil)
+            model_reasoning: false, thinking_level_map: nil, identity: Identity::DEFAULT)
       stdout.sync = true
       agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,
-        thinking_level:, model_reasoning:, thinking_level_map:)
+        thinking_level:, model_reasoning:, thinking_level_map:, identity:)
       Core::Loop.new(session: NullSession.new).run { agent.run(prompt) }
       return error_exit(agent, stderr) if agent.last_error || agent.interrupted?
 

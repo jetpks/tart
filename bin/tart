@@ -66,8 +66,10 @@ module Tart
           contextWindow, thinkingLevel (off/minimal/low/medium/high/xhigh/
           max, default medium; /thinking overrides it for the session),
           compaction {enabled, reserveTokens, keepRecentTokens},
-          defaultTools (plain names replace the default loadout; +name
-          adds, -name removes). Environment overrides settings for
+          defaultTools (default read bash edit write; plain names replace
+          it — e.g. ["find", "grep"] restores the search tools — +name
+          adds, -name removes, e.g. "+find" appends to the default).
+          Environment overrides settings for
           model/provider/apiBase/apiKey — under the identity's namespace
           (see Environment).
 
@@ -205,12 +207,15 @@ module Tart
 
       boot = Models.resolve_boot_model(models, settings, identity:)
       chat = build_chat(settings, models, boot, identity:)
+      thinking = boot_thinking_kwargs(settings, models, boot, chat, identity:)
       exit Print.run(
         prompt: options[:print],
         chat:,
-        tools: build_tools(workdir, settings),
+        tools: build_tools(workdir, settings,
+          identity:, session_env: print_session_env(boot, thinking.fetch(:thinking_level))),
         system_prompt: system_prompt(workdir, settings, skills.skills, identity, context_files:),
-        **boot_thinking_kwargs(settings, models, boot, chat, identity:)
+        identity:,
+        **thinking
       )
     end
 
@@ -248,7 +253,8 @@ module Tart
         kernel = Core::Loop.new(session:)
         surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
           mcp_servers:, resume: resume_path, identity:, models:, context_files:)
-        tools = build_tools(workdir, settings, mcp_servers:)
+        tools = build_tools(workdir, settings, mcp_servers:,
+          identity:, session_env: session_env_readers(surface))
         prompt = system_prompt(workdir, settings, skills.skills, identity, context_files:)
 
         # /new's reset seam: a fresh session is a new recorder (new session
@@ -500,8 +506,40 @@ module Tart
       )
     end
 
-    def build_tools(workdir, settings, mcp_servers: Mcp::Config.load(mcp_config_path))
-      Tools::Registry.build(selected: Settings.selected_tools(settings), cwd: workdir, mcp_servers:)
+    # The bash tool's session-env readers over the interactive surface (I41
+    # spec item 5): SUFFIX → a LIVE reader — /new and resume swap
+    # surface.agent, so each spawn reads the CURRENT session/model/level
+    # (pi resolves per command start, docs/environment-variables.md).
+    # PROVIDER/MODEL source the catalog ref ({current_model_ref} — the
+    # ctx.model analog, OQ-2), not the wire chat pair.
+    def session_env_readers(surface)
+      {
+        "SESSION_ID" => -> { surface.agent&.recorder&.id },
+        "SESSION_FILE" => -> { surface.agent&.recorder&.path },
+        "PROVIDER" => -> { surface.current_model_ref[:provider] },
+        "MODEL" => -> { surface.current_model_ref[:id] },
+        "REASONING_LEVEL" => -> { surface.agent&.thinking_level }
+      }
+    end
+
+    # The print path's session-env values (I41 spec item 5): the boot pair
+    # + the print level; SESSION_ID a minted ephemeral id, SESSION_FILE
+    # absent (OQ-3 — print records no session, the standing I07 cut; pi's
+    # ephemeral shape is id-without-file, session-manager.ts persist=false).
+    def print_session_env(boot, level)
+      session_id = Agent::Session.uuidv7
+      {
+        "SESSION_ID" => -> { session_id },
+        "PROVIDER" => -> { boot[:provider] },
+        "MODEL" => -> { boot[:id] },
+        "REASONING_LEVEL" => -> { level }
+      }
+    end
+
+    def build_tools(workdir, settings, mcp_servers: Mcp::Config.load(mcp_config_path),
+                    identity: Identity::DEFAULT, session_env: {})
+      Tools::Registry.build(selected: Settings.selected_tools(settings), cwd: workdir,
+        mcp_servers:, identity:, session_env:)
     rescue Mcp::Config::ConfigError => e
       abort "tart: #{e.message}"
     end

@@ -99,6 +99,17 @@ module Tart
       assert_equal Tools::ALL.sort, all.keys.sort
     end
 
+    # I41 (AC2): the SELECTED list's order is the wire order — pi
+    # _applyToolLoadout iterates the name list in order (agent-session.ts
+    # :1571-1581). At the default configuration the request's tools array
+    # is exactly [read, bash, edit, write], pi's captured wire order.
+    def test_registry_preserves_the_selected_order
+      assert_equal %w[read bash edit write],
+        Tools::Registry.build(selected: Settings.selected_tools({}), cwd: @dir).keys
+      assert_equal %w[write find read], Tools::Registry.build(selected: %w[write find read], cwd: @dir).keys,
+        "modifier-resolved lists declare in resolved order too"
+    end
+
     def test_registry_rejects_unknown_tools
       assert_raises(ArgumentError) { Tools::Registry.build(selected: %w[rm_rf], cwd: @dir) }
     end
