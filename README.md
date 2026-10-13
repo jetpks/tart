@@ -48,7 +48,7 @@ a file that fails to parse counts as absent (defaults hold) with a warning.
 | `compaction.enabled` | `true` |
 | `compaction.reserveTokens` | `16384` |
 | `compaction.keepRecentTokens` | `20000` |
-| `defaultTools` | all built-in tools (`read write edit bash find grep ls`) |
+| `defaultTools` | `read bash edit write` (pi's default-4; `+find`-style modifiers append, plain lists replace) |
 | `identity` | `pi` |
 | `thinkingLevel` | `medium` (off/minimal/low/medium/high/xhigh/max) |
 | `modelReasoning` | — (the model's registry capability) |
@@ -71,7 +71,9 @@ provider.
 `defaultTools` takes plain names (replacing the default loadout), `+name`
 (adds), and `-name` (removes), in list order; a project list of only
 modifiers composes onto the user's selection, a project list with a plain
-name replaces it.
+name replaces it. The default is pi's four core tools (`read bash edit
+write`) — `"defaultTools": ["+find"]` appends `find` to it, and
+`["find", "grep", "ls"]` restores the pre-I41 search-tool superset.
 
 ### Models
 

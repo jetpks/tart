@@ -130,6 +130,12 @@ module Tart
       # it through {set_thinking_level}).
       attr_reader :thinking_level
 
+      # The session recorder (pi SessionManager) — the launcher's session-env
+      # readers expose the CURRENT session's id + file through it (I41: the
+      # bash tool's <IDENTITY>_SESSION_ID/_SESSION_FILE; /new and resume
+      # swap the loop, and the readers re-resolve at every spawn).
+      attr_reader :recorder
+
       # The thinking level's runtime seam (pi setThinkingLevel :5163-5172 →
       # session state): stored only — the request hook reads it at request
       # time, so the NEXT request carries the new level (pi's per-request

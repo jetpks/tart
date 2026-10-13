@@ -54,9 +54,12 @@ module Tart
     # settings-schema.ts:212) — recorded divergence.
     THINKING_LEVELS = %w[off minimal low medium high xhigh max].freeze
 
-    # The port's built-in tool base (bin/tart's loadout; pi's
-    # DEFAULT_TOOL_NAMES is its four core tools — recorded divergence).
-    DEFAULT_TOOLS = %w[read write edit bash find grep ls].freeze
+    # The boot tool loadout: pi's DEFAULT_TOOL_NAMES — its four core tools
+    # in its order (settings-manager.ts:82; I41 parity — the pre-I41
+    # 7-tool superset was the I10-recorded divergence). The search tools
+    # come back through defaultTools: "+find" appends to the default,
+    # plain lists replace it.
+    DEFAULT_TOOLS = %w[read bash edit write].freeze
 
     # env → settings → built-in default, per key (AC2/AC4). The env KEY
     # rides the resolved identity's namespace ({Identity.env_key}):
