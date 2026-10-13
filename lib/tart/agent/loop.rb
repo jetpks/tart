@@ -80,10 +80,15 @@ module Tart
       # @param thinking_level_map [Hash, nil] the model's thinkingLevelMap
       #   (pi's Partial Record<level, String|null>, symbolized); nil = the
       #   map-less rule (pi's ladder without xhigh/max, off sends nothing).
+      # @param compat [Shapes::ModelCompat, nil] the model's pi-compat
+      #   dialect subset (I46); nil = today's default arm (the I36 effort
+      #   wiring, no thinking object/tool_stream/role rewrite/rename).
+      #   {switch_model} swaps it mid-session — the hook reads it at
+      #   request time, same idiom as the level.
       def initialize(chat:, tools:, system_prompt: nil, on_event: nil,
         recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
         identity: Identity::DEFAULT, thinking_level: "medium",
-        model_reasoning: false, thinking_level_map: nil)
+        model_reasoning: false, thinking_level_map: nil, compat: nil)
         @chat = chat
         @tools = tools
         @on_event = on_event
@@ -94,6 +99,7 @@ module Tart
         @thinking_level = thinking_level
         @model_reasoning = model_reasoning == true
         @thinking_level_map = thinking_level_map
+        @compat = compat
         @overflow_recovery_attempted = false
         @pre_compaction_messages = {}.compare_by_identity
         @entry_ids = {}.compare_by_identity
@@ -166,8 +172,11 @@ module Tart
       # switched entry): +model_reasoning:+/+thinking_level_map:+ carry the
       # switched entry's composed facts ({Settings.thinking_facts}'s rule
       # — the surface passes them; nil = the entry declares none, the
-      # map-less rule).
-      def switch_model(model_id, provider:, context_window: nil, model_reasoning: nil, thinking_level_map: nil)
+      # map-less rule). I46: +compat:+ rides the same wholesale re-resolve
+      # (nil IS "the switched model declares none" — the default arm — not
+      # "keep the previous").
+      def switch_model(model_id, provider:, context_window: nil, model_reasoning: nil, thinking_level_map: nil,
+        compat: nil)
         @chat.with_model(model_id, provider:, protocol: :chat_completions, assume_model_exists: true)
         # pi has no cached window to go stale: setModel swaps the Model
         # object (agent-session.ts:2484) and every check reads
@@ -189,6 +198,7 @@ module Tart
         # declares none" (the map-less rule), not "keep the previous".
         @model_reasoning = model_reasoning == true
         @thinking_level_map = thinking_level_map
+        @compat = compat
         self
       end
 
@@ -478,7 +488,29 @@ module Tart
                                   assume_model_exists: true)
         chat.with_instructions(Compaction::SUMMARIZATION_SYSTEM_PROMPT)
         chat.with_max_output_tokens(summarization_max_tokens)
+        install_summary_chat_seam(chat)
         chat
+      end
+
+      # The summarization one-shot's dialect (I46): ruby_llm callbacks are
+      # per-Chat-instance (chat.rb :142 — @callbacks starts empty on a
+      # fresh context.chat), so the construction hook never ran here and
+      # today's summary bytes carry NO reasoning_effort and the gem's
+      # max_completion_tokens. pi's summarization rides the SAME dialect
+      # branch (compaction.ts:605-607 — the session level into the request
+      # options), so for a zai-compat model the zai arm installs here too:
+      # the thinking object, the mapped effort, and the max_tokens rename
+      # land on the one-shot (the role rewrite with it — the instruction
+      # renders developer on this protocol). The I36 effort arm stays OFF:
+      # the summary request's compat-less bytes are the zero-change bar's
+      # "today's exact shapes" (pin 8). The fresh chat reads the loop
+      # state at BUILD time — a compaction builds it per call, so a
+      # mid-session switch is already settled (idle-only menus).
+      def install_summary_chat_seam(chat)
+        compat = @compat
+        return unless compat && compat.thinking_format == "zai"
+
+        chat.before_request { |payload| apply_zai_dialect(payload, compat) }
       end
 
       def summarization_max_tokens
@@ -616,18 +648,93 @@ module Tart
       #     `reasoning_content` ONLY — the shape pi sends, and the shape the
       #     strict endpoint accepts (the I05 400 class cannot recur through
       #     the port's own payload).
+      # (c) the zai dialect (I46 — pi's zai arm of the else-if chain,
+      #     openai-completions.ts :880-892): for a model whose compat says
+      #     thinkingFormat "zai" the hook emits pi's exact wire instead of
+      #     the generic effort arm — the thinking object, the map-then-
+      #     level reasoning_effort, tool_stream, the instruction-role
+      #     rewrite, and the max_tokens field rename ({apply_zai_dialect}).
+      #     compat nil (or a non-zai thinkingFormat) runs arm (a)
+      #     BYTE-EXACT — the zero-change bar (fireworks default and every
+      #     compat-less catalog).
       def install_thinking_seam
         @chat.before_request do |payload|
-          effort = Models.resolve_reasoning_effort(@thinking_level,
-            map: @thinking_level_map, reasoning: @model_reasoning)
-          if effort
-            payload[:reasoning_effort] = effort
+          compat = @compat
+          if compat && compat.thinking_format == "zai"
+            apply_zai_dialect(payload, compat)
           else
-            payload.delete(:reasoning_effort)
+            effort = Models.resolve_reasoning_effort(@thinking_level,
+              map: @thinking_level_map, reasoning: @model_reasoning)
+            if effort
+              payload[:reasoning_effort] = effort
+            else
+              payload.delete(:reasoning_effort)
+            end
           end
           payload[:messages]&.each do |message|
             message.delete(:reasoning) if message.is_a?(Hash) && message[:role] == "assistant"
           end
+        end
+      end
+
+      # The zai arm (pi openai-completions.ts :880-892 + :749-755 +
+      # :855-860 + :1233 + :841-848), muting the symbol-keyed payload in
+      # place. Runs on the session chat AND (zai only) the compaction
+      # summarization one-shot — pi's summarization carries the session
+      # level through the same dialect branch (compaction.ts:605-607).
+      def apply_zai_dialect(payload, compat)
+        if @model_reasoning
+          clamped = Models.clamp_thinking_level(@thinking_level, map: @thinking_level_map, reasoning: true)
+          # pi :751 — the CLAMPED level is the input and a clamped "off" is
+          # NO effort: the I36 String-off floor does not apply on this arm
+          # (OQ-5 — the generic off-arm is unreachable for zai-format
+          # models, the zai branch takes the chain first).
+          effort_present = !clamped.nil? && clamped != "off"
+          payload[:thinking] = effort_present ? {type: "enabled", clear_thinking: false} : {type: "disabled"}
+          if effort_present && compat.supports_reasoning_effort == true
+            # pi :889-891 — the map's String value for the clamped level;
+            # a MISSING key sends the level itself (a null value cannot
+            # reach here: supported levels never carry null).
+            mapped = @thinking_level_map&.[](clamped.to_sym)
+            payload[:reasoning_effort] = mapped.is_a?(String) ? mapped : clamped
+          else
+            # no effort (clamped off), or the compat says the endpoint
+            # refuses the field (pi's detected-false default for zai).
+            payload.delete(:reasoning_effort)
+          end
+        else
+          # pi :880 gates the arm on model.reasoning — a non-reasoning
+          # model sends no thinking object and no reasoning_effort (the
+          # generic arms cannot fire for it either).
+          payload.delete(:reasoning_effort)
+        end
+        # pi :855-860 — tool_stream iff zaiToolStream AND the request
+        # carries tools; the tool-less fallback sends tools: [] without
+        # the field (:861-863).
+        if compat.zai_tool_stream == true && payload[:tools].is_a?(Array) && !payload[:tools].empty?
+          payload[:tool_stream] = true
+        end
+        # pi :1233 — the wire role is developer iff the model reasons AND
+        # the compat supports it; nil falls to the DETECTION stand-in (a
+        # zai URL detects false, :1593-1675), so on this arm nil == false.
+        # The gem renders the instruction as developer on this protocol
+        # (format_role, chat.rb :376-383) — the rewrite puts the wire role
+        # back to system. With compat nil: NO rewrite (the default arm
+        # never touches roles).
+        unless @model_reasoning && compat.supports_developer_role == true
+          payload[:messages]&.each do |message|
+            message[:role] = "system" if message.is_a?(Hash) && message[:role] == "developer"
+          end
+        end
+        # pi :841-848 — maxTokensField "max_tokens" renames the gem's
+        # max_completion_tokens (chat.rb :96-99 — the openai slug names it
+        # so) for endpoints that only accept the deprecated field. Today
+        # only the compaction summarization sets max output tokens, so the
+        # rename lands there; "max_completion_tokens" and nil rename
+        # nothing. NO store field is ever added (OQ-4); NO strict on tool
+        # defs (OQ-1 — the five-key subset ends here).
+        if compat.max_tokens_field == "max_tokens" && payload.key?(:max_completion_tokens)
+          payload[:max_tokens] = payload.delete(:max_completion_tokens)
         end
       end
 

@@ -2288,8 +2288,9 @@ module Tart
         switched = []
         chat.agent = Object.new.tap do |agent|
           agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil,
-                                                           model_reasoning: nil, thinking_level_map: nil|
-            switched << {model_id:, provider:, context_window:, model_reasoning:, thinking_level_map:}
+                                                           model_reasoning: nil, thinking_level_map: nil,
+                                                           compat: nil|
+            switched << {model_id:, provider:, context_window:, model_reasoning:, thinking_level_map:, compat:}
           end
           # The I40 switch seam also re-clamps the stored level onto the
           # loop (pi setModel → setThinkingLevel); inert for this pin,
@@ -2303,7 +2304,7 @@ module Tart
 
         refute chat.menu_open?, "the selection closes the menu (the editor is restored)"
         assert_equal [{model_id: "glm-5.3", provider: "openai", context_window: 200_000,
-                       model_reasoning: true, thinking_level_map: nil}], switched,
+                       model_reasoning: true, thinking_level_map: nil, compat: nil}], switched,
           "the loop seam swaps the runtime chat model (the wire provider — the port's " \
           "single chat-completions seam), re-resolves the window, and carries the " \
           "switched entry's composed reasoning facts (known-tables-second)"

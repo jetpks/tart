@@ -49,11 +49,11 @@ module Tart
     def test_model_to_h_is_todays_entry_hash_key_order_included
       assert_equal(
         {id: "glm-5.3", name: "GLM 5.3", reasoning: true, context_window: 200_000,
-         max_tokens: 8192, thinking_level_map: {off: "low", medium: nil}, provider: "glm"},
+         max_tokens: 8192, thinking_level_map: {off: "low", medium: nil}, compat: nil, provider: "glm"},
         catalog_model.to_h,
         "the merged build_model shape with the provider key appended LAST"
       )
-      assert_equal %i[id name reasoning context_window max_tokens thinking_level_map provider],
+      assert_equal %i[id name reasoning context_window max_tokens thinking_level_map compat provider],
         catalog_model.to_h.keys, "the DECLARED attribute order is the emission order"
     end
 
@@ -62,6 +62,56 @@ module Tart
       assert_raises(Dry::Struct::Error) { catalog_model(overrides: {reasoning: "true"}) }
       assert_raises(Dry::Struct::Error) { catalog_model(overrides: {context_window: "200000"}) }
       assert_raises(Dry::Struct::Error) { catalog_model(overrides: {thinking_level_map: "high"}) }
+      assert_raises(Dry::Struct::Error) { catalog_model(overrides: {compat: 5}) }
+    end
+
+    # --- I46: the compat subset shape -----------------------------------------
+
+    def zai_compat(overrides = {})
+      Shapes::ModelCompat.new({thinking_format: "zai", max_tokens_field: "max_tokens",
+                               supports_developer_role: false, supports_reasoning_effort: true,
+                               zai_tool_stream: true}.merge(overrides))
+    end
+
+    def test_model_compat_constructs_with_the_owner_subset_and_reads_nil_defaults
+      compat = zai_compat
+
+      assert_equal "zai", compat.thinking_format
+      assert_equal "max_tokens", compat.max_tokens_field
+      assert_equal false, compat.supports_developer_role
+      assert_equal true, compat.supports_reasoning_effort
+      assert_equal true, compat.zai_tool_stream
+
+      # Every attribute is omittable at construction and nil-defaulted
+      # (pi's Optional keys — absent = the detection stand-in).
+      bare = Shapes::ModelCompat.new
+      assert_nil bare.thinking_format
+      assert_nil bare.max_tokens_field
+      assert_nil bare.supports_developer_role
+      assert_nil bare.supports_reasoning_effort
+      assert_nil bare.zai_tool_stream
+    end
+
+    def test_model_compat_enum_and_bool_constraints_raise
+      assert_raises(Dry::Struct::Error) { zai_compat(thinking_format: "nope") }
+      assert_raises(Dry::Struct::Error) { zai_compat(max_tokens_field: "tokens") }
+      assert_raises(Dry::Struct::Error) { zai_compat(supports_developer_role: "yes") }
+      assert_raises(Dry::Struct::Error) { zai_compat(supports_reasoning_effort: 1) }
+      assert_raises(Dry::Struct::Error) { zai_compat(zai_tool_stream: "true") }
+      # The other ten pi thinkingFormat literals construct.
+      %w[openai openrouter deepseek together baseten qwen chat-template
+         qwen-chat-template string-thinking ant-ling].each do |format|
+        assert_equal format, zai_compat(thinking_format: format).thinking_format
+      end
+      assert_equal "max_completion_tokens", zai_compat(max_tokens_field: "max_completion_tokens").max_tokens_field
+    end
+
+    def test_model_carries_the_typed_compat_and_defaults_nil
+      model = catalog_model(overrides: {compat: zai_compat})
+
+      assert_instance_of Shapes::ModelCompat, model.compat
+      assert_equal "zai", model.compat.thinking_format
+      assert_nil catalog_model.compat, "a compat-less entry reads nil (the default arm)"
     end
 
     def test_provider_constructs_with_nested_typed_models
@@ -105,9 +155,9 @@ module Tart
       assert_nil config.error
       assert_equal [
         {id: "glm-5.3", name: "GLM 5.3", reasoning: true, context_window: 200_000, max_tokens: 8192,
-         thinking_level_map: {off: nil, low: "low"}, provider: "glm"},
+         thinking_level_map: {off: nil, low: "low"}, compat: nil, provider: "glm"},
         {id: "glm-5-air", name: "glm-5-air", reasoning: false, context_window: nil, max_tokens: nil,
-         thinking_level_map: nil, provider: "glm"}
+         thinking_level_map: nil, compat: nil, provider: "glm"}
       ], config.model_entries.map(&:to_h), "line-for-line today's flattened entry hashes"
       assert_instance_of Shapes::Model, config.model_entries.first
       assert_instance_of Shapes::Provider, config.provider("glm")

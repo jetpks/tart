@@ -67,7 +67,8 @@ module Tart
       assert_equal "glm/glm-5.3", config.default
       entry = config.model_entries.first
       assert_equal ({provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
-                     context_window: 200_000, max_tokens: 8192, thinking_level_map: nil}), entry.to_h,
+                     context_window: 200_000, max_tokens: 8192, thinking_level_map: nil,
+                     compat: nil}), entry.to_h,
         "the typed entry's to_h IS today's entry hash (key order included)"
       assert_equal "https://example.test/v1", config.provider("glm").base_url
       assert_equal "k-catalog", config.provider("glm").api_key
@@ -115,6 +116,58 @@ module Tart
     def test_non_object_root_surfaces_an_error
       write_models("[]")
       assert load_models.error
+    end
+
+    # --- I46: the compat parse + the legacy bridge ------------------------------
+
+    def test_owner_zai_catalog_loads_clean_with_the_typed_compat
+      write_models(<<~JSON)
+        {"providers": {"zai": {"name": "Z.AI", "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+          "apiKey": "k",
+          "models": [{"id": "glm-5.3", "reasoning": true, "contextWindow": 1000000, "maxTokens": 131072,
+            "thinkingLevelMap": {"off": null, "minimal": null, "low": "low", "medium": null,
+                                 "high": "high", "xhigh": null, "max": "max"},
+            "compat": {"supportsStore": false, "supportsDeveloperRole": false,
+                       "supportsReasoningEffort": true, "maxTokensField": "max_tokens",
+                       "thinkingFormat": "zai", "supportsStrictMode": true, "zaiToolStream": true}}]}}}
+      JSON
+      config = load_models
+
+      assert_nil config.error, "the owner's live object (unknown supportsStore/supportsStrictMode) loads clean"
+      compat = config.model_entries.first.compat
+      assert_instance_of Shapes::ModelCompat, compat
+      assert_equal "zai", compat.thinking_format
+      assert_equal "max_tokens", compat.max_tokens_field
+      assert_equal false, compat.supports_developer_role
+      assert_equal true, compat.supports_reasoning_effort
+      assert_equal true, compat.zai_tool_stream
+    end
+
+    def test_compat_absent_parses_nil_and_partial_compat_picks_the_five
+      write_models('{"providers": {"a": {"models": [{"id": "m"}, {"id": "n", "compat": {"thinkingFormat": "zai", "madeUp": 1}}]}}}')
+      config = load_models
+
+      assert_nil config.error
+      first, second = config.model_entries
+      assert_nil first.compat, "a compat-less entry parses nil"
+      assert_equal "zai", second.compat.thinking_format
+      assert_nil second.compat.max_tokens_field
+      assert_nil second.compat.supports_developer_role
+      assert_nil second.compat.supports_reasoning_effort
+      assert_nil second.compat.zai_tool_stream
+    end
+
+    def test_entry_compat_bridges_typed_and_legacy_raw_hash_entries
+      typed = Shapes::Model.new(id: "m", name: "m", reasoning: true, context_window: nil,
+        max_tokens: nil, thinking_level_map: nil, provider: "glm",
+        compat: Shapes::ModelCompat.new(thinking_format: "zai"))
+      config = Models::Config.new(providers: {}, default: nil, error: nil)
+      assert_equal "zai", config.entry_compat(typed).thinking_format, "the typed attribute read"
+
+      legacy_with = {id: "m", compat: Shapes::ModelCompat.new(thinking_format: "zai")}
+      legacy_without = {id: "m"}
+      assert_equal "zai", config.entry_compat(legacy_with).thinking_format, "the raw-hash read"
+      assert_nil config.entry_compat(legacy_without), "nil default for a legacy entry declaring none"
     end
 
     # --- resolve (pi findExactModelReferenceMatch, reduced) ---

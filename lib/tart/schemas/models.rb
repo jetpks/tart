@@ -20,6 +20,13 @@ module Tart
     module Models
       ROOT_LINE = "  - root: expected a JSON object"
 
+      # pi's compat vocabularies (providers/compat-schema.ts, verbatim): the
+      # thinkingFormat 11-literal union and the maxTokensField two-literal
+      # union — the same sets Shapes::ModelCompat constrains.
+      THINKING_FORMATS = %w[openai openrouter deepseek together baseten zai qwen
+                            chat-template qwen-chat-template string-thinking ant-ling].freeze
+      MAX_TOKENS_FIELDS = %w[max_tokens max_completion_tokens].freeze
+
       class CatalogContract < Dry::Validation::Contract
         json do
           # Bare key declarations only: they symbolize the JSON root's top
@@ -91,6 +98,35 @@ module Tart
                 next if window.nil? || (window.is_a?(Integer) && window.positive?)
 
                 key([*model_path, field]).failure("expected a positive integer")
+              end
+
+              # The per-model compat subset (I46 — pi ModelDefinitionSchema
+              # declares compat last, so the rules ride AFTER
+              # contextWindow/maxTokens): the object check, then the five
+              # carried keys in pi's literal vocabulary. UNKNOWN compat keys
+              # are tolerated with NO error (pi additionalProperties:true —
+              # the owner's live object with supportsStore/supportsStrictMode
+              # must load clean).
+              compat = model["compat"]
+              next if compat.nil?
+              unless compat.is_a?(Hash)
+                key([*model_path, :compat]).failure("expected an object")
+                next
+              end
+
+              format = compat["thinkingFormat"]
+              if !format.nil? && !THINKING_FORMATS.include?(format)
+                key([*model_path, :compat, :thinkingFormat]).failure("expected a thinking format")
+              end
+
+              field_name = compat["maxTokensField"]
+              if !field_name.nil? && !MAX_TOKENS_FIELDS.include?(field_name)
+                key([*model_path, :compat, :maxTokensField]).failure('expected "max_tokens" or "max_completion_tokens"')
+              end
+
+              %w[supportsDeveloperRole supportsReasoningEffort zaiToolStream].each do |field|
+                flag = compat[field]
+                key([*model_path, :compat, field]).failure("expected a boolean") if !flag.nil? && ![true, false].include?(flag)
               end
             end
           end

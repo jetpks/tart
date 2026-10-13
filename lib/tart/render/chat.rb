@@ -1865,9 +1865,10 @@ module Tart
         # rides the struct's own type gate before the seam reads it. The
         # map key is supplied explicitly: the declared-optional attribute
         # still requires its key at construction, and the legacy shape
-        # may omit it.
+        # may omit it. compat (I46) rides the same explicit-key shape.
         entry = Shapes::Model.new(**entry,
-          thinking_level_map: entry.fetch(:thinking_level_map, nil)) unless entry.is_a?(Shapes::Model)
+          thinking_level_map: entry.fetch(:thinking_level_map, nil),
+          compat: entry.fetch(:compat, nil)) unless entry.is_a?(Shapes::Model)
         status = persist ? "Default model: #{entry.provider}/#{entry.id}" : "Model: #{entry.id}"
         # The wire provider is the models.json key mapped onto the port's
         # carried seam (Models.wire_provider — the loop's with_model
@@ -1890,7 +1891,8 @@ module Tart
         @agent&.switch_model(entry.id, provider: Models.wire_provider(entry.provider),
           context_window: entry.context_window,
           model_reasoning: facts.reasoning,
-          thinking_level_map: facts.thinking_level_map)
+          thinking_level_map: facts.thinking_level_map,
+          compat: entry.compat)
         @agent&.set_thinking_level(effective)
         Settings.save(@settings_root, "defaultProvider" => entry.provider, "defaultModel" => entry.id) if persist
         @kernel.request_draw
@@ -1910,14 +1912,16 @@ module Tart
       # Shapes::Model. max_tokens carries none (completeness only — the
       # footer facts hold no such value, Grounds OQ-4); reasoning floors
       # a missing fact to false (today's nil read the same everywhere it
-      # was consumed).
+      # was consumed). compat carries none (I46 — the footer facts hold
+      # no wire facts; the boot compat threads to the loop directly from
+      # the catalog entry, bin/tart's boot kwargs).
       def boot_model_entry
         data = @footer_data || {}
         model = data.fetch(:model, nil) || "no-model"
         Shapes::Model.new(
           provider: data.fetch(:default_provider, "openai"), id: model, name: model,
           reasoning: data[:reasoning] == true, context_window: data[:context_window],
-          max_tokens: nil, thinking_level_map: data[:thinking_level_map]
+          max_tokens: nil, thinking_level_map: data[:thinking_level_map], compat: nil
         )
       end
 

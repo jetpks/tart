@@ -309,7 +309,8 @@ module Tart
             identity:,
             thinking_level: facts.fetch(:thinking_level),
             model_reasoning: facts.fetch(:reasoning),
-            thinking_level_map: facts.fetch(:thinking_level_map)
+            thinking_level_map: facts.fetch(:thinking_level_map),
+            compat: resolve_boot_entry(models, boot)&.compat
           )
         end
 
@@ -454,13 +455,16 @@ module Tart
     # The thinking facts as Agent::Loop kwargs (the print-mode seam): the
     # same composition the interactive boot's footer_data rides — I40, the
     # level clamped through the boot model's facts too (pi createSdk
-    # sdk.ts:271-279; ONE clamp, both boots).
+    # sdk.ts:271-279; ONE clamp, both boots). I46: compat rides from the
+    # same catalog entry (nil without a catalog — the default arm).
     def boot_thinking_kwargs(settings, models, boot, chat, identity:)
-      facts = Settings.thinking_facts(resolve_boot_entry(models, boot),
+      entry = resolve_boot_entry(models, boot)
+      facts = Settings.thinking_facts(entry,
         settings, model_id: boot.id, model: chat.model, identity:)
       {model_reasoning: facts.reasoning, thinking_level_map: facts.thinking_level_map,
        thinking_level: Models.clamp_thinking_level(Settings.resolve_thinking_level(settings),
-         map: facts.thinking_level_map, reasoning: facts.reasoning)}
+         map: facts.thinking_level_map, reasoning: facts.reasoning),
+       compat: entry&.compat}
     end
 
     # The catalog entry for a boot pair (the I28 cross-resolve): the boot

@@ -64,6 +64,14 @@ module Tart
         entry.respond_to?(field) ? entry.public_send(field) : entry.fetch(field)
       end
 
+      # The entry's compat (I46) — the typed attribute read, with the
+      # raw-hash read preserved for legacy-fed entries (see
+      # {model_entries}); nil when the entry declares none. The same
+      # bridge shape as {entry_field}.
+      def entry_compat(entry)
+        entry.respond_to?(:compat) ? entry.compat : entry[:compat]
+      end
+
       # Exact model-reference match (pi findExactModelReferenceMatch,
       # model-resolver.ts:82-118, reduced): a unique canonical
       # "provider/id" wins; then an explicit provider/id pair; then a
@@ -183,7 +191,27 @@ module Tart
         context_window: model["contextWindow"],
         max_tokens: model["maxTokens"],
         thinking_level_map: build_thinking_level_map(model["thinkingLevelMap"]),
+        compat: build_compat(model["compat"]),
         provider:
+      )
+    end
+
+    # The pi compat subset (I46): the five carried keys picked off the
+    # parsed object (symbolized into the struct), UNKNOWN keys dropped —
+    # the schema tolerates them (pi additionalProperties:true) and the
+    # struct carries only the dialect the request seam reads. nil when the
+    # entry carries no compat (the model rides today's default arm). The
+    # load path only ever constructs from schema-VALID parsed files, so
+    # the strict types never see the rejected input classes.
+    def build_compat(raw)
+      return nil unless raw.is_a?(Hash)
+
+      Shapes::ModelCompat.new(
+        thinking_format: raw["thinkingFormat"],
+        max_tokens_field: raw["maxTokensField"],
+        supports_developer_role: raw["supportsDeveloperRole"],
+        supports_reasoning_effort: raw["supportsReasoningEffort"],
+        zai_tool_stream: raw["zaiToolStream"]
       )
     end
 

@@ -293,6 +293,251 @@ module Tart
         "the default facts (non-reasoning) send no reasoning_effort"
     end
 
+    # --- I46: the zai dialect at the request seam (the ten-wire-pin table) ---
+
+    # The owner's live thinkingLevelMap (Grounds §3): the supported ladder
+    # is [low, high, max] — DEFAULT medium clamps FORWARD to high.
+    OWNER_MAP = {off: nil, minimal: nil, low: "low", medium: nil,
+                 high: "high", xhigh: nil, max: "max"}.freeze
+
+    def zai_compat(overrides = {})
+      Shapes::ModelCompat.new({thinking_format: "zai", max_tokens_field: "max_tokens",
+                               supports_developer_role: false, supports_reasoning_effort: true,
+                               zai_tool_stream: true}.merge(overrides))
+    end
+
+    # Pin 1 — the owner dialect: thinking object ALWAYS on a reasoning
+    # zai model, reasoning_effort = the map's value for the CLAMPED level
+    # (medium → high), tool_stream with the tools, and the instruction
+    # role rewritten to system (supportsDeveloperRole false).
+    def test_zai_owner_dialect_rides_the_wire
+      @server.script([{type: :message, content: "ok"}])
+      tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
+      agent, _events = agent_on_kernel(tools:, thinking_level: "medium", model_reasoning: true,
+        thinking_level_map: OWNER_MAP, compat: zai_compat)
+      run_agent(agent, "hi")
+
+      request = @server.captured_requests.first
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, request["thinking"],
+        "the thinking object rides enabled with clear_thinking ONLY on enabled (pi :886-887)")
+      assert_equal "high", request["reasoning_effort"],
+        "medium clamps forward through the owner map (the catalog's null medium)"
+      assert_equal true, request["tool_stream"], "zaiToolStream + request tools → tool_stream"
+      assert_equal "system", request["messages"].first["role"],
+        "the gem's developer instruction is rewritten to system"
+    end
+
+    # Pin 2 — the off-edge (OQ-5): a String off map value floors the I36
+    # generic arm, but the zai arm keys on the CLAMPED level — a clamped
+    # "off" is NO effort (pi :751), so disabled thinking and NO
+    # reasoning_effort, whatever the map's off value.
+    def test_zai_off_edge_sends_disabled_thinking_and_no_effort
+      @server.script([{type: :message, content: "a"}])
+      agent, _events = agent_on_kernel(thinking_level: "off", model_reasoning: true,
+        thinking_level_map: {off: "low", low: "low", high: "high"}, compat: zai_compat)
+      run_agent(agent, "hi")
+
+      request = @server.captured_requests.first
+      assert_equal({"type" => "disabled"}, request["thinking"],
+        "a clamped off sends the disabled thinking object")
+      refute request.key?("reasoning_effort"),
+        "the String off floor does NOT apply on the zai arm (no reasoning_effort key)"
+    end
+
+    # Pin 3 — supportsReasoningEffort false/nil: the thinking object
+    # still rides, the effort field does not (pi :888 gates the effort on
+    # the compat flag; the owner's catalog overrides the detected false —
+    # the flag is the model's say, not the dialect's).
+    def test_zai_supports_reasoning_effort_false_keeps_thinking_drops_effort
+      @server.script([{type: :message, content: "a"}, {type: :message, content: "b"}])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat(supports_reasoning_effort: false))
+      run_agent(agent, "first")
+
+      request = @server.captured_requests.first
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, request["thinking"])
+      refute request.key?("reasoning_effort"), "supportsReasoningEffort false drops the field"
+
+      agent2, _events2 = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat(supports_reasoning_effort: nil))
+      run_agent(agent2, "second")
+      request2 = @server.captured_requests.last
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, request2["thinking"])
+      refute request2.key?("reasoning_effort"), "nil (pi's detected default for zai) drops it too"
+    end
+
+    # Pin 4 — tool_stream is gated on the REQUEST's tools (pi :855-863):
+    # with tools the field rides; a tool-less session's request carries
+    # no tool_stream.
+    def test_zai_tool_stream_is_gated_on_request_tools
+      @server.script([{type: :message, content: "a"}, {type: :message, content: "b"}])
+      tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
+      agent, _events = agent_on_kernel(tools:, thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat)
+      run_agent(agent, "first")
+      assert_equal true, @server.captured_requests.first["tool_stream"]
+
+      agent2, _events2 = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat)
+      run_agent(agent2, "second")
+      refute @server.captured_requests.last.key?("tool_stream"),
+        "no tools on the request, no tool_stream field"
+    end
+
+    # Pin 5 — the instruction role (pi :1233): developer only when the
+    # model reasons AND the compat says so; the zai default (nil → the
+    # detection stand-in false) rewrites the gem's developer to system.
+    def test_zai_instruction_role_rewrite
+      @server.script([{type: :message, content: "a"}, {type: :message, content: "b"}])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat)
+      run_agent(agent, "first")
+      assert_equal "system", @server.captured_requests.first["messages"].first["role"],
+        "nil supportsDeveloperRole on zai falls to the detection stand-in (false)"
+
+      agent2, _events2 = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat(supports_developer_role: true))
+      run_agent(agent2, "second")
+      assert_equal "developer", @server.captured_requests.last["messages"].first["role"],
+        "explicit true keeps the gem's developer instruction"
+    end
+
+    # Pin 6 — the compaction summarization request rides the SAME dialect
+    # (pi compaction.ts:605-607 carries the session level): the max-token
+    # key renames to max_tokens (never max_completion_tokens), the
+    # thinking object + mapped effort ride it, the role rewrites, and the
+    # tool-less one-shot carries no tool_stream.
+    def test_zai_summarization_request_carries_max_tokens_and_thinking
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+        {type: :stream, content: "second answer"},
+        {type: :message, content: "a summary of the second turn"},
+      ])
+      agent, _events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14,
+        thinking_level: "medium", model_reasoning: true, thinking_level_map: OWNER_MAP,
+        compat: zai_compat
+      )
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      requests = @server.captured_requests
+      assert_equal 4, requests.size
+      summary_request = requests[1]
+      assert summary_request.key?("max_tokens"), "the rename lands on the one-shot"
+      refute summary_request.key?("max_completion_tokens"), "never max_completion_tokens under the rename"
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, summary_request["thinking"],
+        "the thinking object rides the summarization too")
+      assert_equal "high", summary_request["reasoning_effort"],
+        "the session level (medium, clamped forward) rides the one-shot"
+      assert_equal "system", summary_request["messages"].first["role"],
+        "the summarization instruction rewrites to system as well"
+      refute summary_request.key?("tool_stream"), "the one-shot carries no tools, no tool_stream"
+    end
+
+    # Pin 7 — a NON-reasoning zai model: no thinking object, no
+    # reasoning_effort (pi :880 gates the arm on model.reasoning), and
+    # the role still rewrites (the effective role is system regardless).
+    def test_zai_non_reasoning_sends_no_thinking_and_no_effort
+      @server.script([{type: :message, content: "ok"}])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: false,
+        thinking_level_map: {high: "high"}, compat: zai_compat)
+      run_agent(agent, "hi")
+
+      request = @server.captured_requests.first
+      refute request.key?("thinking")
+      refute request.key?("reasoning_effort")
+      assert_equal "system", request["messages"].first["role"]
+    end
+
+    # Pin 8 — compat nil zero-change, the loop path (the wire-bodies
+    # digests pin the rig path): no thinking, no tool_stream, developer
+    # role, and the summarization one-shot keeps TODAY'S exact shapes —
+    # max_completion_tokens, no reasoning_effort (the gem's per-chat
+    # callbacks mean the construction hook never ran there; the I36 arm
+    # stays off it).
+    def test_compat_nil_summarization_request_keeps_todays_shapes
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+        {type: :stream, content: "second answer"},
+        {type: :message, content: "a summary of the second turn"},
+      ])
+      agent, _events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14,
+        thinking_level: "medium", model_reasoning: true,
+        thinking_level_map: {off: "low", low: "low", medium: "medium", high: "high"}
+      )
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      requests = @server.captured_requests
+      assert_equal 4, requests.size
+      main_request, summary_request = requests[0], requests[1]
+      refute main_request.key?("thinking")
+      refute main_request.key?("tool_stream")
+      assert_equal "developer", main_request["messages"].first["role"]
+      refute summary_request.key?("thinking"), "no thinking object on the one-shot"
+      refute summary_request.key?("tool_stream")
+      assert_equal "developer", summary_request["messages"].first["role"]
+      assert summary_request.key?("max_completion_tokens"), "today's max-token key unchanged"
+      refute summary_request.key?("max_tokens")
+      refute summary_request.key?("reasoning_effort"),
+        "today's one-shot carries no reasoning_effort (no hook there)"
+    end
+
+    # Pin 9 — the switch seam: switch_model(compat:) swaps the dialect
+    # mid-session and compat: nil restores the default arm (the wholesale
+    # re-resolve idiom — nil IS "the switched model declares none").
+    def test_switch_model_swaps_the_compat_dialect_and_restores
+      @server.script([
+        {type: :message, content: "one"},
+        {type: :message, content: "two"},
+        {type: :message, content: "three"},
+      ])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"})
+      run_agent(agent, "first")
+
+      agent.switch_model("glm-5.3", provider: "openai", model_reasoning: true,
+        thinking_level_map: OWNER_MAP, compat: zai_compat)
+      run_agent(agent, "second")
+
+      agent.switch_model("mock-2", provider: "openai", model_reasoning: true,
+        thinking_level_map: nil, compat: nil)
+      run_agent(agent, "third")
+
+      first, second, third = @server.captured_requests
+      refute first.key?("thinking"), "compat-nil boot: today's arm"
+      assert_equal "developer", first["messages"].first["role"]
+
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, second["thinking"],
+        "the swapped dialect governs the next request")
+      assert_equal "high", second["reasoning_effort"]
+      assert_equal "system", second["messages"].first["role"]
+
+      refute third.key?("thinking"), "compat nil restores the default arm"
+      assert_equal "developer", third["messages"].first["role"]
+      assert_equal "high", third["reasoning_effort"], "the I36 effort wiring re-resolves wholesale"
+    end
+
+    # Pin 10 — print-mode threading (the I36 third-wire-site idiom): the
+    # launcher-threaded compat rides Print.run into the request seam.
+    def test_print_mode_threads_the_compat_into_the_request
+      @server.script([{type: :message, content: "reasoned"}])
+      stdout, stderr = StringIO.new, StringIO.new
+      code = Print.run(prompt: "think", chat: TestChat.build(@server, tools: [], system_prompt: "test prompt"),
+        tools: {}, stdout:, stderr:, thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high", off: "low"}, compat: zai_compat)
+
+      assert_equal Print::EXIT_OK, code
+      request = @server.captured_requests.first
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, request["thinking"])
+      assert_equal "high", request["reasoning_effort"]
+      assert_equal "system", request["messages"].first["role"]
+    end
+
     # The session file (pi's persistence): a thinking reply's recorded
     # entry carries the thinking text — resume replay regains it (the
     # transcript's replay_assistant renders message["thinking"]).
