@@ -1760,11 +1760,12 @@ module Tart
       # session.getAvailableThinkingLevels into the component).
       def thinking_menu_items
         levels = available_thinking_levels
-        # pi's session level is clamped to the model's set (setModel →
-        # _clampThinkingLevel, agent-session.ts:2684-2686) — a stored
-        # level outside the gated set reads as the gate's floor (off).
+        # pi marks the ✓ by EXACT equality only (thinking-selector.ts
+        # :69-73): a stored level OUTSIDE the gated set marks NO row, and
+        # the sealed constructor's preselect falls to index 0
+        # (buildSelectList :101-107) — the I27-era display floor is gone
+        # with the I40 boot/switch clamps.
         current = thinking_level || Settings::DEFAULTS.fetch("thinkingLevel")
-        current = levels.first unless levels.include?(current)
         default = default_thinking_level
         levels.map do |level|
           description = ModelMenu::LEVEL_DESCRIPTIONS.fetch(level)
@@ -1834,22 +1835,46 @@ module Tart
       # footer model segment + the editor border re-ladder (the runtime
       # overlays flow into {footer_data}), report (pi showStatus — the
       # transcript tail row, I33), and persist the default when asked.
+      #
+      # I40, pi setModel (agent-session.ts:2477-2496): the switch resolves
+      # a level FOR THE SWITCH — _getThinkingLevelForModelSwitch
+      # (:2670-2679): the FILE-declared default, else the session level
+      # (the per-model tier is a cut — no scoped-models surface; no
+      # explicit tier — no argument path) — and setThinkingLevel
+      # (:2610-2634) re-clamps it through the SWITCHED model's supported
+      # set (Models.clamp_thinking_level's exact-pass branch covers pi's
+      # includes-then-clamp). The effective level lands on BOTH the
+      # surface state and the loop seam, AFTER switch_model (pi swaps the
+      # model first, :2484-2494). NO Thinking level status row: pi's
+      # thinking_level_changed only invalidates the footer + border
+      # (interactive-mode.ts:3495-3498) — the per-frame {footer_data}
+      # overlay carries the refresh. persist:true rides the SAME re-clamp
+      # (pi setModel {persist} is one path).
       def apply_model_selection(entry, persist:)
         status = persist ? "Default model: #{entry[:provider]}/#{entry[:id]}" : "Model: #{entry[:id]}"
-        @mutex.synchronize do
-          @runtime_model = entry
-          @transcript_state.enqueue_status(status)
-        end
         # The wire provider is the models.json key mapped onto the port's
         # carried seam (Models.wire_provider — the loop's with_model
         # needs a native slug); the window + the composed reasoning facts
         # re-resolve in the loop seam (the entry's flag/map, the known
         # tables when the entry declares none — Settings.thinking_facts).
         facts = Settings.thinking_facts(entry, model_id: entry[:id])
+        # The cwd resolution is the launcher-facts-else-process idiom the
+        # MOTD/commands sections already use (@footer_data[:cwd] || Dir.pwd).
+        level = Settings.declared_thinking_level(root: @settings_root,
+          cwd: @footer_data&.fetch(:cwd, nil) || Dir.pwd) ||
+          (@thinking_level || @footer_data&.fetch(:thinking_level, nil))
+        effective = Models.clamp_thinking_level(level, map: facts[:thinking_level_map],
+          reasoning: facts[:reasoning])
+        @mutex.synchronize do
+          @runtime_model = entry
+          @thinking_level = effective
+          @transcript_state.enqueue_status(status)
+        end
         @agent&.switch_model(entry[:id], provider: Models.wire_provider(entry[:provider]),
           context_window: entry[:context_window],
           model_reasoning: facts[:reasoning],
           thinking_level_map: facts[:thinking_level_map])
+        @agent&.set_thinking_level(effective)
         Settings.save(@settings_root, "defaultProvider" => entry[:provider], "defaultModel" => entry[:id]) if persist
         @kernel.request_draw
       end
@@ -1905,10 +1930,16 @@ module Tart
         entry ? {provider: entry[:provider], id: entry[:id]} : ref
       end
 
-      # The settings-resolved thinking level (the · default badge) —
-      # footer_data's fact, or the built-in default.
+      # The settings-resolved thinking level (the · default badge) — the
+      # UNCLAMPED boot fact when the launcher supplies it (pi badges
+      # getDefaultThinkingLevel() ?? DEFAULT raw, thinking-selector.ts
+      # :71-72 via interactive-mode.ts:5187 — an out-of-set default marks
+      # NO row), the boot level fact otherwise (the pre-I40 footer
+      # fixtures), or the built-in default.
       def default_thinking_level
-        (@footer_data || {}).fetch(:thinking_level, nil) || Settings::DEFAULTS.fetch("thinkingLevel")
+        data = @footer_data || {}
+        data.fetch(:default_thinking_level, nil) || data.fetch(:thinking_level, nil) ||
+          Settings::DEFAULTS.fetch("thinkingLevel")
       end
 
       public :set_thinking_level, :cycle_thinking_level

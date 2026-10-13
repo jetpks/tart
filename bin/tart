@@ -210,7 +210,6 @@ module Tart
         chat:,
         tools: build_tools(workdir, settings),
         system_prompt: system_prompt(workdir, settings, skills.skills, identity, context_files:),
-        thinking_level: Settings.resolve_thinking_level(settings),
         **boot_thinking_kwargs(settings, models, boot, chat, identity:)
       )
     end
@@ -381,7 +380,13 @@ module Tart
     # footer's model segment and the level ladder's source, pi
     # footer.ts:226-258) composes catalog-entry-first, known-tables-second
     # ({Settings.thinking_facts}), stageable via <IDENTITY>_MODEL_REASONING
-    # (Settings); the thinking level rides the settings-resolved value.
+    # (Settings). I40: the thinking level is the settings-resolved value
+    # CLAMPED through the boot model's facts (pi createSdk sdk.ts:271-279 —
+    # createSdk clamps for every mode) — the session level the surface
+    # reader falls back to AND the interactive loop ctor receives. The
+    # · default badge source stays UNCLAMPED (+default_thinking_level+: pi
+    # badges getDefaultThinkingLevel() ?? DEFAULT raw — thinking-selector
+    # .ts:71-72; an out-of-set default marks NO row).
     def footer_data(workdir, settings, boot: nil, chat:, identity: Identity::DEFAULT, models: nil)
       # Optional +boot+: the in-launcher call sites resolve the boot pair
       # per session; the legacy (settings, chat) shape resolves it from
@@ -396,6 +401,7 @@ module Tart
       # owner's live "(openai) " finding). I27: the boot pair is threaded
       # (the /model selector's default badge + degenerate catalog), the
       # model id from the boot resolution (env > models.json > settings).
+      level = Settings.resolve_thinking_level(settings)
       {
         cwd: workdir,
         model: boot[:id],
@@ -404,16 +410,22 @@ module Tart
         thinking_level_map: facts[:thinking_level_map],
         context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
         auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
-        thinking_level: Settings.resolve_thinking_level(settings)
+        thinking_level: Models.clamp_thinking_level(level, map: facts[:thinking_level_map],
+          reasoning: facts[:reasoning]),
+        default_thinking_level: level
       }
     end
 
     # The thinking facts as Agent::Loop kwargs (the print-mode seam): the
-    # same composition the interactive boot's footer_data rides.
+    # same composition the interactive boot's footer_data rides — I40, the
+    # level clamped through the boot model's facts too (pi createSdk
+    # sdk.ts:271-279; ONE clamp, both boots).
     def boot_thinking_kwargs(settings, models, boot, chat, identity:)
       facts = Settings.thinking_facts(resolve_boot_entry(models, boot),
         settings, model_id: boot[:id], model: chat.model, identity:)
-      {model_reasoning: facts[:reasoning], thinking_level_map: facts[:thinking_level_map]}
+      {model_reasoning: facts[:reasoning], thinking_level_map: facts[:thinking_level_map],
+       thinking_level: Models.clamp_thinking_level(Settings.resolve_thinking_level(settings),
+         map: facts[:thinking_level_map], reasoning: facts[:reasoning])}
     end
 
     # The catalog entry for a boot pair (the I28 cross-resolve): the boot
