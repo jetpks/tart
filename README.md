@@ -329,6 +329,72 @@ header; the index row upserts), `read` returns a topic file, `list` returns
 the index. The two memory guidelines join the system prompt's rules; the
 MOTD's [Extensions] section gains a `memory.ts` row.
 
+## Subagents
+
+The native delegation core: the `subagent` tool drives print-mode
+subprocess children — foreground (blocking) or async detached — with the
+run registry on disk, steering, stop, both timeout kinds, and a completion
+notification that wakes an idle interactive parent. It is OPT-IN and OFF by
+default: add `"subagents": true` to settings.json (user or project) or set
+`<IDENTITY>_SUBAGENTS=1` (pi reads `PI_SUBAGENTS`, tart `TART_SUBAGENTS`).
+With the gate off, nothing changes — no tool on the wire, no watcher, no
+run dirs.
+
+Built-in agents: `worker` (implementation; read/grep/find/ls/bash/edit/
+write), `oracle` (high-context decision consistency; runs from a FORK of
+the parent conversation and needs a recorded parent session — without one
+it runs fresh), `reviewer` (read-only review; read/grep/find/ls). Model
+routing: `model:` accepts `provider/id` or `provider/id:level` (the level
+suffix: off/minimal/low/medium/high/xhigh/max).
+
+Spawning: `subagent({ agent: "worker", task: "..." })` — `async` defaults
+to TRUE: the tool returns the start message immediately (`Async: <agent>
+[<id>]` + guidance) and the parent's turn ends free; the child runs as a
+detached `tart -p` subprocess and survives the parent. Completion arrives
+as a native notification (`Background task <state>: **<agent>**` with the
+result preview, run dir, and session file) and wakes an idle interactive
+parent. `async: false` blocks the tool call until the child finishes and
+returns its output verbatim.
+
+Managing runs: `action: "status"` (the fleet, or one run by `id:` — lines
+`Run:/State:/Mode:/Started:/Updated:/Dir:/Output:`), `action: "steer"` +
+`id:` + `message:` (mode `steer` delivers into the running turn,
+`follow_up` queues, `auto` — the default — picks), and `action: "stop"` +
+`id:`. A steer receipt reports `delivered` only when the CHILD consumed
+that request id (its steer-log entry) — never mere inbox acceptance.
+
+Run dirs live under `~/.tart/subagents/<run-id>/` (`<IDENTITY>_SUBAGENTS_HOME`
+overrides the root): `status.json` (the lifecycle: running → completed |
+failed | stopped, `result.json` written before the terminal flip, the task
+text never recorded — length only), `result.json`, `runner.stdout.log` /
+`runner.stderr.log`, `system-prompt.md`, the child's `sessions/`, and
+`control/{steer-requests,stop-requests}/` (the file inbox the child
+consumes at its turn boundaries).
+
+Timeouts (both recommended explicit for long children — the 30-minute run
+default kills): `timeout_ms` is the run-level deadline (default 1800000;
+0 = unbounded; expiration lands the run stopped + timedOut — enforced on
+BOTH sides, the parent supervisor and the child's own deadline env), and
+`tool_timeout_ms` is the per-tool-call hard deadline (default unset; it
+rides `<IDENTITY>_TOOL_TIMEOUT_MS` and becomes the bash tool's default for
+calls that omit `timeout`).
+
+Print-mode parents drain outstanding children at agent end (notifications
+record on the session, no extra stdout). The child harness is the print
+subprocess itself: `tart -p <task> --tools ... --system-prompt-file ...
+--session-root <run>/sessions --steer-inbox <run>/control/steer-requests`
+under a CLOSED env (no nesting, no MCP). The in-process child option was
+measured (~26ms delegation overhead) and recorded as the rejected-for-now
+alternative: async detach forces a subprocess (a child must survive parent
+exit) and one harness keeps steering/stop/deadline/status identical for
+both modes.
+
+CUT this iteration (profiles/intercom/council and everything beyond the
+owner's working set are the next entry — see the iteration record's OQ-6):
+workflows/chains/parallel, worktree isolation, acceptance gates, missions,
+the fleet UI, bg_wait, MCP-direct agents, external-CLI adapters, nested
+delegation.
+
 ## Herdr
 
 When tart runs inside a herdr pane (all three env vars set: `HERDR_ENV=1`,

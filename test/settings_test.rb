@@ -70,6 +70,29 @@ module Tart
         "the DEFAULTS tier is false"
     end
 
+    # --- I48: the subagents gate rows + the thinkingLevel env tier (OQ-1) ---
+
+    def test_subagents_gate_rows_default_off_with_the_identity_env_suffix
+      assert_equal false, Settings::DEFAULTS["subagents"]
+      assert_equal "SUBAGENTS", Settings::RESOLUTION_ENV["subagents"]
+      assert_equal "THINKING_LEVEL", Settings::RESOLUTION_ENV["thinkingLevel"]
+      assert_equal "PI_SUBAGENTS", Identity.env_key("pi", Settings::RESOLUTION_ENV["subagents"])
+      assert_equal "TART_SUBAGENTS", Identity.env_key("tart", Settings::RESOLUTION_ENV["subagents"])
+    end
+
+    def test_subagents_is_a_known_key_and_resolves_env_over_file_over_default
+      result = load_settings
+      assert_empty result.diagnostics, "the subagents row is known — no unknown-key warning"
+      assert_equal false, result.settings["subagents"]
+
+      write_settings(@user_path, '{"subagents": true}')
+      assert_equal true, load_settings.settings["subagents"]
+
+      assert_equal "1", Settings.resolve_setting("subagents", {}, identity: "pi", env: {"PI_SUBAGENTS" => "1"})
+      assert_equal false, Settings.resolve_setting("subagents", {}, identity: "tart", env: {}),
+        "the DEFAULTS tier is false"
+    end
+
     def test_project_deep_merges_over_user
       write_settings(@user_path, '{"compaction": {"reserveTokens": 1000, "keepRecentTokens": 500}}')
       write_settings(@project_path, '{"compaction": {"reserveTokens": 2000}, "defaultModel": "m-project"}')
