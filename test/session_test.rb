@@ -118,6 +118,7 @@ module Tart
       tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
       first = Agent::Session::Recorder.new(cwd: @dir, root: @root)
       run_agent(agent_on_kernel(tools:, recorder: first), "list the files")
+      first_entries = Agent::Session.load_entries(first.path)[1..]
 
       @server.script([{type: :message, content: "continuing"}])
       resumed = Agent::Session::Recorder.new(cwd: @dir, root: @root, parent_session: first.path)
@@ -133,14 +134,30 @@ module Tart
       assert_equal "call_1", payload[2]["tool_call_id"]
       assert_equal "and then?", payload[4]["content"]
 
-      # The resumed run records into a NEW file, header-linked to the old,
-      # starting from the new user message (prior turns are not re-recorded).
+      # The resumed run records into a NEW file, header-linked to the old.
+      # The fork is content-complete (pi forkFrom :1847-1853, I42): the
+      # parent's non-header entries copy VERBATIM — original ids/parentIds,
+      # original contents — and the new turn chains from the copied tail.
       refute_equal first.path, resumed.path
       entries = Agent::Session.load_entries(resumed.path)
       header = entries.first
       assert_equal first.path, header["parentSession"]
-      assert_equal %w[user assistant], entries[1..].map { |e| e["message"]["role"] }
-      assert_equal "and then?", entries[1]["message"]["content"]
+
+      lineage = entries[1, 4]
+      assert_equal %w[user assistant tool assistant], lineage.map { |e| e["message"]["role"] },
+        "the copied lineage precedes the new turn"
+      assert_equal first_entries, lineage, "copied entries are byte-identical (verbatim copy)"
+
+      new_turns = entries[5..]
+      assert_equal %w[user assistant], new_turns.map { |e| e["message"]["role"] }
+      assert_equal "and then?", new_turns[0]["message"]["content"]
+      assert_equal lineage.last["id"], new_turns[0]["parentId"],
+        "the new leaf chains from the copied tail"
+
+      # Self-contained: the resumed FILE alone replays the full lineage
+      # (no re-seed from the parent needed — a second resume hop composes).
+      assert_equal %i[user assistant tool assistant user assistant],
+        Agent::Session.context_messages(resumed.path).map { |m| m[:role] }
     end
 
     # The bashExecution record (pi recordBashResult agent-session.ts:3879)

@@ -203,7 +203,18 @@ module Tart
       require_api_key(settings, models, identity:)
       skills = Skills.load(cwd: workdir)
       context_files = Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root)
-      abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
+
+      # The resume target resolves before the recorder is born — the SAME
+      # helper the interactive path uses: no id = the most recent session
+      # for the workdir; a session-file path as-is; an id by file-name
+      # suffix or header id.
+      resume_path = options[:resume_given] ? resolve_resume(options[:resume], workdir) : nil
+      # Every print run records (pi's print path rides the same
+      # SessionManager.create default, main.ts:447-448): a fresh run opens
+      # its own file; a resumed one records into a fork linked to the old
+      # one (the port's fork resume model everywhere).
+      recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path)
+      seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
 
       boot = Models.resolve_boot_model(models, settings, identity:)
       chat = build_chat(settings, models, boot, identity:)
@@ -212,8 +223,14 @@ module Tart
         prompt: options[:print],
         chat:,
         tools: build_tools(workdir, settings,
-          identity:, session_env: print_session_env(boot, thinking.fetch(:thinking_level))),
+          identity:, session_env: print_session_env(recorder, boot, thinking.fetch(:thinking_level))),
         system_prompt: system_prompt(workdir, settings, skills.skills, identity, context_files:),
+        recorder:,
+        seed_messages:,
+        # The compaction knobs MUST reach the loop (the interactive path
+        # threads them too); context_window: stays nil so the loop's env
+        # tier resolves <IDENTITY>_CONTEXT_WINDOW itself.
+        compaction: Settings.compaction_kwargs(settings),
         identity:,
         **thinking
       )
@@ -522,14 +539,18 @@ module Tart
       }
     end
 
-    # The print path's session-env values (I41 spec item 5): the boot pair
-    # + the print level; SESSION_ID a minted ephemeral id, SESSION_FILE
-    # absent (OQ-3 — print records no session, the standing I07 cut; pi's
-    # ephemeral shape is id-without-file, session-manager.ts persist=false).
-    def print_session_env(boot, level)
-      session_id = Agent::Session.uuidv7
+    # The print path's session-env values (I41 spec item 5; recorder-backed
+    # since I42 — print runs record): SESSION_ID/SESSION_FILE are LIVE
+    # recorder readers, resolved at command start like pi's
+    # resolveSpawnContext (bash.ts:194-197 — the file is exposed only once
+    # it exists; here the bash tool exposes a reader only when truthy, and
+    # the file materializes on the first recorded conversation-bearing
+    # message, which precedes any tool execution). PROVIDER/MODEL/
+    # REASONING_LEVEL unchanged (the boot pair + the print level).
+    def print_session_env(recorder, boot, level)
       {
-        "SESSION_ID" => -> { session_id },
+        "SESSION_ID" => -> { recorder&.id },
+        "SESSION_FILE" => -> { recorder&.path },
         "PROVIDER" => -> { boot[:provider] },
         "MODEL" => -> { boot[:id] },
         "REASONING_LEVEL" => -> { level }
