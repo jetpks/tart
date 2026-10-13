@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "digest"
+require "dry/monads"
 require "tmpdir"
 
 require_relative "../tools/support/truncate"
@@ -20,6 +21,8 @@ module Tart
     #   file (pi's limitMcpContent); isError results become {error:} results;
     #   a content-less result falls back to its structuredContent as JSON.
     class Tool < RubyLLM::Tool
+      include Dry::Monads::Result::Mixin
+
       EXPOSURE = "direct"
 
       # Model-facing text of an MCP result beyond this is cut in the middle.
@@ -60,9 +63,14 @@ module Tart
 
       # @return [String] the model-facing text, or {error:} on failure (house
       #   SafeExecute semantics: execution failures are error tool results,
-      #   cancellation always propagates).
+      #   cancellation always propagates). The client's Result lands here as
+      #   a value: a Failure maps to {error: payload.message} — the bytes
+      #   today's rescue wall produced.
       def execute(**arguments)
-        result = client.call_tool(@remote_name, arguments, timeout_ms: @timeout_ms)
+        outcome = client.call_tool(@remote_name, arguments, timeout_ms: @timeout_ms)
+        return {error: outcome.failure.message} if outcome.failure?
+
+        result = outcome.value!
         text = model_facing_text(result)
         result["isError"] ? {error: text} : text
       rescue RubyLLM::CancelledError

@@ -759,6 +759,48 @@ module Tart
       assert_equal "recovered again", agent.new_messages.last.content
     end
 
+    # -- I45 step-boundary classification (additive): the Bridge terminal is
+    # a Failure typed by the payload class; the three worker-error families
+    # surface today's classes through the public readbacks (agent_end[:error]
+    # + last_error) unchanged.
+
+    def test_worker_http_error_classifies_as_bad_request
+      @server.script([{type: :error, status: 400, message: "Extra inputs are not permitted"}])
+      agent, events = agent_on_kernel
+      run_agent(agent, "hi")
+
+      assert_kind_of RubyLLM::BadRequestError, agent.last_error
+      end_event = events.find { |e| e[:type] == :agent_end }
+      assert_kind_of RubyLLM::BadRequestError, end_event[:error]
+    end
+
+    def test_context_length_error_classifies_with_compaction_disabled
+      @server.script([{type: :error, status: 400,
+                       message: "This model maximum context length is 8 tokens"}])
+      agent, events = agent_on_kernel(compaction: {enabled: false})
+      run_agent(agent, "hi")
+
+      assert_kind_of RubyLLM::ContextLengthExceededError, agent.last_error
+      end_event = events.find { |e| e[:type] == :agent_end }
+      assert_kind_of RubyLLM::ContextLengthExceededError, end_event[:error]
+    end
+
+    def test_dead_endpoint_classifies_as_connection_failed
+      chat = RubyLLM.context do |config|
+        config.openai_api_key = "test"
+        config.openai_api_base = "http://127.0.0.1:1/v1"
+        config.request_timeout = 2
+        config.max_retries = 0
+      end.chat(model: "tart-test-model", provider: "openai",
+              protocol: :chat_completions, assume_model_exists: true)
+      agent, events = agent_on_kernel_with_chat(chat)
+      run_agent(agent, "hi")
+
+      assert_kind_of Faraday::ConnectionFailed, agent.last_error
+      end_event = events.find { |e| e[:type] == :agent_end }
+      assert_kind_of Faraday::ConnectionFailed, end_event[:error]
+    end
+
     private
 
     # Overflow scripts need more than one summary-able message in the
@@ -787,6 +829,16 @@ module Tart
       end
       wait_until { !thread.alive? }
       thread.join
+    end
+
+    # I45: the same kernel harness over a caller-built chat (the
+    # dead-endpoint classification pins a transport the mock server can't
+    # serve).
+    def agent_on_kernel_with_chat(chat)
+      events = []
+      events_mutex = Mutex.new
+      sink = ->(event) { events_mutex.synchronize { events << event } }
+      [Agent::Loop.new(chat:, tools: {}, on_event: sink), events]
     end
   end
 end

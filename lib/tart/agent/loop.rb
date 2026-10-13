@@ -8,6 +8,8 @@ require_relative "session"
 require_relative "status"
 require_relative "system_prompt"
 
+require "dry/monads"
+
 module Tart
   module Agent
     # The agent loop (port of pi's agent-loop.ts runAgentLoop/runLoop shape,
@@ -42,6 +44,10 @@ module Tart
     # the error). The compaction entry goes to the session recorder; the
     # chat history is replaced in place with [summary message, kept tail].
     class Loop
+      # I45: the step boundary consumes the Bridge's Result terminal (the
+      # pattern-matching vocabulary of the flow contract).
+      include Dry::Monads::Result::Mixin
+
       # @param chat [RubyLLM::Chat] configured for the endpoint (model,
       #   provider, protocol).
       # @param tools [Hash{String => RubyLLM::Tool}] the selected loadout
@@ -449,13 +455,17 @@ module Tart
         summary_chat = nil
         bridge = Bridge.new
         bridge.on_cancel { summary_chat&.cancel }
-        terminal = bridge.run(lambda { |_sink|
+        # Any Failure terminal (a failed call, or a cancelled one) aborts the
+        # compaction: nil, and the run continues (never stops the run).
+        case bridge.run(lambda { |_sink|
           summary_chat = build_summary_chat
           result = summary_chat.ask(prompt)
         }) { |_item| }
-        return nil if terminal.is_a?(Hash) && terminal[:type] == :error
-
-        result
+        in Success
+          result
+        in Failure
+          nil
+        end
       end
 
       def build_summary_chat
@@ -488,7 +498,22 @@ module Tart
         @stream_started = false
         terminal = bridge.run(work_callable) { |item| handle_item(item) }
         @sink = nil
-        record_terminal_error(terminal)
+        # The terminal Result branches by payload class (the flow contract's
+        # no-silent-swallow discipline: every arm explicit):
+        # - Failure(RubyLLM::CancelledError): today's cancelled shape — no
+        #   @last_error, no error emit; the nil message breaks the loop;
+        # - Failure(other): the worker's error lands in @last_error with the
+        #   same assistant message_end error emit as before;
+        # - Success(): the step's message (if any) already arrived as the
+        #   yielded :step item.
+        case terminal
+        in Failure(RubyLLM::CancelledError)
+          # cancelled: today's shape — no @last_error, no error emit
+        in Failure(err)
+          record_terminal_error(err)
+        in Success
+          # the step's message arrived as the yielded :step item
+        end
         @last_message
       end
 
@@ -502,10 +527,12 @@ module Tart
         }
       end
 
-      def record_terminal_error(terminal)
-        return unless terminal.is_a?(Hash) && terminal[:type] == :error
-
-        @last_error = terminal[:error]
+      # The error terminal's recording (the arm that used to sit behind the
+      # terminal-Hash check): the payload becomes @last_error — the loop's
+      # existing error branches (stopped_on_error?, recover_overflow?)
+      # classify it by class.
+      def record_terminal_error(error)
+        @last_error = error
         message = @last_message
         emit(type: :message_end, message:, error: true) if message&.role == :assistant
       end
