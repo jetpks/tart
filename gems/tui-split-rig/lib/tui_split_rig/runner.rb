@@ -78,6 +78,9 @@ module TuiSplitRig
       # landing after the scan is a race): the scenario's loaded-resource
       # set, byte-identical per app (the s9 instrument).
       stage_project_resources(home:, sandbox:, agent_dir:) if @scenario.stage_project_resources
+      # Same boot-race discipline for the memory set (the s11 instrument):
+      # pi scans its agent dir's extensions/ at startup.
+      stage_memory(app, home:, sandbox:, agent_dir:) if @scenario.stage_memory
 
       session = session_name(app, n)
       command = app == "pi" ? pi_command(home, agent_dir) : tart_command(sandbox, home, mock.port)
@@ -306,6 +309,80 @@ module TuiSplitRig
       Staged demo prompt body.
     MD
 
+    # The memory-recall staging (the s11 instrument, I47 Grounds §6): BOTH
+    # apps run with the owner's memory behavior ACTIVE. pi loads the owner's
+    # memory.ts VERBATIM — the rig fixture copied into the staged agent
+    # dir's extensions/; user-dir extensions auto-load with NO settings row
+    # (package-manager.ts:2446-2453; verified live: the "[Extensions]\n
+    # memory.ts" header row renders) — and reads its index under the agent
+    # dir (PI_MEMORY_HOME unset → ~/.pi/agent/memory, memory.ts:13). tart
+    # gets the SAME behavior from the core lane's native module, gated by
+    # the settings row {"memory" => true} deep-merged into the staged
+    # settings.json — never clobbering the compaction rows the
+    # context_window lever writes (the s7/s8 family coexist) — with its
+    # store under .tart/memory/<project-key>/. The project key is
+    # memory.ts's own rule (memory_project_key) — NOT the hard-coded
+    # "pi"/"tart" the frozen letter assumed: the sandboxes carry no .git
+    # but the walk ascends PAST them, and rig out dirs live inside the tart
+    # checkout (PHASE 0, verified live — with a hard-coded key the recall
+    # no-ops and the block never renders). The index bytes are the frozen
+    # Grounds §6 oracle content — both sides render them as the recall
+    # block; the bytes are the gate, not a registry class.
+    def stage_memory(app, home:, sandbox:, agent_dir: nil)
+      key = memory_project_key(sandbox)
+      if app == "pi"
+        extensions = File.join(agent_dir, "extensions")
+        FileUtils.mkdir_p(extensions)
+        FileUtils.cp(MEMORY_FIXTURE, File.join(extensions, "memory.ts"))
+        dir = File.join(agent_dir, "memory", key)
+      else
+        settings_path = File.join(home, ".tart", "settings.json")
+        FileUtils.mkdir_p(File.dirname(settings_path))
+        settings = File.exist?(settings_path) ? JSON.parse(File.read(settings_path)) : {}
+        File.write(settings_path, JSON.pretty_generate(deep_merge(settings, "memory" => true)))
+        dir = File.join(home, ".tart", "memory", key)
+      end
+      FileUtils.mkdir_p(dir)
+      File.write(File.join(dir, "MEMORY.md"), MEMORY_INDEX_MD)
+    end
+
+    # memory.ts's project-key rule, mirrored so the staged index lands
+    # under the key the extension ACTUALLY reads (memory.ts:29-44): walk up
+    # from the app's sandbox cwd for a .git entry (file or dir — worktrees
+    # use a file) and take its basename; outside any repo fall back to the
+    # sandbox basename. Both apps' sandboxes are siblings, so the walked
+    # key is the same per run — the parity holds in any checkout location.
+    def memory_project_key(sandbox)
+      start = File.expand_path(sandbox)
+      dir = start
+      loop do
+        return File.basename(dir) if File.exist?(File.join(dir, ".git"))
+
+        parent = File.dirname(dir)
+        return File.basename(start) if parent == dir
+
+        dir = parent
+      end
+    end
+
+    # Recursive right-biased hash merge (the staged-settings helper):
+    # nested mappings merge key-by-key, scalars replace.
+    def deep_merge(base, extra)
+      base.merge(extra) do |_key, old, new|
+        old.is_a?(Hash) && new.is_a?(Hash) ? deep_merge(old, new) : new
+      end
+    end
+
+    # The owner's memory.ts, byte-verbatim (gems/tui-split-rig/lib/
+    # tui_split_rig → the rig fixtures/ dir is two levels up).
+    MEMORY_FIXTURE = File.expand_path("../../fixtures/memory.ts", __dir__)
+    # The frozen Grounds §6 index bytes — the s11 scenario content, rendered
+    # by both sides as the recall block's markdown rows.
+    MEMORY_INDEX_MD = <<~MD.freeze
+      - [deploy](deploy.md): deploys via herdr pipeline, stage first
+      - [api-notes](api-notes.md): gateway streams SSE, no websockets
+    MD
+
     # Pane commands are exec-wrapped so the pane's default shell (fish)
     # replaces itself: pane_pid resolves to the app process, no fish
     # survives teardown, and no real HOME dotfile is ever touched (staged
@@ -428,7 +505,7 @@ module TuiSplitRig
     # methods are public for the same reason (the load pin asserts their
     # staged files and env).
     public :capture, :capture_styled, :settle, :teardown, :boot_session,
-      :stage_pi_agent, :stage_tart_home, :stage_project_resources, :session_name, :pi_command, :tart_command
+      :stage_pi_agent, :stage_tart_home, :stage_project_resources, :stage_memory, :session_name, :pi_command, :tart_command
 
     def pane_pid_tree(session)
       out = Open3.capture2("tmux", "list-panes", "-t", session, "-F", PANE_PID_FORMAT)[0].to_s

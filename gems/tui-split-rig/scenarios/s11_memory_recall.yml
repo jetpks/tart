@@ -1,0 +1,29 @@
+# S11 — the memory-recall parity scenario (I47, Specification §6): BOTH
+# apps run with the owner's memory behavior ACTIVE. pi loads the owner's
+# memory.ts VERBATIM from the rig fixture (fixtures/memory.ts — staged into
+# the agent dir's extensions/; user-dir extensions auto-load with NO
+# settings row, package-manager.ts:2446-2453); tart reads the same
+# behavior through the core lane's native module, gated by the settings
+# row {"memory": true} the runner merges into the staged settings.json.
+# stage_memory also writes the frozen index (the runner's MEMORY_INDEX_MD,
+# the Grounds §6 two-topic bytes) under each app's project key — computed
+# with memory.ts's own rule (walk up from the sandbox for a .git entry,
+# basename; fallback = the sandbox basename). The sandboxes carry no .git
+# but the walk ascends past them: rig out dirs live inside the tart
+# checkout, so the key is that checkout's basename (the frozen letter's
+# hard-coded "pi"/"tart" only holds outside a repo — PHASE 0 item; both
+# apps' sibling sandboxes always share the walked key, so the parity holds
+# in any checkout). The settled screen must
+# carry the recall block (user row, blank, the bold [memory-recall] label
+# row, blank, the padded markdown index rows) plus pi's [Extensions]
+# memory.ts header row, plain AND styled. RED at base BY DESIGN (tart
+# renders no recall block until the core lane's module lands); GREEN only
+# on the integrated tree — the recall bytes are the gate, not a registry
+# class.
+name: s11_memory_recall
+prompt: "hello"
+expected_requests: 1
+stage_memory: true
+responses:
+  - type: stream
+    content: "Memory recall staged; fixed reply for the scenario."
