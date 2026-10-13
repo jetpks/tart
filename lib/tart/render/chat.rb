@@ -206,13 +206,20 @@ module Tart
         # handleBashCommand): the coordinator routes into it — submit's
         # parse, escape's cancel, agent_end's deferred-record flush. The
         # last ctrl+c timestamp stays here (pi's lastSigintTime — the
-        # double-press exit window, handleCtrlC :6840).
+        # double-press exit window, handleCtrlC :6840). The I38 streaming
+        # sinks wire the running block's render state below (pi's
+        # BashExecutionComponent lives from before execution,
+        # :7000-7062): start before the task spawns, each bridged chunk,
+        # and the explicit clear at every terminal path.
         @user_bash = UserBash.new(
           kernel: kernel,
           busy_reader: -> { busy? },
           block_sink: ->(command, fields, excluded) { @transcript_state.enqueue_user_bash_block(command, **fields, excluded:) },
           record_sink: ->(message) { @agent&.record_bash_execution(message) },
-          line_sink: ->(text, fg:) { @transcript_state.enqueue_scrollback(text, fg:) }
+          line_sink: ->(text, fg:) { @transcript_state.enqueue_scrollback(text, fg:) },
+          stream_start_sink: ->(command, excluded) { start_user_bash_stream(command, excluded) },
+          stream_chunk_sink: ->(text) { append_user_bash_stream(text) },
+          stream_end_sink: -> { end_user_bash_stream }
         )
         @last_ctrl_c = nil
         # The copy confirmation's flash ({flash} — the message token) and
@@ -231,6 +238,14 @@ module Tart
         @reasoning = +""
         @busy = false
         @tool = nil
+        # The RUNNING user-bash block's render state (I38 — pi's
+        # BashExecutionComponent): the command/excluded, the accumulated
+        # chunk text (the appendOutput join IS this string buffer), and
+        # the bash loader's OWN time anchor (pi constructs one Loader per
+        # component — independent of the border status's anchor). Mutated
+        # only by the three sinks, under the surface mutex; nil = no run
+        # in flight.
+        @user_bash_stream = nil
         # The spinner's time anchor (pi's Loader frame clock): the glyph is
         # derived from the elapsed monotonic seconds at render
         # ({spinner_glyph}), never from the render count. nil until the
@@ -288,6 +303,13 @@ module Tart
       # @return [Boolean] whether an agent run is in flight.
       def busy?
         @mutex.synchronize { @busy }
+      end
+
+      # @return [Boolean] whether a user-bash run's live rows are on
+      #   screen (the animate gate's second arm — @busy stays false: a
+      #   bash run never lights the border's Working status).
+      def user_bash_streaming?
+        @mutex.synchronize { !@user_bash_stream.nil? }
       end
 
       # @return [String] the input line buffer (the editor's).
@@ -380,8 +402,11 @@ module Tart
           widget = build_widget
         end
         # Keep frames deadline-paced while the agent works (spinner, live
-        # region); idle goes event-driven again on agent_end.
-        @kernel.animate(duration: BUSY_FRAME_SECONDS) if busy?
+        # region) OR a user-bash run streams (the bash loader's glyph must
+        # advance between chunks — pi's Loader ticks requestRender on its
+        # own 80 ms interval, loader.ts:79-84); idle goes event-driven
+        # again on agent_end / stream end.
+        @kernel.animate(duration: BUSY_FRAME_SECONDS) if busy? || user_bash_streaming?
         widget
       end
 
@@ -1441,7 +1466,7 @@ module Tart
         [[glyph, :spinner], [" #{message}", :message]]
       end
 
-      def spinner_glyph
+      def spinner_frame(anchor)
         # pi loader.ts — the frame displayed at time t is
         # frames[floor((t − anchor)/interval) mod n] whatever the render
         # cadence: pi's setInterval advances the frame on TIME (+
@@ -1449,10 +1474,17 @@ module Tart
         # monotonic clock at each already-animated frame (the
         # BUSY_FRAME_SECONDS cadence is unchanged) — no timer task. nil
         # anchor → frame 0 (pi setIndicator resets currentFrame).
-        return SPINNER.first unless @spinner_started_at
+        return SPINNER.first unless anchor
 
-        elapsed = @clock.call - @spinner_started_at
+        elapsed = @clock.call - anchor
         SPINNER[(elapsed / SPINNER_INTERVAL_SECONDS).floor % SPINNER.size]
+      end
+
+      # The border status's glyph — its own anchor ({restart_spinner!}).
+      # The bash-run loader shares the MATH, never the anchor (pi: one
+      # Loader per component).
+      def spinner_glyph
+        spinner_frame(@spinner_started_at)
       end
 
       # pi's per-indicator frame-0 reset (loader.ts setIndicator): every
@@ -1535,7 +1567,9 @@ module Tart
       # The transcript buffer's display lines — completed content plus the
       # live region. The transcript area windows this ({transcript_widget})
       # and the mouse machinery addresses it (selection points are buffer
-      # rows).
+      # rows). Public as the live region's test readback — the
+      # {transcript_lines} parallel for kernel-driven tests that pin rows
+      # the drawn screen's window may clip.
       def display_lines
         @transcript_state.lines + live_lines(viewport_width)
       end
@@ -1558,6 +1592,30 @@ module Tart
       # content. The blank appearing only at completion was the 2nd-pass
       # shift (the row insert moved streaming content down a line).
       def live_lines(width)
+        lines = assistant_live_lines(width)
+        lines.concat(user_bash_live_rows(width))
+        lines
+      end
+
+      # The assistant streaming region's rows (item 3, pi
+      # interactive-mode.ts:3519-3535 + assistant-message.ts:107-109): the
+      # reasoning block renders as DIM MARKDOWN through the shared
+      # converter ({Transcript.reasoning_lines} — the thinkingText+italic
+      # prose default over the markdown theme, pi assistant-message.ts
+      # :99-176; the I13 markdown-of-reasoning cut retired by the owner's
+      # live finding) and the CONTENT re-renders as markdown on every
+      # delta — pi re-renders the whole streaming message each update, no
+      # incremental cleverness. The transcript area's tail clip bounds it
+      # (deltas append; the window slides).
+      #
+      # The region renders the assistant message's SETTLED shape from the
+      # first delta (pi updateContent runs while streaming — the leading
+      # Spacer(1) :103-105 and the between-runs Spacer :172-174 are
+      # component children, not post-hoc inserts): leading blank, the
+      # reasoning rows, a blank when content follows the reasoning, the
+      # content. The blank appearing only at completion was the 2nd-pass
+      # shift (the row insert moved streaming content down a line).
+      def assistant_live_lines(width)
         return [] if @live.empty? && @reasoning.empty?
 
         lines = [Panel.blank_line]
@@ -1565,6 +1623,63 @@ module Tart
         lines << Panel.blank_line if !@reasoning.empty? && !@live.empty?
         lines.concat(Transcript.markdown_lines(@live, width)) unless @live.empty?
         lines
+      end
+
+      # The RUNNING user-bash block's rows (I38 — pi's chat/pending
+      # placements, Grounds 6: appended BELOW the transcript content and
+      # BELOW any streaming assistant rows). Composed fresh per frame —
+      # the toggle state and the glyph read at composition time, pi's
+      # updateDisplay discipline (mid-run ctrl+o re-composes, Grounds
+      # 6f). Own leading blank (the block head's); an idle run renders
+      # nothing here.
+      def user_bash_live_rows(width)
+        state = @user_bash_stream
+        return [] unless state
+
+        BashBlock.running_user_bash_rows(state[:command], width,
+          content: state[:content], excluded: state[:excluded],
+          spinner_glyph: spinner_frame(state[:spinner_started_at]),
+          expanded: @transcript_state.tool_output_expanded)
+      end
+
+      # --- the user-bash live stream's sinks (I38 — the UserBash seam;
+      # pi handleBashCommand :7000-7062: the component added before
+      # execution, appendOutput + ui.requestRender per chunk, setComplete
+      # in place) ---
+
+      # Reactor/frame-loop fibers only (the bridge yields chunks on the
+      # reactor — Grounds 5); all render-state mutation stays under the
+      # surface mutex, exactly the agent-event discipline.
+      def start_user_bash_stream(command, excluded)
+        @mutex.synchronize do
+          @user_bash_stream = {command:, excluded:, content: +"", spinner_started_at: @clock.call}
+        end
+        # pi adds the component then requestRender (:7033-7034) — the
+        # header + loader row paint before the first chunk.
+        @kernel.request_draw
+      end
+
+      # The appendOutput join is the string buffer itself: each chunk
+      # appends (CR already removed by the seam — Grounds 2), an
+      # unterminated trailing line continues on the next chunk's first
+      # piece. The draw per chunk is pi's requestRender (:7050-7057).
+      def append_user_bash_stream(text)
+        appended = false
+        @mutex.synchronize do
+          # A late chunk after the clear (a cancelled run's partial chunks
+          # may still push after the reactor-side wait died) is dropped.
+          appended = !@user_bash_stream.nil?
+          @user_bash_stream[:content] << text if appended
+        end
+        @kernel.request_draw if appended
+      end
+
+      # The explicit terminal clear (every path — completion, worker
+      # error, cancel — notifies exactly once; idempotent). No draw: the
+      # caller's own request_draw paints the settled block in the same
+      # frame the live rows vanish (AC2).
+      def end_user_bash_stream
+        @mutex.synchronize { @user_bash_stream = nil }
       end
 
       # /thinking's seam (pi selectThinkingLevel :5165-5177): the session
@@ -1804,7 +1919,7 @@ module Tart
         @kernel.request_draw
       end
 
-      public :set_tool_output_expanded
+      public :set_tool_output_expanded, :display_lines
     end
   end
 end

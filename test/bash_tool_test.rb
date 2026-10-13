@@ -141,6 +141,56 @@ module Tart
       assert_no_probe(marker)
     end
 
+    # ---- the chunk seam (I38 — pi executeBashWithOperations' onChunk,
+    # bash-executor.ts:96-98: per pipe read, CR-REMOVED text). ----
+
+    # AC3: the joined callback stream equals the returned content after
+    # its CR-strip — the seam hands the same discipline the settled bytes
+    # carry (Grounds 2).
+    def test_run_user_streamed_chunks_join_to_the_returned_content
+      chunks = []
+      outcome = tool.run_user("printf 'alpha\\n'; sleep 0.2; printf 'beta\\r\\ngamma'",
+        on_chunk: ->(text) { chunks << text })
+
+      assert_operator chunks.length, :>=, 2, "both pipe reads fired the seam"
+      assert_equal outcome.content, chunks.join,
+        "the joined callback stream equals the returned content after its CR-strip"
+      refute_includes chunks.join, "\r", "CR removed per chunk, not just at the snapshot"
+    end
+
+    # The seam fires during the run (pi appendOutput + requestRender per
+    # chunk, interactive-mode.ts:7050-7057) — not once at the return.
+    def test_run_user_fires_the_seam_midflight_not_after_the_return
+      seen_after_return = nil
+      returned = false
+      outcome = tool.run_user("printf 'early\\n'; sleep 0.3; printf 'late\\n'",
+        on_chunk: ->(text) { seen_after_return ||= text if returned })
+      returned = true
+
+      assert_includes outcome.content, "early"
+      assert_nil seen_after_return, "chunks fired before run_user returned"
+    end
+
+    # A CR-only chunk strips to nothing — the joined stream is unaffected
+    # (the chat-level append is inert on "").
+    def test_run_user_cr_only_chunk_strips_to_nothing
+      chunks = []
+      tool.run_user("printf 'a\\rb'", on_chunk: ->(text) { chunks << text })
+
+      assert chunks.all? { |text| !text.include?("\r") }, "CR removed per chunk (AC3)"
+      assert_equal "ab", chunks.join
+    end
+
+    # The seam rides run_user alone: the model-facing execute passes
+    # nothing (its render is the I34 pending block — pi's tool path
+    # streams no chunk callback either).
+    def test_execute_takes_no_chunk_callback
+      assert_includes Tools::Bash.instance_method(:run_user).parameters.flatten, :on_chunk,
+        "the on_chunk seam rides run_user"
+      refute_includes Tools::Bash.instance_method(:execute).parameters.flatten, :on_chunk,
+        "execute passes nothing — no callback can fire on the model-facing path"
+    end
+
     # AC3: fast commands pay no poll quantum — exit detection is evented
     # (reaper thread + Queue), so `echo` rounds to Took 0.0s like pi.
     def test_fast_commands_pay_no_poll_quantum

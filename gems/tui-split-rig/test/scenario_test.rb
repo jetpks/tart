@@ -133,6 +133,21 @@ module TuiSplitRig
       assert_nil scenario.context_window, "the probe needs no window shrink"
     end
 
+    # The I38 user-bash streaming probe's driver (Grounds 7): the
+    # !-command emits a line per second for ~3 s (pre-settle frames carry
+    # the loader + output rows against the 0.5 s cadence); the inert
+    # scripted reply is never requested (a user bash runs no model turn —
+    # the loader constraints make one ride along).
+    def test_loads_the_shipped_probe_user_bash_scenario
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/probe_user_bash.yml"))
+      assert_equal "probe_user_bash", scenario.name
+      assert_equal '!for i in 1 2 3; do echo "probe line $i"; sleep 1; done', scenario.prompt
+      assert_equal 1, scenario.expected_requests
+      assert_equal 1, scenario.responses.size
+      assert_match(/probe line/, scenario.prompt, "the probe's output rows echo the header's loop body")
+      assert_nil scenario.context_window, "the probe needs no window shrink"
+    end
+
     def test_context_window_is_optional_and_defaults_to_nil
       path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
       File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
