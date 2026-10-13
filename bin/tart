@@ -314,14 +314,21 @@ module Tart
       # notification records as a custom_message entry on THIS session
       # (no model turn, no extra stdout). The child artifacts stay on
       # disk (result.json).
-      if manager&.outstanding?
-        manager.drain
+      # JUDGE FIX (post-merge, recorded in the verdict): flush AFTER
+      # shutdown, unconditionally — the old `if outstanding?` guard lost
+      # every notification whose child completed during the parent's own
+      # run (queued but never flushed), and any run settling between the
+      # old flush and shutdown. shutdown settles every still-running run
+      # (stop ladder → terminal state → notification queued under the
+      # settle mutex), so drain → shutdown → flush captures ALL of them.
+      if manager
+        manager.drain if manager.outstanding?
+        manager.shutdown
         hooks.pending_next_turn.each do |pending|
           recorder.append_custom_message(custom_type: pending[:custom_type], content: pending[:content],
                                          display: pending[:display])
         end
       end
-      manager&.shutdown
       exit code
     end
 

@@ -261,6 +261,38 @@ module Tart
       assert kernel.calls.size >= 1, "the completion kick went through kernel.async"
     end
 
+    def test_terminal_state_implies_the_notification_is_queued
+      # JUDGE PIN (post-merge fix, recorded in the verdict): the drain
+      # contract leg B rides on — the moment a run is observably terminal
+      # (`outstanding?` false), its completion notification is ALREADY on
+      # the hooks queue. Before the fix, settle_run flipped the state
+      # inside its mutex but queued the notification after releasing it,
+      # so a drain poll landing in that window flushed an empty queue
+      # (the parent exited without recording the custom_message — leg B
+      # flaked 1-in-3 under the loaded rake suite). The notify now runs
+      # under the same mutex as the flip, making the invariant atomic.
+      @server.script([{type: :stream, content: "invariant answer"}])
+      manager = new_manager
+      manager.spawn_run(agent: "worker", task: "invariant", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+
+      # Hammer outstanding? until the run is observably terminal; at THAT
+      # first observation the queue must already carry the notification
+      # (atomic under the fix; any hit on the unfixed code is the race).
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
+      settled = false
+      until settled || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        next if manager.outstanding?
+
+        settled = true
+        pend = @hooks.pending_next_turn
+        refute_empty pend, "terminal observed but the notification was not yet queued (the settle/notify window)"
+        assert pend.any? { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
+      end
+      assert settled, "the run never settled within the window"
+      wait_terminal(manager, manager.runs.first[:id])
+      assert_equal :completed, manager.runs.first[:state]
+    end
+
     def test_failed_run_notification_display_true_with_error_line
       @server.script([{type: :error, status: 400, message: "nope"}])
       manager = new_manager

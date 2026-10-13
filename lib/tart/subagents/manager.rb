@@ -467,8 +467,9 @@ module Tart
 
       # The terminal processor (§2.1/§2.2): read the child's output,
       # write result.json BEFORE the terminal status flip, then flip the
-      # in-memory state; async runs notify (§2.6) after the flip so
-      # `outstanding? == false` implies the notification is queued.
+      # in-memory state; async runs notify (§2.6) under the SAME mutex as
+      # the flip so `outstanding? == false` implies the notification is
+      # queued (no observation window between the two).
       def settle_run(record)
         @mutex.synchronize do
           return record if terminal?(record[:state])
@@ -510,9 +511,18 @@ module Tart
 
           record[:state] = state
           record[:timed_out] = timed_out
+          # JUDGE FIX (post-merge, recorded in the verdict): the notification
+          # must queue INSIDE this mutex — the state flip above was observable
+          # before send_next_turn ran, so `drain`'s outstanding? poll could
+          # return in that window and the print flush would see an empty
+          # queue (leg B flaked 1-in-3 under the loaded rake suite exactly
+          # here). Hooks#send_next_turn is a leaf queue-append (own mutex, no
+          # callbacks) — safe under this lock. With this, `outstanding? ==
+          # false` REALLY implies the notification is queued, as the comment
+          # below always claimed.
+          notify_completion(record) if record[:async]
         end
         close_exit_pipe(record)
-        notify_completion(record) if record[:async]
         record
       end
 
