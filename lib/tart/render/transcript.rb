@@ -27,8 +27,25 @@ module Tart
       # An expandable block riding the scrollback queue: the rows built at
       # the CURRENT toggle state + the builder (re-invoked with the new
       # state at the ctrl+o toggle; the drain records the transcript
-      # range). pi's expandable tool children.
+      # range). pi's expandable tool children — and, since I33, the MOTD
+      # header block + the loaded-resource sections.
       MarkedRegion = Struct.new(:rows, :builder)
+
+      # A persistent status waiting for the flush (pi showStatus,
+      # interactive-mode.ts:3824-3842): a Spacer(1) + dim one-pad text row
+      # at the chat container's tail, a subsequent status REPLACING the
+      # text in place while the pair is still the tail. The text wraps at
+      # flush time (the live width) — the row count follows pi's Text.
+      StatusEntry = Struct.new(:text)
+
+      # The live pending tool-call registration (I34 — pi's pendingTools
+      # Map, interactive-mode.ts:3532): the [name, args] identity the
+      # finalize pairs against, the queued {MarkedRegion} (identity — the
+      # drain links it to its expandable registration), and the
+      # registration hash once the region reached the buffer. nil = no
+      # tool mid-flight (execution is sequential — ruby_llm 2.1.0
+      # tool_concurrency defaults false).
+      PendingTool = Struct.new(:tool, :region, :registration)
 
       # The tool name that dispatches to pi's shell renderers (bash.ts:115
       # createShellRenderers — shared by bash and powershell; the port
@@ -62,12 +79,17 @@ module Tart
         @transcript = []
         # The ctrl+o global tool-output toggle (pi toolOutputExpanded,
         # setToolsExpanded — interactive-mode.ts:6810-6826): every
-        # expandable block rebuilds in place; the border status reports
+        # expandable block rebuilds in place; the status row reports
         # (coordinator-side). The expandable registry tracks each block's
         # transcript row range + row builder (recorded at drain time — the
         # scrollback is a cross-thread queue, the transcript is flat).
         @tool_output_expanded = false
         @expandable_blocks = []
+        # The tail status pair's Line objects (the replace-in-place check
+        # — pi's lastStatusSpacer/lastStatusText comparison; identity
+        # survives expandable rebuilds above the pair, which shift indexes
+        # but never row objects).
+        @status_pair = nil
         # pi's chat container is a separate component from the header
         # (interactive-mode.ts:633-639); its leading-spacer gate (children
         # non-empty, :3930-3931) reads this — any chat region since the
@@ -85,9 +107,10 @@ module Tart
       # to flip — pi's setToolsExpanded call site).
       attr_reader :tool_output_expanded
 
-      # A pre-built region pushed raw (the MOTD block, the compaction
-      # line's blank, the flushed reasoning rows): no container gate —
-      # none of the three base call sites rides one.
+      # A pre-built region pushed raw (the compaction line's blank, the
+      # flushed reasoning rows): no container gate — none of the base call
+      # sites rides one. (The MOTD blocks ride {push_expandable} since
+      # I33 — they flip.)
       def enqueue_region(lines)
         @scrollback << lines
       end
@@ -176,28 +199,83 @@ module Tart
       # I18): bash owns the shell shapes (I17 — carries the duration),
       # write/read their file-tool shapes, everything else the generic ⎿
       # line. Shared by the live and replay paths (I17's shape-sharing
-      # ruling); +duration+ is nil on replay (the recorded gap).
+      # ruling); +duration+ is nil on replay (the recorded gap). The
+      # finalize replaces the pending block with exactly these rows
+      # (same dispatch, same builders) — the settled bytes never moved.
       def enqueue_tool_block(name, args, result, duration)
         args = {} unless args.is_a?(Hash)
-        case name
-        when BASH_TOOL
-          # pi's bash tool marks a nonzero exit an isError result (the
-          # s4 capture: the failed `ls` block renders toolErrorBg) — the
-          # port's Tools::Bash gates identically (bash.rb:126); carry the
-          # flag so the panel picks the error bg.
-          error = result.is_a?(Hash) && result[:error]
-          enqueue_bash_block(args["command"], ToolBlock.tool_result_text(result), duration, error:)
-        when WRITE_TOOL
-          enqueue_write_block(args, result)
-        when READ_TOOL
-          enqueue_read_block(args, result)
+        builder = tool_block_builder(name, args, result, duration)
+        @chat_started = true
+        if builder
+          push_expandable(builder)
         else
           # Every tool block opens with a leading blank (pi
           # tool-execution.ts:85 — the constructor's Spacer), then the
           # bg'd contentText panel (the Box shape over ToolBlock.tool_line).
-          @chat_started = true
           @scrollback << [Panel.blank_line, *ToolBlock.generic_panel_rows(name, result, viewport_width)]
         end
+      end
+
+      # The PENDING tool block's enqueue (I34 — pi renders the running
+      # call's block immediately under toolPendingBg: the component
+      # constructs at :tool_execution_start with theme.bg("toolPendingBg")
+      # and rides the chat container mid-flight, tool-execution.ts:90-91
+      # + updateDisplay :271-277 isPartial): the settled family truncated
+      # to the call rows ({pending_tool_rows}), pushed through the
+      # scrollback queue like any region — order preserved vs queued
+      # submissions/statuses, never spliced ahead. The block rides the
+      # expandable registry with a CONSTANT-SIZE builder (the pending
+      # shape reads no toggle state — a mid-flight ctrl+o rebuilds it
+      # identically; the finalize swaps the builder for the real one).
+      # A second enqueue while one is live appends sanely and SUPERSEDES
+      # the registration (unreachable under sequential execution —
+      # ruby_llm tool_concurrency defaults false; the superseded block
+      # renders on as a plain expandable until its own end appends).
+      def enqueue_pending_tool_block(name, args)
+        args = {} unless args.is_a?(Hash)
+        @chat_started = true
+        region = MarkedRegion.new(pending_tool_rows(name, args), ->(_expanded) { pending_tool_rows(name, args) })
+        @scrollback << region
+        @pending_tool = PendingTool.new([name, args], region)
+      end
+
+      # The tool end's settle (I34 — pi :tool_execution_end's
+      # updateResult mutates the SAME component in place, never a second
+      # block, interactive-mode.ts:3645-3652): the live pending block is
+      # replaced IN PLACE with the rows {enqueue_tool_block} composes —
+      # same dispatch, same builders, the toggle state read at
+      # replacement time — and the expandable registry re-points to the
+      # final block at the updated start. With NO live pending
+      # registration (the replay path never engages the pending
+      # machinery; also the superseded-registration case) this falls
+      # back to today's append.
+      def finalize_tool_block(name, args, result, duration)
+        args = {} unless args.is_a?(Hash)
+        pending = @pending_tool
+        return enqueue_tool_block(name, args, result, duration) unless pending && pending.tool == [name, args]
+
+        @pending_tool = nil
+        builder = tool_block_builder(name, args, result, duration)
+        final_rows = builder ? builder.(@tool_output_expanded) : generic_tool_rows(name, result)
+        if pending.registration
+          replace_flushed_pending(pending.registration, final_rows, builder)
+        else
+          swap_queued_pending(pending.region, final_rows, builder)
+        end
+      end
+
+      # The orphaned pending block's finalize (I34 — pi's message_end
+      # abort/error arm loops pendingTools with updateResult({content:
+      # [errorMessage], isError: true}, interactive-mode.ts:3573-3586):
+      # the SAME component re-renders the call rows + the error text
+      # under toolErrorBg). Routing the synthetic error result through
+      # the settle dispatch is exactly that re-render — the settled
+      # error block, no second composition path.
+      def finalize_pending_as_error(text)
+        pending = @pending_tool
+        return unless pending
+
+        finalize_tool_block(pending.tool.first, pending.tool.last, {error: text}, nil)
       end
 
       # The compaction panel enqueue (pi addMessageToChat case
@@ -211,15 +289,40 @@ module Tart
         push_expandable(->(expanded) { compaction_panel_rows(summary, tokens_before, expanded) })
       end
 
+      # The custom-message block (I47 — pi CustomMessageComponent,
+      # custom-message.ts:41-115, default rendering — memory.ts registers
+      # no custom renderer): the component's own Spacer(1), then the Box
+      # (customMessageBg, paddingX = outputPad, paddingY 1): the bold
+      # [<customType>] label row in customMessageLabel, the Box's inner
+      # blank row, the content through the existing markdown path in
+      # customMessageText (one-column padded, links render `text (href)`),
+      # the Box's bottom blank row. A plain region — the default path
+      # never reads the expand state. The Grounds §6 staged-pi capture is
+      # the row-shape oracle; the s11 gate is the byte judge.
+      def enqueue_custom_block(custom_type, content)
+        content = "" unless content.is_a?(String) # malformed-entry tolerance
+        @chat_started = true
+        bg = Theme[:custom_message_bg]
+        label = TUI.span("[#{custom_type}]", fg: Theme[:custom_message_label], modifiers: [:bold], bg: bg)
+        rows = [Panel.panel_blank_line(viewport_width, bg), # Box paddingY top
+                Panel.padded_spans_row([label], viewport_width, bg),
+                Panel.panel_blank_line(viewport_width, bg)] # the Box's inner Spacer(1)
+        rows.concat(Transcript.markdown_lines(content, viewport_width,
+          prose_fg: Theme[:custom_message_text], bg: bg))
+        rows << Panel.panel_blank_line(viewport_width, bg) # Box paddingY bottom
+        @scrollback << [Panel.blank_line, *rows]
+      end
+
       # The resume replay (item 3, pi renderSessionEntries, interactive-
       # mode.ts :3900-3975): the recorded entries through the live-turn
       # shapes — user echoes, assistant thinking-then-content markdown,
       # tool blocks (the assistant's recorded tool_calls joined to their
       # recorded results), compaction summaries — as the entries carry
-      # them. Recorded gaps (itemized, never invented): thinking is
-      # stripped before record (agent/loop.rb strip_thinking_replay), so no
-      # reasoning block replays; non-string (multimodal) content is
-      # skipped; usage only when the provider reported it.
+      # them. Recorded gaps (itemized, never invented): non-string
+      # (multimodal) content is skipped; usage only when the provider
+      # reported it. Since I36 the recorded `thinking` REPLAYS as the dim
+      # markdown block ({replay_assistant}) — the old
+      # strip-thinkings-before-record is gone.
       def replay_entries(entries, update_footer: true, populate_history: true)
         results = entries.filter_map do |entry|
           next unless entry.is_a?(Hash) && entry["type"] == "message"
@@ -232,36 +335,61 @@ module Tart
       end
 
       # Completed lines move into the transcript buffer (pi: completed
-      # content into scrollback). Entries are final display Lines — or a
+      # content into scrollback). Entries are final display Lines — a
       # {MarkedRegion}: an expandable block, whose transcript range is
       # recorded at drain time so the ctrl+o toggle can rebuild it in
-      # place (pi setToolsExpanded's child sweep). The inline
-      # insert_before path is retired from the interactive surface — the
-      # buffer is drawn wholesale every frame.
+      # place (pi setToolsExpanded's child sweep) — or a {StatusEntry}:
+      # the replace-or-append status pair. The inline insert_before path
+      # is retired from the interactive surface — the buffer is drawn
+      # wholesale every frame.
       def flush_scrollback
         until @scrollback.empty?
           item = @scrollback.pop
-          if item.is_a?(MarkedRegion)
-            @expandable_blocks << {start: @transcript.size, size: item.rows.length,
-                                   builder: item.builder}
+          case item
+          when MarkedRegion
+            registered = {start: @transcript.size, size: item.rows.length,
+                          builder: item.builder}
+            @expandable_blocks << registered
             @transcript.concat(item.rows)
+            # The pending block's drain links the region to its registry
+            # entry — the finalize replaces through this registration.
+            @pending_tool.registration = registered if @pending_tool&.region&.equal?(item)
+          when StatusEntry
+            flush_status(item.text)
           else
             @transcript.concat(item)
           end
         end
       end
 
+      # A persistent status row (pi showStatus :3824-3842 — the three
+      # sites: thinking-level selection, model selection, the tool-output
+      # toggle). Never transient, never border chrome.
+      def enqueue_status(text)
+        return if text.nil? || text.empty?
+
+        @scrollback << StatusEntry.new(text)
+      end
+
       # The ctrl+o toggle's state half (pi setToolsExpanded's child sweep):
       # every registered block rebuilds collapsed↔expanded in place.
-      # Returns whether the state changed — the coordinator reports the
-      # border status and requests the draw only then (the base gate).
+      # Blocks register in ascending start order (the drain appends at the
+      # tail), so the walk carries the row DELTA: an earlier block's size
+      # change shifts every later block's start (the boot header +
+      # sections flip exposed the stale-start latent). Returns whether the
+      # state changed — the coordinator reports the status row and
+      # requests the draw only then (the base gate).
       def set_tool_output_expanded(expanded)
         return false if expanded == @tool_output_expanded
 
         @tool_output_expanded = expanded
+        delta = 0
         @expandable_blocks.each do |registered|
+          start = registered[:start] + delta
           rows = registered[:builder].call(expanded)
-          @transcript[registered[:start], registered[:size]] = rows
+          @transcript[start, registered[:size]] = rows
+          delta += rows.length - registered[:size]
+          registered[:start] = start
           registered[:size] = rows.length
         end
         true
@@ -269,15 +397,17 @@ module Tart
 
       # The /new + resume shared reset's component half (the coordinator's
       # {Chat#clear_transcript} component reset — the {Footer#reset_usage}
-      # I24 precedent): the buffer, the queue and the expandable registry
-      # drop. The chat container emptied with the transcript (pi
-      # renderCurrentSessionState, interactive-mode.ts:2210-2216) — the
-      # leading-spacer gate restarts. The ctrl+o toggle state survives
-      # (base behavior).
+      # I24 precedent): the buffer, the queue, the expandable registry and
+      # the status pair drop. The chat container emptied with the
+      # transcript (pi renderCurrentSessionState, interactive-mode.ts
+      # :2210-2216) — the leading-spacer gate restarts. The ctrl+o toggle
+      # state survives (base behavior).
       def reset
         @transcript = []
         @scrollback.clear
         @expandable_blocks.clear
+        @pending_tool = nil
+        @status_pair = nil
         @chat_started = false
       end
 
@@ -289,15 +419,31 @@ module Tart
       # Shared by the completion path and the live region (item 3: pi
       # re-renders the whole streaming message as markdown on every
       # update — interactive-mode.ts:3519-3535, assistant-message.ts
-      # :107-109).
-      def self.markdown_lines(text, width, prose_fg: nil, bg: nil)
+      # :107-109) — and, since I37, by the reasoning block
+      # ({reasoning_lines}).
+      #
+      # +prose_fg+ recolors the PROSE spans (the panel's custom-text
+      # override). +prose_modifiers+ unions modifiers into the same spans
+      # (the reasoning default style — pi's defaultTextStyle {color,
+      # italic}: applyDefaultStyle reaches the text tokens and the
+      # strong/em/del runs, never the themed structure — markdown.ts
+      # :382-413/:683-698 vs :477-493/:567-585/:695-697). "Prose" is the
+      # CONVERTER's nil-fg vocabulary — plain text, bold/em/del runs,
+      # list-item text; every structure span (code/heading/link/quote/
+      # list-bullet/code-block — a non-nil fg from Render::Markdown::FG)
+      # gains nothing.
+      def self.markdown_lines(text, width, prose_fg: nil, bg: nil, prose_modifiers: nil)
         content_width = width - Panel::OUTPUT_PAD.length * 2
         rows = Render::Markdown.rows(text, width: content_width).flat_map { |row| Text.wrap_row(row, content_width) }
         rows.map do |row|
           themed = row.map do |span|
             fg = Theme.md_fg(span.fg)
-            fg = prose_fg if fg.nil? && prose_fg # the panel's prose-color override
-            Render::Markdown::Span.new(text: span.text, fg:, modifiers: span.modifiers)
+            modifiers = span.modifiers
+            if span.fg.nil?
+              fg = prose_fg if prose_fg
+              modifiers = (modifiers | prose_modifiers) if prose_modifiers
+            end
+            Render::Markdown::Span.new(text: span.text, fg:, modifiers:)
           end
           bg ? panel_markdown_row(themed, bg, width) : Panel.padded_row(themed)
         end
@@ -320,11 +466,19 @@ module Tart
         count.to_i.to_s.gsub(/(\d)(?=(\d{3})+$)/, '\\1,')
       end
 
-      # Reasoning text as dim italic display lines (pi assistant-message.ts
-      # :140-150: thinkingText fg, italic; markdown-of-reasoning is cut,
-      # plain dim text — itemized reduction).
+      # Reasoning text as DIM MARKDOWN (pi assistant-message.ts:99-176:
+      # the thinking runs render as a Markdown component over
+      # defaultTextStyle {color: thinkingText, italic: true}): the SAME
+      # converter as the content, the prose default riding the nil-fg
+      # spans ({markdown_lines} +prose_fg+/+prose_modifiers+ — structure
+      # keeps its theme fns). Stripped first (pi thinking.trim(),
+      # assistant-message.ts:125 — leading/trailing delta whitespace no
+      # longer renders blank rows). Shared by all three sites — the live
+      # region, the completion, the replay (one path: the settled-shape
+      # discipline). The I13 "markdown-of-reasoning is cut" ruling
+      # retired (I37 — the owner's live finding is the ruling).
       def self.reasoning_lines(text, width)
-        Text.wrap(text, width - Panel::OUTPUT_PAD.length * 2).map { |line| TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(line, fg: Theme[:thinkingText], modifiers: [:italic])]) }
+        markdown_lines(text.strip, width, prose_fg: Theme[:thinkingText], prose_modifiers: [:italic])
       end
 
       private
@@ -332,6 +486,30 @@ module Tart
       # The threaded width seam: the surface's viewport width.
       def viewport_width
         @width_reader.call
+      end
+
+      # pi showStatus (:3824-3842): a Spacer(1) + dim one-pad text row at
+      # the tail — REPLACED in place while that pair is still the tail
+      # (the lastStatusSpacer/lastStatusText comparison), else appended.
+      # The pair arms the leading-spacer gate: pi's gate reads the chat
+      # container's children, and the status children count.
+      def flush_status(text)
+        rows = [Panel.blank_line]
+        rows.concat(Text.wrap(text, viewport_width - Panel::OUTPUT_PAD.length * 2).map do |row|
+          TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(row, fg: Theme[:dim])])
+        end)
+        @transcript.pop(@status_pair.size) if status_at_tail?
+        @transcript.concat(rows)
+        @status_pair = rows
+        @chat_started = true
+      end
+
+      # Whether the recorded status pair is still the transcript's tail
+      # (by Line identity — rebuilds above shift indexes, not objects).
+      def status_at_tail?
+        pair = @status_pair
+        !pair.nil? && pair.size <= @transcript.size &&
+          pair.each_with_index.all? { |line, i| @transcript[-pair.size + i].equal?(line) }
       end
 
       # The submitted prompt's echo (item 4, pi UserMessageComponent,
@@ -450,6 +628,11 @@ module Tart
           # chronological position (renderSessionEntries case
           # compactionSummary, riding the global expand state).
           enqueue_compaction_panel(entry["summary"], entry["tokensBefore"])
+        when "custom_message"
+          # pi renderSessionEntries' custom_message case (the resume
+          # replay renders the recorded recall — pi renders it from the
+          # session entries; display-gated like the live path).
+          enqueue_custom_block(entry["customType"], entry["content"]) if entry["display"]
         end
       end
 
@@ -517,61 +700,97 @@ module Tart
         @scrollback << Transcript.markdown_lines(text, viewport_width)
       end
 
-      # The bash tool block (I17 — pi's shell renderer over the tool-turn
-      # component): the constructor's Spacer (1 blank, tool-execution.ts:85),
-      # the render box's paddingY (1 blank above and below the children,
-      # tool-execution.ts:87 Box(1,1)), then the children — the bold
-      # bashMode `$ <command>` header (bash.ts:36 theme.bold over
-      # formatShellCall; colorKey bashMode — the port carries no
-      # context-exclusion state, the dim variant is unreachable, itemized),
-      # the output lines blank-separated from the header (bash.ts:78-84 —
-      # the Text children's leading "\n") collapsed to the preview's last
-      # rows plus the earlier-lines hint (I19 — {BashBlock.collapse_bash_preview};
-      # the truncation notice rides after, {BashBlock.split_truncation_notice}), and
-      # the muted `Took <duration>` line (bash.ts:105-109 — a nil/absent
-      # duration, the replay path, renders none; the recorded gap is
-      # itemized, never invented).
-      def enqueue_bash_block(command, output, duration, error: false)
-        @chat_started = true
-        push_expandable(->(expanded) { BashBlock.bash_block_rows(command, output, duration, viewport_width, expanded:, error:) })
+      # The per-tool final-block BUILDER (pi's per-tool renderers — the
+      # dispatch {enqueue_tool_block} and {finalize_tool_block} share,
+      # I17/I18's shape-sharing ruling): a lambda re-invoked at the
+      # CURRENT toggle state (the expandable registry's builder
+      # contract), or nil for the generic family (a plain, non-expandable
+      # region — {generic_tool_rows}). bash owns the shell shapes (I17 —
+      # carries the duration; the error-result gate rides through so the
+      # failed call renders toolErrorBg — the s4 capture, Tools::Bash
+      # bash.rb:126), write/read their file-tool shapes (I18 —
+      # write_block_rows/read_block_rows' formatWriteResult/formatReadResult
+      # paths), everything else the generic ⎿ line.
+      def tool_block_builder(name, args, result, duration)
+        case name
+        when BASH_TOOL
+          error = result.is_a?(Hash) && result[:error]
+          ->(expanded) { BashBlock.bash_block_rows(args["command"], ToolBlock.tool_result_text(result), duration, viewport_width, expanded:, error:) }
+        when WRITE_TOOL
+          ->(expanded) { FileBlocks.write_block_rows(args, result, viewport_width, expanded:) }
+        when READ_TOOL
+          ->(expanded) { FileBlocks.read_block_rows(args, result, viewport_width, expanded:) }
+        end
+      end
+
+      # The PENDING block's rows per family (I34 — pi renders the call
+      # rows alone under toolPendingBg while isPartial,
+      # tool-execution.ts:271-277): the settled family truncated to the
+      # call — Spacer blank (PLAIN), the pending-bg pad, the family's
+      # CALL rows, the closing pending-bg pad. No output rows, no Took
+      # row, no expand hint — nothing exists to show yet.
+      def pending_tool_rows(name, args)
+        case name
+        when BASH_TOOL then BashBlock.pending_block_rows(args["command"], viewport_width)
+        when WRITE_TOOL then FileBlocks.pending_write_block_rows(args, viewport_width)
+        when READ_TOOL then FileBlocks.pending_read_block_rows(args, viewport_width)
+        else generic_tool_rows(name, nil, bg: Theme[:tool_pending_bg])
+        end
+      end
+
+      # The generic family's plain region (the arm {enqueue_tool_block}
+      # composes — the constructor's Spacer, then the bg'd contentText
+      # panel); +bg:+ overrides the result-derived bg (the pending shape).
+      def generic_tool_rows(name, result, bg: nil)
+        [Panel.blank_line, *ToolBlock.generic_panel_rows(name, result, viewport_width, bg:)]
+      end
+
+      # The FLUSHED pending's in-place replacement (the I33 discipline —
+      # the stale-start cure): the final rows splice in at the recorded
+      # start, the row DELTA threads to every later registration, and
+      # the registration re-points to the final block's builder at the
+      # updated start. The generic family rides no builder — its
+      # registration drops (the append path registers it nowhere).
+      def replace_flushed_pending(registration, final_rows, builder)
+        start = registration[:start]
+        @transcript[start, registration[:size]] = final_rows
+        index = @expandable_blocks.index { |registered| registered.equal?(registration) }
+        delta = final_rows.length - registration[:size]
+        @expandable_blocks[(index + 1)..]&.each { |registered| registered[:start] += delta }
+        if builder
+          registration[:start] = start
+          registration[:size] = final_rows.length
+          registration[:builder] = builder
+        else
+          @expandable_blocks.delete_at(index)
+        end
+      end
+
+      # The QUEUED pending's swap: the region still rides the scrollback
+      # queue — drain-and-repush under the coordinator's mutex swaps the
+      # entry in place, order preserved (the plain region's final block
+      # replaces the MarkedRegion; the registry never sees either —
+      # matching the append path's generic arm).
+      def swap_queued_pending(region, final_rows, builder)
+        replacement = builder ? MarkedRegion.new(final_rows, builder) : final_rows
+        requeue = []
+        until @scrollback.empty?
+          item = @scrollback.pop
+          requeue << (item.equal?(region) ? replacement : item)
+        end
+        requeue.each { |item| @scrollback << item }
       end
 
       # The expandable-block enqueue: the block rides the scrollback as a
       # {MarkedRegion} (the drain records its transcript range for the
-      # ctrl+o toggle's in-place rebuild).
+      # ctrl+o toggle's in-place rebuild). Public — the coordinator's MOTD
+      # header + resource-section blocks ride the same registry (I33, pi
+      # BuiltInHeader/setToolsExpanded's container sweep).
       def push_expandable(builder)
         @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder)
       end
 
-      # The write tool block (I18 — pi write.ts renderers over the
-      # tool-turn component): the constructor's Spacer + render-box
-      # paddingY (tool-execution.ts:85,87 — the bash block's shape), the
-      # bold toolTitle `write` header + the renderToolPath display
-      # (write.ts:99-100), blank, the content as toolOutput rows
-      # (write.ts:108-122), box pad. The SUCCESS result renders NOTHING
-      # (formatWriteResult is undefined unless error, write.ts:128-143);
-      # an error renders its text in the error token after a blank (the
-      # leading "\n", write.ts:143). Cuts, itemized: the syntax
-      # highlighting (highlightCode — the port has no highlighter;
-      # invisible to text files) and the ctrl+o expand binding (backlog
-      # C) — the hint's TEXT renders for byte parity.
-      def enqueue_write_block(args, result)
-        @chat_started = true
-        push_expandable(->(expanded) { FileBlocks.write_block_rows(args, result, viewport_width, expanded:) })
-      end
-
-      # The read tool block (I18 — pi read.ts renderers): the Spacer + box
-      # padding (tool-execution.ts:85,87), then the call line alone —
-      # formatReadCall's bold toolTitle `read` + renderToolPath + the
-      # warning :start-end range (read.ts:35-42), or the compact resource
-      # shape (getCompactReadClassification, read.ts:63-88). The result
-      # renders NOTHING unless error or expanded (read.ts:68-70 — the
-      # expand binding is cut, itemized); an error renders its text as
-      # toolOutput rows (formatReadResult's isError path).
-      def enqueue_read_block(args, result)
-        @chat_started = true
-        push_expandable(->(expanded) { FileBlocks.read_block_rows(args, result, viewport_width, expanded:) })
-      end
+      public :push_expandable
     end
   end
 end

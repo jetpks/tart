@@ -42,12 +42,28 @@ module Tart
       #   wired after construction).
       # @param line_sink [Proc] +call(text, fg:)+ — the single-flight
       #   warning and the worker-error line.
-      def initialize(kernel:, busy_reader:, block_sink:, record_sink:, line_sink:)
+      # @param stream_start_sink [Proc, nil] +call(command, excluded)+ — the
+      #   running block's birth, fired BEFORE the task spawns (pi adds the
+      #   component to its container before execution starts,
+      #   handleBashCommand :7000-7012).
+      # @param stream_chunk_sink [Proc, nil] +call(text)+ — each bridged
+      #   chunk, delivered on the reactor fiber (the bridge yields there;
+      #   Grounds 5 — the reader threads only push queue items).
+      # @param stream_end_sink [Proc, nil] +call+ — the explicit clear,
+      #   fired exactly once at EVERY terminal path (the outcome arm, the
+      #   worker-error arm — both at finish's entry, so the rare
+      #   terminal-without-outcome shape clears too — and cancel). Never
+      #   implicit in a render sink.
+      def initialize(kernel:, busy_reader:, block_sink:, record_sink:, line_sink:,
+        stream_start_sink: nil, stream_chunk_sink: nil, stream_end_sink: nil)
         @kernel = kernel
         @busy_reader = busy_reader
         @block_sink = block_sink
         @record_sink = record_sink
         @line_sink = line_sink
+        @stream_start_sink = stream_start_sink
+        @stream_chunk_sink = stream_chunk_sink
+        @stream_end_sink = stream_end_sink
         # The in-flight execution: the running task (single-flight — pi's
         # isBashRunning gate), the escape-cancel handshake state, and the
         # deferred records while a turn runs (pi's _pendingBashMessages).
@@ -71,9 +87,11 @@ module Tart
       # pop-loop blocks its thread; the reactor must keep drawing), and the
       # block renders on completion; the RECORD defers to agent_end while
       # a turn runs (pi's _pendingBashMessages — the entry must not
-      # interleave a tool sequence in the record). Streaming chunks are
-      # execution-transient in pi's Loader frames — the port renders the
-      # completed block (itemized).
+      # interleave a tool sequence in the record). The RUNNING block lives
+      # from BEFORE execution (pi :7000-7012 — the component added to the
+      # container, then requestRender) and streams its chunks over the
+      # bridge queue (pi executeBash's chunkCb :7050-7057); the sinks are
+      # Chat's seams — this class owns no render state.
       def run(command, excluded)
         if @task
           @line_sink.call("A bash command is already running. Press Esc to cancel it first.",
@@ -89,6 +107,8 @@ module Tart
         # worker filled (read after the bridge's bounded join).
         @command = command
         @excluded = excluded
+        # The running block's birth, before the task spawns (pi :7000-7012).
+        @stream_start_sink&.call(command, excluded)
         @cancel_flag = false
         @slot = {}
         @task = @kernel.async do
@@ -98,11 +118,15 @@ module Tart
               RubyLLM::Support::Cancellation.watch(
                 -> { raise RubyLLM::CancelledError if @cancel_flag }
               ) do
-                outcome = tool.run_user(command)
+                # The chunk seam: the tool's reader threads push onto the
+                # bridge's thread-safe queue; the queue pops HERE on the
+                # reactor and the yield block forwards (Grounds 5) — no
+                # render state crosses a thread.
+                outcome = tool.run_user(command, on_chunk: ->(text) { sink.call({chunk: text}) })
                 @slot[:outcome] = outcome
                 sink.call({})
               end
-            end) { |_item| }
+            end) { |item| @stream_chunk_sink&.call(item[:chunk]) if item[:chunk] }
           finish(terminal)
         end
       end
@@ -118,6 +142,10 @@ module Tart
         deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
         sleep 0.05 while @slot.empty? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
         outcome = @slot[:outcome]
+        # The explicit clear before the block enqueues (the live rows and
+        # the completed block never share a frame) — cancel is this run's
+        # sole terminal path (the stopped task's finish never runs).
+        @stream_end_sink&.call
         @task = nil
         @block_sink.call(@command,
           outcome ? fields(outcome) : {content: "", exit_code: nil, cancelled: true,
@@ -142,11 +170,18 @@ module Tart
       # error surfaces as an error line (the ENOENT class — no block).
       def finish(terminal)
         @task = nil
+        # The explicit clear — once per run, BEFORE the completed rows
+        # enqueue (AC2: the live rows and the completed block never share
+        # a frame). Covers the outcome arm, the worker-error arm, and the
+        # terminal-without-outcome shape alike; cancel clears its own path
+        # (this method never runs there — the stopped task dies at the
+        # bridge's pop).
+        @stream_end_sink&.call
         if (outcome = @slot[:outcome])
           @block_sink.call(@command, fields(outcome), @excluded)
           record(build_record(@command, outcome, excluded: @excluded))
-        elsif terminal&.dig(:type) == :error
-          @line_sink.call("bash: #{terminal[:error].message}", fg: Theme[:error])
+        elsif terminal&.failure? && !terminal.failure.is_a?(RubyLLM::CancelledError)
+          @line_sink.call("bash: #{terminal.failure.message}", fg: Theme[:error])
         end
         @kernel.request_draw
       end

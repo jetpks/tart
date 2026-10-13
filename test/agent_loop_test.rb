@@ -2,8 +2,10 @@
 
 require_relative "test_helper"
 require_relative "support/mock_llm_server"
+require "stringio"
 require "tmpdir"
 require "fileutils"
+require "json"
 
 module Tart
   # The agent loop on the I02 kernel (AC1/AC3): multi-turn tool round-trip
@@ -120,14 +122,15 @@ module Tart
       assert_equal %i[user], agent.new_messages.map(&:role)
     end
 
-    # I05 defect 2 (live repro: GLM-5.3-flash thinking reply): ruby_llm
-    # stores reasoning_content deltas as Message#thinking and replays it as
-    # `reasoning` + `reasoning_content` on every later request (chat.rb
-    # format_thinking), which fireworks rejects with a schema 400. The port
-    # strips it at the step boundary: the captured follow-up payload must
-    # carry no reasoning field on any assistant message, and the
-    # tool-result continuation must stream to completion.
-    def test_thinking_replay_is_suppressed_on_followup_requests
+    # I36 (the replay protocol — pi :1340-1352, the delta-carried field):
+    # a thinking reply's assistant message KEEPS its thinking (the I05
+    # strip_thinking_replay deviation is gone), and follow-up request
+    # bodies replay it under `reasoning_content` — the field the provider's
+    # deltas carried (live-verified for fireworks) — with ruby_llm's
+    # duplicate `reasoning` field ABSENT (the request-seam normalization).
+    # The tool-result continuation completes (the I05 400 class cannot
+    # recur through the port's own payload shape).
+    def test_followup_requests_replay_the_assistant_reasoning_content
       @server.script([
         {type: :stream, content: "listing", reasoning_content: "I should list the files",
          tool_calls: [{id: "call_1", name: "ls", arguments: {path: "."}}]},
@@ -142,15 +145,415 @@ module Tart
       assert_equal 2, requests.size
       assistants = requests.last["messages"].select { |m| m["role"] == "assistant" }
       assert assistants.any?
+      replayed = assistants.find { |message| message["reasoning_content"] }
+      assert_equal "I should list the files", replayed["reasoning_content"],
+        "the thinking replays under the delta-carried signature (pi's assistantMsg[signature])"
       assistants.each do |message|
-        refute message.key?("reasoning"), "replayed `reasoning` must be stripped"
-        refute message.key?("reasoning_content"), "replayed `reasoning_content` must be stripped"
+        refute message.key?("reasoning"), "ruby_llm's duplicate `reasoning` field must be absent"
       end
       assert_equal "done", result.last.content
       types = events.map { |e| e[:type] }
       assert_includes types, :turn_end
       error_ends = events.select { |e| e[:type] == :agent_end && e[:error] }
       assert_empty error_ends, "the continuation must complete without an error"
+    end
+
+    # I36 AC1: the resolved level reaches the wire — reasoning_effort =
+    # Models.resolve_reasoning_effort (the map's value for the clamped
+    # level), read at request time so a mid-session set_thinking_level
+    # changes the NEXT request with no gem state to reset.
+    def test_reasoning_effort_rides_the_wire_and_follows_the_session_level
+      @server.script([
+        {type: :message, content: "one"},
+        {type: :message, content: "two"},
+      ])
+      agent, _events = agent_on_kernel(
+        model_reasoning: true,
+        thinking_level_map: {off: "low", low: "low", medium: "medium", high: "high"}
+      )
+      run_agent(agent, "first")
+      assert_equal "medium", @server.captured_requests.first["reasoning_effort"],
+        "pi's DEFAULT_THINKING_LEVEL medium resolves through the map"
+
+      agent.set_thinking_level("high")
+      run_agent(agent, "second")
+      assert_equal "high", @server.captured_requests.first["reasoning_effort"],
+        "the mid-session level applies to the next request"
+      assert_equal "high", agent.thinking_level
+    end
+
+    # The off-floor shapes: a null-off map clamps upward (off → low); an
+    # owner-override String off value floors directly; a map-less off
+    # sends NO reasoning_effort key.
+    def test_reasoning_effort_off_floor_shapes
+      @server.script([
+        {type: :message, content: "a"},
+        {type: :message, content: "b"},
+      ])
+
+      agent, _events = agent_on_kernel(
+        thinking_level: "off", model_reasoning: true,
+        thinking_level_map: {off: nil, minimal: nil, low: "low", medium: nil, high: "high", xhigh: nil, max: "max"}
+      )
+      run_agent(agent, "first")
+      assert_equal "low", @server.captured_requests.first["reasoning_effort"],
+        "the null-off floor clamps upward (the live-catalog shape)"
+
+      agent2, _events2 = agent_on_kernel(
+        thinking_level: "off", model_reasoning: true,
+        thinking_level_map: {off: "low", low: "low", high: "high"}
+      )
+      run_agent(agent2, "second")
+      assert_equal "low", @server.captured_requests.last["reasoning_effort"],
+        "the owner-override String off value floors directly"
+
+      agent3, _events3 = agent_on_kernel(thinking_level: "off", model_reasoning: true)
+      run_agent(agent3, "third")
+      refute @server.captured_requests.last.key?("reasoning_effort"),
+        "map-less off sends nothing"
+    end
+
+    # A non-reasoning model never sends reasoning_effort, whatever the
+    # level and map (pi: the generic branch gates on model.reasoning).
+    def test_non_reasoning_model_never_sends_reasoning_effort
+      @server.script([{type: :message, content: "ok"}])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: false,
+        thinking_level_map: {high: "high"})
+      run_agent(agent, "hi")
+
+      refute @server.captured_requests.first.key?("reasoning_effort")
+    end
+
+    # The switch seam re-resolves the reasoning facts alongside the window
+    # (pi setModel swaps the Model object): the switched entry's flag/map
+    # govern the following requests.
+    def test_switch_model_re_resolves_the_reasoning_facts
+      @server.script([
+        {type: :message, content: "before"},
+        {type: :message, content: "after"},
+        {type: :message, content: "muted"},
+      ])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: false)
+      run_agent(agent, "first")
+      refute @server.captured_requests.first.key?("reasoning_effort"), "non-reasoning boot sends nothing"
+
+      agent.switch_model("glm-5.3", provider: "openai", model_reasoning: true,
+        thinking_level_map: {high: "high"})
+      run_agent(agent, "second")
+      assert_equal "high", @server.captured_requests.first["reasoning_effort"],
+        "the switched entry's facts govern (the map's value for the level)"
+
+      agent.switch_model("mock-2", provider: "openai", model_reasoning: true, thinking_level_map: nil)
+      run_agent(agent, "third")
+      assert_equal "high", @server.captured_requests.first["reasoning_effort"],
+        "the map-less rule falls back to the level itself"
+    end
+
+    # The map re-resolve is TOTAL (pi setModel swaps the Model object — no
+    # stale facts survive the switch): switching to a map-less entry DROPS
+    # the previous map. A leaked map would keep flooring "off" to its
+    # String value where the map-less rule sends nothing.
+    def test_switch_to_a_mapless_entry_drops_the_previous_map
+      @server.script([
+        {type: :message, content: "one"},
+        {type: :message, content: "two"},
+      ])
+      agent, _events = agent_on_kernel(thinking_level: "off", model_reasoning: true,
+        thinking_level_map: {off: "low", high: "high"})
+      run_agent(agent, "first")
+      assert_equal "low", @server.captured_requests.first["reasoning_effort"],
+        "the String off map value floors off"
+
+      agent.switch_model("mock-2", provider: "openai", model_reasoning: true, thinking_level_map: nil)
+      run_agent(agent, "second")
+      refute @server.captured_requests.last.key?("reasoning_effort"),
+        "the map-less entry re-resolves: off sends nothing (a stale map would still floor to low)"
+    end
+
+    # Print mode (AC1's third wire site): the launcher-threaded thinking
+    # facts ride Print.run into the loop's request seam — reasoning_effort
+    # on the wire when the model reasons, no key when it doesn't (the
+    # defaults keep the legacy shape).
+    def test_print_mode_wires_the_thinking_facts_into_the_request
+      @server.script([
+        {type: :message, content: "reasoned"},
+        {type: :message, content: "plain"},
+      ])
+      stdout, stderr = StringIO.new, StringIO.new
+      code = Print.run(prompt: "think", chat: TestChat.build(@server, tools: [], system_prompt: "test prompt"),
+        tools: {}, stdout:, stderr:, thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high", off: "low"})
+
+      assert_equal Print::EXIT_OK, code
+      assert_equal "high", @server.captured_requests.first["reasoning_effort"]
+
+      code = Print.run(prompt: "plain", chat: TestChat.build(@server, tools: [], system_prompt: "test prompt"),
+        tools: {}, stdout:, stderr:)
+      assert_equal Print::EXIT_OK, code
+      refute @server.captured_requests.last.key?("reasoning_effort"),
+        "the default facts (non-reasoning) send no reasoning_effort"
+    end
+
+    # --- I46: the zai dialect at the request seam (the ten-wire-pin table) ---
+
+    # The owner's live thinkingLevelMap (Grounds §3): the supported ladder
+    # is [low, high, max] — DEFAULT medium clamps FORWARD to high.
+    OWNER_MAP = {off: nil, minimal: nil, low: "low", medium: nil,
+                 high: "high", xhigh: nil, max: "max"}.freeze
+
+    def zai_compat(overrides = {})
+      Shapes::ModelCompat.new({thinking_format: "zai", max_tokens_field: "max_tokens",
+                               supports_developer_role: false, supports_reasoning_effort: true,
+                               zai_tool_stream: true}.merge(overrides))
+    end
+
+    # Pin 1 — the owner dialect: thinking object ALWAYS on a reasoning
+    # zai model, reasoning_effort = the map's value for the CLAMPED level
+    # (medium → high), tool_stream with the tools, and the instruction
+    # role rewritten to system (supportsDeveloperRole false).
+    def test_zai_owner_dialect_rides_the_wire
+      @server.script([{type: :message, content: "ok"}])
+      tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
+      agent, _events = agent_on_kernel(tools:, thinking_level: "medium", model_reasoning: true,
+        thinking_level_map: OWNER_MAP, compat: zai_compat)
+      run_agent(agent, "hi")
+
+      request = @server.captured_requests.first
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, request["thinking"],
+        "the thinking object rides enabled with clear_thinking ONLY on enabled (pi :886-887)")
+      assert_equal "high", request["reasoning_effort"],
+        "medium clamps forward through the owner map (the catalog's null medium)"
+      assert_equal true, request["tool_stream"], "zaiToolStream + request tools → tool_stream"
+      assert_equal "system", request["messages"].first["role"],
+        "the gem's developer instruction is rewritten to system"
+    end
+
+    # Pin 2 — the off-edge (OQ-5): a String off map value floors the I36
+    # generic arm, but the zai arm keys on the CLAMPED level — a clamped
+    # "off" is NO effort (pi :751), so disabled thinking and NO
+    # reasoning_effort, whatever the map's off value.
+    def test_zai_off_edge_sends_disabled_thinking_and_no_effort
+      @server.script([{type: :message, content: "a"}])
+      agent, _events = agent_on_kernel(thinking_level: "off", model_reasoning: true,
+        thinking_level_map: {off: "low", low: "low", high: "high"}, compat: zai_compat)
+      run_agent(agent, "hi")
+
+      request = @server.captured_requests.first
+      assert_equal({"type" => "disabled"}, request["thinking"],
+        "a clamped off sends the disabled thinking object")
+      refute request.key?("reasoning_effort"),
+        "the String off floor does NOT apply on the zai arm (no reasoning_effort key)"
+    end
+
+    # Pin 3 — supportsReasoningEffort false/nil: the thinking object
+    # still rides, the effort field does not (pi :888 gates the effort on
+    # the compat flag; the owner's catalog overrides the detected false —
+    # the flag is the model's say, not the dialect's).
+    def test_zai_supports_reasoning_effort_false_keeps_thinking_drops_effort
+      @server.script([{type: :message, content: "a"}, {type: :message, content: "b"}])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat(supports_reasoning_effort: false))
+      run_agent(agent, "first")
+
+      request = @server.captured_requests.first
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, request["thinking"])
+      refute request.key?("reasoning_effort"), "supportsReasoningEffort false drops the field"
+
+      agent2, _events2 = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat(supports_reasoning_effort: nil))
+      run_agent(agent2, "second")
+      request2 = @server.captured_requests.last
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, request2["thinking"])
+      refute request2.key?("reasoning_effort"), "nil (pi's detected default for zai) drops it too"
+    end
+
+    # Pin 4 — tool_stream is gated on the REQUEST's tools (pi :855-863):
+    # with tools the field rides; a tool-less session's request carries
+    # no tool_stream.
+    def test_zai_tool_stream_is_gated_on_request_tools
+      @server.script([{type: :message, content: "a"}, {type: :message, content: "b"}])
+      tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
+      agent, _events = agent_on_kernel(tools:, thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat)
+      run_agent(agent, "first")
+      assert_equal true, @server.captured_requests.first["tool_stream"]
+
+      agent2, _events2 = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat)
+      run_agent(agent2, "second")
+      refute @server.captured_requests.last.key?("tool_stream"),
+        "no tools on the request, no tool_stream field"
+    end
+
+    # Pin 5 — the instruction role (pi :1233): developer only when the
+    # model reasons AND the compat says so; the zai default (nil → the
+    # detection stand-in false) rewrites the gem's developer to system.
+    def test_zai_instruction_role_rewrite
+      @server.script([{type: :message, content: "a"}, {type: :message, content: "b"}])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat)
+      run_agent(agent, "first")
+      assert_equal "system", @server.captured_requests.first["messages"].first["role"],
+        "nil supportsDeveloperRole on zai falls to the detection stand-in (false)"
+
+      agent2, _events2 = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"}, compat: zai_compat(supports_developer_role: true))
+      run_agent(agent2, "second")
+      assert_equal "developer", @server.captured_requests.last["messages"].first["role"],
+        "explicit true keeps the gem's developer instruction"
+    end
+
+    # Pin 6 — the compaction summarization request rides the SAME dialect
+    # (pi compaction.ts:605-607 carries the session level): the max-token
+    # key renames to max_tokens (never max_completion_tokens), the
+    # thinking object + mapped effort ride it, the role rewrites, and the
+    # tool-less one-shot carries no tool_stream.
+    def test_zai_summarization_request_carries_max_tokens_and_thinking
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+        {type: :stream, content: "second answer"},
+        {type: :message, content: "a summary of the second turn"},
+      ])
+      agent, _events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14,
+        thinking_level: "medium", model_reasoning: true, thinking_level_map: OWNER_MAP,
+        compat: zai_compat
+      )
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      requests = @server.captured_requests
+      assert_equal 4, requests.size
+      summary_request = requests[1]
+      assert summary_request.key?("max_tokens"), "the rename lands on the one-shot"
+      refute summary_request.key?("max_completion_tokens"), "never max_completion_tokens under the rename"
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, summary_request["thinking"],
+        "the thinking object rides the summarization too")
+      assert_equal "high", summary_request["reasoning_effort"],
+        "the session level (medium, clamped forward) rides the one-shot"
+      assert_equal "system", summary_request["messages"].first["role"],
+        "the summarization instruction rewrites to system as well"
+      refute summary_request.key?("tool_stream"), "the one-shot carries no tools, no tool_stream"
+    end
+
+    # Pin 7 — a NON-reasoning zai model: no thinking object, no
+    # reasoning_effort (pi :880 gates the arm on model.reasoning), and
+    # the role still rewrites (the effective role is system regardless).
+    def test_zai_non_reasoning_sends_no_thinking_and_no_effort
+      @server.script([{type: :message, content: "ok"}])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: false,
+        thinking_level_map: {high: "high"}, compat: zai_compat)
+      run_agent(agent, "hi")
+
+      request = @server.captured_requests.first
+      refute request.key?("thinking")
+      refute request.key?("reasoning_effort")
+      assert_equal "system", request["messages"].first["role"]
+    end
+
+    # Pin 8 — compat nil zero-change, the loop path (the wire-bodies
+    # digests pin the rig path): no thinking, no tool_stream, developer
+    # role, and the summarization one-shot keeps TODAY'S exact shapes —
+    # max_completion_tokens, no reasoning_effort (the gem's per-chat
+    # callbacks mean the construction hook never ran there; the I36 arm
+    # stays off it).
+    def test_compat_nil_summarization_request_keeps_todays_shapes
+      @server.script([
+        {type: :stream, content: "first answer"},
+        {type: :message, content: "a summary of the first turn"},
+        {type: :stream, content: "second answer"},
+        {type: :message, content: "a summary of the second turn"},
+      ])
+      agent, _events = agent_on_kernel(
+        compaction: {reserve_tokens: 1, keep_recent_tokens: 1}, context_window: 14,
+        thinking_level: "medium", model_reasoning: true,
+        thinking_level_map: {off: "low", low: "low", medium: "medium", high: "high"}
+      )
+      agent.push_message("second question")
+      run_agent(agent, "first question")
+
+      requests = @server.captured_requests
+      assert_equal 4, requests.size
+      main_request, summary_request = requests[0], requests[1]
+      refute main_request.key?("thinking")
+      refute main_request.key?("tool_stream")
+      assert_equal "developer", main_request["messages"].first["role"]
+      refute summary_request.key?("thinking"), "no thinking object on the one-shot"
+      refute summary_request.key?("tool_stream")
+      assert_equal "developer", summary_request["messages"].first["role"]
+      assert summary_request.key?("max_completion_tokens"), "today's max-token key unchanged"
+      refute summary_request.key?("max_tokens")
+      refute summary_request.key?("reasoning_effort"),
+        "today's one-shot carries no reasoning_effort (no hook there)"
+    end
+
+    # Pin 9 — the switch seam: switch_model(compat:) swaps the dialect
+    # mid-session and compat: nil restores the default arm (the wholesale
+    # re-resolve idiom — nil IS "the switched model declares none").
+    def test_switch_model_swaps_the_compat_dialect_and_restores
+      @server.script([
+        {type: :message, content: "one"},
+        {type: :message, content: "two"},
+        {type: :message, content: "three"},
+      ])
+      agent, _events = agent_on_kernel(thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high"})
+      run_agent(agent, "first")
+
+      agent.switch_model("glm-5.3", provider: "openai", model_reasoning: true,
+        thinking_level_map: OWNER_MAP, compat: zai_compat)
+      run_agent(agent, "second")
+
+      agent.switch_model("mock-2", provider: "openai", model_reasoning: true,
+        thinking_level_map: nil, compat: nil)
+      run_agent(agent, "third")
+
+      first, second, third = @server.captured_requests
+      refute first.key?("thinking"), "compat-nil boot: today's arm"
+      assert_equal "developer", first["messages"].first["role"]
+
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, second["thinking"],
+        "the swapped dialect governs the next request")
+      assert_equal "high", second["reasoning_effort"]
+      assert_equal "system", second["messages"].first["role"]
+
+      refute third.key?("thinking"), "compat nil restores the default arm"
+      assert_equal "developer", third["messages"].first["role"]
+      assert_equal "high", third["reasoning_effort"], "the I36 effort wiring re-resolves wholesale"
+    end
+
+    # Pin 10 — print-mode threading (the I36 third-wire-site idiom): the
+    # launcher-threaded compat rides Print.run into the request seam.
+    def test_print_mode_threads_the_compat_into_the_request
+      @server.script([{type: :message, content: "reasoned"}])
+      stdout, stderr = StringIO.new, StringIO.new
+      code = Print.run(prompt: "think", chat: TestChat.build(@server, tools: [], system_prompt: "test prompt"),
+        tools: {}, stdout:, stderr:, thinking_level: "high", model_reasoning: true,
+        thinking_level_map: {high: "high", off: "low"}, compat: zai_compat)
+
+      assert_equal Print::EXIT_OK, code
+      request = @server.captured_requests.first
+      assert_equal({"type" => "enabled", "clear_thinking" => false}, request["thinking"])
+      assert_equal "high", request["reasoning_effort"]
+      assert_equal "system", request["messages"].first["role"]
+    end
+
+    # The session file (pi's persistence): a thinking reply's recorded
+    # entry carries the thinking text — resume replay regains it (the
+    # transcript's replay_assistant renders message["thinking"]).
+    def test_thinking_reply_persists_to_the_session_file
+      @server.script([
+        {type: :stream, content: "the answer", reasoning_content: "pondering hard"},
+      ])
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: File.join(@dir, "root"))
+      agent, _events = agent_on_kernel(recorder:)
+      run_agent(agent, "question")
+
+      entries = Agent::Session.load_entries(recorder.path)
+      assistant = entries.find { |entry| entry.dig("message", "role") == "assistant" }
+      assert_equal "pondering hard", assistant.dig("message", "thinking"),
+        "no strip: the recorded entry keeps the thinking"
     end
 
     def test_queued_message_continues_the_outer_loop
@@ -204,6 +607,42 @@ module Tart
       end
       chat = TestChat.build(@server, tools: tools.values, system_prompt: "test prompt")
       [Agent::Loop.new(chat:, tools:, on_event: on_event || sink, **loop_kwargs), events]
+    end
+
+    # Runs the agent on a BACKGROUND-thread reactor (the I48 inbox tests
+    # write files mid-run; the run must proceed while the test thread
+    # works). A bare Async reactor — Core::Loop's trap net is main-thread-
+    # only; the loop machinery needs a reactor fiber, not the kernel.
+    def run_in_background(agent, prompt)
+      Thread.new do
+        Thread.current.report_on_exception = false
+        begin
+          Async do |root|
+            root.async { agent.run(prompt) }.wait
+          end
+        rescue Async::Cancel
+          nil # the stop-file path: run() re-raises after the interrupted agent_end
+        end
+      end
+    end
+
+    # The bounded join: a wedged run fails the test instead of hanging it.
+    def join_run(thread)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
+      until !thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        sleep 0.02
+      end
+      flunk "the run never finished" if thread.alive?
+      thread.join
+    end
+
+    # Runs #wake on the kernel (the reactor fiber — the documented
+    # contract for run-shaped calls). Returns wake's return value.
+    def run_wake(agent)
+      result = nil
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      kernel.run { result = agent.wake }
+      result
     end
 
     def empty_tools
@@ -267,6 +706,48 @@ module Tart
       kernel = Core::Loop.new(session: ScriptedSession.new)
       kernel.run { result = agent.run("hi") }
       assert_equal "switched", result.last.content
+    end
+
+    # I41 (AC4, the tier readback): the loop's env tier speaks the
+    # identity's namespace — the resolved face decides which CONTEXT_WINDOW
+    # var the compaction denominator reads (tart → TART_, default pi →
+    # PI_). Direct readback on the private resolver (the mcp_test send
+    # precedent); the print path's forwarding is pinned in print_test.
+    def test_env_tier_reads_the_identity_namespaced_context_window
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      tart_agent = Agent::Loop.new(chat:, tools: empty_tools, identity: "tart")
+      pi_agent = Agent::Loop.new(chat:, tools: empty_tools)
+      saved_tart = ENV["TART_CONTEXT_WINDOW"]
+      saved_pi = ENV["PI_CONTEXT_WINDOW"]
+      begin
+        ENV["TART_CONTEXT_WINDOW"] = "4242"
+        ENV.delete("PI_CONTEXT_WINDOW")
+        assert_equal 4242, tart_agent.send(:resolved_context_window),
+          "the tart face reads TART_CONTEXT_WINDOW"
+        assert_nil pi_agent.send(:resolved_context_window),
+          "the pi face ignores TART_CONTEXT_WINDOW (namespace isolation)"
+
+        ENV["PI_CONTEXT_WINDOW"] = "77"
+        assert_equal 77, pi_agent.send(:resolved_context_window), "the pi face reads PI_CONTEXT_WINDOW"
+      ensure
+        saved_tart ? ENV["TART_CONTEXT_WINDOW"] = saved_tart : ENV.delete("TART_CONTEXT_WINDOW")
+        saved_pi ? ENV["PI_CONTEXT_WINDOW"] = saved_pi : ENV.delete("PI_CONTEXT_WINDOW")
+      end
+    end
+
+    # I41 (spec item 5): the recorder reader — the launcher's session-env
+    # readers expose the current session's id + file through it (a /new or
+    # resume swap re-points surface.agent; the reader re-resolves at every
+    # spawn).
+    def test_recorder_reader_exposes_the_session_recorder
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      assert_nil Agent::Loop.new(chat:, tools: empty_tools).recorder, "no recorder wired, nil"
+
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: File.join(@dir, "root"))
+      agent = Agent::Loop.new(chat:, tools: empty_tools, recorder:)
+      assert_same recorder, agent.recorder
+      assert recorder.id, "the SESSION_ID reader's source is present"
+      assert recorder.path, "the SESSION_FILE reader's source is present"
     end
 
     # AC2: threshold compaction after a completed turn — usage (the mock
@@ -560,6 +1041,287 @@ module Tart
       assert_equal "recovered again", agent.new_messages.last.content
     end
 
+    # -- I45 step-boundary classification (additive): the Bridge terminal is
+    # a Failure typed by the payload class; the three worker-error families
+    # surface today's classes through the public readbacks (agent_end[:error]
+    # + last_error) unchanged.
+
+    def test_worker_http_error_classifies_as_bad_request
+      @server.script([{type: :error, status: 400, message: "Extra inputs are not permitted"}])
+      agent, events = agent_on_kernel
+      run_agent(agent, "hi")
+
+      assert_kind_of RubyLLM::BadRequestError, agent.last_error
+      end_event = events.find { |e| e[:type] == :agent_end }
+      assert_kind_of RubyLLM::BadRequestError, end_event[:error]
+    end
+
+    def test_context_length_error_classifies_with_compaction_disabled
+      @server.script([{type: :error, status: 400,
+                       message: "This model maximum context length is 8 tokens"}])
+      agent, events = agent_on_kernel(compaction: {enabled: false})
+      run_agent(agent, "hi")
+
+      assert_kind_of RubyLLM::ContextLengthExceededError, agent.last_error
+      end_event = events.find { |e| e[:type] == :agent_end }
+      assert_kind_of RubyLLM::ContextLengthExceededError, end_event[:error]
+    end
+
+    def test_dead_endpoint_classifies_as_connection_failed
+      chat = RubyLLM.context do |config|
+        config.openai_api_key = "test"
+        config.openai_api_base = "http://127.0.0.1:1/v1"
+        config.request_timeout = 2
+        config.max_retries = 0
+      end.chat(model: "tart-test-model", provider: "openai",
+              protocol: :chat_completions, assume_model_exists: true)
+      agent, events = agent_on_kernel_with_chat(chat)
+      run_agent(agent, "hi")
+
+      assert_kind_of Faraday::ConnectionFailed, agent.last_error
+      end_event = events.find { |e| e[:type] == :agent_end }
+      assert_kind_of Faraday::ConnectionFailed, end_event[:error]
+    end
+
+    # --- I47 seam pins (the hooks-semantics gate drives the same surface) ---
+
+    # The nextTurn drain: the pending queue injects AFTER the user message
+    # — wire order [user, custom-as-user], the :message_start/:message_end
+    # events carry the Hooks::CustomMessage, and the session records the
+    # custom_message entry between them (pi _handleUserPrompt :2086-2095 +
+    # messages.ts:161-170).
+    def test_next_turn_drain_injects_after_the_user_message
+      recorder_root = File.join(@dir, "agent")
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: recorder_root)
+      # The production shape: Hooks HOLDS the surface sink (the loop's emit
+      # routes through the seam, which forwards to the base sink).
+      events = []
+      events_mutex = Mutex.new
+      sink = ->(event) { events_mutex.synchronize { events << event } }
+      hooks = Hooks.new(on_event: sink)
+      hooks.send_next_turn(custom_type: "memory-recall", content: "RECALL-TEXT", display: true)
+      @server.script([{type: :message, content: "ok"}])
+
+      agent = Agent::Loop.new(chat: TestChat.build(@server, system_prompt: "test prompt"), tools: empty_tools,
+        hooks:, recorder:)
+      result = run_agent(agent, "hi")
+
+      request = @server.captured_requests.last
+      assert_equal %w[user user], request["messages"].map { |m| m["role"] }.last(2),
+        "the recall rides the wire as a user-role message after the prompt"
+      assert_includes request["messages"].last["content"], "RECALL-TEXT"
+      assert_equal %i[user user assistant], result.map(&:role)
+
+      custom_events = events.select { |event| event[:message].respond_to?(:role) && event[:message].role == :custom }
+      assert_equal %i[message_start message_end], custom_events.map { |event| event[:type] }.uniq
+      custom = custom_events.first[:message]
+      assert_equal :custom, custom.role
+      assert_equal "memory-recall", custom.custom_type
+      assert_equal "RECALL-TEXT", custom.content
+      assert_equal true, custom.display
+
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      assert_equal ["session", "user", "custom_message", "assistant"],
+        entries.map { |entry| entry["type"] == "message" ? entry.dig("message", "role") : entry["type"] }
+      assert_equal({"type" => "custom_message", "customType" => "memory-recall", "content" => "RECALL-TEXT",
+                    "display" => true}, entries[2].slice("type", "customType", "content", "display"))
+    end
+
+    # The terminate consult: a batch whose every tool call was a
+    # terminate-marked block stops the INNER loop — one request total (pi
+    # shouldTerminateToolBatch, agent-loop.ts:690-691).
+    def test_all_terminate_batch_breaks_the_inner_loop
+      File.write(File.join(@dir, "fixture.txt"), "x")
+      hooks = Hooks.new
+      hooks.on_tool_call { |_event, _ctx| {block: true, reason: "t", terminate: true} }
+      @server.script([
+        {type: :stream, content: "working", tool_calls: [
+          {id: "call_1", name: "ls", arguments: {path: "."}},
+          {id: "call_2", name: "read", arguments: {path: "fixture.txt"}}
+        ]},
+        {type: :message, content: "unreachable"},
+      ])
+
+      tools = Tools::Registry.build(selected: %w[ls read], cwd: @dir, hooks: hooks)
+      agent, = agent_on_kernel(tools:, hooks:)
+      result = run_agent(agent, "go")
+
+      assert_equal 1, @server.captured_requests.size, "the terminated batch never reaches a second request"
+      assert_equal %i[user assistant tool tool], result.map(&:role),
+        "one blocked tool result per call, then the inner loop breaks"
+      assert_equal "t", result.last.content, "the blocked result is the plain reason string"
+    end
+
+    # A partial terminate (some call unblocked) keeps the loop running —
+    # the model answers on the next step.
+    def test_partial_terminate_batch_continues_the_loop
+      File.write(File.join(@dir, "fixture.txt"), "x")
+      hooks = Hooks.new
+      hooks.on_tool_call do |event, _ctx|
+        {block: true, reason: "t", terminate: true} if event["tool_call_id"] == "call_1"
+      end
+      @server.script([
+        {type: :stream, content: "working", tool_calls: [
+          {id: "call_1", name: "ls", arguments: {path: "."}},
+          {id: "call_2", name: "read", arguments: {path: "fixture.txt"}}
+        ]},
+        {type: :message, content: "the reply after the batch"},
+      ])
+
+      tools = Tools::Registry.build(selected: %w[ls read], cwd: @dir, hooks: hooks)
+      agent, = agent_on_kernel(tools:, hooks:)
+      result = run_agent(agent, "go")
+
+      assert_equal 2, @server.captured_requests.size, "the loop continues after a non-all-terminate batch"
+      assert_equal "the reply after the batch", result.last.content
+    end
+
+    # hooks: nil = today's path, byte-identical: events flow through
+    # on_event and no pending queue drains.
+    def test_hooks_nil_keeps_the_on_event_path
+      @server.script([{type: :message, content: "ok"}])
+      agent, events = agent_on_kernel
+      result = run_agent(agent, "hi")
+
+      assert_equal "ok", result.last.content
+      assert events.any? { |event| event[:type] == :agent_start }, "the direct sink still receives events"
+      assert_nil agent.instance_variable_get(:@hooks), "no hooks object is constructed"
+    end
+
+    # --- I48 steering-inbox pins (the async child's file inbox, §5.1) ---
+
+    # A steer request file written mid-stream is consumed at the turn
+    # boundary: the message joins the queue (the child's next request
+    # carries it as a user message), the consumption log names the
+    # requestId, and the file is unlinked (at-least-once).
+    def test_steer_inbox_file_is_consumed_at_the_turn_boundary
+      inbox = File.join(@dir, "control", "steer-requests")
+      FileUtils.mkdir_p(inbox)
+      @server.script([
+        {type: :slow_stream, content: "x" * 80, chunk_every: 0.1},
+        {type: :message, content: "steered reply"},
+      ])
+      agent, = agent_on_kernel(steer_inbox: inbox)
+      thread = run_in_background(agent, "start the work")
+
+      # Mid-stream: the request file lands while the turn runs.
+      sleep 0.4
+      request_id = "req-#{object_id}"
+      File.write(File.join(inbox, "0001700000000000-#{request_id}.json"),
+                 JSON.generate({"type" => "steer", "id" => request_id, "ts" => 1_700_000_000_000,
+                                "message" => "STEER-INBOX-MARKER", "mode" => "steer", "source" => "tool"}))
+      join_run(thread)
+      request = @server.captured_requests.last
+      users = request["messages"].select { |m| m["role"] == "user" }
+      assert users.any? { |m| m["content"].to_s.include?("STEER-INBOX-MARKER") },
+             "the steer rides the child's next request as a user message"
+      log = File.join(File.dirname(inbox), "steer-log.jsonl")
+      entries = File.readlines(log).map { |line| JSON.parse(line) }
+      entry = entries.find { |e| e["requestId"] == request_id }
+      refute_nil entry, "the consumption log correlates by requestId"
+      assert entry["consumedAt"].is_a?(Integer)
+      assert_empty Dir.glob(File.join(inbox, "*.json")), "the consumed file is unlinked"
+    end
+
+    # A stop request file interrupts the run exactly like a kernel
+    # interrupt: Async::Cancel through run() → the interrupted agent_end,
+    # the child exits non-zero with the abort message (print's error_exit).
+    def test_stop_file_interrupts_the_run_at_the_boundary
+      stop_dir = File.join(@dir, "control", "stop-requests")
+      FileUtils.mkdir_p(stop_dir)
+      @server.script([{type: :slow_stream, content: "x" * 80, chunk_every: 0.1}])
+      agent, events = agent_on_kernel(steer_inbox: File.join(@dir, "control", "steer-requests"))
+      thread = run_in_background(agent, "long stream")
+
+      sleep 0.4
+      File.write(File.join(stop_dir, "0001700000000000-stop.json"),
+                 JSON.generate({"type" => "stop", "ts" => 1_700_000_000_000}))
+      join_run(thread)
+      assert agent.interrupted?, "the stop file interrupted the run"
+      agent_end = events.find { |event| event[:type] == :agent_end }
+      assert agent_end[:interrupted], "the interrupted flag rides agent_end"
+      assert_empty Dir.glob(File.join(stop_dir, "*.json")), "the consumed stop file is unlinked"
+    end
+
+    # A file that fails JSON parse is unlinked and skipped (poison-pill
+    # safety) — a valid steer beside it still delivers.
+    def test_poison_inbox_file_is_skipped
+      inbox = File.join(@dir, "control", "steer-requests")
+      FileUtils.mkdir_p(inbox)
+      @server.script([
+        {type: :slow_stream, content: "x" * 80, chunk_every: 0.1},
+        {type: :message, content: "steered reply"},
+      ])
+      agent, = agent_on_kernel(steer_inbox: inbox)
+      thread = run_in_background(agent, "start the work")
+
+      sleep 0.4
+      File.write(File.join(inbox, "0001700000000001-garbage.json"), "{not json")
+      File.write(File.join(inbox, "0001700000000002-ok.json"),
+                 JSON.generate({"type" => "steer", "id" => "req-ok", "ts" => 1_700_000_000_002,
+                                "message" => "POISON-NEIGHBOR-MARKER", "mode" => "steer"}))
+      join_run(thread)
+      request = @server.captured_requests.last
+      assert request["messages"].any? { |m| m["role"] == "user" && m["content"].to_s.include?("POISON-NEIGHBOR-MARKER") }
+      assert_empty Dir.glob(File.join(inbox, "*.json")), "the poison file is unlinked too"
+    end
+
+    # --- I48 wake pins (§5.3 — pi triggerTurn on the port's seams) ---
+
+    # The wake drains the hooks' pending queue AS the run's opening
+    # messages: wire [custom-as-user] first (the §I47 drain path), the
+    # CustomMessage events, and the session custom_message entry.
+    def test_wake_drains_the_pending_notification_as_the_opening_turn
+      recorder_root = File.join(@dir, "agent")
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: recorder_root)
+      events = []
+      events_mutex = Mutex.new
+      sink = ->(event) { events_mutex.synchronize { events << event } }
+      hooks = Hooks.new(on_event: sink)
+      hooks.send_next_turn(custom_type: "subagent-notify", content: "Background task completed: **worker**", display: false)
+      @server.script([{type: :message, content: "post-notify reply"}])
+
+      agent = Agent::Loop.new(chat: TestChat.build(@server, system_prompt: "test prompt"), tools: {},
+                              hooks:, recorder:)
+      refute agent.running?
+      assert run_wake(agent), "the wake ran a turn"
+
+      request = @server.captured_requests.last
+      non_system = request["messages"].reject { |m| %w[system developer].include?(m["role"]) }
+      assert_equal %w[user], non_system.map { |m| m["role"] }
+      assert_includes non_system.first["content"], "Background task completed: **worker**"
+
+      custom_events = events.select { |event| event[:message].respond_to?(:role) && event[:message].role == :custom }
+      assert_equal %i[message_start message_end], custom_events.map { |event| event[:type] }.uniq
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      assert_equal ["session", "custom_message", "message"], entries.map { |entry| entry["type"] }
+      assert_equal "subagent-notify", entries[1]["customType"]
+      assert_equal "post-notify reply", agent.new_messages.last.content
+    end
+
+    # Empty queue + empty steering → NO model call, nothing recorded.
+    def test_wake_with_nothing_pending_makes_no_request
+      hooks = Hooks.new
+      agent = Agent::Loop.new(chat: TestChat.build(@server), tools: {}, hooks:)
+      assert_equal false, run_wake(agent), "the empty wake is a no-op"
+      assert_empty @server.captured_requests, "no model call"
+    end
+
+    # A wake landing mid-run no-ops (race-safe: one Loop one fiber).
+    def test_wake_noops_while_a_run_is_in_flight
+      @server.script([{type: :slow_stream, content: "x" * 40, chunk_every: 0.1}])
+      agent, = agent_on_kernel
+      thread = run_in_background(agent, "long stream")
+      sleep 0.3
+      assert agent.running?, "the run is in flight"
+
+      result = nil
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      kernel.run { result = agent.wake }
+      assert_equal false, result, "the mid-run wake is a no-op"
+      join_run(thread)
+    end
+
     private
 
     # Overflow scripts need more than one summary-able message in the
@@ -588,6 +1350,16 @@ module Tart
       end
       wait_until { !thread.alive? }
       thread.join
+    end
+
+    # I45: the same kernel harness over a caller-built chat (the
+    # dead-endpoint classification pins a transport the mock server can't
+    # serve).
+    def agent_on_kernel_with_chat(chat)
+      events = []
+      events_mutex = Mutex.new
+      sink = ->(event) { events_mutex.synchronize { events << event } }
+      [Agent::Loop.new(chat:, tools: {}, on_event: sink), events]
     end
   end
 end

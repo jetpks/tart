@@ -39,6 +39,9 @@ module Tart
       # @return [String] newline-joined entries, or {error:} on failure.
       def execute(path: nil, limit: nil)
         safe_execute do
+          failure = validate_input(path:, limit:)
+          return failure if failure
+
           RubyLLM::Support::Cancellation.check
           dir_path = PathUtils.resolve_to_cwd(path || ".", @cwd)
           raise ArgumentError, "Path not found: #{dir_path}" unless File.exist?(dir_path)

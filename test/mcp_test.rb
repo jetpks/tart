@@ -40,11 +40,12 @@ module Tart
       assert_equal "1.0.0", client.server_info["version"]
 
       tools = client.list_tools
-      assert_equal %w[echo sleep], tools.map { |t| t["name"] }
-      assert tools.all? { |t| t["inputSchema"].is_a?(Hash) }
+      assert tools.success?, "list_tools must return a Result"
+      assert_equal %w[echo sleep], tools.value!.map { |t| t["name"] }
+      assert tools.value!.all? { |t| t["inputSchema"].is_a?(Hash) }
 
       result = client.call_tool("echo", {"message" => "hello"})
-      assert_equal "echo: hello", result["content"][0]["text"]
+      assert_equal "echo: hello", result.value!["content"][0]["text"]
     end
 
     def test_close_reaps_the_child_process
@@ -59,11 +60,13 @@ module Tart
       assert_equal "closed", client.connection_state
     end
 
-    def test_request_timeout_raises_with_the_default_message
+    def test_request_timeout_is_a_failure_typed_by_the_timeout_error
       client = connected_client(request_timeout_ms: 250)
-      error = assert_raises(Mcp::TimeoutError) do
-        client.call_tool("sleep", {"ms" => 5000})
-      end
+      result = client.call_tool("sleep", {"ms" => 5000})
+
+      assert result.failure?, "the timeout taxonomy must arrive as a Failure value"
+      error = result.failure
+      assert_kind_of Mcp::TimeoutError, error
       assert_equal "MCP request timed out after 250ms", error.message
       assert_equal 250, error.timeout_ms
     end
@@ -71,8 +74,12 @@ module Tart
     def test_invalid_initialize_result_fails_the_handshake_and_closes_the_transport
       client = Mcp::Client.new
       transport = echo_transport(env: {"MCP_ECHO_FAIL_INITIALIZE" => "1"})
-      error = assert_raises(Mcp::Error) { client.connect(transport) }
-      assert_equal "Invalid MCP initialize result", error.message
+      result = client.connect(transport)
+
+      assert result.failure?, "the invalid handshake must arrive as a Failure value"
+      assert_kind_of Mcp::Error, result.failure
+      assert_equal "Invalid MCP initialize result", result.failure.message
+      assert_equal "closed", client.connection_state
       # pi: a failed connect closes the transport (client.ts catch -> close).
       wait_until { transport.pid.nil? || !child_alive?(transport.pid) }
     end
@@ -84,13 +91,14 @@ module Tart
       assert Mcp::Client::SUPPORTED_PROTOCOL_VERSIONS.include?("2024-11-05")
     end
 
-    def test_server_method_not_found_surfaces_as_mcp_error
+    def test_server_method_not_found_surfaces_as_a_failure_typed_by_mcp_error
       client = connected_client
-      error = assert_raises(Mcp::Error) do
-        client.send(:request, "resources/list", nil, timeout_ms: nil)
-      end
-      assert_equal(-32_601, error.code)
-      assert_equal "Method not found: resources/list", error.message
+      result = client.send(:request, "resources/list", nil, timeout_ms: nil)
+
+      assert result.failure?
+      assert_kind_of Mcp::Error, result.failure
+      assert_equal(-32_601, result.failure.code)
+      assert_equal "Method not found: resources/list", result.failure.message
     end
 
     def test_jsonrpc_validation_matches_pis_predicates_and_codes
@@ -163,6 +171,16 @@ module Tart
       path = write_config("mcpServers" => {"x" => {"url" => "https://example.com/mcp"}})
       error = assert_raises(Mcp::Config::ConfigError) { Mcp::Config.load(path) }
       assert_equal %(#{path}: server "x": streamable HTTP transport is not supported (stdio only)), error.message
+    end
+
+    # I43: fail-fast preserved through the contract — with BOTH servers
+    # invalid, the FIRST server in parsed insertion order wins (not a
+    # collect-all).
+    def test_first_invalid_server_in_insertion_order_wins
+      path = write_config("mcpServers" => {"z" => "nope", "a" => {"cwd" => 3}})
+      error = assert_raises(Mcp::Config::ConfigError) { Mcp::Config.load(path) }
+
+      assert_equal %(#{path}: server "z" must be an object), error.message
     end
 
     def test_malformed_config_json_names_the_file

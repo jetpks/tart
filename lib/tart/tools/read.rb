@@ -47,6 +47,9 @@ module Tart
       # @return [String] the model-facing text, or {error:} on failure.
       def execute(path:, offset: nil, limit: nil)
         safe_execute do
+          failure = validate_input(path:, offset:, limit:)
+          return failure if failure
+
           RubyLLM::Support::Cancellation.check
           absolute_path = PathUtils.resolve_read_path(path, @cwd)
           mime_type = Mime.detect_from_file(absolute_path)

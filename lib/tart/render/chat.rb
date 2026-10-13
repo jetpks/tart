@@ -18,6 +18,8 @@ require_relative "viewport"
 require_relative "slash_source"
 require_relative "transcript"
 require_relative "../models"
+require_relative "../shapes/model"
+require_relative "../shapes/session"
 
 module Tart
   module Render
@@ -45,6 +47,11 @@ module Tart
     # side lives in the agent lane.)
     class Chat
       SPINNER = %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏].freeze
+
+      # pi loader.ts:17 DEFAULT_INTERVAL_MS — the spinner's frame dwell: the
+      # glyph advances on TIME, never on renders ({spinner_glyph} derives
+      # the frame from the monotonic clock at each already-animated frame).
+      SPINNER_INTERVAL_SECONDS = 0.08
 
       # How long one draw re-arms the animation window while the agent works
       # (frame pacing: deadline-paced at the frame rate while busy, purely
@@ -114,6 +121,14 @@ module Tart
       #   templates — the MOTD's [Prompts] section (injectable so tests
       #   never touch the filesystem; the empty default renders no
       #   section, as in pi).
+      # @param skills [Array<Skills::Skill>] the loaded skill structs —
+      #   the MOTD's [Skills] section (file_path feeds the expanded scope
+      #   groups; the SlashSource name-only view stays the completion
+      #   catalog).
+      # @param context_files [Array<{path:, content:}>] the discovered
+      #   context files (Agent::ContextFiles.load) — the MOTD's [Context]
+      #   input ahead of the config sources (pi's contextFiles = the
+      #   system-prompt sources + the agents files, :1843-1853).
       # @param extensions [Array<String>] the loaded MCP server names —
       #   the MOTD's [Extensions] section (the port's loaded
       #   external-resource analog; empty renders none).
@@ -123,19 +138,27 @@ module Tart
       # @param models [Models::Config, nil] the models.json catalog (the
       #   /model selector's entries, I27); nil (tests) degenerates the
       #   catalog to the boot model (see {model_menu_entries}).
+      # @param clock [Proc] +call+ → Float monotonic seconds — the ONLY
+      #   time source for the spinner ({spinner_glyph}; the viewport.rb
+      #   monotonic precedent, the UserBash constructor-seam idiom).
+      #   Tests pin fake time with zero sleeps.
       def initialize(session:, kernel:, footer_data: nil, branch_reader: Footer::DEFAULT_BRANCH_READER, autocomplete: nil,
         motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
-        prompts: [], extensions: [], models: nil)
+        prompts: [], skills: [], context_files: [], extensions: [], models: nil,
+        clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) })
         @session = session
         @kernel = kernel
         @footer_data = footer_data
         @agent = nil
         @mutex = Mutex.new
-        # The input-line editor (pi's Input — the editor state and
-        # operations) and its suggestion list over the injected completion
-        # source (pi editor.ts autocompleteState/autocompleteList +
-        # SelectList). Both unsynchronized — see the class comment.
-        @editor = Editor.new
+        # The multi-line input editor (pi's Editor — the visual-line state
+        # and operations) and its suggestion list over the injected
+        # completion source (pi editor.ts autocompleteState/
+        # autocompleteList + SelectList). Both unsynchronized — see the
+        # class comment. The rows_reader seam shares the screen height
+        # with the render window and the editor's page size (pi reads
+        # terminal.rows at both sites).
+        @editor = Editor.new(rows_reader: -> { screen_height })
         @autocomplete = Autocomplete.new(source: autocomplete)
         # The viewport state machines (I23 wave 3): the transcript scroll
         # state — the offset over the buffer, the follow-end pin and the
@@ -147,11 +170,14 @@ module Tart
         @selection_state = Selection.new(line_reader: ->(row) { selection_line(row) })
         # The running compaction's reason (the border-status label's key).
         @compaction_reason = nil
-        # The header-container rows the boot MOTD enqueued (the compaction
-        # rebuild restores them — pi's headerContainer survives the
-        # compaction_end chatContainer clear). nil = no header on screen
-        # (motd: false, or the /resume screen) — the rebuild restores none.
-        @header_rows = nil
+        # Whether the boot/new header block is on screen (the compaction
+        # rebuild re-enqueues it — pi's headerContainer survives the
+        # compaction_end chatContainer clear). Since I33 the header rides
+        # the expandable registry ({enqueue_motd_header} — the flip
+        # rebuilds it at the CURRENT toggle state). false = no header on
+        # screen (motd: false, or the /resume screen) — the rebuild
+        # restores none.
+        @header_enqueued = false
         # The /resume session picker (item 2, pi SessionSelectorComponent
         # reduced): nil = closed; open it holds the {Picker} over the
         # launcher-built [{path:, label:}] list (newest first).
@@ -178,18 +204,24 @@ module Tart
           history_sink: ->(text) { @editor.add_to_history(text) },
           reseed_sink: ->(message) { @footer.reseed_usage(message) }
         )
-        @border_status = nil
         # The !-prefix bash execution state machine (backlog C, pi
         # handleBashCommand): the coordinator routes into it — submit's
         # parse, escape's cancel, agent_end's deferred-record flush. The
         # last ctrl+c timestamp stays here (pi's lastSigintTime — the
-        # double-press exit window, handleCtrlC :6840).
+        # double-press exit window, handleCtrlC :6840). The I38 streaming
+        # sinks wire the running block's render state below (pi's
+        # BashExecutionComponent lives from before execution,
+        # :7000-7062): start before the task spawns, each bridged chunk,
+        # and the explicit clear at every terminal path.
         @user_bash = UserBash.new(
           kernel: kernel,
           busy_reader: -> { busy? },
           block_sink: ->(command, fields, excluded) { @transcript_state.enqueue_user_bash_block(command, **fields, excluded:) },
           record_sink: ->(message) { @agent&.record_bash_execution(message) },
-          line_sink: ->(text, fg:) { @transcript_state.enqueue_scrollback(text, fg:) }
+          line_sink: ->(text, fg:) { @transcript_state.enqueue_scrollback(text, fg:) },
+          stream_start_sink: ->(command, excluded) { start_user_bash_stream(command, excluded) },
+          stream_chunk_sink: ->(text) { append_user_bash_stream(text) },
+          stream_end_sink: -> { end_user_bash_stream }
         )
         @last_ctrl_c = nil
         # The copy confirmation's flash ({flash} — the message token) and
@@ -202,13 +234,26 @@ module Tart
         @live = +""
         # The in-flight message's reasoning (pi's live thinking block): the
         # joined chunk.thinking deltas, rendered dim while it grows and
-        # flushed as the completed thinking block at :message_end (the loop
-        # strips Message#thinking before the surface sees the event —
-        # loop.rb strip_thinking_replay).
+        # flushed as the completed thinking block at :message_end (replay
+        # normalization happens at the request seam — Agent::Loop's
+        # before_request hook; the message itself keeps its thinking).
         @reasoning = +""
         @busy = false
         @tool = nil
-        @frames = 0
+        # The RUNNING user-bash block's render state (I38 — pi's
+        # BashExecutionComponent): the command/excluded, the accumulated
+        # chunk text (the appendOutput join IS this string buffer), and
+        # the bash loader's OWN time anchor (pi constructs one Loader per
+        # component — independent of the border status's anchor). Mutated
+        # only by the three sinks, under the surface mutex; nil = no run
+        # in flight.
+        @user_bash_stream = nil
+        # The spinner's time anchor (pi's Loader frame clock): the glyph is
+        # derived from the elapsed monotonic seconds at render
+        # ({spinner_glyph}), never from the render count. nil until the
+        # first status-kind start re-anchors it ({restart_spinner!}).
+        @clock = clock
+        @spinner_started_at = nil
         # The footer state machine (I24 wave 4): the branch cache and the
         # usage accounting (pi footer-data-provider.ts + footer.ts), fed
         # the launcher facts per frame from {@footer_data}.
@@ -217,6 +262,8 @@ module Tart
         @models = models
         @identity = identity
         @prompts = prompts
+        @skills = skills
+        @context_files = context_files
         @extensions = extensions
         # The runtime thinking level (nil = the settings default shows;
         # /thinking sets it — pi agent.state.thinkingLevel).
@@ -258,6 +305,13 @@ module Tart
       # @return [Boolean] whether an agent run is in flight.
       def busy?
         @mutex.synchronize { @busy }
+      end
+
+      # @return [Boolean] whether a user-bash run's live rows are on
+      #   screen (the animate gate's second arm — @busy stays false: a
+      #   bash run never lights the border's Working status).
+      def user_bash_streaming?
+        @mutex.synchronize { !@user_bash_stream.nil? }
       end
 
       # @return [String] the input line buffer (the editor's).
@@ -347,12 +401,14 @@ module Tart
           enqueue_motd if @motd_pending
           @motd_pending = false
           @transcript_state.flush_scrollback
-          @frames += 1
           widget = build_widget
         end
         # Keep frames deadline-paced while the agent works (spinner, live
-        # region); idle goes event-driven again on agent_end.
-        @kernel.animate(duration: BUSY_FRAME_SECONDS) if busy?
+        # region) OR a user-bash run streams (the bash loader's glyph must
+        # advance between chunks — pi's Loader ticks requestRender on its
+        # own 80 ms interval, loader.ts:79-84); idle goes event-driven
+        # again on agent_end / stream end.
+        @kernel.animate(duration: BUSY_FRAME_SECONDS) if busy? || user_bash_streaming?
         widget
       end
 
@@ -375,11 +431,23 @@ module Tart
           case event[:type]
           when :agent_start
             @busy = true
-            @border_status = nil # pi's status indicators clear on agent events
+            # pi turn_start creates the working indicator (interactive-mode.ts
+            # :3427-3433) — the Loader's frame-0 reset.
+            restart_spinner!
             @footer.invalidate_branch # per-turn branch invalidation (pi's provider cache, reduced)
           when :message_start
-            @live = +""
-            @reasoning = +""
+            message = event[:message]
+            if message.respond_to?(:role) && message.role == :custom
+              # The custom-message arm (I47 — pi message_start case custom,
+              # interactive-mode.ts:3498-3502: the component is added at
+              # message_start, display-gated). The :message_end custom case
+              # needs no arm — the assistant guard below already no-ops it
+              # (pi renders the block ONCE).
+              @transcript_state.enqueue_custom_block(message.custom_type, message.content) if message.display
+            else
+              @live = +""
+              @reasoning = +""
+            end
           when :message_update
             chunk = event[:chunk]
             @live << chunk.content if chunk.content.is_a?(String) && !chunk.content.empty?
@@ -401,20 +469,32 @@ module Tart
             end
           when :tool_execution_start
             @tool = event[:tool_call].name
+            # The PENDING block's enqueue (I34 — pi renders the running
+            # call's block immediately under toolPendingBg, the component
+            # added to the chat container at :tool_execution_start,
+            # interactive-mode.ts:3611-3621): paints on the next frame
+            # while the tool runs; the finalize replaces it in place.
+            call = event[:tool_call]
+            @transcript_state.enqueue_pending_tool_block(call.name, call.arguments)
           when :tool_execution_end
             @tool = nil
             call = event[:tool_call]
-            # The per-tool block dispatch (pi's per-tool renderers): bash
-            # owns the shell shapes (I17 — the frozen :tool_execution_end
-            # contract carries `duration:`), write/read their file-tool
-            # shapes (I18), the rest the generic ⎿ line.
-            @transcript_state.enqueue_tool_block(call.name, call.arguments, event[:result], event[:duration])
+            # The settle (I34): the pending block replaced IN PLACE with
+            # the per-tool block dispatch's rows (pi's per-tool renderers
+            # — bash owns the shell shapes, I17 — the frozen
+            # :tool_execution_end contract carries `duration:`; write/read
+            # their file-tool shapes, I18; the rest the generic ⎿ line).
+            # No live pending (the replay path) falls back to the append.
+            @transcript_state.finalize_tool_block(call.name, call.arguments, event[:result], event[:duration])
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after
             # prepare succeeds): the border shows pi's per-reason label
             # (status-indicator.ts:85-95 minus the cancel hint) until the
             # result (+:compaction+) or the run end clears it.
             @compaction_reason = event[:reason]
+            # pi constructs CompactionStatusIndicator (:3681) — a new
+            # Loader, frame 0.
+            restart_spinner!
           when :compaction
             # pi compaction_end's result arm (interactive-mode.ts:3686-3725):
             # the chat container clears and rebuilds from the post-compaction
@@ -425,14 +505,19 @@ module Tart
             # INVALIDATES — post-compaction the context numerator is
             # unknown until the next LLM response (the "?") — never /new's
             # usage reset. The border status came from :compaction_start
-            # (the frozen I12 contract); its clearing here stays.
+            # (the frozen I12 contract); its clearing here stays — and
+            # re-anchors the spinner (pi clearStatusIndicator :3694 → the
+            # next working indicator restarts).
             @compaction_reason = nil
+            restart_spinner!
             wipe_transcript
             # The header container survives pi's chatContainer clear
             # (interactive-mode.ts:633-639 — sibling containers; the s7
             # capture: art + help + onboarding ride again, no resource
-            # listings). The boot's captured shape, exact rows.
-            @transcript_state.enqueue_region(@header_rows) if @header_rows
+            # listings). Re-enqueued as the EXPANDABLE block — rebuilt at
+            # its CURRENT expansion state (pi's live header rides the
+            # toggle).
+            enqueue_motd_header if @header_enqueued
             entries = event[:entries].is_a?(Array) ? event[:entries] : []
             @transcript_state.replay_entries(entries, update_footer: false, populate_history: false)
             @transcript_state.enqueue_compaction_panel(event[:summary], event[:tokens_before])
@@ -444,9 +529,16 @@ module Tart
             # _pendingBashMessages flush) — never mid-tool-sequence.
             @user_bash.flush_pending
             if event[:interrupted] == true
+              # The orphaned pending block's finalize (I34 — pi's abort
+              # arm loops pendingTools with the "Operation aborted" error
+              # result, interactive-mode.ts:3573-3586); the interrupt
+              # scrollback line stays (additive).
+              @transcript_state.finalize_pending_as_error("Operation aborted")
               handled = "interrupted"
               @transcript_state.enqueue_scrollback(handled, fg: Theme[:warning])
             elsif event[:error]
+              # pi's error arm: the same loop with the error's message.
+              @transcript_state.finalize_pending_as_error(event[:error].message.to_s)
               handled = "error: #{event[:error].message}"
               @transcript_state.enqueue_scrollback(handled, fg: Theme[:error])
             end
@@ -465,16 +557,21 @@ module Tart
       # The /new surface (bin/tart's reset seam): pi handleClearCommand →
       # newSession → renderCurrentSessionState — the chat container clears,
       # initial state re-renders, then the accent "✓ New session started"
-      # line (interactive-mode.ts:6926-6936, 2209-2216). The port's flat
-      # transcript analog: drop the buffer and stream state, re-render the
-      # MOTD block, then the accent line (deviation, itemized: pi's header
-      # lives in a separate container and never re-renders). Cross-lane
-      # contract: bin/tart's reset lambda calls this after swapping in the
-      # fresh agent (start_session + surface.new_session).
+      # line (interactive-mode.ts:6926-6936, 2209-2216). pi's shape: the
+      # HEADER container untouched (never cleared, never re-rendered — its
+      # live state rides the toggle), the loadedResourcesContainer cleared
+      # and NEVER re-rendered (sections are boot-once). The port's flat
+      # buffer wipes both, so the header block RE-ENQUEUES as the one
+      # faithful translation (at the CURRENT toggle state; tart-mode's
+      # fresh random art is the sanctioned identity presentation), and the
+      # resource sections drop out of the path entirely (the sections-
+      # resurrect was a real /new divergence — I33). Cross-lane contract:
+      # bin/tart's reset lambda calls this after swapping in the fresh
+      # agent (start_session + surface.new_session).
       def new_session
         @mutex.synchronize do
           clear_transcript
-          enqueue_motd
+          enqueue_motd_header
           @transcript_state.enqueue_scrollback("✓ New session started", fg: Theme[:accent])
         end
       end
@@ -494,15 +591,19 @@ module Tart
           entries = Agent::Session.load_entries(path)
           @transcript_state.replay_entries(entries)
           # The resumed session's last assistant text is ctrl+x's fallback
-          # (pi getLastAssistantText reads the loaded messages).
+          # (pi getLastAssistantText reads the loaded messages). The entry
+          # gates ride the typed envelopes (the same nil-skip table the
+          # loader guards had).
           @last_assistant_text = entries.filter_map { |entry|
-            message = entry.is_a?(Hash) && entry["message"]
-            next unless message.is_a?(Hash) && message["role"] == "assistant" &&
-              message["content"].is_a?(String) && !message["content"].strip.empty?
+            envelope = Shapes::MessageEntry.of(entry)
+            next unless envelope && envelope.role == "assistant"
 
-            message["content"].strip
+            text = envelope.message["content"]
+            next unless text.is_a?(String) && !text.strip.empty?
+
+            text.strip
           }.last
-          compactions = entries.count { |entry| entry.is_a?(Hash) && entry["type"] == "compaction" }
+          compactions = entries.count { |entry| Shapes::CompactionEntry.of(entry) }
           if compactions.positive?
             times = compactions == 1 ? "1 time" : "#{compactions} times"
             @transcript_state.enqueue_scrollback("Session compacted #{times}", fg: Theme[:dim])
@@ -541,41 +642,65 @@ module Tart
         text
       end
 
-      # The startup MOTD block: the header-container shape (pi
-      # interactive-mode.ts:1075-1077 — Spacer(1), the header, Spacer(1))
-      # around the identity's header content. In tart-mode the content is
-      # the owner's art, the version line, the hints line, then the
-      # [Context] and [Skills] resource sections (pi's showLoadedResources
-      # :1778-1860; the [Prompts]/[Extensions]/[Themes] sections and
-      # package-update notices are cut — the port loads none of them,
-      # itemized). pi-mode renders pi's actual built-in header bytes.
+      # The startup MOTD: the header-container block as ONE expandable
+      # (pi interactive-mode.ts:1075-1077 — Spacer(1), the header,
+      # Spacer(1); BuiltInHeader extends ExpandableText :256-270) plus
+      # each loaded-resource section as its own expandable (pi
+      # showLoadedResources' per-section ExpandableText children, swept by
+      # the same toggle :4568-4572). The ctrl+o flip rebuilds every block
+      # collapsed↔expanded in place ({Transcript#set_tool_output_expanded}).
+      # Boot-only: /new re-enqueues the header alone ({new_session}), the
+      # compaction rebuild ditto (the sections are boot-once, the I31
+      # ruling).
       def enqueue_motd
-        # The header-container shape (Spacer(1), the header, Spacer(1)) —
-        # captured so the compaction rebuild can restore the exact rows
-        # (pi's headerContainer is a separate container the compaction_end
-        # clear never touches; re-rendering would resurrect the port-only
-        # resource listings and tart-mode's random art would swap).
-        header = [Panel.blank_line]
-        header.concat(@identity == Identity::PI ? Motd.pi_header_lines : Motd.tart_header_lines(viewport_width))
-        @header_rows = [*header, Panel.blank_line]
-        lines = header.dup
-        # The loaded-resource sections ride BOTH identities (pi
-        # showLoadedResources renders for any theme/identity — the owner's
-        # missing [Context]/[Skills]/[Prompts]/[Extensions] block; each
-        # section opens with its blank, the enqueue's trailing blank is
-        # the header container's closing Spacer). Wrapped at the content
-        # width, as the sections always have. The section inputs gather
-        # from this surface's constructor state (Motd is stateless —
-        # everything threads).
-        Motd.sections(viewport_width - Panel::OUTPUT_PAD.length * 2,
-          context: Motd.context_sources(@settings_root, @footer_data&.fetch(:cwd, nil) || Dir.pwd),
-          skills: Motd.motd_skill_names(@autocomplete.source),
-          prompts: @prompts, extensions: @extensions).each do |header, rows|
-          lines << Panel.blank_line << TUI.line("#{Panel::OUTPUT_PAD}#{header}", fg: Theme[:md_heading])
-          lines.concat(rows)
+        enqueue_motd_header
+        enqueue_motd_sections
+      end
+
+      # The header-container block: the identity's header content between
+      # its Spacers, built at the CURRENT global toggle state (pi
+      # getStartupExpansionState = verbose || toolOutputExpanded; the port
+      # has no --verbose, cut, itemized). Registered so the flip and the
+      # compaction rebuild re-invoke the builder. The tart art samples
+      # ONCE per block (the flip must restore the collapsed bytes exactly;
+      # a /new re-enqueue samples fresh art — the sanctioned presentation).
+      def enqueue_motd_header
+        @header_enqueued = true
+        logo_lines = Motd.motd_logo_lines
+        @transcript_state.push_expandable(->(expanded) { motd_header_rows(expanded, logo_lines) })
+      end
+
+      def motd_header_rows(expanded, logo_lines)
+        header = @identity == Identity::PI ? Motd.pi_header_lines(expanded:) : Motd.tart_header_lines(viewport_width, @identity, expanded:, logo_lines:)
+        [Panel.blank_line, *header, Panel.blank_line]
+      end
+
+      # The loaded-resource sections (boot-once). Each block mirrors pi's
+      # container children — paddingX-0 components (addLoadedSection's
+      # ExpandableText(..., 0, 0): the header row and the expanded bodies
+      # render at column 0; only the COMPACT lists carry the port's pad,
+      # the frozen I24 shape).
+      # container children: the [Context] branch's LEADING Spacer rides
+      # its block (interactive-mode.ts:1852-1853 — the contextFiles branch
+      # only), every section carries its TRAILING Spacer (addLoadedSection
+      # :1814). The section inputs gather from this surface's constructor
+      # state (Motd is stateless — everything threads).
+      def enqueue_motd_sections
+        cwd = @footer_data&.fetch(:cwd, nil) || Dir.pwd
+        Motd.sections(viewport_width,
+          context: @context_files.map { |file| file.fetch(:path) } + Motd.context_sources(@settings_root, cwd),
+          skills: @skills, prompts: @prompts, extensions: @extensions,
+          user_root: @settings_root, project_root: File.join(cwd, Settings::CONFIG_DIR)).each do |section|
+          @transcript_state.push_expandable(->(expanded) { motd_section_rows(section, expanded) })
         end
-        lines << Panel.blank_line
-        @transcript_state.enqueue_region(lines)
+      end
+
+      def motd_section_rows(section, expanded)
+        rows = [TUI.line(section.name, fg: Theme[:md_heading])]
+        rows.concat(expanded ? section.expanded_rows : section.collapsed_rows)
+        rows.unshift(Panel.blank_line) if section.leading_blank
+        rows << Panel.blank_line
+        rows
       end
 
       # The /new + resume shared reset: the buffer and stream state drop
@@ -587,7 +712,7 @@ module Tart
         wipe_transcript
         # The capture dies with the screen it rode (the /resume screen
         # re-renders no MOTD — the itemized cut; /new re-captures below).
-        @header_rows = nil
+        @header_enqueued = false
         @last_assistant_text = nil # the fresh session has no messages to copy
         # pi's footer stats re-derive from the fresh (empty) session.
         @footer.reset_usage
@@ -617,7 +742,7 @@ module Tart
       # objects own the state.
       def edit_input(event)
         if event.paste?
-          @editor.insert(event.content)
+          @editor.insert_paste(event.content)
           @autocomplete.cancel # pi editor.ts:1261 — paste cancels the list
           return
         end
@@ -655,8 +780,26 @@ module Tart
         # mechanism, Task#stop — no second path), idle escape is a no-op;
         # pi's double-escape /tree//fork is cut — no session branching).
         when "enter"
-          @autocomplete.apply(@editor) if @autocomplete.suggestions
-          submit
+          # pi editor.ts:889-919 — the newline keys route to addNewLine
+          # BEFORE the submit path (tui.input.newLine = shift+enter/
+          # ctrl+j, keybindings.ts:143; alt+enter is pi's terminal
+          # fallback arm), and plain enter submits — with the
+          # no-shift+enter terminal workaround: a "\\" before the cursor
+          # is deleted and a newline inserted instead (:906-917). The
+          # list keeps pi's select.confirm fall-through: a "/"-prefix
+          # completion applies then submits (editor.ts:790-816).
+          if event.modifiers.include?("shift") || alt
+            @autocomplete.cancel # pi addNewLine editor.ts:1329
+            @editor.add_new_line
+          elsif @autocomplete.suggestions
+            @autocomplete.apply(@editor)
+            submit
+          elsif @editor.backslash_before_cursor?
+            @editor.delete_backward
+            @editor.add_new_line
+          else
+            submit
+          end
         when "esc"
           # pi onEscape (interactive-mode.ts:3069-3092): a streaming run
           # aborts through the kernel's interrupt path; a running user
@@ -710,9 +853,11 @@ module Tart
           # true}, interactive-mode.ts:3114): the copy seam; bare x types.
           ctrl ? copy_message : @editor.insert_printable(event)
         # While the list is active up/down navigate the LIST (history
-        # yields — pi custom-editor.ts:127-131 → editor.ts:766-771).
-        when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.history_previous
-        when "down" then @autocomplete.suggestions ? @autocomplete.navigate(1) : @editor.history_next
+        # yields — pi custom-editor.ts:127-131 → editor.ts:766-771);
+        # otherwise pi's cursorUp/cursorDown dispatch runs (history at
+        # the visual extremes per its gating, else one visual row).
+        when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.cursor_up
+        when "down" then @autocomplete.suggestions ? @autocomplete.navigate(1) : @editor.cursor_down
         when "tab"
           # app.thinking.cycle (pi keybindings.ts:33-35, default
           # shift+tab): the in-session level cycle — kept when bare
@@ -724,20 +869,18 @@ module Tart
           else
             @autocomplete.update(@editor) # explicit trigger (pi handleTabCompletion)
           end
-        # Transcript paging (pi keybindings.ts:114-115 tui.editor.pageUp/
+        # Editor paging (pi keybindings.ts:114-115 tui.editor.pageUp/
         # pageDown, defaultKeys pageUp/ctrl+pageUp, pageDown/ctrl+pageDown;
-        # the gem spells the codes "page_up"/"page_down") — the port maps
-        # the action onto the transcript viewport (the port's editor is
-        # single-line; mapping judgment, itemized). The list wins while
-        # active (pi's precedence: the list owns the vertical keys).
-        when "page_up"
-          unless @autocomplete.suggestions
-            mark_scrollbar_activity(@viewport.scroll_page(-1, display_lines.size, transcript_area_rows))
-          end
-        when "page_down"
-          unless @autocomplete.suggestions
-            mark_scrollbar_activity(@viewport.scroll_page(1, display_lines.size, transcript_area_rows))
-          end
+        # the gem spells the codes "page_up"/"page_down") — I35 OPTION A:
+        # the page keys page the EDITOR's visual rows (pi pageScroll,
+        # editor.ts:1961-1973 — pi's editor pages even with the list
+        # open, :960-967 fall-through, so no list guard); the transcript
+        # stays wheel-only (the I12 transcript page mapping and its
+        # Viewport helper retired with it). The editor paging is silent:
+        # pi's pageScroll marks no
+        # scrollbar activity (it never touches the transcript).
+        when "page_up" then @editor.page_scroll(-1)
+        when "page_down" then @editor.page_scroll(1)
         when "backspace"
           alt ? @editor.delete_word_backward : @editor.delete_backward
           @autocomplete.update(@editor) # pi editor.ts:1449-1463 — re-filter/re-trigger
@@ -764,11 +907,26 @@ module Tart
             @editor.insert_printable(event)
           end
         when "w" then ctrl ? @editor.delete_word_backward : @editor.insert_printable(event)
+        when "j"
+          # tui.input.newLine's ctrl+j arm (keybindings.ts:143); pi's
+          # addNewLine cancels the list (editor.ts:1329).
+          if ctrl
+            @autocomplete.cancel
+            @editor.add_new_line
+          else
+            @editor.insert_printable(event)
+          end
         # The emacs kill/yank slice (I26, pi keybindings.ts:129-135): the
         # kill ops exit history browsing and push the cut span themselves.
         when "u" then ctrl ? @editor.delete_to_line_start : @editor.insert_printable(event)
         when "k" then ctrl ? @editor.delete_to_line_end : @editor.insert_printable(event)
         when "y" then ctrl ? @editor.yank : (alt ? @editor.yank_pop : @editor.insert_printable(event))
+        # tui.editor.undo (I39, pi keybindings.ts:142, default ctrl+-):
+        # pi matches undo BEFORE the autocomplete-mode block (editor.ts
+        # :751-755) — it fires with the list open, neither cancelled nor
+        # re-filtered (the printable re-filter below stays off ctrl+-).
+        # Bare - types; alt+- is the modifier-guard no-op.
+        when "-" then ctrl ? @editor.undo : @editor.insert_printable(event)
         else @editor.insert_printable(event)
         end
         # pi editor.ts:1228-1251 — the list re-filters on every printable
@@ -794,6 +952,7 @@ module Tart
 
         @editor.add_to_history(text)
         @editor.clear
+        @editor.clear_undo_stack # pi submitValue editor.ts:1373 — the submit surface clears the stack
         @editor.exit_history_browsing
         @footer.invalidate_branch # per-turn branch invalidation
         if @commands && text.start_with?("/")
@@ -1045,8 +1204,8 @@ module Tart
         editor_top = footer_top - editor_area_rows
         if y >= editor_top
           offset = y - editor_top
-          return editor_border_text(status_title) if offset.zero?
-          return "─" * viewport_width if offset == editor_area_rows - 1
+          return editor_top_border_line.spans.map(&:content).join if offset.zero?
+          return editor_bottom_border_line.spans.map(&:content).join if offset == editor_area_rows - 1
 
           line = editor_slot_lines[offset - 1]
           return line ? line.spans.map(&:content).join : ""
@@ -1061,20 +1220,16 @@ module Tart
         line ? line.spans.map(&:content).join : ""
       end
 
-      # The editor block's top-border row bytes (the status title rides
-      # it — custom-editor.ts renderTopBorder; the gem renders the title
-      # first, dashes to width).
-      def editor_border_text(title)
-        return "─" * viewport_width unless title
-
-        title + "─" * [viewport_width - TUI.text_width(title), 0].max
-      end
-
+      # pi chat-viewport.ts:33 — the editor dock is shrink 1, minSize 3
+      # ({MIN_EDITOR_ROWS}): the two border rows + the windowed input
+      # rows (always ≥ 1 — the empty editor lays out one row) + the
+      # suggestion list, capped at the screen (the cap is what makes the
+      # dock yield under pressure — pi's VStack shrink).
       def editor_area_rows(height = screen_height)
         return [@picker.widget_rows + 2, height - 1].min if @picker # + borders
         return [@menu.widget_rows + 2, height - 1].min if @menu # + borders
 
-        [MIN_EDITOR_ROWS + @autocomplete.rows, height - 1].min
+        [MIN_EDITOR_ROWS - 1 + @editor.windowed_rows(editor_inner_width) + @autocomplete.rows, height - 1].min
       end
 
       # The editor slot's top border row (the composition's third child:
@@ -1093,12 +1248,20 @@ module Tart
         editor_content_lines
       end
 
-      # The editor's content lines (the input row + the suggestion rows)
-      # — the edit box's inner rows, shared by {editor_widget}'s build
-      # and the selection's dock composition ({below_line}).
+      # The editor's content lines (the windowed input rows + the
+      # suggestion rows) — the edit box's inner rows, shared by
+      # {editor_widget}'s build and the selection's dock composition
+      # ({below_line}). The editor wraps at the inner width itself (pi
+      # layoutText's contentWidth — one column reserved for the cursor,
+      # paddingX 0), so rows arrive render-ready; no clip pass.
       def editor_content_lines
-        inner = [viewport_width - 1, 1].max
-        [TUI.line(Text.clip_spans(@editor.input_spans, inner))] + @autocomplete.lines(inner)
+        @editor.input_rows(editor_inner_width) + @autocomplete.lines(editor_inner_width)
+      end
+
+      # The editor's wrap width (pi render :536-556: layoutWidth =
+      # width − 1 — one column reserved for the cursor at paddingX 0).
+      def editor_inner_width
+        [viewport_width - 1, 1].max
       end
 
       # The selection highlight over composed dock rows (the transcript's
@@ -1208,24 +1371,15 @@ module Tart
       # paddingX 0 (pi's editorPaddingX default, settings-defaults.ts:46)
       # with pi's one reserved cursor column (editor.ts:518-521: without
       # padding the layout width is width − 1). The suggestion list renders
-      # below the input row, inside the editor area (pi editor.ts:618-634
+      # below the input rows, inside the editor area (pi editor.ts:618-634
       # — the area height grows by the list height; the port's standing
-      # I12 placement). The content rows carry the selection highlight at
-      # their synthetic rows (I28 AC2; the border rows stay unhighlighted
-      # — the gem's native Block composes them, itemized).
+      # I12 placement). Since I35 the area composes its own border rows
+      # (see {editor_top_border_line}); the content rows carry the
+      # selection highlight at their synthetic rows (I28 AC2) and the
+      # border rows stay unhighlighted, itemized as at base.
       def editor_widget
         content = highlight_lines(editor_content_lines, editor_area_top + 1)
-        TUI.block(
-          title: status_title,
-          borders: [:top, :bottom],
-          # pi updateEditorBorderColor (interactive-mode.ts:4514-4522):
-          # the border follows the input — bash mode (a leading "!")
-          # renders the bashMode token; otherwise the session's thinking
-          # level (getThinkingBorderColor — {editor_border_color}).
-          border_style: TUI.style(fg: editor_border_color),
-          title_style: TUI.style(fg: Theme[:dim]),
-          children: [TUI.paragraph(text: content, wrap: false)]
-        )
+        TUI.paragraph(text: [editor_top_border_line, *content, editor_bottom_border_line], wrap: false)
       end
 
       # pi getThinkingBorderColor (theme.ts:348) over the session's level
@@ -1243,6 +1397,146 @@ module Tart
         Theme::TOKENS.key?(token) ? Theme[token] : Theme[:thinking_off]
       end
 
+      # The editor area's composed border rows (pi renderTopBorder/
+      # renderBottomBorder, editor.ts:509-518 + createScrollBorder
+      # :279-296): dashes in the border color; when the window hides
+      # rows, the centered " ↑/↓ N more " label. Deviation, itemized: pi
+      # wraps each border segment in borderColor(...) directly; the gem
+      # seam exposes no bottom-title/multi-style border row (tui.rb is
+      # shared), so the rows are composed here as span lines inside the
+      # editor's paragraph — the BYTES and the segment routing (border
+      # color for the border, the embedded status's per-kind colors) are
+      # pi's ({Editor.scroll_border} is unit-pinned).
+      def editor_top_border_line
+        status = status_title
+        hidden = @editor.scroll_offset
+        unless status || hidden.positive?
+          return TUI.line("─" * viewport_width, fg: editor_border_color)
+        end
+        unless status
+          return TUI.line(Editor.scroll_border("↑", hidden, viewport_width), fg: editor_border_color)
+        end
+
+        TUI.line(status_border_segments(hidden, status).map do |text, segment|
+          TUI.span(text, fg: status_segment_fg(segment))
+        end)
+      end
+
+      def editor_bottom_border_line
+        hidden = @editor.hidden_below
+        row = hidden.positive? ? Editor.scroll_border("↓", hidden, viewport_width) : "─" * viewport_width
+        TUI.line(row, fg: editor_border_color)
+      end
+
+      # The top border's segments with an embedded working status
+      # (custom-editor.ts:36-66): "── " + status + " " on the left (pi's
+      # single-space shape — the status rides UNFLANKED since I37), the
+      # hidden-rows label centered in the border color, and on collision
+      # the status degrades to the spinner alone (pi
+      # renderSpinnerInBorder) — after which the centered form may fit
+      # again (pi re-runs canFitOverflow against the degraded status).
+      # Returns [text, :border|:spinner|:message] pairs — the spinner
+      # glyph and the message are separate segments so each takes its
+      # own color ({status_segment_fg}).
+      def status_border_segments(hidden, status)
+        width = viewport_width
+        label = hidden.positive? ? " ↑ #{hidden} more " : nil
+        status = spinner_glyph if label && !status_label_fit?(status, label, width)
+
+        status_width = TUI.text_width(status)
+        label_width = label ? TUI.text_width(label) : 0
+        overflow_start = (width - label_width) / 2
+        left_block = 3 + status_width + 1
+        if label && label_width + 2 <= width && overflow_start - left_block >= 1
+          tail = " #{"─" * (overflow_start - left_block)}#{label}#{"─" * (width - overflow_start - label_width)}"
+          return [["── ", :border], *status_spans(status), [tail, :border]]
+        end
+        if width >= status_width + 5
+          return [["── ", :border], *status_spans(status), [" #{"─" * (width - status_width - 4)}", :border]]
+        end
+
+        # pi degrades to the spinner alone here too (custom-editor.ts:66-67
+        # re-renders renderSpinnerInBorder before the prefix math).
+        status = spinner_glyph
+        status_width = TUI.text_width(status)
+        prefix = [3, [width - status_width, 0].max].min
+        [["─" * prefix, :border], *status_spans(status),
+         ["─" * [[width - prefix - status_width, 0].max, 0].max, :border]]
+      end
+
+      # custom-editor.ts:44-46 canFitOverflow: the label needs its width
+      # plus margins, and the centered label's start must clear the
+      # status block ("── " + status + " ") by at least one dash.
+      def status_label_fit?(status, label, width)
+        label_width = TUI.text_width(label)
+        return false unless label_width + 2 <= width
+
+        ((width - label_width) / 2) - (3 + TUI.text_width(status) + 1) >= 1
+      end
+
+      # The status block's spans over the composed "<glyph> <message>"
+      # (pi renderInBorder's slice — the Loader's `<glyph> <message>`
+      # text): the leading glyph and the message are separate segments
+      # so each carries its own color ({status_segment_fg}); the
+      # degraded bare-glyph form (renderSpinnerInBorder) is the spinner
+      # alone. The split is positional — the glyph was composed from ONE
+      # clock read in {status_title}; re-deriving it here could race a
+      # frame tick.
+      def status_spans(status)
+        glyph, message = status.split(" ", 2)
+        return [[glyph, :spinner]] unless message
+
+        [[glyph, :spinner], [" #{message}", :message]]
+      end
+
+      def spinner_frame(anchor)
+        # pi loader.ts — the frame displayed at time t is
+        # frames[floor((t − anchor)/interval) mod n] whatever the render
+        # cadence: pi's setInterval advances the frame on TIME (+
+        # requestRender); the port derives the same frame from the
+        # monotonic clock at each already-animated frame (the
+        # BUSY_FRAME_SECONDS cadence is unchanged) — no timer task. nil
+        # anchor → frame 0 (pi setIndicator resets currentFrame).
+        return SPINNER.first unless anchor
+
+        elapsed = @clock.call - anchor
+        SPINNER[(elapsed / SPINNER_INTERVAL_SECONDS).floor % SPINNER.size]
+      end
+
+      # The border status's glyph — its own anchor ({restart_spinner!}).
+      # The bash-run loader shares the MATH, never the anchor (pi: one
+      # Loader per component).
+      def spinner_glyph
+        spinner_frame(@spinner_started_at)
+      end
+
+      # pi's per-indicator frame-0 reset (loader.ts setIndicator): every
+      # status-kind (re)start re-anchors the spinner — :agent_start
+      # creates the working indicator (interactive-mode.ts:3427-3433),
+      # :compaction_start constructs CompactionStatusIndicator (:3681),
+      # the :compaction result clears it (clearStatusIndicator :3694 —
+      # the next working indicator restarts).
+      def restart_spinner!
+        @spinner_started_at = @clock.call
+      end
+
+      # The embedded status's per-segment colors (pi's embedded colorFns):
+      # the border dashes ride the editor border color; the WORKING
+      # status's spinner AND message ride it too (interactive-mode.ts
+      # :2346-2359 — the embedded colorFn overrides both constructor
+      # defaults with editor.borderColor — bashMode in bash mode, else
+      # the thinking-level ladder — dereferenced lazily per frame, so a
+      # mid-turn level change re-colors the status); the COMPACTION
+      # indicator has no colorFn — its constructor defaults hold (accent
+      # spinner, muted message — status-indicator.ts:80-96).
+      def status_segment_fg(segment)
+        return editor_border_color if segment == :border
+        return Theme[:accent] if segment == :spinner && @compaction_reason
+        return Theme[:muted] if segment == :message && @compaction_reason
+
+        editor_border_color
+      end
+
       # The session's thinking level (pi agent.state.thinkingLevel): nil
       # = not set this session — the settings-resolved default shows.
       def thinking_level
@@ -1250,54 +1544,93 @@ module Tart
       end
 
       def status_title
-        # pi shows the compaction indicator regardless of the streaming
-        # state (a manual /compact runs outside a turn in the port); the
-        # toggle status rides the same slot until the next agent event.
-        # Direct ivars — this runs inside render_frame's synchronize.
-        return " #{@border_status} " if @border_status && !@busy
+        # The transient working/compaction spinner ONLY (pi
+        # embedWorkingStatus — unmeasurable at settle, stays): the three
+        # persistent statuses are transcript tail rows now
+        # ({Transcript::StatusEntry} — pi showStatus :3824-3842). Direct
+        # ivars — this runs inside render_frame's synchronize. UNFLANKED
+        # since I37: pi's renderInBorder slices the Text pad and the
+        # border composition adds its own single spaces
+        # (custom-editor.ts:26-29/:60-66) — the I34-era " #{…} " wrapper
+        # double-spaced the row.
         return nil unless @busy || @compaction_reason
 
-        " #{status_line} "
+        "#{spinner_glyph} #{status_message}"
       end
 
-      def status_line
-        # The running compaction displaces the working/tool detail (pi
-        # status-indicator.ts:85-95 via interactive-mode.ts:3672-3681).
-        return "#{SPINNER[@frames % SPINNER.size]} #{COMPACTION_LABELS.fetch(@compaction_reason, "Compacting context...")}" if @compaction_reason
+      def status_message
+        # The running compaction displaces the working message (pi
+        # status-indicator.ts:85-95 via interactive-mode.ts:3672-3681);
+        # the working message is pi's constant defaultWorkingMessage
+        # (interactive-mode.ts:487) — the I04-era phase-detail vocabulary
+        # ("thinking"/"…"/"tool: <name>") retires with I37.
+        return COMPACTION_LABELS.fetch(@compaction_reason, "Compacting context...") if @compaction_reason
 
-        detail = @tool ? "tool: #{@tool}" : (@live.empty? ? "thinking" : "…")
-        "#{SPINNER[@frames % SPINNER.size]} #{detail}"
+        "Working"
       end
 
       # The footer's per-frame data view: the launcher facts with the
       # runtime overlays — the thinking level ({thinking_level}, pi
       # footer.ts:226-244) and the switched model's id, context window,
-      # and reasoning capability (I27, the footer model segment's
-      # refresh after a /model switch). nil footer_data renders from
-      # what the surface knows alone, as at base.
+      # reasoning capability, and thinkingLevelMap (I27 + I36, the footer
+      # model segment's + the level ladder's refresh after a /model
+      # switch). nil footer_data renders from what the surface knows
+      # alone, as at base.
       def footer_data
         data = @footer_data || {}
         data = data.merge(thinking_level: @thinking_level) if @thinking_level
         return data unless @runtime_model
 
-        data = data.merge(model: @runtime_model[:id])
-        data = data.merge(context_window: @runtime_model[:context_window]) if @runtime_model[:context_window]
-        @runtime_model[:reasoning].nil? ? data : data.merge(reasoning: @runtime_model[:reasoning])
+        data = data.merge(model: @runtime_model.id)
+        data = data.merge(context_window: @runtime_model.context_window) if @runtime_model.context_window
+        # The typed entry always carries the map key (nil when the entry
+        # declares none) — the overlay rides on every switch, as the
+        # catalog-shaped row always did.
+        data = data.merge(thinking_level_map: @runtime_model.thinking_level_map)
+        data.merge(reasoning: @runtime_model.reasoning)
       end
 
       # The transcript buffer's display lines — completed content plus the
       # live region. The transcript area windows this ({transcript_widget})
       # and the mouse machinery addresses it (selection points are buffer
-      # rows).
+      # rows). Public as the live region's test readback — the
+      # {transcript_lines} parallel for kernel-driven tests that pin rows
+      # the drawn screen's window may clip.
       def display_lines
         @transcript_state.lines + live_lines(viewport_width)
       end
 
       # The streaming region (item 3, pi interactive-mode.ts:3519-3535 +
-      # assistant-message.ts:107-109): the reasoning block stays plain dim
-      # italic (the I13 standing ruling — markdown-of-reasoning is cut,
-      # itemized) and the CONTENT re-renders as markdown on every delta —
-      # pi re-renders the whole streaming message each update, no
+      # assistant-message.ts:107-109): the reasoning block renders as DIM
+      # MARKDOWN through the shared converter ({Transcript.reasoning_lines}
+      # — the thinkingText+italic prose default over the markdown theme,
+      # pi assistant-message.ts:99-176; the I13 markdown-of-reasoning cut
+      # retired by the owner's live finding) and the CONTENT re-renders as
+      # markdown on every delta — pi re-renders the whole streaming
+      # message each update, no incremental cleverness. The transcript
+      # area's tail clip bounds it (deltas append; the window slides).
+      #
+      # The region renders the assistant message's SETTLED shape from the
+      # first delta (pi updateContent runs while streaming — the leading
+      # Spacer(1) :103-105 and the between-runs Spacer :172-174 are
+      # component children, not post-hoc inserts): leading blank, the
+      # reasoning rows, a blank when content follows the reasoning, the
+      # content. The blank appearing only at completion was the 2nd-pass
+      # shift (the row insert moved streaming content down a line).
+      def live_lines(width)
+        lines = assistant_live_lines(width)
+        lines.concat(user_bash_live_rows(width))
+        lines
+      end
+
+      # The assistant streaming region's rows (item 3, pi
+      # interactive-mode.ts:3519-3535 + assistant-message.ts:107-109): the
+      # reasoning block renders as DIM MARKDOWN through the shared
+      # converter ({Transcript.reasoning_lines} — the thinkingText+italic
+      # prose default over the markdown theme, pi assistant-message.ts
+      # :99-176; the I13 markdown-of-reasoning cut retired by the owner's
+      # live finding) and the CONTENT re-renders as markdown on every
+      # delta — pi re-renders the whole streaming message each update, no
       # incremental cleverness. The transcript area's tail clip bounds it
       # (deltas append; the window slides).
       #
@@ -1308,7 +1641,7 @@ module Tart
       # reasoning rows, a blank when content follows the reasoning, the
       # content. The blank appearing only at completion was the 2nd-pass
       # shift (the row insert moved streaming content down a line).
-      def live_lines(width)
+      def assistant_live_lines(width)
         return [] if @live.empty? && @reasoning.empty?
 
         lines = [Panel.blank_line]
@@ -1316,6 +1649,63 @@ module Tart
         lines << Panel.blank_line if !@reasoning.empty? && !@live.empty?
         lines.concat(Transcript.markdown_lines(@live, width)) unless @live.empty?
         lines
+      end
+
+      # The RUNNING user-bash block's rows (I38 — pi's chat/pending
+      # placements, Grounds 6: appended BELOW the transcript content and
+      # BELOW any streaming assistant rows). Composed fresh per frame —
+      # the toggle state and the glyph read at composition time, pi's
+      # updateDisplay discipline (mid-run ctrl+o re-composes, Grounds
+      # 6f). Own leading blank (the block head's); an idle run renders
+      # nothing here.
+      def user_bash_live_rows(width)
+        state = @user_bash_stream
+        return [] unless state
+
+        BashBlock.running_user_bash_rows(state[:command], width,
+          content: state[:content], excluded: state[:excluded],
+          spinner_glyph: spinner_frame(state[:spinner_started_at]),
+          expanded: @transcript_state.tool_output_expanded)
+      end
+
+      # --- the user-bash live stream's sinks (I38 — the UserBash seam;
+      # pi handleBashCommand :7000-7062: the component added before
+      # execution, appendOutput + ui.requestRender per chunk, setComplete
+      # in place) ---
+
+      # Reactor/frame-loop fibers only (the bridge yields chunks on the
+      # reactor — Grounds 5); all render-state mutation stays under the
+      # surface mutex, exactly the agent-event discipline.
+      def start_user_bash_stream(command, excluded)
+        @mutex.synchronize do
+          @user_bash_stream = {command:, excluded:, content: +"", spinner_started_at: @clock.call}
+        end
+        # pi adds the component then requestRender (:7033-7034) — the
+        # header + loader row paint before the first chunk.
+        @kernel.request_draw
+      end
+
+      # The appendOutput join is the string buffer itself: each chunk
+      # appends (CR already removed by the seam — Grounds 2), an
+      # unterminated trailing line continues on the next chunk's first
+      # piece. The draw per chunk is pi's requestRender (:7050-7057).
+      def append_user_bash_stream(text)
+        appended = false
+        @mutex.synchronize do
+          # A late chunk after the clear (a cancelled run's partial chunks
+          # may still push after the reactor-side wait died) is dropped.
+          appended = !@user_bash_stream.nil?
+          @user_bash_stream[:content] << text if appended
+        end
+        @kernel.request_draw if appended
+      end
+
+      # The explicit terminal clear (every path — completion, worker
+      # error, cancel — notifies exactly once; idempotent). No draw: the
+      # caller's own request_draw paints the settled block in the same
+      # frame the live rows vanish (AC2).
+      def end_user_bash_stream
+        @mutex.synchronize { @user_bash_stream = nil }
       end
 
       # /thinking's seam (pi selectThinkingLevel :5165-5177): the session
@@ -1336,26 +1726,33 @@ module Tart
       end
 
       # pi getAvailableThinkingLevels (:2657-2662 →
-      # getSupportedThinkingLevels, models.ts:1224-1231): a non-reasoning
-      # model offers [off] alone; a reasoning model the full ladder. The
-      # runtime switch re-gates (the reasoning flag rides the per-frame
-      # footer view). The port's catalog schema carries no
-      # thinkingLevelMap — xhigh/max never filter (itemized).
+      # getSupportedThinkingLevels, models.ts:1224-1233): a non-reasoning
+      # model offers [off] alone; a reasoning model the ladder filtered
+      # through the runtime model's thinkingLevelMap (null marks a level
+      # unsupported, xhigh/max need a present entry; no map = pi's
+      # map-less rule off..high). The runtime switch re-gates (the map
+      # rides the per-frame footer view). Retires the I27 deviation
+      # ("xhigh/max never filter" — the catalog schema carries the map
+      # since I36).
       def available_thinking_levels
-        reasoning_capable? ? Settings::THINKING_LEVELS : %w[off]
+        Models.supported_thinking_levels(map: footer_data[:thinking_level_map], reasoning: reasoning_capable?)
       end
 
       # pi cycleThinkingLevel (agent-session.ts:2641-2653): the next
       # level in THINKING_LEVEL_OPTIONS order, wrapping — app.thinking.cycle
       # (shift+tab), kept in-session when bare /thinking became the menu
-      # (I27); no thinking support is a no-op (:2645-2646). (Public — the
-      # keybinding's callable.)
+      # (I27); no thinking support is a no-op (:2645-2646). A stored
+      # level outside the gated set (a switch re-laddered under it)
+      # cycles to the FIRST rung — pi's `indexOf → -1` makes
+      # `(−1 + 1) % size` land on index 0 (agent-session.ts:2641-2653).
+      # (Public — the keybinding's callable.)
       def cycle_thinking_level
         return unless reasoning_capable?
 
-        current = @mutex.synchronize { thinking_level || Settings::DEFAULTS.fetch("thinkingLevel") }
+        current = @mutex.synchronize { thinking_level || Settings::DEFAULT_THINKING_LEVEL }
         levels = available_thinking_levels
-        next_level = levels[(levels.index(current) + 1) % levels.size]
+        index = levels.index(current) || -1
+        next_level = levels[(index + 1) % levels.size]
         set_thinking_level(next_level)
         next_level
       end
@@ -1382,11 +1779,12 @@ module Tart
       # session.getAvailableThinkingLevels into the component).
       def thinking_menu_items
         levels = available_thinking_levels
-        # pi's session level is clamped to the model's set (setModel →
-        # _clampThinkingLevel, agent-session.ts:2684-2686) — a stored
-        # level outside the gated set reads as the gate's floor (off).
-        current = thinking_level || Settings::DEFAULTS.fetch("thinkingLevel")
-        current = levels.first unless levels.include?(current)
+        # pi marks the ✓ by EXACT equality only (thinking-selector.ts
+        # :69-73): a stored level OUTSIDE the gated set marks NO row, and
+        # the sealed constructor's preselect falls to index 0
+        # (buildSelectList :101-107) — the I27-era display floor is gone
+        # with the I40 boot/switch clamps.
+        current = thinking_level || Settings::DEFAULT_THINKING_LEVEL
         default = default_thinking_level
         levels.map do |level|
           description = ModelMenu::LEVEL_DESCRIPTIONS.fetch(level)
@@ -1405,8 +1803,8 @@ module Tart
         @mutex.synchronize do
           @menu = ModelMenu.model(
             entries: model_menu_entries, current: current_model_ref, default: default_model_ref, seed:,
-            on_select: ->(item) { close_menu; apply_model_selection(item, persist: false) },
-            on_select_as_default: ->(item) { close_menu; apply_model_selection(item, persist: true) }
+            on_select: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: false) },
+            on_select_as_default: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: true) }
           )
         end
       end
@@ -1435,34 +1833,78 @@ module Tart
 
       # pi selectThinkingLevel (:5163-5172): the session level, the
       # footer's re-ladder and the editor border's (the overlays flow
-      # through {footer_data}), the status; persist:true reports "Default
-      # thinking level" and writes the settings default (ctrl+s).
+      # through {footer_data}), the status (pi showStatus — the transcript
+      # tail row, I33); persist:true reports "Default thinking level" and
+      # writes the settings default (ctrl+s). The level rides the AGENT
+      # seam too ({Agent::Loop#set_thinking_level}) — the next request
+      # carries it (pi sets session state the stream options read).
       def apply_thinking_selection(level, persist:)
         @mutex.synchronize do
           @thinking_level = level
-          @border_status = "#{persist ? "Default thinking level" : "Thinking level"}: #{level}"
+          @transcript_state.enqueue_status("#{persist ? "Default thinking level" : "Thinking level"}: #{level}")
         end
+        @agent&.set_thinking_level(level)
         Settings.save(@settings_root, "thinkingLevel" => level) if persist
         @kernel.request_draw
       end
 
       # The switch seam (pi selectModel → session.setModel { persist }):
       # swap the runtime chat model (the loop re-resolves the context
-      # window — Loop#switch_model), refresh the footer model segment +
-      # the editor border re-ladder (the runtime overlays flow into
-      # {footer_data}), report, and persist the default when asked.
+      # window AND the reasoning facts — Loop#switch_model), refresh the
+      # footer model segment + the editor border re-ladder (the runtime
+      # overlays flow into {footer_data}), report (pi showStatus — the
+      # transcript tail row, I33), and persist the default when asked.
+      #
+      # I40, pi setModel (agent-session.ts:2477-2496): the switch resolves
+      # a level FOR THE SWITCH — _getThinkingLevelForModelSwitch
+      # (:2670-2679): the FILE-declared default, else the session level
+      # (the per-model tier is a cut — no scoped-models surface; no
+      # explicit tier — no argument path) — and setThinkingLevel
+      # (:2610-2634) re-clamps it through the SWITCHED model's supported
+      # set (Models.clamp_thinking_level's exact-pass branch covers pi's
+      # includes-then-clamp). The effective level lands on BOTH the
+      # surface state and the loop seam, AFTER switch_model (pi swaps the
+      # model first, :2484-2494). NO Thinking level status row: pi's
+      # thinking_level_changed only invalidates the footer + border
+      # (interactive-mode.ts:3495-3498) — the per-frame {footer_data}
+      # overlay carries the refresh. persist:true rides the SAME re-clamp
+      # (pi setModel {persist} is one path).
       def apply_model_selection(entry, persist:)
-        status = persist ? "Default model: #{entry[:provider]}/#{entry[:id]}" : "Model: #{entry[:id]}"
-        @mutex.synchronize do
-          @runtime_model = entry
-          @border_status = status
-        end
+        # The menu and /model paths deliver the typed entry; the direct-
+        # switch keyword shape (provider:/id:/... — one positional Hash)
+        # rides the struct's own type gate before the seam reads it. The
+        # map key is supplied explicitly: the declared-optional attribute
+        # still requires its key at construction, and the legacy shape
+        # may omit it. compat (I46) rides the same explicit-key shape.
+        entry = Shapes::Model.new(**entry,
+          thinking_level_map: entry.fetch(:thinking_level_map, nil),
+          compat: entry.fetch(:compat, nil)) unless entry.is_a?(Shapes::Model)
+        status = persist ? "Default model: #{entry.provider}/#{entry.id}" : "Model: #{entry.id}"
         # The wire provider is the models.json key mapped onto the port's
         # carried seam (Models.wire_provider — the loop's with_model
-        # needs a native slug); the window re-resolves in the loop seam.
-        @agent&.switch_model(entry[:id], provider: Models.wire_provider(entry[:provider]),
-          context_window: entry[:context_window])
-        Settings.save(@settings_root, "defaultProvider" => entry[:provider], "defaultModel" => entry[:id]) if persist
+        # needs a native slug); the window + the composed reasoning facts
+        # re-resolve in the loop seam (the entry's flag/map, the known
+        # tables when the entry declares none — Settings.thinking_facts).
+        facts = Settings.thinking_facts(entry, model_id: entry.id)
+        # The cwd resolution is the launcher-facts-else-process idiom the
+        # MOTD/commands sections already use (@footer_data[:cwd] || Dir.pwd).
+        level = Settings.declared_thinking_level(root: @settings_root,
+          cwd: @footer_data&.fetch(:cwd, nil) || Dir.pwd) ||
+          (@thinking_level || @footer_data&.fetch(:thinking_level, nil))
+        effective = Models.clamp_thinking_level(level, map: facts.thinking_level_map,
+          reasoning: facts.reasoning)
+        @mutex.synchronize do
+          @runtime_model = entry
+          @thinking_level = effective
+          @transcript_state.enqueue_status(status)
+        end
+        @agent&.switch_model(entry.id, provider: Models.wire_provider(entry.provider),
+          context_window: entry.context_window,
+          model_reasoning: facts.reasoning,
+          thinking_level_map: facts.thinking_level_map,
+          compat: entry.compat)
+        @agent&.set_thinking_level(effective)
+        Settings.save(@settings_root, "defaultProvider" => entry.provider, "defaultModel" => entry.id) if persist
         @kernel.request_draw
       end
 
@@ -1476,12 +1918,21 @@ module Tart
       end
 
       # The boot entry from the launcher facts (footer_data): the
-      # resolved model/provider/window/reasoning.
+      # resolved model/provider/window/reasoning/level-map, as the typed
+      # Shapes::Model. max_tokens carries none (completeness only — the
+      # footer facts hold no such value, Grounds OQ-4); reasoning floors
+      # a missing fact to false (today's nil read the same everywhere it
+      # was consumed). compat carries none (I46 — the footer facts hold
+      # no wire facts; the boot compat threads to the loop directly from
+      # the catalog entry, bin/tart's boot kwargs).
       def boot_model_entry
         data = @footer_data || {}
         model = data.fetch(:model, nil) || "no-model"
-        {provider: data.fetch(:default_provider, "openai"), id: model, name: model,
-         reasoning: data[:reasoning], context_window: data[:context_window]}
+        Shapes::Model.new(
+          provider: data.fetch(:default_provider, "openai"), id: model, name: model,
+          reasoning: data[:reasoning] == true, context_window: data[:context_window],
+          max_tokens: nil, thinking_level_map: data[:thinking_level_map], compat: nil
+        )
       end
 
       # The ✓ current marker's ref: the runtime switch, else the boot
@@ -1511,35 +1962,40 @@ module Tart
       # runtime pair is a wire pair.
       def boot_model_ref
         data = @footer_data || {}
-        ref = {provider: data.fetch(:default_provider, "openai"), id: data[:model]}
-        entry = @models&.resolve("#{ref[:provider]}/#{ref[:id]}") || @models&.resolve(ref[:id].to_s)
-        entry ? {provider: entry[:provider], id: entry[:id]} : ref
+        ref = Shapes::ModelRef.new(provider: data.fetch(:default_provider, "openai"),
+          id: data.fetch(:model, nil) || "no-model")
+        entry = @models&.resolve("#{ref.provider}/#{ref.id}") || @models&.resolve(ref.id.to_s)
+        entry ? Shapes::ModelRef.new(provider: entry.provider, id: entry.id) : ref
       end
 
-      # The settings-resolved thinking level (the · default badge) —
-      # footer_data's fact, or the built-in default.
+      # The settings-resolved thinking level (the · default badge) — the
+      # UNCLAMPED boot fact when the launcher supplies it (pi badges
+      # getDefaultThinkingLevel() ?? DEFAULT raw, thinking-selector.ts
+      # :71-72 via interactive-mode.ts:5187 — an out-of-set default marks
+      # NO row), the boot level fact otherwise (the pre-I40 footer
+      # fixtures), or the built-in default.
       def default_thinking_level
-        (@footer_data || {}).fetch(:thinking_level, nil) || Settings::DEFAULTS.fetch("thinkingLevel")
+        data = @footer_data || {}
+        data.fetch(:default_thinking_level, nil) || data.fetch(:thinking_level, nil) ||
+          Settings::DEFAULT_THINKING_LEVEL
       end
 
-      public :set_thinking_level, :cycle_thinking_level
+      public :set_thinking_level, :cycle_thinking_level, :current_model_ref
 
       # app.tools.expand (pi setToolsExpanded :6810-6826): the GLOBAL
       # toggle — every expandable block rebuilds collapsed↔expanded in
-      # place; the border status reports (pi showStatus). The registry
-      # sweep is the component's state half; the report + draw stay here
-      # (the frozen public op — I25 extraction). Cuts, itemized: the
-      # header's startup-help flip (the expanded header's full hint
-      # list + loaded-resources sections are unported) — the block sweep
-      # is the feature.
+      # place (the registry sweep; since I33 that includes the MOTD header
+      # block + the loaded-resource sections, pi's container sweep
+      # :4568-4572), and the status reports as pi's showStatus — a
+      # persistent transcript tail row, never the editor border.
       def set_tool_output_expanded(expanded)
         return unless @transcript_state.set_tool_output_expanded(expanded)
 
-        @border_status = "Tool output: #{expanded ? "expanded" : "collapsed"}"
+        @transcript_state.enqueue_status("Tool output: #{expanded ? "expanded" : "collapsed"}")
         @kernel.request_draw
       end
 
-      public :set_tool_output_expanded
+      public :set_tool_output_expanded, :display_lines
     end
   end
 end

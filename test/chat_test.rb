@@ -151,7 +151,7 @@ module Tart
         10.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session) # settle: the buffer flushes, follow pins to the end
         chat.scrollbar_hide_delay_ms = 10_000 # fresh for the duration of the test — no real sleeps
-        3.times { chat.on_event(TUI.key_event("page_up")) } # scroll to the top; the echo is on screen
+        wheel_to_top(chat) # scroll to the top; the echo is on screen
         draw(chat, session)
         assert_equal "│", session.cell_symbol(19, 3), "the rail is visible (the overlay is what clipped the bg away)"
 
@@ -231,8 +231,8 @@ module Tart
         chat.on_agent_event({type: :agent_start})
         tool_start(chat, "grep")
         draw(chat, session)
-        assert_includes editor_area(session, chat), "tool: grep",
-          "the tool name renders in the editor's status border while it runs"
+        assert_includes editor_area(session, chat), "Working",
+          "the border status is pi's constant working message while the tool runs"
 
         tool_end(chat, "grep", "done\nmore")
         draw(chat, session)
@@ -265,11 +265,12 @@ module Tart
         stream(chat, "streaming")
         draw(chat, session)
         # The status renders in the editor's top border (after the corner
-        # glyph) — scan cells, not lead cells. The dim TOKEN color (dark
-        # has no dimTokens — the attribute pin was the system-theme
-        # artifact; pi's border title rides theme.fg("dim")).
-        assert fg_cell?(session, ->(symbol, _x, _y) { Render::Chat::SPINNER.include?(symbol) }, Theme[:dim]),
-          "the status line renders the dim token color"
+        # glyph) — scan cells, not lead cells. I37: the WORKING status's
+        # spinner AND message ride the editor border color (pi's embedded
+        # colorFn, interactive-mode.ts:2346-2359 — not the base border
+        # title's dim); this fixture is non-reasoning → the off token.
+        assert fg_cell?(session, ->(symbol, _x, _y) { Render::Chat::SPINNER.include?(symbol) }, Theme[:thinking_off]),
+          "the working status renders the editor border color"
 
         finish_message(chat, "assistant answer") # transcript: assistant, terminal default
         tool_end(chat, "grep", "tool output")    # transcript: tool, muted
@@ -289,6 +290,164 @@ module Tart
         # keeps the terminal default, visually apart from the colored echo.
         assert_nil session.cell_fg(0, input_row(session)),
           "the input line keeps the terminal default"
+      end
+    end
+
+    # --- the time-gated spinner + the status spans/colors (I37, pi
+    # loader.ts + interactive-mode.ts:2346-2359): the glyph derives from
+    # the injected clock at render — renders alone never move it — and
+    # the working status rides the editor border color while the
+    # compaction indicator keeps its constructor defaults. ---
+
+    def test_spinner_advances_on_time_not_renders
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        stream(chat, "hi")
+        draw(chat, session)
+        assert_equal "⠋", status_spinner_glyph(session), "t=0 renders frame 0"
+
+        now = 0.040
+        draw(chat, session)
+        assert_equal "⠋", status_spinner_glyph(session),
+          "two renders within 80ms of the anchor show the SAME frame"
+
+        now = 0.081
+        draw(chat, session)
+        assert_equal "⠙", status_spinner_glyph(session), "frame 1 at +81ms"
+
+        now = 0.160
+        draw(chat, session)
+        assert_equal "⠹", status_spinner_glyph(session), "frame 2 (SPINNER[2]) at +160ms — exactly floor(160ms/80ms)"
+
+        3.times { draw(chat, session) }
+        assert_equal "⠹", status_spinner_glyph(session),
+          "repeated renders without clock advance never move the glyph (the render counter is gone)"
+      end
+    end
+
+    def test_spinner_reanchors_at_every_status_kind_restart
+      now = 10.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        now = 10.40 # mid-working, a late frame: floor(0.40/0.08) % 10 = 5
+        draw(chat, session)
+        assert_equal "⠴", status_spinner_glyph(session), "the late frame shows"
+
+        chat.on_agent_event({type: :compaction_start, reason: :threshold})
+        draw(chat, session)
+        assert_equal "⠋", status_spinner_glyph(session),
+          "compaction_start re-anchors (pi constructs a new Loader — frame 0)"
+
+        chat.on_agent_event({type: :compaction, reason: :threshold, tokens_before: 100, summary: "s", entries: []})
+        draw(chat, session)
+        assert_equal "⠋", status_spinner_glyph(session),
+          "the :compaction result re-anchors again (pi clearStatusIndicator → the next working indicator restarts)"
+      end
+    end
+
+    def test_working_status_spans_read_the_editor_border_color
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        y = status_border_row_index(session)
+        assert_equal Theme[:thinking_off], session.cell_fg(3, y),
+          "the spinner cell rides the editor border color (off-default fixture)"
+        assert_equal Theme[:thinking_off], session.cell_fg(session.buffer_content[y].index("Working"), y),
+          "the message cell rides it too (pi's embedded colorFn overrides both constructor defaults)"
+      end
+    end
+
+    # pi updateEditorBorderColor in bash mode (:4516-4518): the embedded
+    # working status rides the bashMode token too (the colorFn reads
+    # editor.borderColor, not the ladder).
+    def test_working_status_reads_the_bash_mode_token_in_bash_mode
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        "!ech".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        y = status_border_row_index(session)
+        assert_equal Theme[:bashMode], session.cell_fg(3, y),
+          "the spinner cell rides the bashMode border color in bash mode"
+        assert_equal Theme[:bashMode], session.cell_fg(session.buffer_content[y].index("Working"), y),
+          "the message cell rides it too"
+      end
+    end
+
+    def test_working_status_recolors_with_a_mid_turn_thinking_level_change
+      now = 0.0
+      with_chat(width: 40, clock: -> { now },
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, reasoning: true}) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        chat.set_thinking_level("high")
+        draw(chat, session)
+        y = status_border_row_index(session)
+        assert_equal Theme[:thinking_high], session.cell_fg(3, y), "the set level's ladder token"
+        assert_equal Theme[:thinking_high], session.cell_fg(session.buffer_content[y].index("Working"), y),
+          "both cells take the ladder token"
+
+        chat.set_thinking_level("low") # mid-turn — pi's lazy borderColor deref
+        draw(chat, session)
+        assert_equal Theme[:thinking_low], session.cell_fg(3, y),
+          "the same status recolors on the next draw"
+        assert_equal Theme[:thinking_low], session.cell_fg(session.buffer_content[y].index("Working"), y)
+      end
+    end
+
+    def test_compaction_status_reads_accent_spinner_and_muted_message
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :compaction_start, reason: :threshold})
+        draw(chat, session)
+        y = status_border_row_index(session)
+        row = session.buffer_content[y]
+        assert_includes row, "Auto-compacting...", "COMPACTION_LABELS text unchanged"
+        assert_equal Theme[:accent], session.cell_fg(3, y),
+          "the compaction spinner keeps the accent constructor default (no colorFn)"
+        assert_equal Theme[:muted], session.cell_fg(row.index("Auto-compacting..."), y),
+          "the compaction message keeps the muted constructor default"
+      end
+    end
+
+    def test_working_border_row_matches_pis_single_space_layout
+      now = 0.0
+      with_chat(width: 40, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        assert_equal "── ⠋ Working #{"─" * 27}", status_border_row(session).rstrip,
+          "── ⠋ Working + ONE space + dashes to width (pi custom-editor.ts:60-66 — the double flanks are gone)"
+      end
+    end
+
+    def test_narrow_width_degrades_the_status_to_the_spinner_alone
+      now = 0.0
+      with_chat(width: 8, clock: -> { now }) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        assert_equal "───⠋────", status_border_row(session).rstrip,
+          "width < status + 5: the spinner alone between dashes (pi renderSpinnerInBorder, custom-editor.ts:66-67)"
+        assert_equal Theme[:thinking_off], session.cell_fg(3, status_border_row_index(session)),
+          "the lone glyph rides the spinner's color"
+      end
+    end
+
+    def test_label_collision_degrades_the_status_to_the_spinner_alone
+      now = 0.0
+      with_chat(width: 24, screen_height: 12, clock: -> { now }) do |chat, session|
+        "abcdefghi".each_char do |char|
+          chat.on_event(TUI.key_event(char))
+          chat.on_event(TUI.key_event("enter", modifiers: ["shift"])) unless char == "i"
+        end
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        y = session.buffer_content.index { |row| row.include?("⠋") } # the box grew — find the border row
+        row = session.buffer_content[y]
+        assert_includes row, "↑ 4 more", "the centered label renders"
+        refute_includes row, "Working", "the full status degraded to the spinner alone (pi canFitOverflow refit)"
+        assert_equal "── ⠋ ── ↑ 4 more ───────", row.rstrip, "pi's degraded centered form"
+        assert_equal Theme[:thinking_off], session.cell_fg(row.index("⠋"), y), "the degraded glyph keeps the spinner's color"
       end
     end
 
@@ -794,6 +953,228 @@ module Tart
       end
     end
 
+    # --- the PENDING tool block (I34 — pi tool-execution.ts:90-91 +
+    # --- updateDisplay :271-277 isPartial; the event wiring pins) ---
+
+    # AC1: the start event enqueues the pending block and it paints on
+    # the next drawn frame while the tool "runs" — the four rows (PLAIN
+    # blank, pending pad, bold toolTitle header, pending pad).
+    def test_pending_block_paints_mid_flight
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+
+        assert_equal ["", "", " $ sleep 6", ""], chat.transcript_lines,
+          "the pending block is the call rows alone — no output, no Took, no hint"
+        rows = session.buffer_content
+        header = rows.index { |row| row.include?("$ sleep 6") }
+        x = rows[header].index("$")
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(x, header),
+          "the header rides the pending bg #34383a (the I26 measured bytes)"
+        assert_equal Theme[:toolTitle], session.cell_fg(x, header), "the header is toolTitle"
+        assert_includes session.cell_modifiers(x, header), :bold, "the header is bold"
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(0, header - 1), "the opening pad"
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(0, header + 1), "the closing pad"
+      end
+    end
+
+    # AC2, drained case: start → draw → end lands the final block
+    # BYTE-IDENTICAL (rows and position) to a control chat that received
+    # only the end event — no pending-bg row survives.
+    def test_flushed_pending_settles_byte_identical_to_the_control
+      control = with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_end(chat, "bash", "out", duration: 1.0, arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        [chat.transcript_lines, session.buffer_content]
+      end
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        tool_end(chat, "bash", "out", duration: 1.0, arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+
+        assert_equal control[0], chat.transcript_lines, "rows and position byte-identical"
+        assert_equal control[1], session.buffer_content, "the drawn frame is byte-identical"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg]), "no pending bg survives the settle"
+      end
+    end
+
+    # AC2, fast path: start → end with NO draw between — the queued
+    # region swaps in place, the pending rows never reach the buffer.
+    def test_queued_pending_settles_byte_identical_to_the_control
+      control = with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_end(chat, "bash", "res", arguments: {"command" => "fast"})
+        draw(chat, session)
+        [chat.transcript_lines, session.buffer_content]
+      end
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "fast"})
+        tool_end(chat, "bash", "res", arguments: {"command" => "fast"})
+        draw(chat, session)
+
+        assert_equal control[0], chat.transcript_lines
+        assert_equal control[1], session.buffer_content
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg]),
+          "no pending rows ever painted"
+      end
+    end
+
+    # AC4: ctrl+o mid-flight corrupts neither the buffer nor the registry
+    # — the constant-size builder rebuilds the pending block identically,
+    # and the settled block toggles normally afterward.
+    def test_ctrl_o_mid_flight_and_the_settled_toggle
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "seq 1 12"})
+        draw(chat, session)
+        pending_rows = chat.transcript_lines
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+
+        # The toggle reports in the tail status pair (pi showStatus) — the
+        # pending block itself must rebuild identically at the buffer head
+        # (constant-size builder) and the registry must still resolve.
+        assert_equal pending_rows, chat.transcript_lines[0, pending_rows.length],
+          "the toggle rebuilds the pending block identically (constant-size builder)"
+        assert chat.transcript_lines.any? { |row| row.include?("Tool output: expanded") },
+          "the registry resolved (the toggle state flipped)"
+        tool_end(chat, "bash", (1..12).to_a.join("\n"), arguments: {"command" => "seq 1 12"})
+        draw(chat, session)
+        expanded = chat.transcript_lines
+        refute_includes expanded.join, "earlier lines",
+          "the finalize reads the toggle state at replacement time — the flipped state rides through"
+        assert_includes expanded.join, " 12", "the whole output renders expanded"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        collapsed = chat.transcript_lines
+        assert_includes collapsed.join, "earlier lines", "the finalized block collapses"
+        assert_operator collapsed.length, :<, expanded.length
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_equal expanded, chat.transcript_lines, "the toggle round-trips"
+      end
+    end
+
+    # AC4: the orphaned pending block finalizes at :agent_end's
+    # interrupted arm pi's way (interactive-mode.ts:3573-3586) — the call
+    # rows + "Operation aborted" under toolErrorBg; the interrupt
+    # scrollback line stays.
+    def test_interrupt_finalizes_the_orphaned_pending_block
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        chat.on_agent_event({type: :agent_end, interrupted: true})
+        draw(chat, session)
+
+        rows = session.buffer_content
+        aborted = rows.index { |row| row.include?("Operation aborted") }
+        refute_nil aborted, "the orphan finalizes with pi's abort text"
+        assert_equal Theme[:tool_error_bg], session.cell_bg(rows[aborted].index("O"), aborted),
+          "the error text rides toolErrorBg"
+        header = rows.index { |row| row.include?("$ sleep 6") }
+        assert_equal Theme[:tool_error_bg], session.cell_bg(rows[header].index("$"), header),
+          "the whole block re-renders the error bg (the same component, pi's updateResult)"
+        assert_includes chat.transcript_lines, "interrupted", "the interrupt scrollback line stays"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg]), "no pending bg survives"
+      end
+    end
+
+    # AC4: the error arm finalizes with the error's message.
+    def test_error_finalizes_the_orphaned_pending_block_with_the_message
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        chat.on_agent_event({type: :agent_end, error: StandardError.new("boom")})
+        draw(chat, session)
+
+        assert_includes chat.transcript_lines.join, "boom", "the error text lands in the block"
+        assert_includes chat.transcript_lines, "error: boom", "the error scrollback line stays"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg])
+      end
+    end
+
+    # AC3: the replay (resume) renders final blocks only — zero
+    # pending-bg spans (the pending machinery never engages).
+    def test_resume_replays_render_no_pending_bg
+      dir = File.join(@dir, "sessions")
+      FileUtils.mkpath(dir)
+      recorded = File.join(dir, "pending_replay_test-session.jsonl")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"pending-replay","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"run the sleeper"}}
+        {"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":"","tool_calls":{"call_1":{"id":"call_1","name":"bash","arguments":{"command":"sleep 6"}}},"finish_reason":"tool_calls","input_tokens":10,"output_tokens":5}}
+        {"type":"message","id":"e3","parentId":"e2","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"tool","content":"slept","tool_call_id":"call_1"}}
+      JSONL
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+
+        assert_includes chat.transcript_lines.join, "$ sleep 6", "the final block replays"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg]), "zero pending-bg spans on replay"
+      end
+    end
+
+    # AC1 per family: write/read/generic pendings are the call rows alone
+    # under the pending bg (each family interrupted off first — the
+    # transcript keeps only the finished blocks below).
+    def test_pending_shapes_per_family
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "write", arguments: {"path" => "note.txt", "content" => "parity note"})
+        draw(chat, session)
+        assert_equal " write note.txt", chat.transcript_lines.reject(&:empty?).last, "the write call rows alone"
+        write_row = session.buffer_content.index { |r| r.include?("write note.txt") }
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(1, write_row)
+
+        chat.on_agent_event({type: :agent_end, interrupted: true}) # clear the orphan for the next family
+        draw(chat, session)
+        tool_start(chat, "read", arguments: {"path" => "note.txt"})
+        draw(chat, session)
+        assert_equal " read note.txt", chat.transcript_lines.reject(&:empty?).last, "the read call rows alone"
+        read_row = session.buffer_content.index { |r| r.include?("read note.txt") }
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(1, read_row)
+
+        chat.on_agent_event({type: :agent_end, interrupted: true})
+        draw(chat, session)
+        tool_start(chat, "grep")
+        draw(chat, session)
+        assert_equal "  ⎿ grep", chat.transcript_lines.reject(&:empty?).last, "the generic ⎿ call line alone"
+        grep_row = session.buffer_content.index { |r| r.rstrip == "  ⎿ grep" }
+        assert_equal Theme[:tool_pending_bg], session.cell_bg(2, grep_row)
+      end
+    end
+
+    # AC4: a sequential multi-tool turn lands both blocks in order with
+    # no pending residue — byte-identical to a control chat that received
+    # only the end events.
+    def test_sequential_multi_tool_turn_leaves_no_residue
+      control = with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_end(chat, "bash", "one", arguments: {"command" => "echo one"})
+        tool_end(chat, "bash", "two", arguments: {"command" => "echo two"})
+        draw(chat, session)
+        chat.transcript_lines
+      end
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "echo one"})
+        draw(chat, session)
+        tool_end(chat, "bash", "one", arguments: {"command" => "echo one"})
+        draw(chat, session)
+        tool_start(chat, "bash", arguments: {"command" => "echo two"})
+        draw(chat, session)
+        tool_end(chat, "bash", "two", arguments: {"command" => "echo two"})
+        draw(chat, session)
+
+        lines = chat.transcript_lines
+        assert_equal control, lines, "two settled blocks, byte-identical to the control"
+        one = lines.index(" $ echo one")
+        two = lines.index(" $ echo two")
+        refute_nil one
+        refute_nil two
+        assert_operator one, :<, two, "the blocks land in call order"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg])
+      end
+    end
+
     def test_chat_runs_inside_the_seam_lifecycle_and_restores
       TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: false)
@@ -1089,7 +1470,7 @@ module Tart
       source = Render::SlashSource.new(commands: {"new" => {description: "x"}}, skills: skills)
       TUI.run(headless: true, viewport: :fullscreen, width: 60, screen_height: 24) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
-          settings_root: @dir, autocomplete: source, identity: "tart",
+          settings_root: @dir, autocomplete: source, identity: "tart", skills:,
           footer_data: {cwd: @dir})
         draw(chat, session)
         lines = chat.transcript_lines
@@ -1100,7 +1481,7 @@ module Tart
           "a random logo piece from the owner's collection renders in full (padded)"
         assert_includes lines, " tart v#{Tart::VERSION}", "the version line renders Tart::VERSION (padded)"
         assert_includes lines.join, "/ commands", "the hints line carries the port's real keys"
-        refute_includes lines.join, "! ", "no `!` bash hint — the port has no bash mode"
+        refute_includes lines.join, "! ", "no `!` hint on the FROZEN compact line (the expanded header lists it — I33)"
 
         context_i = lines.index { |line| line.include?("[Context]") }
         skills_i = lines.index { |line| line.include?("[Skills]") }
@@ -1134,6 +1515,153 @@ module Tart
       end
     end
 
+    # --- I33: the startup-help flip, the section flip, and the
+    # showStatus transcript rows ---
+
+    # AC1: ctrl+o after boot expands the startup header IN PLACE to pi's
+    # expanded shape (the live-oracle capture, hint 1 on the mark's line,
+    # hints 2–19 one per row, the notice gone); a second ctrl+o restores
+    # the collapsed bytes exactly and reports collapsed. The header block
+    # registers at BOOT (before any turn) — the flip exercises the
+    # boot-time expandable range.
+    def test_ctrl_o_flips_the_startup_header_in_place
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          footer_data: {cwd: @dir})
+        draw(chat, session)
+        collapsed = chat.transcript_lines
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        expanded = chat.transcript_lines
+        assert_equal " ▀▀█  v#{Identity::ORACLE_VERSION}", expanded[1], "the mark + version lead"
+        assert_equal " █▀ █ escape to interrupt", expanded[2], "hint 1 rides the mark's second line"
+        assert_equal " ctrl+c to clear", expanded[3], "hints 2–19 one per row"
+        assert_equal " drop files to attach", expanded[20]
+        assert_equal "", expanded[21]
+        assert_equal " #{Render::Motd::PI_ONBOARDING_LINE}", expanded[22]
+        refute_includes expanded.join, Render::Motd::PI_NOTICE_LINE, "the notice renders ONLY collapsed"
+        assert_equal "", expanded[-2], "the status pair's leading Spacer"
+        assert_equal " Tool output: expanded", expanded[-1], "the toggle status is a transcript tail row (AC4)"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        restored = chat.transcript_lines
+        assert_equal collapsed, restored[0, collapsed.size], "the second press restores the collapsed bytes exactly"
+        assert_equal " Tool output: collapsed", restored[-1]
+      end
+    end
+
+    # AC2: the loaded-resource sections flip with the same toggle —
+    # expanded bodies in pi's shapes ([Context] display paths, the scope
+    # groups, /name entries), compact bodies restored on the flip-back.
+    def test_ctrl_o_flips_the_resource_sections_in_place
+      FileUtils.mkpath(File.join(@dir, ".tart", "skills"))
+      File.write(File.join(@dir, ".tart", "settings.json"), "{}")
+      File.write(File.join(@dir, ".tart", "skills", "demo.md"), "---\nname: demo\ndescription: d\n---\nb")
+      skills = Skills.load(cwd: @dir, root: @dir, claude_dir: File.join(@dir, "claude-skills")).skills
+      template = Prompts::Template.new(name: "council", description: "d", content: "b",
+        file_path: File.join(@dir, ".tart", "prompts", "council.md"))
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          identity: "tart", footer_data: {cwd: @dir}, skills:, prompts: [template], extensions: [])
+        draw(chat, session)
+        collapsed = chat.transcript_lines
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        expanded = chat.transcript_lines
+        assert_includes expanded.join, "  project", "the scope-group label renders (pi formatScopeGroups)"
+        assert_includes expanded.join, "    #{File.join(@dir, '.tart', 'skills', 'demo.md')}",
+          "the skill's full display path renders"
+        assert_includes expanded.join, "    /council", "the prompt renders as /name"
+        assert_includes expanded.join, "  #{File.join(@dir, '.tart', 'settings.json')}",
+          "the [Context] display path renders"
+        refute_includes expanded.join, "  demo
+", "no compact list survives the flip"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_equal collapsed, chat.transcript_lines[0, collapsed.size], "the compact bodies restore byte-exact"
+      end
+    end
+
+    # AC2: /new drops the resource sections entirely (pi
+    # renderCurrentSessionState clears loadedResourcesContainer — boot-
+    # once) and re-enqueues the header block at the CURRENT toggle state.
+    def test_new_session_rerenders_the_header_alone_at_the_current_state
+      FileUtils.mkpath(File.join(@dir, ".tart", "skills"))
+      File.write(File.join(@dir, ".tart", "skills", "demo.md"), "---\nname: demo\ndescription: d\n---\nb")
+      skills = Skills.load(cwd: @dir, root: @dir, claude_dir: File.join(@dir, "claude-skills")).skills
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          identity: "tart", footer_data: {cwd: @dir}, skills:)
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join, "[Skills]", "the boot renders the sections"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"])) # flip BEFORE /new
+        chat.new_session
+        draw(chat, session)
+        lines = chat.transcript_lines
+        refute_includes lines.join, "[Skills]", "the sections are boot-once (pi's cleared container)"
+        refute_includes lines.join, "pgup/pgdn scroll", "the header re-enqueued EXPANDED (the current state — no compact line)"
+        assert_includes lines.join, " !! to run bash (no context)", "the expanded hint list rode the re-enqueue"
+      end
+    end
+
+    # AC2: the compaction rebuild restores the header AT ITS CURRENT
+    # expansion state — and never resurrects the sections (I31 ruling).
+    def test_compaction_rebuild_restores_the_header_at_its_current_state
+      with_chat(width: 60, screen_height: 24, motd: true,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, auto_compact: true}) do |chat, session|
+        draw(chat, session)
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"])) # flip BEFORE the compaction
+        chat.on_agent_event({type: :compaction, reason: :threshold, tokens_before: 100, summary: "s", entries: []})
+        draw(chat, session)
+
+        lines = chat.transcript_lines
+        refute_includes lines.join, Render::Motd::PI_NOTICE_LINE,
+          "the header rebuilt EXPANDED (pi's live header rides the toggle)"
+        assert_includes lines.join, " drop files to attach"
+      end
+    end
+
+    # AC4: the persistent statuses render as pi's showStatus — a blank row
+    # then a dim one-pad row at the tail, REPLACED in place while still
+    # the tail — and the editor border never carries them.
+    def test_statuses_render_as_transcript_tail_rows_replaced_in_place
+      with_chat(width: 60, screen_height: 24, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", default_provider: "openai"}) do |chat, session|
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: false,
+          context_window: 200_000, max_tokens: nil)
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_equal "", lines[-2], "the status pair's blank row"
+        assert_equal " Model: glm-5.3", lines[-1], "the dim status row at the tail"
+        refute_includes editor_area(session, chat), "Model:", "the editor border never carries the status"
+
+        chat.set_thinking_level("high") # a second status while the pair is still the tail
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_equal " Thinking level: high", lines[-1], "replaced in place (pi showStatus's tail rule)"
+        refute_includes lines.join, "Model: glm-5.3", "the replaced status is GONE (pi updates the same line)"
+
+        draw(chat, session) # a later frame — the status persists at settle
+        assert_includes chat.transcript_lines.join, "Thinking level: high", "statuses are persistent history"
+      end
+    end
+
+    # The status row renders the dim token (pi showStatus's theme.fg("dim")).
+    def test_status_row_renders_dim
+      with_chat(width: 60, screen_height: 24, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", default_provider: "openai"}) do |chat, session|
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: false,
+          context_window: 200_000, max_tokens: nil)
+        draw(chat, session)
+        status_y = session.buffer_content.rindex { |row| row.include?("Model: glm-5.3") }
+        assert_equal Theme[:dim], session.cell_fg(1, status_y), "the status renders dim"
+      end
+    end
     # pi-mode's MOTD (I16 AC2): the oracle's built-in header bytes — the
     # half-block mark with the tracked oracle version on its first line,
     # the hints on its second, the ctrl+o notice, then the onboarding
@@ -1403,10 +1931,11 @@ module Tart
     end
 
     # Live markdown (item 3, pi interactive-mode.ts:3519-3535 +
-    # assistant-message.ts:107-109): the live region's CONTENT re-renders
-    # as markdown on every delta — proven by styled readback BEFORE
-    # :message_end; the reasoning block above it stays plain dim italic
-    # (the I13 standing ruling, itemized).
+    # assistant-message.ts:107-109): the live region re-renders as
+    # markdown on every delta — proven by styled readback BEFORE
+    # :message_end; since I37 the reasoning block above the content rides
+    # the same converter (the dim-markdown routing — the I13 cut
+    # retired).
     def test_live_region_renders_markdown_mid_stream
       with_chat do |chat, session|
         chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
@@ -1422,6 +1951,91 @@ module Tart
         assert_includes thinking[4], :italic
         refute_includes live_region(session, chat), "**",
           "no raw markdown markers survive into the live region's rendered rows"
+      end
+    end
+
+    # --- reasoning as dim markdown (I37, pi assistant-message.ts:99-176):
+    # ONE converter path for the live, completed, and replay shapes — the
+    # thinkingText+italic prose default over the markdown theme, structure
+    # spans keeping their theme fns. The I13 cut retires. ---
+
+    # Reasoning fixture with a bold run, an inline code span, and a list.
+    REASONING_MD = "**bold** and `code`\n\n- item one"
+
+    def test_reasoning_renders_as_dim_markdown_mid_stream
+      with_chat(width: 40) do |chat, session|
+        chat.on_agent_event({type: :agent_start})
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk(nil, REASONING_MD)})
+        draw(chat, session)
+        assert_reasoning_markdown_cells(session, chat)
+        live = live_region(session, chat)
+        refute_includes live, "**", "no raw markers in the live region"
+        refute_includes live, "`"
+      end
+    end
+
+    def test_reasoning_renders_as_dim_markdown_at_completion
+      with_chat(width: 40) do |chat, session|
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk(nil, REASONING_MD)})
+        chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("answer")})
+        chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "answer")})
+        draw(chat, session)
+        assert_reasoning_markdown_cells(session, chat)
+      end
+    end
+
+    def test_reasoning_renders_as_dim_markdown_on_replay
+      dir = File.join(@dir, "sessions")
+      FileUtils.mkpath(dir)
+      recorded = File.join(dir, "reasoning_md_replay_test-session.jsonl")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"reasoning-md-replay","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"go"}}
+        {"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":"answer","thinking":#{REASONING_MD.to_json}}}
+      JSONL
+      with_chat(width: 40, screen_height: 24) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+        assert_reasoning_markdown_cells(session, chat)
+      end
+    end
+
+    # The shared cell readback (the [y, x, symbol, fg, modifiers] scan):
+    # bold rides thinkingText+italic, the codespan and the list marker
+    # keep their theme fns (no prose styling), plain prose rides
+    # thinkingText+italic, and no raw markers survive.
+    def assert_reasoning_markdown_cells(session, chat)
+      cells = transcript_cells(session, chat)
+      bold = cells.find { |cell| cell[2] == "b" }
+      assert_equal Theme[:thinkingText], bold[3], "the bold run rides the thinkingText prose color"
+      assert_equal [:bold, :italic], bold[4], "bold + the italic default (pi defaultTextStyle inside strong)"
+      code = cells.find { |cell| cell[2] == "c" }
+      assert_equal Theme[:md_code], code[3], "the codespan keeps its theme fn (no prose styling)"
+      refute_includes code[4], :italic
+      marker = cells.find { |cell| cell[2] == "-" }
+      assert_equal Theme[:md_list_bullet], marker[3], "the list marker keeps its theme fn"
+      refute_includes marker[4], :italic
+      prose = cells.find { |cell| cell[2] == "a" } # the "and" run — before any content rows
+      assert_equal Theme[:thinkingText], prose[3], "plain prose rides thinkingText"
+      assert_includes prose[4], :italic
+      rows = chat.transcript_lines.join
+      refute_includes rows, "**", "no raw markdown markers survive into the rendered rows"
+      refute_includes rows, "`"
+    end
+
+    # pi thinking.trim() (assistant-message.ts:125): leading/trailing
+    # delta whitespace strips before the markdown routing — no blank edge
+    # rows.
+    def test_reasoning_delta_whitespace_strips_to_no_blank_edge_rows
+      with_chat(width: 40) do |chat, session|
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk(nil, "\n\n pondering \n\n")})
+        chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "")})
+        draw(chat, session)
+        assert_equal ["", " pondering"], chat.transcript_lines,
+          "the strip kills the blank edge rows the delta whitespace would render"
       end
     end
 
@@ -1575,18 +2189,69 @@ module Tart
       end
     end
 
+    # I36 AC3: every selection path lands on the AGENT seam —
+    # apply_thinking_selection drives Agent::Loop#set_thinking_level, so
+    # /thinking, the shift+tab cycle, and the menu apply to the next
+    # request without restart (unit-pinned with a spy on the seam).
+    def test_thinking_selections_reach_the_agent_seam
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true}) do |chat, session|
+        levels = []
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:set_thinking_level) { |level| levels << level }
+        end
+        chat.commands = Commands::Handler.new(
+          skills: [], settings: {}, output: ->(text) { @commands_output << text },
+          spawn: ->(&block) { block.call }, agent: -> { chat.agent }, reset: -> {},
+          thinking: ->(arg) { chat.set_thinking_level(arg) },
+          thinking_menu: -> { chat.open_thinking_menu }, quit: -> {}
+        )
+
+        send_message(chat, "/thinking low")
+        assert_equal ["low"], levels, "the /thinking command rides the agent seam"
+
+        chat.on_event(TUI.key_event("tab", modifiers: ["shift"]))
+        assert_equal ["low", "medium"], levels, "the shift+tab cycle rides the agent seam"
+
+        chat.open_thinking_menu
+        chat.on_event(TUI.key_event("down"))
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal ["low", "medium", "high"], levels, "the menu selection rides the agent seam"
+      end
+    end
+
+    # pi cycleThinkingLevel (:2641-2653): a stored level OUTSIDE the gated
+    # set (a switch re-laddered under it) cycles to the FIRST rung — the
+    # JS `indexOf → -1` makes `(−1 + 1) % size` land on index 0, not on
+    # the rung after the floor.
+    def test_cycle_from_an_out_of_set_level_lands_on_the_first_rung
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "max", reasoning: true}) do |chat, session|
+        levels = []
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:set_thinking_level) { |level| levels << level }
+        end
+
+        assert_equal "off", chat.cycle_thinking_level,
+          "the wrap lands on the first rung (the map-less ladder has no max)"
+        assert_equal ["off"], levels, "the wrapped cycle rides the agent seam"
+      end
+    end
+
     # --- the selector menus (I27): key routes, dispatch wiring, the
     # switch seams — pi showSelector/app.model.select/app.models.save ---
 
     def model_catalog
+      typed_model = lambda do |provider, id, name, reasoning, context_window|
+        Shapes::Model.new(id: id, name: name, reasoning: reasoning, context_window: context_window,
+          max_tokens: nil, thinking_level_map: nil, provider: provider)
+      end
       Models::Config.new(
         providers: {
-          "glm" => {name: "GLM", base_url: nil, api_key: nil, api: nil,
-                    models: [{provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
-                              context_window: 200_000, max_tokens: nil}]},
-          "zai" => {name: "Z.ai", base_url: nil, api_key: nil, api: nil,
-                    models: [{provider: "zai", id: "glm-5-air", name: "Air", reasoning: false,
-                              context_window: 130_000, max_tokens: nil}]}
+          "glm" => Shapes::Provider.new(name: "GLM", base_url: nil, api_key: nil, api: nil,
+                                        models: [typed_model.call("glm", "glm-5.3", "GLM 5.3", true, 200_000)]),
+          "zai" => Shapes::Provider.new(name: "Z.ai", base_url: nil, api_key: nil, api: nil,
+                                        models: [typed_model.call("zai", "glm-5-air", "Air", false, 130_000)])
         },
         default: nil, error: nil
       )
@@ -1622,9 +2287,15 @@ module Tart
                       default_provider: "openai", thinking_level: "medium", reasoning: false}) do |chat, session|
         switched = []
         chat.agent = Object.new.tap do |agent|
-          agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil|
-            switched << {model_id:, provider:, context_window:}
+          agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil,
+                                                           model_reasoning: nil, thinking_level_map: nil,
+                                                           compat: nil|
+            switched << {model_id:, provider:, context_window:, model_reasoning:, thinking_level_map:, compat:}
           end
+          # The I40 switch seam also re-clamps the stored level onto the
+          # loop (pi setModel → setThinkingLevel); inert for this pin,
+          # which asserts the switch_model kwargs alone.
+          agent.define_singleton_method(:set_thinking_level) do |_level| end
         end
 
         chat.open_model_menu
@@ -1632,14 +2303,15 @@ module Tart
         draw(chat, session)
 
         refute chat.menu_open?, "the selection closes the menu (the editor is restored)"
-        assert_equal [{model_id: "glm-5.3", provider: "openai", context_window: 200_000}], switched,
+        assert_equal [{model_id: "glm-5.3", provider: "openai", context_window: 200_000,
+                       model_reasoning: true, thinking_level_map: nil, compat: nil}], switched,
           "the loop seam swaps the runtime chat model (the wire provider — the port's " \
-          "single chat-completions seam) and re-resolves the window"
+          "single chat-completions seam), re-resolves the window, and carries the " \
+          "switched entry's composed reasoning facts (known-tables-second)"
         assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("glm-5.3 • medium"),
           "the footer model segment refreshed (the entry's reasoning flag rides along)"
-        border_row = session.buffer_content.index { |row| row.include?("─") }
-        assert session.buffer_content[border_row].include?("Model: glm-5.3"),
-          "the border status reports pi's showStatus text"
+        assert_includes chat.transcript_lines.join, "Model: glm-5.3",
+          "the status reports pi's showStatus text (the transcript tail row, I33)"
       end
     end
 
@@ -1679,9 +2351,8 @@ module Tart
         assert_equal "glm-5.3", saved["defaultModel"], "defaultModel persisted"
         assert_equal true, saved["unknownKey"], "unknown keys survive the write"
         assert_equal "high", saved["thinkingLevel"], "unmodified keys survive"
-        border_row = session.buffer_content.index { |row| row.include?("─") }
-        assert session.buffer_content[border_row].include?("Default model: glm/glm-5.3"),
-          "the persisted status reports the pair"
+        assert_includes chat.transcript_lines.join, "Default model: glm/glm-5.3",
+          "the persisted status reports the pair (the transcript tail row, I33)"
       end
     end
 
@@ -1697,9 +2368,8 @@ module Tart
         refute chat.menu_open?
         saved = JSON.parse(File.read(File.join(@dir, "settings.json")))
         assert_equal "medium", saved["thinkingLevel"], "the settings default persisted"
-        border_row = session.buffer_content.index { |row| row.include?("─") }
-        assert session.buffer_content[border_row].include?("Default thinking level: medium"),
-          "the persisted status reports the level"
+        assert_includes chat.transcript_lines.join, "Default thinking level: medium",
+          "the persisted status reports the level (the transcript tail row, I33)"
       end
     end
 
@@ -1723,8 +2393,7 @@ module Tart
         draw(chat, session)
 
         refute chat.menu_open?, "the click selected and closed (pi click → onSelect)"
-        border_row = session.buffer_content.index { |row| row.include?("─") }
-        assert session.buffer_content[border_row].include?("Model: glm-5.3"),
+        assert_includes chat.transcript_lines.join, "Model: glm-5.3",
           "the clicked entry switched (the drawn frame's flush renders the status)"
       end
     end
@@ -1739,9 +2408,10 @@ module Tart
     def mock_native_catalog
       Models::Config.new(
         providers: {
-          "mock" => {name: "Mock", base_url: nil, api_key: nil, api: nil,
-                     models: [{provider: "mock", id: "mock-1", name: "Mock 1", reasoning: true,
-                               context_window: 33_000, max_tokens: nil}]}
+          "mock" => Shapes::Provider.new(name: "Mock", base_url: nil, api_key: nil, api: nil,
+                                         models: [Shapes::Model.new(id: "mock-1", name: "Mock 1", reasoning: true,
+                                             context_window: 33_000, max_tokens: nil, thinking_level_map: nil,
+                                             provider: "mock")])
         },
         default: nil, error: nil
       )
@@ -1765,9 +2435,11 @@ module Tart
 
     # pi getAvailableThinkingLevels (agent-session.ts:2657 →
     # getSupportedThinkingLevels, models.ts:1224): a non-reasoning model
-    # offers [off] alone — the menu gates, the ✓ clamps onto the gate's
-    # floor (pi setModel's _clampThinkingLevel), and the /thinking arg
-    # error lists the GATED set (handleThinkingCommand :5153-5155).
+    # offers [off] alone — the menu gates, and the /thinking arg error
+    # lists the GATED set (handleThinkingCommand :5153-5155). The ✓ rides
+    # EXACT equality (thinking-selector.ts:69-73, I40): the fixture's
+    # stored "medium" is outside the gated set, so NO row is marked (the
+    # preselect falls to index 0 — buildSelectList :101-107).
     def test_thinking_menu_gates_to_off_for_a_non_reasoning_runtime_model
       with_chat(width: 40, screen_height: 16,
         footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: false}) do |chat, session|
@@ -1777,21 +2449,231 @@ module Tart
         menu = chat.instance_variable_get(:@menu)
         assert_equal %w[off], menu.instance_variable_get(:@items).map { |item| item[:value] },
           "the gated set is [off] alone"
-        assert_equal "off", chat.menu_selection&.fetch(:value), "the gate's floor preselects"
+        assert_equal "off", chat.menu_selection&.fetch(:value), "the preselect lands on index 0"
         rows = TUI.widget_lines(chat.renderer.call).join("\n")
-        assert_includes rows, "✓ off", "the ✓ clamps onto the gated set"
+        refute_includes rows, "✓", "exact equality: the out-of-set stored level marks NO row (I40)"
         refute_includes rows, "minimal", "no ungated levels render"
       end
     end
 
-    def test_thinking_menu_lists_all_levels_for_a_reasoning_runtime_model
+    def test_thinking_menu_lists_the_mapless_rule_for_a_reasoning_runtime_model
       with_chat(width: 40, screen_height: 16,
         footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true}) do |chat, session|
         chat.open_thinking_menu
 
         menu = chat.instance_variable_get(:@menu)
+        assert_equal %w[off minimal low medium high], menu.instance_variable_get(:@items).map { |item| item[:value] },
+          "no map = pi's map-less rule: the ladder without xhigh/max (models.ts:1224-1231)"
+      end
+    end
+
+    # The runtime map filters the ladder (I36 — the I27 "xhigh/max never
+    # filter" deviation retired): a mapped model offers exactly
+    # Models.supported_thinking_levels.
+    def test_thinking_menu_gates_by_the_boot_map
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "medium", reasoning: true,
+                      thinking_level_map: {off: nil, minimal: nil, low: "low", medium: nil, high: "high",
+                                           xhigh: nil, max: "max"}}) do |chat, session|
+        chat.open_thinking_menu
+
+        menu = chat.instance_variable_get(:@menu)
+        assert_equal %w[low high max], menu.instance_variable_get(:@items).map { |item| item[:value] },
+          "null values mark levels unsupported (pi getSupportedThinkingLevels)"
+      end
+    end
+
+    # The switch overlay carries the switched entry's map: the ladder
+    # re-gates after a /model switch (pi setModel → _clampThinkingLevel).
+    def test_thinking_ladder_re_gates_on_the_switched_entrys_map
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", reasoning: true,
+                      thinking_level_map: {off: "low", low: "low", medium: "medium", high: "high",
+                                           xhigh: "xhigh", max: "max"}}) do |chat, session|
+        chat.open_thinking_menu
+        menu = chat.instance_variable_get(:@menu)
         assert_equal Settings::THINKING_LEVELS, menu.instance_variable_get(:@items).map { |item| item[:value] },
-          "the full ladder (no thinkingLevelMap in the port's schema — itemized)"
+          "the boot map offers the whole ladder"
+        chat.on_event(TUI.key_event("esc"))
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+        chat.open_thinking_menu
+        menu = chat.instance_variable_get(:@menu)
+        assert_equal %w[off minimal low medium high], menu.instance_variable_get(:@items).map { |item| item[:value] },
+          "the switched entry's map-less shape re-gates (the overlay replaces the boot map)"
+      end
+    end
+
+    # --- I40: the stored level re-clamps on the switch (pi setModel,
+    # the named I28 residual) ---
+
+    # The loop-seam spy: records the switch call ORDER (pi setModel swaps
+    # the model first, agent-session.ts:2484-2494, then setThinkingLevel
+    # :2610) and the levels the seam received.
+    def switching_agent(levels)
+      calls = []
+      spy = Object.new.tap do |agent|
+        agent.define_singleton_method(:switch_model) do |*|
+          calls << :switch_model
+        end
+        agent.define_singleton_method(:set_thinking_level) do |level|
+          calls << :set_thinking_level
+          levels << level
+        end
+      end
+      [spy, calls]
+    end
+
+    # pi setModel (agent-session.ts:2477-2496) resolves a level FOR THE
+    # SWITCH — _getThinkingLevelForModelSwitch (:2670-2679, the session
+    # level when no settings FILE declares a default) — and
+    # setThinkingLevel (:2610-2634) re-clamps it through the SWITCHED
+    # model's supported set: a stored xhigh no longer survives a switch
+    # to a map-less reasoning model (the map-less rule tops out at high,
+    # models.ts:1224-1231). The clamped level rides the loop seam AFTER
+    # switch_model (pi's order) and re-renders the footer.
+    def test_switch_re_clamps_a_stored_level_through_the_switched_model
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "xhigh", reasoning: false}) do |chat, session|
+        levels = []
+        agent, calls = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "high", chat.instance_variable_get(:@thinking_level),
+          "the stored xhigh re-clamps through the map-less rule (pi _clampThinkingLevel)"
+        assert_equal ["high"], levels, "the loop seam carries the clamped level"
+        assert_equal %i[switch_model set_thinking_level], calls,
+          "pi swaps the model first, then sets the level (agent-session.ts:2484-2494)"
+        draw(chat, session)
+        assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("glm-5.3 • high"),
+          "the footer renders the clamped level (the overlay view)"
+      end
+    end
+
+    # A non-reasoning switch re-clamps to off (pi: ["off"] is the whole
+    # supported set when reasoning is false, models.ts:1225).
+    def test_switch_to_a_non_reasoning_model_clamps_the_level_to_off
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "high", reasoning: true}) do |chat|
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "zai", id: "glm-5-air", name: "Air", reasoning: false,
+          context_window: 130_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "off", chat.instance_variable_get(:@thinking_level),
+          "the stored high re-clamps to the non-reasoning floor"
+        assert_equal ["off"], levels
+      end
+    end
+
+    # The declared-default tier (pi _getThinkingLevelForModelSwitch
+    # :2676-2677 — getDefaultThinkingLevel() ?? this.thinkingLevel): a
+    # FILE-declared default re-applies on EVERY switch and wins over the
+    # session level (settings-manager.ts:758-760 — only a file declares
+    # it; the baked DEFAULTS never counts).
+    def test_switch_prefers_the_declared_default_over_the_session_level
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "high", reasoning: true}) do |chat|
+        FileUtils.mkpath(@dir)
+        File.write(File.join(@dir, "settings.json"), '{"thinkingLevel": "low"}')
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "low", chat.instance_variable_get(:@thinking_level),
+          "the declared default wins over the session level (pi getDefaultThinkingLevel)"
+        assert_equal ["low"], levels
+      end
+    end
+
+    # No file default: an in-set session level carries across the switch
+    # unchanged (pi's ?? this.thinkingLevel tier).
+    def test_switch_keeps_an_in_set_session_level_without_a_declared_default
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "medium", reasoning: false}) do |chat|
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "medium", chat.instance_variable_get(:@thinking_level),
+          "the in-set session level survives (the clamp's exact-pass branch)"
+        assert_equal ["medium"], levels
+      end
+    end
+
+    # The clamp applies to whatever the resolution yields: an out-of-set
+    # DECLARED default clamps through the new model too (pi setThinkingLevel
+    # runs on the composed level, not only on the stored one).
+    def test_switch_clamps_an_out_of_set_declared_default
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "low", reasoning: true}) do |chat|
+        FileUtils.mkpath(@dir)
+        File.write(File.join(@dir, "settings.json"), '{"thinkingLevel": "xhigh"}')
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+
+        assert_equal "high", chat.instance_variable_get(:@thinking_level),
+          "the declared xhigh clamps to the map-less ceiling"
+        assert_equal ["high"], levels
+      end
+    end
+
+    # pi setModel shows ONLY the model status (interactive-mode.ts
+    # :5347-5351); the level change rides thinking_level_changed, which
+    # refreshes footer + border without a status row (:3495-3498).
+    def test_switch_enqueues_no_thinking_status_row
+      with_chat(width: 40, screen_height: 16, models: model_catalog,
+        footer_data: {cwd: @dir, model: "boot-model", context_window: 1000,
+                      default_provider: "openai", thinking_level: "xhigh", reasoning: false}) do |chat, session|
+        levels = []
+        agent, = switching_agent(levels)
+        chat.agent = agent
+
+        chat.switch_model(provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
+          context_window: 200_000, max_tokens: nil, thinking_level_map: nil)
+        draw(chat, session)
+
+        tail = chat.transcript_lines.join
+        assert_includes tail, "Model: glm-5.3", "the switch reports pi's showStatus text"
+        refute_includes tail, "Thinking level:", "no level status on the switch path"
+        refute_includes tail, "Default thinking level:"
+      end
+    end
+
+    # The ✓ letter (pi thinking-selector.ts:69-73): EXACT equality — a
+    # stored level OUTSIDE the gated set marks NO row; the sealed
+    # constructor's preselect falls to index 0 (buildSelectList :101-107).
+    def test_thinking_menu_marks_no_row_for_an_out_of_set_stored_level
+      with_chat(width: 40, screen_height: 16,
+        footer_data: {cwd: @dir, model: "m", context_window: 1000, thinking_level: "xhigh", reasoning: true}) do |chat|
+        chat.open_thinking_menu
+
+        menu = chat.instance_variable_get(:@menu)
+        refute menu.instance_variable_get(:@items).any? { |item| item[:current] },
+          "no ✓ row: the map-less ladder has no xhigh (exact equality, no display floor)"
+        assert_equal "off", chat.menu_selection&.fetch(:value), "the preselect lands on index 0"
       end
     end
 
@@ -1819,7 +2701,7 @@ module Tart
         assert_includes chat.transcript_lines.join, 'Unknown thinking level "high". Available levels: off.',
           "the error lists the GATED set (pi handleThinkingCommand :5153-5155)"
         assert_nil chat.instance_variable_get(:@thinking_level), "the level holds (no status rode)"
-        assert_nil chat.instance_variable_get(:@border_status), "no selection status rendered"
+        refute_includes chat.transcript_lines.join, "Thinking level:", "no selection status rendered"
       end
     end
 
@@ -2322,6 +3204,313 @@ module Tart
       end
     end
 
+    # ---- the user-bash live stream (I38 — pi's BashExecutionComponent:
+    # the running block exists from BEFORE execution, appendOutput +
+    # requestRender per chunk, setComplete in place; handleBashCommand
+    # :6987-7062). Mid-flight drives the manual-reactor idiom (the
+    # escape-cancel test's shape): the IdleKernel task block runs in a
+    # side reactor thread while the test thread draws. ----
+
+    # Runs the queued user-bash task block in a side reactor thread (the
+    # bridge's queue pop needs a real reactor); returns the thread.
+    def run_user_bash_task(chat)
+      workers = chat.kernel.submitted.slice!(0..)
+      Thread.new do
+        Async do |root|
+          workers.each { |block| root.async { block.call } }
+        end
+      end
+    end
+
+    def row_texts(lines)
+      lines.map { |line| line.spans.map(&:content).join }
+    end
+
+    # The live loader row's spans (nil when no running block is on screen).
+    def loader_row_spans(chat)
+      chat.display_lines.map(&:spans).find { |spans| spans.map(&:content).join.include?("Running...") }
+    end
+
+    # AC1: mid-flight the live region renders the running family below the
+    # transcript content while the transcript itself has NO block. The
+    # settled-flush pins live in the main-thread tests below — the side
+    # reactor thread owns no terminal (the escape-cancel idiom's known
+    # artifact: the task's finish dies at the block_sink viewport read;
+    # the explicit stream_end clear has already run).
+    def test_running_user_bash_renders_the_streaming_block_midflight
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!printf 'alpha\\n'; sleep 0.5; printf 'beta\\n'")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2 # the first chunk has landed; the second has not
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert chat.user_bash_streaming?, "the run is in flight"
+        assert rows.any? { |row| row == " $ printf 'alpha\\n'; sleep 0.5; printf 'beta\\n'" },
+          "the running block's header renders (the block exists before execution, :7000-7012)"
+        assert rows.any? { |row| row == " alpha" }, "the landed chunk renders mid-flight"
+        refute rows.any? { |row| row == " beta" }, "only the accumulated text renders"
+        assert rows.any? { |row| row.include?("Running... (escape/ctrl+c to cancel)") },
+          "the loader row renders pi's bytes"
+        refute chat.transcript_lines.any? { |row| row.include?("$ printf") },
+          "the transcript has NO block mid-flight (the live rows are transient)"
+
+        reactor.join(5)
+        draw(chat, session)
+        refute chat.user_bash_streaming?, "the terminal path cleared the live rows"
+        refute row_texts(chat.display_lines).any? { |row| row.include?("Running...") },
+          "zero live rows after the run (AC2)"
+      end
+    end
+
+    # AC2: the completed block flushes byte-identical (rows + position) to
+    # a control chat that received only the enqueue with the same fields.
+    def test_completed_block_flush_is_byte_identical_to_a_control_enqueue
+      settled = nil
+      with_chat(width: 60) do |chat, session|
+        send_message(chat, "!echo settle-check")
+        drain_runs(chat)
+        draw(chat, session)
+        settled = chat.transcript_lines
+        refute chat.user_bash_streaming?
+        assert_equal settled, row_texts(chat.display_lines), "zero live rows at the outcome terminal (AC2)"
+      end
+
+      with_chat(width: 60) do |chat, session|
+        chat.instance_variable_get(:@transcript_state).enqueue_user_bash_block(
+          "echo settle-check", content: "settle-check\n", exit_code: 0, cancelled: false,
+          truncated: false, full_output_path: nil, excluded: false)
+        draw(chat, session)
+        assert_equal settled, chat.transcript_lines,
+          "the flushed block is byte-identical in rows and position (AC2)"
+      end
+    end
+
+    # AC3 mid-flight: the appendOutput join, string-buffer equivalent — an
+    # unterminated trailing line renders as its own row and the next
+    # chunk's first piece continues it. The settled bytes re-run through
+    # the main-thread drain (the side reactor owns no terminal).
+    def test_user_bash_chunks_join_through_the_string_buffer
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!printf 'par'; sleep 0.3; printf 'tial\\r\\nline2'; sleep 0.3; printf 'tail'")
+        reactor = run_user_bash_task(chat)
+        sleep 0.45 # chunks 1-2 have landed ("par" + "tial\nline2")
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert rows.any? { |row| row == " partial" }, "the unterminated first line joined across chunks"
+        assert rows.any? { |row| row == " line2" }, "the chunk's newline opened the second row"
+        refute rows.any? { |row| row == " tial" }, "no split fragment row (the appendOutput join)"
+
+        reactor.join(5)
+        send_message(chat, "!printf 'par'; printf 'tial\\r\\nline2'; printf 'tail'")
+        drain_runs(chat)
+        draw(chat, session)
+        assert chat.transcript_lines.any? { |row| row == " line2tail" },
+          "the trailing chunk continued the unterminated row (settled bytes agree)"
+      end
+    end
+
+    # AC3: CR-only chunk text vanishes — CR is REMOVED, never mapped.
+    def test_user_bash_cr_only_chunks_vanish
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!printf 'x\\ry'; sleep 0.4; printf ' end'")
+        reactor = run_user_bash_task(chat)
+        sleep 0.15
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert rows.any? { |row| row == " xy" }, "the CR-only piece vanished; the line joins through"
+        refute rows.any? { |row| row.include?("\r") }, "no CR anywhere mid-flight"
+
+        reactor.join(5)
+        send_message(chat, "!printf 'x\\ry'; sleep 0.3; printf ' end'")
+        drain_runs(chat)
+        draw(chat, session)
+        assert chat.transcript_lines.any? { |row| row == " xy end" },
+          "the settled block carries the same joined bytes (the trailing chunk continues the row)"
+      end
+    end
+
+    # AC2: the worker-error terminal (the ENOENT arm) clears the live rows
+    # too — the error line renders, no block, zero live rows.
+    def test_worker_error_clears_the_live_rows
+      Dir.chdir(@dir) do
+        # footer_data pins the cwd: the deleted-cwd trick must not trip the
+        # footer's Dir.pwd fallback mid-test.
+        with_chat(width: 60, screen_height: 24, footer_data: {cwd: @dir}) do |chat, session|
+          send_message(chat, "!echo boom") # the tool captured the (still-live) cwd
+          FileUtils.rmdir(@dir) # the cwd dies before the worker runs — the ENOENT arm
+          drain_runs(chat)
+          draw(chat, session)
+
+          refute chat.user_bash_streaming?, "the worker-error terminal cleared the live rows"
+          refute row_texts(chat.display_lines).any? { |row| row.include?("Running...") },
+            "zero Running... anywhere (AC2)"
+          assert chat.transcript_lines.any? { |row| row.include?("bash: No such file or directory") },
+            "the worker error surfaced as the error line (the ENOENT arm)"
+          refute chat.transcript_lines.any? { |row| row.include?("$ echo boom") },
+            "no block renders on a worker error"
+        end
+      end
+    end
+
+    # AC2: the escape-cancel terminal clears the live rows; the cancelled
+    # block keeps its partial output (existing behavior).
+    def test_escape_cancel_clears_the_live_rows_and_keeps_partial_output
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!printf 'kept\\n'; sleep 5")
+        reactor = run_user_bash_task(chat)
+        sleep 0.3
+        draw(chat, session)
+        assert chat.user_bash_streaming?, "the run is mid-flight"
+
+        chat.on_event(TUI.key_event("esc"))
+        reactor.join(5)
+        draw(chat, session)
+
+        refute chat.user_bash_streaming?, "the cancel terminal cleared the live rows"
+        refute row_texts(chat.display_lines).any? { |row| row.include?("Running...") },
+          "zero Running... anywhere (AC2)"
+        assert chat.transcript_lines.any? { |row| row.include?("kept") },
+          "the cancelled block keeps its partial output"
+        assert chat.transcript_lines.any? { |row| row.include?("cancelled") },
+          "the cancelled status row renders"
+      end
+    end
+
+    # AC4: the glyph advances across draws with NO chunk between (the
+    # animation window is open for the run) while @busy stays false — no
+    # border Working status renders from a bash run.
+    def test_bash_loader_glyph_advances_across_draws_without_busy
+      t = 0.0
+      clock = -> { t }
+      kernel = RecordingKernel.new
+      with_chat(width: 60, screen_height: 24, clock:, kernel:) do |chat, session|
+        send_message(chat, "!sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2
+
+        refute chat.busy?, "@busy stays false — a bash run is no agent turn"
+        draw(chat, session)
+        assert_equal "⠋", loader_row_spans(chat)[1].content, "frame 0 at the run-start anchor"
+        animate_after_first_draw = kernel.animate_calls.length
+        assert_operator animate_after_first_draw, :>=, 1, "the animation window is open for the run"
+
+        t += Render::Chat::SPINNER_INTERVAL_SECONDS
+        draw(chat, session) # no chunk between the draws — the glyph advances on TIME
+        assert_equal "⠙", loader_row_spans(chat)[1].content
+
+        t += Render::Chat::SPINNER_INTERVAL_SECONDS
+        draw(chat, session)
+        assert_equal "⠹", loader_row_spans(chat)[1].content
+
+        assert_operator kernel.animate_calls.length, :>, animate_after_first_draw,
+          "frames keep pacing while the run is in flight"
+        refute chat.busy?, "still no agent turn"
+        draw(chat, session)
+        refute session.buffer_content.any? { |row| row.include?("Working") },
+          "no border Working status renders from a bash run (mid-flight)"
+        reactor.join(5)
+      end
+    end
+
+    # AC4: the bash loader's anchor resets at each run start (pi: one
+    # Loader per component) and is independent of the border status's
+    # anchor — no bash run ever re-anchors the border spinner.
+    def test_bash_loader_anchor_resets_at_run_start_independent_of_the_border_anchor
+      t = 0.0
+      clock = -> { t }
+      with_chat(width: 60, screen_height: 24, clock:) do |chat, session|
+        send_message(chat, "!sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2
+        draw(chat, session)
+        assert_equal "⠋", loader_row_spans(chat)[1].content
+        reactor.join(5)
+
+        # The second run starts with the clock advanced one dwell: a stale
+        # anchor (the first run's) would show ⠙; the reset shows ⠋.
+        t += Render::Chat::SPINNER_INTERVAL_SECONDS
+        send_message(chat, "!sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2
+        draw(chat, session)
+        assert_equal "⠋", loader_row_spans(chat)[1].content,
+          "the anchor resets at each run start (pi: one Loader per component)"
+        assert_nil chat.instance_variable_get(:@spinner_started_at),
+          "the border-status anchor is untouched by bash runs"
+        reactor.join(5)
+      end
+    end
+
+    # The colorKey: "!!" marks the excluded execution — the RUNNING
+    # block's border and spinner ride dim (Grounds 6, the component's
+    # constructor colorKey).
+    def test_bang_bang_running_block_rides_dim_midflight
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!!sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2
+        draw(chat, session)
+
+        buffer = session.buffer_content
+        border_row = buffer.index { |row| row.include?("─" * 60) }
+        assert_equal Theme[:dim], session.cell_fg(0, border_row),
+          "the running block's border renders dim (excludeFromContext colorKey)"
+        loader = buffer.index { |row| row.include?("Running...") }
+        assert loader, "the loader row is on screen"
+        assert_equal Theme[:dim], session.cell_fg(1, loader), "the spinner rides dim too"
+        reactor.join(5)
+      end
+    end
+
+    # Grounds 6f: mid-run ctrl+o reaches the RUNNING component — the
+    # preview toggles (collapsed last-20 ↔ whole), and NO hidden-lines
+    # hint renders in either state (pi's running branch replaces the
+    # status block).
+    def test_ctrl_o_toggles_the_running_preview_without_a_hint
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        send_message(chat, "!seq 1 25; sleep 2")
+        reactor = run_user_bash_task(chat)
+        sleep 0.2 # seq has printed all 25 lines; the run is mid-flight
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert rows.any? { |row| row == " 25" }, "the output tail renders mid-flight"
+        refute rows.any? { |row| row == " 1" }, "collapsed: the last-20 preview (AC1)"
+        refute rows.any? { |row| row.include?("more lines") }, "NO hidden-lines hint mid-flight"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert row_texts(chat.display_lines).any? { |row| row == " 1" },
+          "expanded mid-run: the whole output (pi setToolsExpanded reaches the running component)"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        refute row_texts(chat.display_lines).any? { |row| row == " 1" }, "collapsed again mid-run"
+        reactor.join(5)
+      end
+    end
+
+    # AC2: the replay path never sees mid-flight state — a recorded
+    # bashExecution entry renders zero loader rows.
+    def test_replay_renders_no_loader_rows
+      recorded = File.join(@dir, "bash-replay-i38.jsonl")
+      File.write(recorded, <<~JSONL)
+        {"type":"session","version":3,"id":"i38","timestamp":"2026-01-01T00:00:00.000Z","cwd":"#{@dir}"}
+        {"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"bashExecution","command":"echo hi","output":"hi","exitCode":0,"cancelled":false,"truncated":false,"fullOutputPath":null,"timestamp":"2026-01-01T00:00:02.000Z","excludeFromContext":false}}
+      JSONL
+      with_chat(width: 60) do |chat, session|
+        chat.resume_session(recorded)
+        draw(chat, session)
+
+        rows = row_texts(chat.display_lines)
+        assert rows.any? { |row| row.include?("$ echo hi") }, "the replayed block renders"
+        refute rows.any? { |row| row.include?("Running...") }, "replay renders zero loader rows (AC2)"
+      end
+    end
+
     # (A byte-identical duplicate of the bash-mode border test above
     # shadowed it at HEAD — the second definition won, the first never
     # ran; dropped, the suite's run count reconciles with its source.)
@@ -2388,6 +3577,55 @@ module Tart
         "x".each_char { |char| chat.on_event(TUI.key_event(char)) } # typing closes the yank window
         chat.on_event(TUI.key_event("y", modifiers: ["alt"]))
         assert_equal "x", chat.input, "alt+y without a preceding yank does nothing"
+      end
+    end
+
+    # --- undo (I39, pi keybindings.ts:142 tui.editor.undo = ctrl+-):
+    # the arm fires with the list open (pi matches undo BEFORE the
+    # autocomplete block, editor.ts:751-755); bare - types; submit
+    # clears the stack (pi submitValue editor.ts:1373).
+
+    def test_ctrl_minus_undoes_the_last_edit_through_the_key_surface
+      with_headless_chat do |chat|
+        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("-", modifiers: ["ctrl"]))
+        assert_equal "hello", chat.input, "ctrl+- undoes the ' world' unit (the space captured pre-space)"
+        chat.on_event(TUI.key_event("-", modifiers: ["ctrl"]))
+        assert_equal "", chat.input, "'hello' is one typing unit"
+      end
+    end
+
+    def test_bare_minus_still_types
+      with_headless_chat do |chat|
+        "a-b".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        assert_equal "a-b", chat.input, "bare - inserts (the arm's printable fall-through)"
+      end
+    end
+
+    def test_alt_minus_stays_a_no_op
+      with_headless_chat do |chat|
+        "ab".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("-", modifiers: ["alt"]))
+        assert_equal "ab", chat.input, "alt+- is the modifier-guard no-op"
+      end
+    end
+
+    def test_ctrl_minus_with_the_list_open_leaves_the_list_open
+      with_headless_chat(autocomplete: slash_source("new", "help")) do |chat|
+        chat.on_event(TUI.key_event("/"))
+        assert_equal ["new", "help"], chat.suggestions.map { |item| item[:value] }
+        chat.on_event(TUI.key_event("-", modifiers: ["ctrl"]))
+        assert_equal "", chat.input, "undo fires with the list open (pi editor.ts:751-755)"
+        assert chat.suggestions, "the list is neither cancelled nor re-filtered by undo"
+      end
+    end
+
+    def test_submit_clears_the_undo_stack
+      with_headless_chat do |chat|
+        "hello world".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+        chat.on_event(TUI.key_event("-", modifiers: ["ctrl"]))
+        assert_equal "", chat.input, "after submit, ctrl+- is a no-op (pi submitValue clears the stack)"
       end
     end
 
@@ -2575,26 +3813,46 @@ module Tart
     end
 
     # --- transcript scrolling (AC2, I12): pi ScrollView follow-end + the
-    # auto scrollbar (pageUp/pageDown per keybindings.ts:114-115 — the gem
-    # spells the codes page_up/page_down). ---
+    # auto scrollbar. The user-scroll seam is the WHEEL since I35 — the
+    # page keys page the editor now (I35 OPTION A, pi pageScroll; the
+    # I12 page-key mapping retired). ---
 
-    def test_page_up_pans_the_transcript_and_the_tail_refollows
+    # The wheel seam scrolled one VIEWPORT back (6 rows at these tests'
+    # 12-row screen — the same window the I12 page key used to land on;
+    # the page keys page the editor since I35). One line per event (pi
+    # lines-per-event default 1).
+    def wheel_page_back(chat)
+      6.times { chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0)) }
+    end
+
+    # The wheel seam scrolled to the very top — generous on purpose: the
+    # wheel clamps at 0 and a clamped no-op neither moves nor re-marks
+    # (pi scrollBy: moved === 0).
+    def wheel_to_top(chat)
+      40.times { chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0)) }
+    end
+
+    def wheel_to_end(chat)
+      40.times { chat.on_event(TUI.mouse_event(kind: "scroll_down", x: 0, y: 0)) }
+    end
+
+    def test_scrolling_up_pans_the_transcript_and_the_tail_refollows
       with_chat(width: 20, screen_height: 12) do |chat, session|
         20.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session)
         assert_equal " line19", transcript_view(session, chat).last, "following: the tail is visible"
 
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
         visible = transcript_view(session, chat)
-        refute_includes visible, "line19", "a page up detaches from the end"
-        assert_equal 28, chat.scroll_offset, "one page = the transcript viewport rows (6 off 34)"
-        assert_includes visible, " line14", "the window sits a page back into the transcript"
+        refute_includes visible, "line19", "a scroll away from the end detaches"
+        assert_equal 28, chat.scroll_offset, "scrolled to the top (34 buffer lines off a 6-row viewport)"
+        assert_includes visible, " line14", "the window sits a viewport back into the transcript"
 
-        chat.on_event(TUI.key_event("page_down"))
+        28.times { chat.on_event(TUI.mouse_event(kind: "scroll_down", x: 0, y: 0)) }
         draw(chat, session)
         assert_equal " line19", transcript_view(session, chat).last,
-          "a page down from the page-up position lands at the end and re-follows"
+          "scrolling back to the end re-follows"
       end
     end
 
@@ -2602,7 +3860,7 @@ module Tart
       with_chat(width: 20, screen_height: 12) do |chat, session|
         20.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session)
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
 
         finish_message(chat, "late")
@@ -2611,22 +3869,22 @@ module Tart
           "the detached view stays put while output streams"
         refute_includes transcript_view(session, chat), "late"
 
-        chat.on_event(TUI.key_event("page_down"))
+        chat.on_event(TUI.mouse_event(kind: "scroll_down", x: 0, y: 0))
         draw(chat, session)
-        refute_includes transcript_view(session, chat), "late", "a paged view pans one page, not to the end"
-        chat.on_event(TUI.key_event("page_down"))
+        refute_includes transcript_view(session, chat), "late", "a scroll down pans one line, not to the end"
+        wheel_to_end(chat)
         draw(chat, session)
         assert_equal " late", transcript_view(session, chat).last,
           "landing at the end re-follows the new output"
       end
     end
 
-    def test_page_scrolling_is_the_lists_prisoner_and_needs_no_overflow
+    def test_wheel_scrolling_needs_no_overflow
       with_chat(width: 20, screen_height: 12) do |chat, session|
         chat.on_agent_event({type: :agent_start})
-        "ar".each_char { |char| chat.on_event(TUI.key_event(char)) } # no slash: no list, page keys free
-        chat.on_event(TUI.key_event("page_up"))
-        assert_equal 0, chat.scroll_offset, "paging with nothing to scroll is a no-op"
+        "ar".each_char { |char| chat.on_event(TUI.key_event(char)) } # no slash: no list
+        chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0))
+        assert_equal 0, chat.scroll_offset, "wheeling with nothing to scroll is a no-op"
       end
     end
 
@@ -2656,7 +3914,7 @@ module Tart
         20.times { |i| finish_message(chat, "line#{i}") }
         draw(chat, session) # settle: the buffer flushes, follow pins to the end
         chat.scrollbar_hide_delay_ms = 10_000 # fresh for the duration of the test — no real sleeps
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
         assert_equal "┃", session.cell_symbol(19, 4), "the thumb paints the last column while activity is fresh (offset 28 of 34 → thumb rows 3-4)"
         assert_equal Theme[:scrollbarThumb], session.cell_fg(19, 4), "the thumb routes through the theme (pi's blue-tinted token)"
@@ -2672,11 +3930,10 @@ module Tart
       end
     end
 
-    # Mark sites (AC2): the user-scroll seams (pi scrollTo/scrollBy/
-    # scrollToStart/scrollToEnd analogs — page keys and the wheel) mark
-    # activity; the render-time follow-end adjustment never does (pi
-    # updateLayout :180-192), and a clamped no-op scroll marks nothing
-    # (pi scrollBy: moved === 0).
+    # Mark sites (AC2): the user-scroll seam (the wheel — the page keys
+    # page the editor since I35) marks activity; the render-time
+    # follow-end adjustment never does (pi updateLayout :180-192), and a
+    # clamped no-op scroll marks nothing (pi scrollBy: moved === 0).
     def test_user_scroll_marks_scrollbar_activity_follow_end_does_not
       with_chat(width: 20, screen_height: 12) do |chat, session, kernel|
         20.times { |i| finish_message(chat, "line#{i}") }
@@ -2687,9 +3944,9 @@ module Tart
         assert_equal " ", session.cell_symbol(19, 5),
           "the follow-end adjustment never marks activity (pi updateLayout)"
 
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
-        assert_equal "┃", session.cell_symbol(19, 4), "the page-key seam marks"
+        assert_equal "┃", session.cell_symbol(19, 4), "the wheel seam marks"
         assert_equal "│", session.cell_symbol(19, 5), "the thumb is not pinned at the bottom — the view is detached"
         chat.scrollbar_hide_delay_ms = 0 # the timer reads the delay at fire time
         kernel.fire_timers
@@ -2723,7 +3980,7 @@ module Tart
         assert_equal " line19", rows[5], "content ends at content — no carved column pads overflow rows"
         assert_equal "", rows[4], "the settled window's rows carry no padding"
 
-        chat.on_event(TUI.key_event("page_up"))
+        wheel_page_back(chat)
         draw(chat, session)
         rows = TUI.widget_lines(chat.renderer.call)
         assert_equal "│", rows[0][-1], "the track paints the last column while visible"
@@ -2733,6 +3990,179 @@ module Tart
 
     # --- mouse: wheel scroll + transcript selection (I14 items 6/10,
     # driven through the synthetic-seam event shapes) ---
+
+    # --- I35 OPTION A (AC5): the page keys page the EDITOR's visual
+    # rows (pi pageScroll, editor.ts:1961-1973) — the transcript pans
+    # only through the wheel (the re-pointed family above); the I12
+    # page-key mapping is retired with Viewport#scroll_page. ---
+
+    def test_page_up_down_page_the_editor_and_the_transcript_does_not_move
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        9.times do |n|
+          chat.on_event(TUI.key_event("e"))
+          chat.on_event(TUI.key_event("enter", modifiers: ["shift"])) unless n == 8
+        end
+        draw(chat, session)
+        editor = chat.instance_variable_get(:@editor)
+        assert_equal 9, editor.lines.length, "the setup: 9 visual rows in the editor"
+        following = chat.scroll_offset
+
+        chat.on_event(TUI.key_event("page_up"))
+        draw(chat, session)
+        assert_equal following, chat.scroll_offset, "the transcript does not move on page_up"
+        assert_equal [3, 1], [editor.cursor_line, editor.cursor_col],
+          "the editor pages up 5 visual rows (max(5, floor(12*0.3))) with the sticky move"
+
+        chat.on_event(TUI.key_event("page_down"))
+        draw(chat, session)
+        assert_equal following, chat.scroll_offset, "the transcript does not move on page_down"
+        assert_equal [8, 1], [editor.cursor_line, editor.cursor_col], "the editor pages back down, clamped"
+      end
+    end
+
+    def test_viewport_has_no_scroll_page_and_the_wheel_still_pans
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        refute Render::Viewport.method_defined?(:scroll_page), "the retired I12 mapping is gone"
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        max = chat.scroll_offset
+        chat.on_event(TUI.key_event("page_up")) # pages the editor, not the transcript
+        draw(chat, session)
+        assert_equal max, chat.scroll_offset
+        chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0))
+        draw(chat, session)
+        assert_equal max - 1, chat.scroll_offset, "the wheel still pans the transcript"
+      end
+    end
+
+    # --- test list (5): the box grows with the wrapped rows, caps at
+    # the maxVisible window, keeps the cursor row visible, and composes
+    # the ↑/↓ borders (pi createScrollBorder). ---
+
+    def test_the_editor_box_grows_with_wrapped_rows_and_the_transcript_cedes
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session)
+        assert_equal 6, transcript_height(session, chat)
+
+        "aaaa bbbb cccc dddd eeee".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        draw(chat, session)
+        # Layout: transcript 0-4 (a row ceded), spacer 5, editor 6-9
+        # (border, 2 rows, border), footer 10-11.
+        assert_equal " line19", session.buffer_content[4].rstrip, "the transcript ceded a row to the wrapped editor"
+        # Layout: transcript 0-4, spacer 5, editor 6-9 (border, 2 rows, border), footer 10-11.
+        assert_equal "─" * 20, session.buffer_content[6].rstrip, "no hidden rows: a plain top border"
+        assert_equal "aaaa bbbb cccc", session.buffer_content[7].rstrip, "content row 1"
+        assert_equal "dddd eeee", session.buffer_content[8].rstrip, "content row 2 — the box grew"
+        assert_equal " ", session.cell_symbol(9, 8), "the cursor's trailing space sits past the row end"
+        assert session.cell_modifiers(9, 8).include?(:reversed), "the fake cursor marks the wrapped row"
+        assert_equal "─" * 20, session.buffer_content[9].rstrip, "no hidden rows: a plain bottom border"
+      end
+    end
+
+    def test_the_window_caps_the_box_and_the_borders_compose
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        "abcdefghi".each_char do |char|
+          chat.on_event(TUI.key_event(char))
+          chat.on_event(TUI.key_event("enter", modifiers: ["shift"])) unless char == "i"
+        end
+        draw(chat, session)
+        editor = chat.instance_variable_get(:@editor)
+        assert_equal 9, editor.lines.length
+        # maxVisible = max(5, floor(12*0.3)) = 5 → the box caps at 7 rows;
+        # the cursor row (8) pins the window at scroll 4. Layout: 2
+        # transcript rows, the spacer, editor 3-9 (border + 5 rows +
+        # border), the footer.
+        assert_equal 5, editor.rendered_rows
+        assert_equal 4, editor.scroll_offset
+        assert_equal "───── ↑ 4 more ─────", session.buffer_content[3].rstrip, "the ↑ border composes (createScrollBorder)"
+        assert_equal "─" * 20, session.buffer_content[9].rstrip, "nothing hidden below: a plain bottom border"
+        assert session.cell_modifiers(1, 8).include?(:reversed), "the cursor row stays visible under the cap"
+
+        chat.on_event(TUI.key_event("page_up"))
+        draw(chat, session)
+        assert_equal 3, editor.scroll_offset, "the editor paged up one window (the cursor row pins the top)"
+        assert_equal "───── ↓ 1 more ─────", session.buffer_content[9].rstrip, "the ↓ border composes"
+      end
+    end
+
+    # --- test list (7) through the dispatch: the newline keys route to
+    # addNewLine BEFORE the submit path (pi editor.ts:889-919). ---
+
+    def test_newline_keys_insert_newlines_without_submitting
+      with_chat(width: 20, screen_height: 12) do |chat, session|
+        "  a".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter", modifiers: ["shift"]))
+        assert_equal "  a\n", chat.input, "shift+enter inserts a newline (tui.input.newLine)"
+        chat.on_event(TUI.key_event("enter", modifiers: ["alt"]))
+        assert_equal "  a\n\n", chat.input, "alt+enter is pi's terminal fallback"
+        chat.on_event(TUI.key_event("j", modifiers: ["ctrl"]))
+        assert_equal "  a\n\n\n", chat.input, "ctrl+j inserts a newline (keybindings.ts:143)"
+        "b  ".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal "", chat.input, "plain enter submits"
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_includes lines, " a", "the echo carried the joined text (leading-trimmed)"
+        assert_includes lines, " b", "...and the trailing spaces are gone (pi submitValue trims)"
+        chat.on_event(TUI.key_event("up")) # empty editor: straight into history
+        assert_equal "a\n\n\nb", chat.input,
+          "submit sent the JOINED TRIMMED text — the interior blanks survive the trim (pi submitValue)"
+      end
+    end
+
+    def test_the_backslash_enter_idiom_inserts_a_newline
+      with_headless_chat do |chat|
+        "hello\\".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal "hello\n", chat.input, "the backslash-enter workaround (pi editor.ts:906-917)"
+        refute_includes chat.input, "\\", "the backslash was deleted, not kept"
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal "", chat.input, "a second enter submits (trimmed join)"
+      end
+    end
+
+    def test_multi_line_paste_normalizes_through_the_dispatch
+      with_headless_chat do |chat|
+        chat.on_event(TUI.paste_event("x\r\ny\tz\x01"))
+        assert_equal "x\ny    z", chat.input, "pi normalizeText + the non-printable filter"
+        editor = chat.instance_variable_get(:@editor)
+        assert_equal ["x", "y    z"], editor.lines
+      end
+    end
+
+    def test_multi_line_history_recall_edits_and_submits_as_text
+      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: false)
+        send_message(chat, "A1")
+        "B1".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter", modifiers: ["shift"]))
+        "B2".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+        chat.on_event(TUI.key_event("up")) # empty editor: straight into history
+        assert_equal ["B1", "B2"], chat.instance_variable_get(:@editor).lines,
+          "the multi-line entry recalls all rows"
+        chat.on_event(TUI.key_event("end"))
+        chat.on_event(TUI.key_event("X"))
+        assert_equal "B1X\nB2", chat.input, "the recalled entry edits at the cursor"
+        chat.on_event(TUI.key_event("enter"))
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join("\n"), "B1X", "the edited multi-line entry submits as text"
+      end
+    end
+
+    def test_slash_context_stays_line_zero_only_through_the_dispatch
+      with_headless_chat(autocomplete: slash_source("help")) do |chat|
+        "/he".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        assert chat.suggestions, "the list opens in slash context on line 0"
+        chat.on_event(TUI.key_event("enter", modifiers: ["shift"]))
+        assert_nil chat.suggestions, "the newline cancelled the list (pi addNewLine)"
+        "l".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        assert_nil chat.suggestions, "no list off line 0 (pi isSlashMenuAllowed)"
+      end
+    end
 
     def test_wheel_scrolls_one_line_per_event_and_alt_wheel_five
       with_chat(width: 20, screen_height: 12) do |chat, session|
@@ -3518,13 +4948,16 @@ module Tart
     # Render-only tests: the real headless fullscreen test terminal (buffer
     # readback). Width 9 makes wrapping observable ("aaaa bbbb" is exactly 9
     # cells). motd: false — the MOTD block is pinned by its own tests.
+    # kernel: injectable (the I38 animation-window pins record animate
+    # calls; default IdleKernel unchanged).
     def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false,
-      models: nil, settings_root: nil)
+      models: nil, settings_root: nil, clock: nil, kernel: nil)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
-        kernel = IdleKernel.new
-        chat = Render::Chat.new(session:, kernel:,
-          footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
-          models:, settings_root: settings_root || @dir)
+        kernel ||= IdleKernel.new
+        kwargs = {session:, kernel:, footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
+          models:, settings_root: settings_root || @dir}
+        kwargs[:clock] = clock if clock # the spinner's fake-time seam (pi's 80ms dwell pinned, zero sleeps)
+        chat = Render::Chat.new(**kwargs)
         yield(chat, session, kernel)
       end
     end
@@ -3559,8 +4992,8 @@ module Tart
       chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "done", tokens)})
     end
 
-    def tool_start(chat, name)
-      chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(name)})
+    def tool_start(chat, name, arguments: {})
+      chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(name, arguments)})
     end
 
     # `duration:` rides the frozen :tool_execution_end contract (Float
@@ -3634,6 +5067,14 @@ module Tart
       session.buffer_content[0, transcript_height(session, chat)].map(&:rstrip).reject(&:empty?)
     end
 
+    # Whether any buffer cell renders +bg+ (the I34 pending-survival scan:
+    # no #34383a span may survive a settle or appear on the replay path).
+    def buffer_bg_hit?(session, bg)
+      session.buffer_content.each_with_index.any? do |row, y|
+        row.chars.each_index.any? { |x| session.cell_bg(x, y) == bg }
+      end
+    end
+
     # The editor area rows (block borders + inner content).
     # Line objects (with their spans) of a drawn widget tree — the style
     # readback for kernel-driven tests, where ScriptedSession keeps the
@@ -3651,6 +5092,22 @@ module Tart
     def editor_area(session, chat)
       h = session.buffer_content.size
       session.buffer_content[(h - 5)..(h - 3)].join
+    end
+
+    # The editor's top border row while the 3-row box holds (the status
+    # line's row — pi custom-editor.ts renderTopBorder).
+    def status_border_row(session)
+      session.buffer_content[status_border_row_index(session)]
+    end
+
+    def status_border_row_index(session)
+      session.buffer_content.size - 5
+    end
+
+    # The status's spinner glyph: "── " prefix, then the glyph (pi's
+    # single-space border layout).
+    def status_spinner_glyph(session)
+      status_border_row(session)[3]
     end
 
     def footer_text(session)
@@ -3816,6 +5273,22 @@ module Tart
 
       # The task role (async returns self).
       def stop = nil
+    end
+
+    # The idle kernel plus an animation-window recording (the I38
+    # frame-pacing pins: the bash loader's window opens without busy?).
+    class RecordingKernel < IdleKernel
+      attr_reader :animate_calls
+
+      def initialize
+        super
+        @animate_calls = []
+      end
+
+      def animate(duration:)
+        @animate_calls << duration
+        nil
+      end
     end
   end
 end

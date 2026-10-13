@@ -118,6 +118,7 @@ module Tart
       tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
       first = Agent::Session::Recorder.new(cwd: @dir, root: @root)
       run_agent(agent_on_kernel(tools:, recorder: first), "list the files")
+      first_entries = Agent::Session.load_entries(first.path)[1..]
 
       @server.script([{type: :message, content: "continuing"}])
       resumed = Agent::Session::Recorder.new(cwd: @dir, root: @root, parent_session: first.path)
@@ -133,14 +134,30 @@ module Tart
       assert_equal "call_1", payload[2]["tool_call_id"]
       assert_equal "and then?", payload[4]["content"]
 
-      # The resumed run records into a NEW file, header-linked to the old,
-      # starting from the new user message (prior turns are not re-recorded).
+      # The resumed run records into a NEW file, header-linked to the old.
+      # The fork is content-complete (pi forkFrom :1847-1853, I42): the
+      # parent's non-header entries copy VERBATIM — original ids/parentIds,
+      # original contents — and the new turn chains from the copied tail.
       refute_equal first.path, resumed.path
       entries = Agent::Session.load_entries(resumed.path)
       header = entries.first
       assert_equal first.path, header["parentSession"]
-      assert_equal %w[user assistant], entries[1..].map { |e| e["message"]["role"] }
-      assert_equal "and then?", entries[1]["message"]["content"]
+
+      lineage = entries[1, 4]
+      assert_equal %w[user assistant tool assistant], lineage.map { |e| e["message"]["role"] },
+        "the copied lineage precedes the new turn"
+      assert_equal first_entries, lineage, "copied entries are byte-identical (verbatim copy)"
+
+      new_turns = entries[5..]
+      assert_equal %w[user assistant], new_turns.map { |e| e["message"]["role"] }
+      assert_equal "and then?", new_turns[0]["message"]["content"]
+      assert_equal lineage.last["id"], new_turns[0]["parentId"],
+        "the new leaf chains from the copied tail"
+
+      # Self-contained: the resumed FILE alone replays the full lineage
+      # (no re-seed from the parent needed — a second resume hop composes).
+      assert_equal %i[user assistant tool assistant user assistant],
+        Agent::Session.context_messages(resumed.path).map { |m| m[:role] }
     end
 
     # The bashExecution record (pi recordBashResult agent-session.ts:3879)
@@ -156,10 +173,10 @@ module Tart
 
       entry = Agent::Session.load_entries(recorder.path).last
       projected = Agent::Session.entry_to_context_message(entry)
-      assert_equal :user, projected[:role]
+      assert_equal :user, projected.role
       # pi's bytes: the raw output (its trailing newline included)
       # fenced between the code markers.
-      assert_equal "Ran `echo hi`\n```\nhi\n\n```", projected[:content]
+      assert_equal "Ran `echo hi`\n```\nhi\n\n```", projected.content
     end
 
     def test_bash_execution_context_text_variants
@@ -171,7 +188,7 @@ module Tart
       # keys), exactly what a resume reads.
       text = lambda do |message|
         entry = Agent::Session.message_entry(message, id: "e", parent_id: nil, timestamp: "t")
-        Agent::Session.entry_to_context_message(JSON.parse(JSON.generate(entry)))[:content]
+        Agent::Session.entry_to_context_message(JSON.parse(JSON.generate(entry))).content
       end
 
       assert_equal "Ran `x`\n(no output)", text.call(build.call(output: "")),
@@ -409,6 +426,60 @@ module Tart
       assert recorder.persisted?, "the file exists once a user message landed"
     end
 
+    # The shapes-family additive pins (I44): the wrap tolerance rows ride
+    # the REAL loaded-file path, the projection output stays today's Hash
+    # shape (the .to_h-at-the-gem-seam rule), and read_header returns the
+    # typed header with the discovery reads intact.
+    def test_shapes_wraps_tolerance_rows_on_the_load_path
+      path = File.join(@dir, "tolerant.jsonl")
+      File.write(path, [
+        '{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/tmp"}',
+        "not json at all",
+        '{"type":"usage","id":"e0","parentId":null,"timestamp":"t"}',
+        '{"type":"message","id":"e1","parentId":null,"timestamp":"t","message":"nope"}',
+        '{"type":"message","id":"e2","parentId":null,"timestamp":"t","message":{"content":"role-less"}}',
+        '{"type":"message","id":"e3","parentId":null,"timestamp":"t","message":{"role":"user","content":null}}'
+      ].join("\n"))
+
+      assert_equal({role: :user, content: ""}, Agent::Session.context_messages(path).first,
+        "every malformed class projects to nothing; the one good row carries null content as the empty string")
+    end
+
+    def test_context_messages_output_stays_the_recorded_hash_shape
+      path = File.join(@dir, "shape.jsonl")
+      File.write(path, [
+        '{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/tmp"}',
+        '{"type":"message","id":"e1","parentId":null,"timestamp":"t","message":{"role":"user","content":"q"}}',
+        '{"type":"message","id":"e2","parentId":"e1","timestamp":"t","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","name":"ls","arguments":{"path":"."}}]}}',
+        '{"type":"message","id":"e3","parentId":"e2","timestamp":"t","message":{"role":"tool","tool_call_id":"call_1","content":"fixture.txt"}}'
+      ].join("\n"))
+
+      messages = Agent::Session.context_messages(path)
+      messages.each { |message| assert_instance_of Hash, message, "the add_message seam consumes plain hashes" }
+      assert_equal({role: :user, content: "q"}, messages[0])
+      assert_equal({role: :assistant, content: "", tool_calls: [{"id" => "call_1", "name" => "ls",
+        "arguments" => {"path" => "."}}]}, messages[1],
+        "the open body rides whole, in the recorded key order (the wire shape)")
+      assert_equal({role: :tool, tool_call_id: "call_1", content: "fixture.txt"}, messages[2])
+    end
+
+    def test_read_header_returns_the_typed_header
+      path = File.join(@dir, "headed.jsonl")
+      File.write(path, [
+        '{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/tmp","parentSession":"/old"}',
+        '{"type":"message","id":"e1","parentId":null,"timestamp":"t","message":{"role":"user","content":"hi"}}'
+      ].join("\n"))
+
+      header = Agent::Session.read_header(path)
+      assert_instance_of Shapes::SessionHeader, header
+      assert_equal "abc", header.id
+      assert_equal "/tmp", header.cwd
+      assert_equal "3", header.version.to_s, "the metadata rides nominal"
+      assert_equal "/old", header.parentSession
+      assert_equal "/old", header["parentSession"], "the discovery reads stay (string-keyed, nil-safe)"
+      assert_nil Agent::Session.read_header(File.join(@dir, "absent.jsonl"))
+    end
+
     private
 
     def agent_on_kernel(tools: {}, recorder: nil, seed_messages: [])
@@ -429,6 +500,48 @@ module Tart
         id: Agent::Session.generate_id(Set.new), parent_id: nil, timestamp: Agent::Session.now_iso)
       File.write(path, "#{JSON.generate(header)}\n#{JSON.generate(entry)}\n")
       path
+    end
+
+    # --- I47: the custom_message entry (pi CustomMessageEntry,
+    # session-manager.ts:1339-1360) ---
+
+    def test_append_custom_message_writes_the_pi_entry_shape_on_the_leaf_chain
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      user_id = recorder.append_message(OpenStruct.new(role: :user, content: "hi", to_h: {role: "user", content: "hi"}))
+      custom_id = recorder.append_custom_message(custom_type: "memory-recall", content: "RECALL", display: true)
+
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      custom = entries[2]
+      assert_equal({"type" => "custom_message", "customType" => "memory-recall", "content" => "RECALL",
+                    "display" => true}, custom.slice("type", "customType", "content", "display"))
+      assert_equal user_id, custom["parentId"], "the entry chains from the leaf"
+      assert_equal custom_id, custom["id"]
+      assert custom["timestamp"]
+      refute custom.key?("details"), "pi's details-undefined is omitted"
+    end
+
+    def test_a_custom_message_never_opens_the_session_file
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_custom_message(custom_type: "memory-recall", content: "RECALL", display: true)
+
+      refute recorder.persisted?, "a recall never creates a session file alone"
+      refute File.exist?(recorder.path)
+
+      recorder.append_message(OpenStruct.new(role: :user, content: "hi", to_h: {role: "user", content: "hi"}))
+      assert recorder.persisted?
+      types = File.readlines(recorder.path).map { |line| JSON.parse(line)["type"] }
+      assert_equal %w[session custom_message message], types, "the held entry rides the first flush in order"
+    end
+
+    def test_custom_message_replays_as_a_user_role_context_message
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_message(OpenStruct.new(role: :user, content: "hi", to_h: {role: "user", content: "hi"}))
+      recorder.append_custom_message(custom_type: "memory-recall", content: "RECALL", display: true)
+
+      messages = Agent::Session.context_messages(recorder.path)
+
+      assert_equal [%i[user user], ["hi", "RECALL"]], messages.map { |message| [message[:role], message[:content]] },
+        "pi sessionEntryToContextMessages: the recall text rides the wire again on resume"
     end
   end
 end

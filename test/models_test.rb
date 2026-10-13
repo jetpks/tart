@@ -67,9 +67,11 @@ module Tart
       assert_equal "glm/glm-5.3", config.default
       entry = config.model_entries.first
       assert_equal ({provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
-                     context_window: 200_000, max_tokens: 8192}), entry
-      assert_equal "https://example.test/v1", config.provider("glm").fetch(:base_url)
-      assert_equal "k-catalog", config.provider("glm").fetch(:api_key)
+                     context_window: 200_000, max_tokens: 8192, thinking_level_map: nil,
+                     compat: nil}), entry.to_h,
+        "the typed entry's to_h IS today's entry hash (key order included)"
+      assert_equal "https://example.test/v1", config.provider("glm").base_url
+      assert_equal "k-catalog", config.provider("glm").api_key
     end
 
     def test_jsonc_comments_and_trailing_commas_are_tolerated
@@ -116,28 +118,81 @@ module Tart
       assert load_models.error
     end
 
+    # --- I46: the compat parse + the legacy bridge ------------------------------
+
+    def test_owner_zai_catalog_loads_clean_with_the_typed_compat
+      write_models(<<~JSON)
+        {"providers": {"zai": {"name": "Z.AI", "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+          "apiKey": "k",
+          "models": [{"id": "glm-5.3", "reasoning": true, "contextWindow": 1000000, "maxTokens": 131072,
+            "thinkingLevelMap": {"off": null, "minimal": null, "low": "low", "medium": null,
+                                 "high": "high", "xhigh": null, "max": "max"},
+            "compat": {"supportsStore": false, "supportsDeveloperRole": false,
+                       "supportsReasoningEffort": true, "maxTokensField": "max_tokens",
+                       "thinkingFormat": "zai", "supportsStrictMode": true, "zaiToolStream": true}}]}}}
+      JSON
+      config = load_models
+
+      assert_nil config.error, "the owner's live object (unknown supportsStore/supportsStrictMode) loads clean"
+      compat = config.model_entries.first.compat
+      assert_instance_of Shapes::ModelCompat, compat
+      assert_equal "zai", compat.thinking_format
+      assert_equal "max_tokens", compat.max_tokens_field
+      assert_equal false, compat.supports_developer_role
+      assert_equal true, compat.supports_reasoning_effort
+      assert_equal true, compat.zai_tool_stream
+    end
+
+    def test_compat_absent_parses_nil_and_partial_compat_picks_the_five
+      write_models('{"providers": {"a": {"models": [{"id": "m"}, {"id": "n", "compat": {"thinkingFormat": "zai", "madeUp": 1}}]}}}')
+      config = load_models
+
+      assert_nil config.error
+      first, second = config.model_entries
+      assert_nil first.compat, "a compat-less entry parses nil"
+      assert_equal "zai", second.compat.thinking_format
+      assert_nil second.compat.max_tokens_field
+      assert_nil second.compat.supports_developer_role
+      assert_nil second.compat.supports_reasoning_effort
+      assert_nil second.compat.zai_tool_stream
+    end
+
+    def test_entry_compat_bridges_typed_and_legacy_raw_hash_entries
+      typed = Shapes::Model.new(id: "m", name: "m", reasoning: true, context_window: nil,
+        max_tokens: nil, thinking_level_map: nil, provider: "glm",
+        compat: Shapes::ModelCompat.new(thinking_format: "zai"))
+      config = Models::Config.new(providers: {}, default: nil, error: nil)
+      assert_equal "zai", config.entry_compat(typed).thinking_format, "the typed attribute read"
+
+      legacy_with = {id: "m", compat: Shapes::ModelCompat.new(thinking_format: "zai")}
+      legacy_without = {id: "m"}
+      assert_equal "zai", config.entry_compat(legacy_with).thinking_format, "the raw-hash read"
+      assert_nil config.entry_compat(legacy_without), "nil default for a legacy entry declaring none"
+    end
+
     # --- resolve (pi findExactModelReferenceMatch, reduced) ---
 
     def catalog
+      typed_model = lambda do |provider, id, name, reasoning, context_window|
+        Shapes::Model.new(id: id, name: name, reasoning: reasoning, context_window: context_window,
+          max_tokens: nil, thinking_level_map: nil, provider: provider)
+      end
       Models::Config.new(
         providers: {
-          "glm" => {name: nil, base_url: nil, api_key: nil, api: nil,
-                    models: [{provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
-                              context_window: 200_000, max_tokens: nil},
-                             {provider: "glm", id: "air", name: "Air", reasoning: false,
-                              context_window: nil, max_tokens: nil}]},
-          "zai" => {name: nil, base_url: nil, api_key: nil, api: nil,
-                    models: [{provider: "zai", id: "glm-5.3", name: "GLM 5.3 (zai)", reasoning: true,
-                              context_window: nil, max_tokens: nil}]}
+          "glm" => Shapes::Provider.new(name: nil, base_url: nil, api_key: nil, api: nil,
+                                        models: [typed_model.call("glm", "glm-5.3", "GLM 5.3", true, 200_000),
+                                                 typed_model.call("glm", "air", "Air", false, nil)]),
+          "zai" => Shapes::Provider.new(name: nil, base_url: nil, api_key: nil, api: nil,
+                                        models: [typed_model.call("zai", "glm-5.3", "GLM 5.3 (zai)", true, nil)])
         },
         default: nil, error: nil
       )
     end
 
     def test_resolve_canonical_and_provider_scoped_and_bare
-      assert_equal "glm", catalog.resolve("GLM/GLM-5.3").fetch(:provider), "the canonical ref is case-insensitive"
-      assert_equal "zai", catalog.resolve("zai/glm-5.3").fetch(:provider), "the provider prefix disambiguates"
-      assert_equal "Air", catalog.resolve("air").fetch(:name), "a unique bare id matches"
+      assert_equal "glm", catalog.resolve("GLM/GLM-5.3").provider, "the canonical ref is case-insensitive"
+      assert_equal "zai", catalog.resolve("zai/glm-5.3").provider, "the provider prefix disambiguates"
+      assert_equal "Air", catalog.resolve("air").name, "a unique bare id matches"
     end
 
     def test_resolve_ambiguity_and_unknowns_are_no_match
@@ -154,48 +209,201 @@ module Tart
 
     def test_boot_resolves_env_over_all
       boot = Models.resolve_boot_model(catalog, settings, env: {"PI_MODEL" => "m-env", "PI_PROVIDER" => "p-env"})
-      assert_equal ({provider: "p-env", id: "m-env"}), boot
+      assert_equal ({provider: "p-env", id: "m-env"}), boot.to_h
     end
 
     def test_boot_env_model_alone_keeps_the_settings_provider
       boot = Models.resolve_boot_model(catalog, settings, env: {"PI_MODEL" => "m-env"})
-      assert_equal ({provider: "settings-provider", id: "m-env"}), boot
+      assert_equal ({provider: "settings-provider", id: "m-env"}), boot.to_h
     end
 
     def test_boot_env_provider_alone_keeps_the_settings_model
       boot = Models.resolve_boot_model(catalog, settings, env: {"PI_PROVIDER" => "p-env"})
-      assert_equal ({provider: "p-env", id: "settings-model"}), boot
+      assert_equal ({provider: "p-env", id: "settings-model"}), boot.to_h
     end
 
     # The env keys ride the identity's namespace (I32 AC4).
     def test_boot_env_keys_follow_the_identity
       tart = Models.resolve_boot_model(catalog, settings, identity: "tart",
         env: {"TART_MODEL" => "m-env", "TART_PROVIDER" => "p-env"})
-      assert_equal ({provider: "p-env", id: "m-env"}), tart
+      assert_equal ({provider: "p-env", id: "m-env"}), tart.to_h
       foo = Models.resolve_boot_model(catalog, settings, identity: "foo", env: {"FOO_MODEL" => "m-foo"})
-      assert_equal ({provider: "settings-provider", id: "m-foo"}), foo
+      assert_equal ({provider: "settings-provider", id: "m-foo"}), foo.to_h
       # A pi-key boot under identity tart is NOT read — the namespaces
       # don't bleed.
       assert_equal ({provider: "settings-provider", id: "settings-model"}),
-        Models.resolve_boot_model(catalog, settings, identity: "tart", env: {"PI_MODEL" => "m-env"})
+        Models.resolve_boot_model(catalog, settings, identity: "tart", env: {"PI_MODEL" => "m-env"}).to_h
     end
 
     def test_boot_resolves_the_models_json_default_over_settings
       write_models(CATALOG)
       config = load_models
       boot = Models.resolve_boot_model(config, settings, env: {})
-      assert_equal ({provider: "glm", id: "glm-5.3"}), boot
+      assert_equal ({provider: "glm", id: "glm-5.3"}), boot.to_h
     end
 
     def test_boot_falls_through_to_settings_without_a_default
       write_models('{"providers": {"glm": {"models": [{"id": "glm-5.3"}]}}}')
       boot = Models.resolve_boot_model(load_models, settings, env: {})
-      assert_equal ({provider: "settings-provider", id: "settings-model"}), boot
+      assert_equal ({provider: "settings-provider", id: "settings-model"}), boot.to_h
     end
 
     def test_boot_resolves_settings_alone_when_no_catalog
       boot = Models.resolve_boot_model(Models.load(root: @root), settings, env: {})
-      assert_equal ({provider: "settings-provider", id: "settings-model"}), boot
+      assert_equal ({provider: "settings-provider", id: "settings-model"}), boot.to_h
+    end
+
+    # --- thinkingLevelMap (I36): parse, validate, resolve —
+    # pi model-config.ts:38/:54 (the catalog field), model-schema.ts:14-15
+    # (Partial Record<level, String|null>), models.ts:1224-1254
+    # (supported/clamp), openai-completions.ts:745-755 + :969-976 (effort) ---
+
+    def test_thinking_level_map_parses_symbolized_with_null_values
+      write_models(<<~JSON)
+        {"providers": {"glm": {"models": [{"id": "m", "reasoning": true,
+          "thinkingLevelMap": {"off": null, "low": "low", "madeup": "x"}}]}}}
+      JSON
+
+      entry = load_models.model_entries.first
+      assert_equal ({off: nil, low: "low", madeup: "x"}), entry.thinking_level_map,
+        "symbolized keys, null kept, unknown level keys tolerated (pi's Partial-Record default)"
+    end
+
+    def test_thinking_level_map_absent_is_nil
+      write_models('{"providers": {"glm": {"models": [{"id": "m"}]}}}')
+      assert_nil load_models.model_entries.first.thinking_level_map
+    end
+
+    def test_thinking_level_map_schema_violations_surface_an_error
+      write_models('{"providers": {"glm": {"models": [{"id": "m", "thinkingLevelMap": "high"}]}}}')
+      config = load_models
+      assert config.error
+      assert_match(/thinkingLevelMap: expected an object/, config.error)
+
+      write_models('{"providers": {"glm": {"models": [{"id": "m", "thinkingLevelMap": {"low": 5}}]}}}')
+      config = load_models
+      assert config.error
+      assert_match(/thinkingLevelMap\.low: expected a string or null/, config.error)
+    end
+
+    def test_thinking_level_map_valid_shapes_load_clean
+      write_models(<<~JSON)
+        {"providers": {"glm": {"models": [{"id": "m", "thinkingLevelMap":
+          {"off": null, "low": "low", "future_level": null}}]}}}
+      JSON
+      assert_nil load_models.error, "unknown level keys are tolerated (pi's Partial-Record default)"
+    end
+
+    # The owner's override map (every level a String; off floors to "low"
+    # directly) — Settings::THINKING_LEVEL_MAPS' glm row.
+    def owner_map
+      {off: "low", minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max"}
+    end
+
+    # The live fireworks catalog map ({off:null, ...} — the grounding's
+    # glm-5p3-flash shape).
+    def catalog_map
+      {off: nil, minimal: nil, low: "low", medium: nil, high: "high", xhigh: nil, max: "max"}
+    end
+
+    def test_resolve_reasoning_effort_owner_override
+      assert_equal "low", Models.resolve_reasoning_effort("off", map: owner_map, reasoning: true),
+        "the String off map value floors off directly"
+      assert_equal "low", Models.resolve_reasoning_effort("minimal", map: owner_map, reasoning: true)
+      assert_equal "medium", Models.resolve_reasoning_effort("medium", map: owner_map, reasoning: true)
+      assert_equal "max", Models.resolve_reasoning_effort("max", map: owner_map, reasoning: true)
+    end
+
+    def test_resolve_reasoning_effort_live_catalog_map
+      assert_equal "low", Models.resolve_reasoning_effort("off", map: catalog_map, reasoning: true),
+        "the null-off floor clamps upward: off → low"
+      assert_equal "low", Models.resolve_reasoning_effort("minimal", map: catalog_map, reasoning: true),
+        "minimal (null) clamps forward to low"
+      assert_equal "high", Models.resolve_reasoning_effort("medium", map: catalog_map, reasoning: true),
+        "medium (null) clamps forward to high"
+      assert_equal "max", Models.resolve_reasoning_effort("xhigh", map: catalog_map, reasoning: true),
+        "xhigh (null) clamps forward to max"
+      assert_equal "max", Models.resolve_reasoning_effort("max", map: catalog_map, reasoning: true)
+    end
+
+    def test_resolve_reasoning_effort_mapless
+      assert_nil Models.resolve_reasoning_effort("off", map: nil, reasoning: true),
+        "map-less off sends nothing"
+      assert_equal "medium", Models.resolve_reasoning_effort("medium", map: nil, reasoning: true),
+        "no map value falls back to the level itself"
+      assert_equal "high", Models.resolve_reasoning_effort("xhigh", map: nil, reasoning: true),
+        "map-less xhigh clamps down to high"
+      assert_equal "high", Models.resolve_reasoning_effort("max", map: nil, reasoning: true)
+    end
+
+    def test_resolve_reasoning_effort_non_reasoning_sends_nothing
+      assert_nil Models.resolve_reasoning_effort("high", map: owner_map, reasoning: false)
+      assert_nil Models.resolve_reasoning_effort("off", map: owner_map, reasoning: false)
+      assert_nil Models.resolve_reasoning_effort("medium", map: nil, reasoning: false)
+    end
+
+    def test_supported_thinking_levels_per_shape
+      assert_equal %w[off], Models.supported_thinking_levels(map: owner_map, reasoning: false),
+        "a non-reasoning model offers off alone"
+      assert_equal Settings::THINKING_LEVELS, Models.supported_thinking_levels(map: owner_map, reasoning: true),
+        "a full-String map offers the whole ladder"
+      assert_equal %w[low high max], Models.supported_thinking_levels(map: catalog_map, reasoning: true),
+        "null values mark levels unsupported"
+      assert_equal %w[off minimal low medium high], Models.supported_thinking_levels(map: nil, reasoning: true),
+        "the map-less rule: the ladder without xhigh/max"
+      assert_equal %w[off minimal low medium high],
+        Models.supported_thinking_levels(map: {off: "low"}, reasoning: true),
+        "xhigh/max need a PRESENT entry even when other levels map"
+    end
+
+    def test_clamp_thinking_level_forward_then_backward
+      assert_equal "low", Models.clamp_thinking_level("minimal", map: catalog_map, reasoning: true)
+      assert_equal "max", Models.clamp_thinking_level("xhigh", map: catalog_map, reasoning: true)
+      assert_equal "low", Models.clamp_thinking_level("off", map: catalog_map, reasoning: true),
+        "the null-off rung is skipped forward"
+      assert_equal "high", Models.clamp_thinking_level("max", map: nil, reasoning: true),
+        "map-less max clamps backward to high"
+      assert_equal "low", Models.clamp_thinking_level("bogus", map: catalog_map, reasoning: true),
+        "an unknown level lands on the first supported"
+      assert_equal "high", Models.clamp_thinking_level("high", map: catalog_map, reasoning: true),
+        "an exactly-supported level passes through"
+    end
+
+    # --- I43: the schema-path pins (the contract replaced the hand-rolled
+    # validate* family — same strings, same order, same entry shape) ---
+
+    # The multi-error interleave: default, then provider fields, then the
+    # models in order — the frozen Grounds §5 golden.
+    def test_multi_error_interleave_order_is_frozen
+      write_models('{"default": 5, "providers": {"a": {"name": 5, "models": [{"id": ""}, {"id": "m", "thinkingLevelMap": {"low": 5}}]}}}')
+
+      assert_equal(
+        "Invalid models.json schema:\n" \
+        "  - default: expected a \"provider/model-id\" string\n" \
+        "  - providers.a.name: expected a string\n" \
+        "  - providers.a.models[0].id: required non-empty string\n" \
+        "  - providers.a.models[1].thinkingLevelMap.low: expected a string or null\n" \
+        "(#{@path})",
+        load_models.error
+      )
+    end
+
+    # The thinkingLevelMap symbolization through the schema-checked load:
+    # a full-ladder catalog fixture (every level a String; off floors to
+    # "low" — the owner's override shape) parses to the symbol-keyed map
+    # the resolution functions consume.
+    def test_full_ladder_map_catalog_fixture_symbolizes_through_the_schema_path
+      write_models(<<~JSON)
+        {"providers": {"glm": {"models": [{"id": "glm-5.3", "reasoning": true,
+          "thinkingLevelMap": {"off": "low", "minimal": "low", "low": "low", "medium": "medium",
+                               "high": "high", "xhigh": "xhigh", "max": "max"}}]}}}
+      JSON
+
+      config = load_models
+      assert_nil config.error
+      assert_equal Settings::THINKING_LEVEL_MAPS.fetch("accounts/fireworks/models/glm-5p3-flash"),
+        config.model_entries.first.thinking_level_map,
+        "the owner's override map round-trips symbolized through the contract path"
     end
   end
 end

@@ -106,10 +106,17 @@ module Tart
     #   showModelSelector).
     # @param prompts [Array<Prompts::Template>] the loaded templates
     #   (/name expansion; empty = templates never match).
+    # @param hooks [Tart::Hooks, nil] the extension seam (I47): the
+    #   registered-command consult (injected callable — the frozen
+    #   Commands::BUILTINS table stays byte-identical). Builtins dispatch
+    #   FIRST (a registered name can never shadow a builtin — OQ-8);
+    #   registered commands match pi's per-command shapes (exact when
+    #   args: false, prefix "/name " when true), dispatch in registration
+    #   order, and list in /help. nil (the default) = today's shape.
     # @param quit [Proc] exits the app (/quit).
     class Handler
       def initialize(skills:, settings:, output:, spawn:, agent:, reset:, resume: nil, thinking: nil,
-        quit:, prompts: [], thinking_menu: nil, models: nil, model: nil, model_menu: nil)
+        quit:, prompts: [], thinking_menu: nil, models: nil, model: nil, model_menu: nil, hooks: nil)
         @skills = skills
         @settings = settings
         @output = output
@@ -124,6 +131,7 @@ module Tart
         @models = models
         @model = model
         @model_menu = model_menu
+        @hooks = hooks
       end
 
       # Expands /skill:<name> then /<template> text (pi agent-session.ts
@@ -133,11 +141,12 @@ module Tart
         Prompts.expand(Commands.expand_skill(text, @skills), @prompts)
       end
 
-      # Dispatches a builtin (pi's submit-top if-chain); false when the
-      # text matches no builtin — the caller sends it to the agent.
+      # Dispatches a builtin (pi's submit-top if-chain); then the seam's
+      # registered commands (I47); false when the text matches nothing —
+      # the caller sends it to the agent.
       def dispatch(text)
         name = Commands.builtin_name(text)
-        return false unless name
+        return dispatch_registered(text) unless name
 
         case name
         when "quit" then @quit.call
@@ -154,6 +163,26 @@ module Tart
       end
 
       private
+
+      # The registered-command arm (I47 — pi registerCommand): exact
+      # match when args: false, "/name " prefix when true; registration
+      # order; the handler receives the command's argument string ("" on
+      # an exact match). Registered names can never shadow a builtin (the
+      # builtin match runs first — OQ-8).
+      def dispatch_registered(text)
+        return false unless @hooks
+
+        @hooks.registered_commands.each do |command|
+          name = command[:name].to_s
+          next unless command[:args] ? text.start_with?("/#{name} ") : text == "/#{name}"
+
+          handler = @hooks.command_handler(name)
+          arg = command[:args] ? text.split(/\s+/, 2)[1].to_s.strip : ""
+          handler&.call(arg)
+          return true
+        end
+        false
+      end
 
       # pi handleThinkingCommand (:5145-5163): an arg sets the exact
       # level; the bare command opens pi's selector (the port's menu —
@@ -212,6 +241,10 @@ module Tart
 
       def show_help
         lines = Commands::BUILTINS.map { |name, meta| "  /#{name}  #{meta[:description]}" }
+        (@hooks&.registered_commands || []).each do |command|
+          hint = command[:args] ? " [args]" : ""
+          lines << "  /#{command[:name]}#{hint}  #{command[:description]}"
+        end
         @output.call("Commands:\n#{lines.join("\n")}")
       end
     end

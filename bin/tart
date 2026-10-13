@@ -53,6 +53,18 @@ module Tart
                               final response to stdout, exit 0 (1 on error)
           -r, --resume [ID]   resume a session in WORKDIR: ID is a session id
                               or session-file path; default: the most recent
+          --identity IDENTITY the face to show: any non-empty name (default
+                              pi) — branding, prompt preamble and the app
+                              env namespace follow it
+          --steer-inbox DIR   print mode only: consume steering/stop request
+                              files from DIR at this run's turn boundaries
+          --tools A,B,C       print mode only: the exact tool allowlist for
+                              this run (replaces the settings selection)
+          --system-prompt-file PATH
+                              print mode only: replace the composed system
+                              prompt with PATH's bytes
+          --session-root DIR  print mode only: record this run's session
+                              under DIR instead of ~/.tart/sessions
           -h, --help          show this help
 
         Sessions:
@@ -66,8 +78,10 @@ module Tart
           contextWindow, thinkingLevel (off/minimal/low/medium/high/xhigh/
           max, default medium; /thinking overrides it for the session),
           compaction {enabled, reserveTokens, keepRecentTokens},
-          defaultTools (plain names replace the default loadout; +name
-          adds, -name removes). Environment overrides settings for
+          defaultTools (default read bash edit write; plain names replace
+          it — e.g. ["find", "grep"] restores the search tools — +name
+          adds, -name removes, e.g. "+find" appends to the default).
+          Environment overrides settings for
           model/provider/apiBase/apiKey — under the identity's namespace
           (see Environment).
 
@@ -100,13 +114,18 @@ module Tart
           The model catalog loads from ~/.tart/models.json (pi's shape,
           JSON comments tolerated): {"providers": {"<provider>": {name,
           baseUrl, apiKey, api, "models": [{id, name, reasoning,
-          contextWindow, maxTokens}]}}} plus an optional "default":
-          "<provider/model-id>" boot reference. The boot model resolves
-          the identity-namespaced MODEL/PROVIDER env (below) > the
+          contextWindow, maxTokens, thinkingLevelMap}]}}} plus an optional
+          "default": "<provider/model-id>" boot reference. The boot model
+          resolves the identity-namespaced MODEL/PROVIDER env (below) > the
           models.json default > the settings defaultModel/defaultProvider;
           a provider's baseUrl/apiKey feed the endpoint (the namespaced
-          API_KEY/API_BASE still override). ctrl+s in the model menu
-          persists defaultProvider + defaultModel to ~/.tart/settings.json.
+          API_KEY/API_BASE still override). thinkingLevelMap maps the
+          thinking levels onto the model's reasoning_effort values
+          ("off"→"low" style; a null marks a level unsupported) — the
+          selected level reaches the wire as reasoning_effort through it;
+          a model that cannot turn thinking off floors "off" to the map's
+          String off value. ctrl+s in the model menu persists
+          defaultProvider + defaultModel to ~/.tart/settings.json.
 
         Prompt templates:
           Prompt templates load from ~/.tart/prompts and
@@ -167,6 +186,26 @@ module Tart
           "the face to show: any non-empty name (default pi) — branding, prompt preamble and the app env namespace follow it") do |identity|
           options[:identity] = identity
         end
+        # The print-child harness flags (I48 §5.2) — print mode ONLY:
+        # they thread to their Print.run seams (steer_inbox:,
+        # selected_tools:, system_prompt: file bytes, the Recorder's
+        # root:); absent = exactly today.
+        parser.on("--steer-inbox DIR",
+          "print mode only: consume steering/stop request files from DIR at turn boundaries") do |dir|
+          options[:steer_inbox] = dir
+        end
+        parser.on("--tools A,B,C",
+          "print mode only: the exact tool allowlist for this run") do |tools|
+          options[:tools] = tools
+        end
+        parser.on("--system-prompt-file PATH",
+          "print mode only: replace the composed system prompt with PATH's bytes") do |path|
+          options[:system_prompt_file] = path
+        end
+        parser.on("--session-root DIR",
+          "print mode only: record this run's session under DIR") do |dir|
+          options[:session_root] = dir
+        end
         parser.on("-h", "--help", "show this help") { $stdout.write(usage); exit 0 }
       end.parse!(argv)
       options
@@ -179,6 +218,11 @@ module Tart
       Warning.extend(QuietIOBufferWarning)
       options = parse(argv)
       workdir = argv.shift || Dir.pwd
+      # The I48 child-harness flags are print-mode only (the interactive
+      # parent steers through its editor, never a file inbox).
+      if %i[steer_inbox tools system_prompt_file session_root].any? { |key| options[key] } && !options[:print]
+        abort "tart: --steer-inbox/--tools/--system-prompt-file/--session-root are print mode only (see --help)."
+      end
       return print_mode(options, workdir) if options[:print]
 
       interactive(options, workdir)
@@ -191,18 +235,101 @@ module Tart
       settings = result.settings
       report_diagnostics(result.diagnostics)
       identity = resolve_identity(options, settings)
+      # The resolved-settings view (Shapes::ResolvedSettings): built once
+      # per boot, right after the identity settles; the launcher's settings
+      # reads below go through it (the Settings helpers themselves keep
+      # their signatures — this is the consumer view).
+      resolved = Shapes::ResolvedSettings.from_load(result, identity:)
       models = Models.load
       warn "tart: #{models.error}" if models.error
-      require_api_key(settings, models, identity:)
+      require_api_key(settings, models, identity:, resolved:)
       skills = Skills.load(cwd: workdir)
-      abort "tart: --resume is interactive-only (--print runs single-shot)." if options[:resume_given]
+      context_files = Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root)
 
-      exit Print.run(
+      # The resume target resolves before the recorder is born — the SAME
+      # helper the interactive path uses: no id = the most recent session
+      # for the workdir; a session-file path as-is; an id by file-name
+      # suffix or header id.
+      resume_path = options[:resume_given] ? resolve_resume(options[:resume], workdir) : nil
+      # Every print run records (pi's print path rides the same
+      # SessionManager.create default, main.ts:447-448): a fresh run opens
+      # its own file; a resumed one records into a fork linked to the old
+      # one (the port's fork resume model everywhere). --session-root
+      # (I48 §5.2) overrides the Recorder root — the child harness pins
+      # the run dir's sessions/ here.
+      recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_path,
+                                              **(options[:session_root] ? {root: options[:session_root]} : {}))
+      seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
+
+      boot = Models.resolve_boot_model(models, settings, identity:)
+      chat = build_chat(models, boot, identity:, resolved:)
+      thinking = boot_thinking_kwargs(settings, models, boot, chat, identity:)
+      # The seam boots in print mode too (pi loads the modules regardless of
+      # mode): one Hooks per boot (no base sink — text mode prints nothing
+      # but the final response), the settings-gated memory register, the
+      # herdr register, the settings-gated subagents register (I48 — the
+      # tool merges LAST via the hooks seam), then the session_start
+      # emission (pi's default reason "startup"); the TUI-only gate roots
+      # nothing here.
+      hooks = Hooks.new
+      memory_on = memory_enabled?(settings, identity)
+      Memory.register(hooks:, identity:) if memory_on
+      Herdr.register(hooks:)
+      # The subagents gate (I48 — OQ-1): register ONLY when on — no tool,
+      # no watcher, no run dirs when off (the frozen digests hold). The
+      # returned Manager owns the agent-end drain below (pi's auto-drain).
+      manager = subagents_enabled?(settings, identity) ?
+        Subagents.register(hooks:, cwd: workdir, env: ENV, identity:) : nil
+      hooks.emit({"type" => "session_start", "reason" => "startup"},
+        context: {cwd: workdir, mode: "print", session: session_ref(recorder), identity:})
+      # --system-prompt-file (I48 §5.2): the file bytes REPLACE the
+      # composed harness prompt (systemPromptMode: replace).
+      prompt = options[:system_prompt_file] ? read_system_prompt_file(options[:system_prompt_file]) :
+        system_prompt(workdir, settings, skills.skills, identity, context_files:,
+          prompt_guidelines: memory_on ? Memory::PROMPT_GUIDELINES : [])
+      # --tools (I48 §5.2): the exact allowlist rides selected_tools: —
+      # Print.run builds the loadout from exactly that list.
+      selected_tools = parse_tools_flag(options[:tools])
+      code = Print.run(
         prompt: options[:print],
-        chat: build_chat(settings, models, Models.resolve_boot_model(models, settings, identity:), identity:),
-        tools: build_tools(workdir, settings),
-        system_prompt: system_prompt(workdir, settings, skills.skills, identity)
+        chat:,
+        tools: selected_tools ? nil : build_tools(workdir, settings,
+          identity:, session_env: print_session_env(recorder, boot, thinking.fetch(:thinking_level)), hooks:),
+        selected_tools:,
+        steer_inbox: options[:steer_inbox],
+        system_prompt: prompt,
+        recorder:,
+        seed_messages:,
+        # The compaction knobs MUST reach the loop (the interactive path
+        # threads them too); context_window: stays nil so the loop's env
+        # tier resolves <IDENTITY>_CONTEXT_WINDOW itself.
+        compaction: Settings.compaction_kwargs(settings),
+        identity:,
+        hooks:,
+        **thinking
       )
+      # The print drain (I48 §5.4 — pi's agent_end auto-drain): AFTER the
+      # final response prints (the parent's answer is never delayed), the
+      # parent waits for its outstanding async children; each completion
+      # notification records as a custom_message entry on THIS session
+      # (no model turn, no extra stdout). The child artifacts stay on
+      # disk (result.json).
+      # JUDGE FIX (post-merge, recorded in the verdict): flush AFTER
+      # shutdown, unconditionally — the old `if outstanding?` guard lost
+      # every notification whose child completed during the parent's own
+      # run (queued but never flushed), and any run settling between the
+      # old flush and shutdown. shutdown settles every still-running run
+      # (stop ladder → terminal state → notification queued under the
+      # settle mutex), so drain → shutdown → flush captures ALL of them.
+      if manager
+        manager.drain if manager.outstanding?
+        manager.shutdown
+        hooks.pending_next_turn.each do |pending|
+          recorder.append_custom_message(custom_type: pending[:custom_type], content: pending[:content],
+                                         display: pending[:display])
+        end
+      end
+      exit code
     end
 
     def interactive(options, workdir)
@@ -213,6 +340,9 @@ module Tart
       # point). Resolved before any env-tier read so the namespace is
       # settled (the load order: file → identity → env overrides).
       identity = resolve_identity(options, settings)
+      # The resolved-settings view (Shapes::ResolvedSettings): built once
+      # per boot; require_api_key / footer_data / build_chat read it.
+      resolved = Shapes::ResolvedSettings.from_load(result, identity:)
       skills = Skills.load(cwd: workdir)
       prompts = Prompts.load(cwd: workdir)
       mcp_servers = Mcp::Config.load(mcp_config_path)
@@ -220,7 +350,11 @@ module Tart
       # boot-model resolution's middle layer; a load/parse/schema
       # failure sets its error (surfaced below, never a crash).
       models = Models.load
-      require_api_key(settings, models, identity:)
+      require_api_key(settings, models, identity:, resolved:)
+      # The discovered context files (pi's contextFiles: the system-prompt
+      # sources + the agents files) — the system prompt's <project_context>
+      # section and the MOTD's [Context] section share the load (I33).
+      context_files = Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root)
 
       # The resume path is known before the surface is built: a resumed
       # boot skips the MOTD (item 3 — pi's chat container gets the
@@ -233,16 +367,45 @@ module Tart
 
       TUI.run(viewport: :fullscreen, bracketed_paste: true) do |session|
         kernel = Core::Loop.new(session:)
+        # The seam (I47): ONE Hooks per boot — the surface sink inside;
+        # constructed before the surface (the autocomplete's registered-
+        # command merge reads it) with the sink lambda closing over the
+        # surface local (events only flow once the loop runs). The module
+        # rows join the MOTD's [Extensions] list per §5: memory.ts when
+        # the settings gate is on, herdr-agent-state iff its env gate is
+        # on (pi's compact label = the module's display label, OQ-2).
+        memory_on = memory_enabled?(settings, identity)
+        surface = nil # the forward ref the sink lambda closes over (assigned below)
+        hooks = Hooks.new(on_event: ->(event) { surface.on_agent_event(event) })
+        extensions = mcp_servers.keys.dup
+        extensions << "memory.ts" if memory_on
+        extensions << "herdr-agent-state" if Herdr.enabled?(ENV)
         surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
-          mcp_servers:, resume: resume_path, identity:, models:)
-        tools = build_tools(workdir, settings, mcp_servers:)
-        prompt = system_prompt(workdir, settings, skills.skills, identity)
+          mcp_servers:, resume: resume_path, identity:, models:, context_files:, extensions:, hooks:)
+        Memory.register(hooks:, identity:) if memory_on
+        Herdr.register(hooks:)
+        # The subagents gate (I48 — OQ-1): registered BEFORE build_tools so
+        # the tool merges into the loadout (declared LAST). The kernel is
+        # the WAKE BRIDGE (the Manager's kick ferries onto the reactor
+        # through the synthetic-event channel) and the agent is a callable
+        # because /new and resume swap it. NO MOTD row: subagents is a
+        # tool, not an extension-module row (pi-subagents' config lives
+        # outside the [Extensions] list).
+        if subagents_enabled?(settings, identity)
+          Subagents.register(hooks:,
+            kernel: Subagents::KernelBridge.new(->(block) { TUI.push_event(block) }),
+            agent: -> { surface.agent }, cwd: workdir, env: ENV, identity:)
+        end
+        tools = build_tools(workdir, settings, mcp_servers:,
+          identity:, session_env: session_env_readers(surface), hooks:)
+        prompt = system_prompt(workdir, settings, skills.skills, identity, context_files:,
+          prompt_guidelines: memory_on ? Memory::PROMPT_GUIDELINES : [])
 
         # /new's reset seam: a fresh session is a new recorder (new session
         # file, no parent) plus a fresh Agent::Loop on the same settings,
         # system prompt, skills, and tools. The surface then clears itself
         # and re-renders the MOTD + accent line (Chat#new_session).
-        start_session = lambda do |resume_target|
+        start_session = lambda do |resume_target, reason|
           recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_target)
           current_recorder = recorder
           seed_messages = resume_target ? Agent::Session.context_messages(resume_target) : []
@@ -250,19 +413,33 @@ module Tart
           # models.json "default" > Settings — I27), so a ctrl+s persisted
           # default is honored by the next /new too.
           boot = Models.resolve_boot_model(models, settings, identity:)
-          chat = build_chat(settings, models, boot, identity:)
-          surface.footer_data = footer_data(workdir, settings, boot:, chat:, identity:)
+          chat = build_chat(models, boot, identity:, resolved:)
+          facts = footer_data(workdir, settings, boot:, chat:, identity:, models:, resolved:)
+          surface.footer_data = facts
           surface.agent = Agent::Loop.new(
             chat:,
             tools:,
             system_prompt: prompt,
-            on_event: ->(event) { surface.on_agent_event(event) },
+            hooks:,
+            # The emission context re-reads per event — /new swaps the
+            # recorder, the lambda re-resolves the current one.
+            hooks_context: -> { {cwd: workdir, mode: "tui", session: session_ref(current_recorder), identity:} },
             recorder:,
             seed_messages:,
             context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
             compaction: Settings.compaction_kwargs(settings),
-            identity:
+            identity:,
+            thinking_level: facts.fetch(:thinking_level),
+            model_reasoning: facts.fetch(:reasoning),
+            thinking_level_map: facts.fetch(:thinking_level_map),
+            compat: resolve_boot_entry(models, boot)&.compat
           )
+          # The session_start emission (pi extensions/types.ts:744 —
+          # reasons startup|new|resume; fork/reload have no port surface):
+          # the boot's fresh session is "startup", /new is "new", every
+          # resume (picker or CLI) is "resume".
+          hooks.emit({"type" => "session_start", "reason" => reason},
+            context: {cwd: workdir, mode: "tui", session: session_ref(recorder), identity:})
         end
 
         # The resume seam (item 2/3): the picker's enter and the CLI
@@ -270,7 +447,7 @@ module Tart
         # (pi switchSession), then the surface replays the recorded
         # entries + the "Resumed session" status (Chat#resume_session).
         resume = lambda do |path|
-          start_session.call(path)
+          start_session.call(path, "resume")
           surface.resume_session(path)
         end
 
@@ -279,8 +456,9 @@ module Tart
           settings: settings,
           output: ->(text) { surface.command_line(text) },
           spawn: ->(&block) { kernel.async(&block) },
+          hooks:,
           agent: -> { surface.agent },
-          reset: lambda { start_session.call(nil); surface.new_session },
+          reset: lambda { start_session.call(nil, "new"); surface.new_session },
           thinking: ->(arg) { surface.set_thinking_level(arg) },
           thinking_menu: -> { surface.open_thinking_menu },
           models:,
@@ -299,14 +477,24 @@ module Tart
         )
         surface.on_resume = resume
         resume.call(resume_path) if resume_path
-        start_session.call(nil) unless resume_path
+        start_session.call(nil, "startup") unless resume_path
         report_diagnostics(result.diagnostics, surface:)
         surface.command_line(models.error) if models.error
         skills.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
         prompts.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
 
         kernel.renderer = surface.renderer
-        kernel.on_event = ->(event, source) { surface.on_event(event, source) }
+        # I48: the subagents completion wake arrives as a synthetic Proc
+        # (the KernelBridge ferry — the Manager's exact block); land it on
+        # the reactor (kernel.async is reactor-context-only). Loop#wake
+        # no-ops when a run is in flight, so the kick is race-safe.
+        kernel.on_event = lambda do |event, source|
+          if event.is_a?(Proc) && source == :synthetic
+            kernel.async(&event)
+          else
+            surface.on_event(event, source)
+          end
+        end
         kernel.run
       end
 
@@ -323,17 +511,11 @@ module Tart
 
     # Identity.resolve's invalid value aborts the launch — pi's CLI prints
     # its errors bare ("Error: <message>", cli.ts:333); the port's
-    # app-name prefix stays (no comparable pi prefix, itemized).
-    # The identity seam (I16, free-form since I32): CLI > TART_IDENTITY
-    # env > settings "identity" (Tart::Identity is the one resolution
-    # point). The resolved face is recorded for the one render path that
-    # cannot take it threaded (chat.rb's frozen Motd header call) — pi's
-    # CLI prints its errors bare ("Error: <message>", cli.ts:333); the
-    # port's app-name prefix stays (no comparable pi prefix, itemized).
+    # app-name prefix stays (no comparable pi prefix, itemized). The face
+    # threads explicitly to every consumer (I33 — the render paths take it
+    # through the surface constructor; no boot-recorded global).
     def resolve_identity(options, settings)
-      identity = Identity.resolve(cli: options[:identity], settings:)
-      Identity.current = identity
-      identity
+      Identity.resolve(cli: options[:identity], settings:)
     rescue Identity::Error => e
       abort "tart: #{e.message}"
     end
@@ -355,41 +537,121 @@ module Tart
     end
 
     # The boot provider's key (I27): identity-namespaced env > the
-    # models.json provider config > the Settings key.
-    def require_api_key(settings, models = nil, identity: Identity::DEFAULT)
+    # models.json provider config > the resolved-settings view's key.
+    def require_api_key(settings, models, identity:, resolved:)
       boot = Models.resolve_boot_model(models, settings, identity:)
-      key = ENV[Identity.env_key(identity, "API_KEY")] || models&.provider(boot[:provider])&.fetch(:api_key, nil) ||
-        Settings.resolve_setting("apiKey", settings, identity:)
+      key = ENV[Identity.env_key(identity, "API_KEY")] || models&.provider(boot.provider)&.api_key ||
+        resolved.api_key
       abort "#{Identity.env_prefix(identity)}API_KEY is not set (see --help)." if key.nil?
+    end
+
+    # The memory gate (I47 — OQ-1): the resolved settings row or the
+    # <IDENTITY>_MEMORY env tier, default off — the env tier speaks "1"/
+    # "true" like the other staged toggles.
+    def memory_enabled?(settings, identity)
+      resolved = Settings.resolve_setting("memory", settings, identity:)
+      resolved == true || resolved == "true" || resolved == "1"
+    end
+
+    # The subagents gate (I48 — OQ-1): the memory gate's idiom — the
+    # resolved settings row or the <IDENTITY>_SUBAGENTS env tier, default
+    # off.
+    def subagents_enabled?(settings, identity)
+      resolved = Settings.resolve_setting("subagents", settings, identity:)
+      resolved == true || resolved == "true" || resolved == "1"
+    end
+
+    # --tools A,B,C (I48 §5.2): the comma list; empty/absent = nil (the
+    # settings selection holds).
+    def parse_tools_flag(value)
+      return nil if value.nil?
+
+      list = value.split(",").map(&:strip).reject(&:empty?)
+      list.empty? ? nil : list
+    end
+
+    # --system-prompt-file (I48 §5.2): the file bytes replace the
+    # composed harness prompt; a missing file is a clean abort.
+    def read_system_prompt_file(path)
+      abort "tart: system prompt file not found: #{path}" unless File.file?(path)
+
+      File.read(path)
+    end
+
+    # The session ref herdr carries on every request (pi's sessionManager
+    # ref — agent_session_path preferred over agent_session_id).
+    def session_ref(recorder)
+      return nil unless recorder
+
+      {"agent_session_path" => recorder.path, "agent_session_id" => recorder.id}
     end
 
     # Footer facts (AC4): the I10 resolved window is the context-usage
     # denominator; the model id is the settings-resolved one; the model
-    # metadata (provider label + reasoning capability — the footer's model
-    # segment, pi footer.ts:226-258) resolves off the chat's registry
-    # model, stageable via <IDENTITY>_MODEL_REASONING (Settings); the
-    # thinking level rides the settings-resolved value.
-    def footer_data(workdir, settings, boot: nil, chat:, identity: Identity::DEFAULT)
-      # Optional +boot+: the in-launcher call sites resolve the boot pair
-      # per session; the legacy (settings, chat) shape resolves it from
-      # settings alone.
-      boot ||= {provider: Settings.resolve_setting("defaultProvider", settings),
-                id: Settings.resolve_setting("defaultModel", settings)}
+    # metadata (reasoning capability + the I36 thinkingLevelMap — the
+    # footer's model segment and the level ladder's source, pi
+    # footer.ts:226-258) composes catalog-entry-first, known-tables-second
+    # ({Settings.thinking_facts}), stageable via <IDENTITY>_MODEL_REASONING
+    # (Settings). I40: the thinking level is the settings-resolved value
+    # CLAMPED through the boot model's facts (pi createSdk sdk.ts:271-279 —
+    # createSdk clamps for every mode) — the session level the surface
+    # reader falls back to AND the interactive loop ctor receives. The
+    # · default badge source stays UNCLAMPED (+default_thinking_level+: pi
+    # badges getDefaultThinkingLevel() ?? DEFAULT raw — thinking-selector
+    # .ts:71-72; an out-of-set default marks NO row).
+    def footer_data(workdir, settings, boot: nil, chat:, identity: Identity::DEFAULT, models: nil, resolved: nil)
+      # Optional +resolved+: the in-launcher call sites thread the
+      # resolved-settings view built once per boot; the legacy (settings,
+      # chat) shape builds it from the merged hash on the spot. Optional
+      # +boot+: ditto per session — the legacy shape resolves the boot
+      # pair from the view alone.
+      resolved ||= Shapes::ResolvedSettings.from_load(settings, identity:)
+      boot ||= Shapes::ModelRef.new(provider: resolved.default_provider, id: resolved.default_model)
+      facts = Settings.thinking_facts(models && resolve_boot_entry(models, boot),
+        settings, model_id: boot.id, model: chat.model, identity:)
       # No provider label: pi prefixes the provider only when MORE THAN
       # one provider is available (footer.ts:246-258) — the port resolves
       # a single static provider, so the segment is the bare model (the
       # owner's live "(openai) " finding). I27: the boot pair is threaded
       # (the /model selector's default badge + degenerate catalog), the
       # model id from the boot resolution (env > models.json > settings).
+      # The badge level is the resolved-settings view's (the same
+      # resolve_thinking_level outcome, built once per boot).
+      level = resolved.thinking_level
       {
         cwd: workdir,
-        model: boot[:id],
-        default_provider: boot[:provider],
-        reasoning: Settings.model_reasoning_capable(settings, chat.model, identity:),
+        model: boot.id,
+        default_provider: boot.provider,
+        reasoning: facts.reasoning,
+        thinking_level_map: facts.thinking_level_map,
         context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
         auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
-        thinking_level: Settings.resolve_thinking_level(settings)
+        thinking_level: Models.clamp_thinking_level(level, map: facts.thinking_level_map,
+          reasoning: facts.reasoning),
+        default_thinking_level: level
       }
+    end
+
+    # The thinking facts as Agent::Loop kwargs (the print-mode seam): the
+    # same composition the interactive boot's footer_data rides — I40, the
+    # level clamped through the boot model's facts too (pi createSdk
+    # sdk.ts:271-279; ONE clamp, both boots). I46: compat rides from the
+    # same catalog entry (nil without a catalog — the default arm).
+    def boot_thinking_kwargs(settings, models, boot, chat, identity:)
+      entry = resolve_boot_entry(models, boot)
+      facts = Settings.thinking_facts(entry,
+        settings, model_id: boot.id, model: chat.model, identity:)
+      {model_reasoning: facts.reasoning, thinking_level_map: facts.thinking_level_map,
+       thinking_level: Models.clamp_thinking_level(Settings.resolve_thinking_level(settings),
+         map: facts.thinking_level_map, reasoning: facts.reasoning),
+       compat: entry&.compat}
+    end
+
+    # The catalog entry for a boot pair (the I28 cross-resolve): the boot
+    # provider is a WIRE slug for env/settings boots while catalog keys
+    # are endpoint keys — canonical pair resolve first, then the bare id.
+    def resolve_boot_entry(models, boot)
+      models.resolve("#{boot.provider}/#{boot.id}") || models.resolve(boot.id.to_s)
     end
 
     def report_diagnostics(diagnostics, surface: nil)
@@ -404,15 +666,20 @@ module Tart
     # <docs> (pi's own install paths, owner ruling 2026-10-12), the
     # discovered context files, the loaded skills, <cwd> — replacing the
     # I04-era terse string. The loadout is the settings-resolved one (the
-    # same list Tools::Registry builds from).
-    def system_prompt(workdir, settings, skills, identity)
+    # same list Tools::Registry builds from). +context_files+ is the
+    # launcher's single ContextFiles.load (shared with the MOTD's
+    # [Context] section, I33). +prompt_guidelines+ (I47) threads the
+    # memory module's two bullets when its gate is on (pi
+    # system-prompt.ts:121).
+    def system_prompt(workdir, settings, skills, identity, context_files:, prompt_guidelines: [])
       Agent::SystemPrompt.build(
         selected_tools: Settings.selected_tools(settings),
         cwd: workdir,
-        context_files: Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root),
+        context_files: context_files,
         docs_paths: Agent::SystemPrompt.pi_docs_paths,
         skills: skills,
-        identity: identity
+        identity: identity,
+        prompt_guidelines:
       )
     end
 
@@ -422,41 +689,89 @@ module Tart
     # of silently degenerating the /model menu to the boot model (the
     # defect the post-integration probe caught: the launcher wired the
     # catalog into build_chat/the handler/footer_data but not here).
-    def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:)
+    def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:,
+                      context_files: [], extensions: nil, hooks: nil)
       Render::Chat.new(
         session:, kernel:,
         # Autocomplete sources (AC1): the builtin slash commands + the
+        # seam's registered commands (I47 — registration order after the
+        # builtins; a registered name can never shadow a builtin) + the
         # loaded skills + the prompt templates (the same catalog the
         # Commands::Handler routes).
-        autocomplete: Render::SlashSource.new(commands: Commands::BUILTINS, skills: skills,
-          prompts: prompts),
+        autocomplete: Render::SlashSource.new(
+          commands: Commands::BUILTINS.merge((hooks&.registered_commands || []).to_h do |command|
+            [command[:name], {description: command[:description]}]
+          end),
+          skills: skills,
+          prompts: prompts
+        ),
         motd: resume.nil?,
-        identity:, prompts:, extensions: mcp_servers.keys,
+        identity:, prompts:, skills:, context_files:,
+        # The [Extensions] compact list: the loaded MCP server names plus
+        # the active module rows (I47 §5 — merged, sorted comma-joined by
+        # the section renderer).
+        extensions: extensions || mcp_servers.keys,
         models:
       )
     end
 
     # The chat (I27): the boot model pair resolves identity-namespaced env
     # > models.json "default" > Settings ({Models.resolve_boot_model});
-    # the resolved provider's models.json config (baseUrl/apiKey/api)
-    # slots between the env overrides and the Settings keys — the
-    # identity-namespaced API_KEY/API_BASE keep working against it.
-    def build_chat(settings, models, boot, identity: Identity::DEFAULT)
-      provider = models.provider(boot[:provider])
+    # the resolved provider's models.json config (endpoint block) slots
+    # between the env overrides and the resolved-settings view's keys —
+    # the identity-namespaced API_KEY/API_BASE keep working against it.
+    def build_chat(models, boot, identity:, resolved:)
+      provider = models.provider(boot.provider)
       context = RubyLLM.context do |config|
-        config.openai_api_key = ENV[Identity.env_key(identity, "API_KEY")] || provider&.fetch(:api_key, nil) || Settings.resolve_setting("apiKey", settings, identity:)
-        config.openai_api_base = ENV[Identity.env_key(identity, "API_BASE")] || provider&.fetch(:base_url, nil) || Settings.resolve_setting("apiBase", settings, identity:)
+        config.openai_api_key = ENV[Identity.env_key(identity, "API_KEY")] || provider&.api_key || resolved.api_key
+        config.openai_api_base = ENV[Identity.env_key(identity, "API_BASE")] || provider&.base_url || resolved.api_base
         config.request_timeout = 120
         config.max_retries = 1
       end
       context.chat(
-        model: boot[:id], provider: Models.wire_provider(boot[:provider]),
+        model: boot.id, provider: Models.wire_provider(boot.provider),
         protocol: :chat_completions, assume_model_exists: true
       )
     end
 
-    def build_tools(workdir, settings, mcp_servers: Mcp::Config.load(mcp_config_path))
-      Tools::Registry.build(selected: Settings.selected_tools(settings), cwd: workdir, mcp_servers:)
+    # The bash tool's session-env readers over the interactive surface (I41
+    # spec item 5): SUFFIX → a LIVE reader — /new and resume swap
+    # surface.agent, so each spawn reads the CURRENT session/model/level
+    # (pi resolves per command start, docs/environment-variables.md).
+    # PROVIDER/MODEL source the catalog ref ({current_model_ref} — the
+    # ctx.model analog, OQ-2), not the wire chat pair.
+    def session_env_readers(surface)
+      {
+        "SESSION_ID" => -> { surface.agent&.recorder&.id },
+        "SESSION_FILE" => -> { surface.agent&.recorder&.path },
+        "PROVIDER" => -> { surface.current_model_ref&.provider },
+        "MODEL" => -> { surface.current_model_ref&.id },
+        "REASONING_LEVEL" => -> { surface.agent&.thinking_level }
+      }
+    end
+
+    # The print path's session-env values (I41 spec item 5; recorder-backed
+    # since I42 — print runs record): SESSION_ID/SESSION_FILE are LIVE
+    # recorder readers, resolved at command start like pi's
+    # resolveSpawnContext (bash.ts:194-197 — the file is exposed only once
+    # it exists; here the bash tool exposes a reader only when truthy, and
+    # the file materializes on the first recorded conversation-bearing
+    # message, which precedes any tool execution). PROVIDER/MODEL/
+    # REASONING_LEVEL unchanged (the boot pair + the print level).
+    def print_session_env(recorder, boot, level)
+      {
+        "SESSION_ID" => -> { recorder&.id },
+        "SESSION_FILE" => -> { recorder&.path },
+        "PROVIDER" => -> { boot.provider },
+        "MODEL" => -> { boot.id },
+        "REASONING_LEVEL" => -> { level }
+      }
+    end
+
+    def build_tools(workdir, settings, mcp_servers: Mcp::Config.load(mcp_config_path),
+                    identity: Identity::DEFAULT, session_env: {}, hooks: nil)
+      Tools::Registry.build(selected: Settings.selected_tools(settings), cwd: workdir,
+        mcp_servers:, identity:, session_env:, hooks:)
     rescue Mcp::Config::ConfigError => e
       abort "tart: #{e.message}"
     end
@@ -479,7 +794,7 @@ module Tart
     def find_session_by_id(workdir, id)
       Agent::Session.list(cwd: workdir).find do |path|
         File.basename(path, ".jsonl").end_with?("_#{id}") ||
-          Agent::Session.read_header(path)&.fetch("id", nil) == id
+          Agent::Session.read_header(path)&.id == id
       end
     end
 

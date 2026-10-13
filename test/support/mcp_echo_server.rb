@@ -12,6 +12,10 @@
 # Environment toggles (for failure-injection tests):
 # - MCP_ECHO_FAIL_INITIALIZE=1  initialize answers an invalid result.
 # - MCP_ECHO_STDERR=<text>      writes <text> to stderr at boot.
+# - MCP_ECHO_PROTOCOL_VERSION=<v>  initialize answers protocol version <v>
+#   (the client's unsupported-version taxonomy row).
+# - MCP_ECHO_DUPLICATE_CURSOR=1  tools/list repeats the same nextCursor on
+#   every page (the client's duplicate-cursor taxonomy row).
 #
 # Exits cleanly when the client closes stdin.
 require "json"
@@ -41,16 +45,22 @@ module EchoServer
 
     case message["method"]
     when "initialize"
+      # MCP_ECHO_PROTOCOL_VERSION rides the well-formed answer (and the
+      # invalid one) — the version check is the client-side taxonomy row.
+      version = ENV["MCP_ECHO_PROTOCOL_VERSION"] || PROTOCOL_VERSION
       result = if ENV["MCP_ECHO_FAIL_INITIALIZE"]
-        {"protocolVersion" => PROTOCOL_VERSION, "capabilities" => {}}
+        {"protocolVersion" => version, "capabilities" => {}}
       else
-        {"protocolVersion" => PROTOCOL_VERSION, "capabilities" => {}, "serverInfo" => stringified(SERVER_INFO)}
+        {"protocolVersion" => version, "capabilities" => {}, "serverInfo" => stringified(SERVER_INFO)}
       end
       {result:}
     when "ping"
       {result: {}}
     when "tools/list"
-      {result: {tools: stringified(TOOLS)}}
+      result = {tools: stringified(TOOLS)}
+      # Same cursor every page: the second page trips the duplicate check.
+      result[:nextCursor] = "page-2" if ENV["MCP_ECHO_DUPLICATE_CURSOR"]
+      {result:}
     when "tools/call"
       {result: call(message.dig("params", "name"), message.dig("params", "arguments") || {})}
     else

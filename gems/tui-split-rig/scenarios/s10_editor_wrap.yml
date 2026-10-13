@@ -1,0 +1,29 @@
+# S10 — the editor wrap/growth flip (I35): one tiny text turn, then ONE
+# long literal typed into the editor via post_settle_keys (the s9
+# precedent) — NO Enter: the capture shows the SETTLED screen with the
+# WRAPPED, GROWN editor box and the fake cursor at the end of the typed
+# text. pi wraps the input across visual rows and grows its editor box to
+# the windowed row count (the visual-line model, layoutLines wrapped at
+# the inner width; the box height is capped at max(5, floor(rows/3)) —
+# packages/tui/src/components/editor.ts:538 — and hidden rows surface as
+# ` ↑ N more ` / ` ↓ N more ` border labels, editor.ts:277-293
+# createScrollBorder + custom-editor.ts:45). The port at base renders ONE
+# clipped row (render/editor.rb: input beyond one row clips at the inner
+# width) — the candidate list IS the visual-line editor work list, and the
+# scenario exits 0 on the integrated tree once the port's editor lands
+# (the I14 wave-1 tripwire precedent: RED at base BY DESIGN).
+#
+# The literal is simple ASCII words + spaces: tmux send-keys types the
+# token literally (no braces/semicolons/control chars that tmux would
+# re-tokenize; no @/# — the editor's autocomplete trigger characters,
+# editor.ts:254), long enough to wrap past the rig's 120-col geometry onto
+# >= 3 editor rows. Newlines are NOT typed: tmux's encoding of
+# shift+enter through the pane is not dependable, and newlines are
+# unit-pinned in the core lane.
+name: s10_editor_wrap
+prompt: "hi"
+expected_requests: 1
+post_settle_keys: ["the quick brown fox jumps over the lazy dog while every long line typed here wraps onto another editor row and the small box grows taller above the quiet footer where both apps must agree byte for byte on the settled screen without pressing enter and every extra word keeps the wrap honest"]
+responses:
+  - type: stream
+    content: "Fixed short reply; the wrap happens in the editor, not the turn."

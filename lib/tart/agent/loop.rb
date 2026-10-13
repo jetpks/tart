@@ -1,11 +1,17 @@
 # frozen_string_literal: true
 
 require_relative "../compaction"
+require_relative "../hooks"
+require_relative "../herdr"
+require_relative "../memory"
+require_relative "../models"
 require_relative "../settings"
 require_relative "bridge"
 require_relative "session"
 require_relative "status"
 require_relative "system_prompt"
+
+require "dry/monads"
 
 module Tart
   module Agent
@@ -27,10 +33,14 @@ module Tart
     # cancelled (tools kill their subprocess groups at the next checkpoint),
     # and the cancel propagates.
     #
-    # Events (minimal surface, pi's AgentEvent vocabulary plus a compaction
-    # event): :agent_start, :turn_start, :message_start, :message_update
-    # (streamed chunks), :message_end, :tool_execution_start,
-    # :tool_execution_end, :turn_end, :compaction, :agent_end.
+    # Events (minimal surface, pi's AgentEvent vocabulary plus the
+    # compaction events): :agent_start, :turn_start, :message_start,
+    # :message_update (streamed chunks), :message_end,
+    # :tool_execution_start, :tool_execution_end, :turn_end,
+    # :compaction_start, :compaction, :agent_end — ELEVEN emitted types
+    # (Grounds §2 count correction: the :compaction_start border-status
+    # event landed with the I30-era compaction work; this comment listed
+    # ten until I47).
     #
     # Compaction (pi's auto-compaction, agent-session.ts:3007-3219): after
     # a completed turn, provider-reported context usage over the model's
@@ -41,6 +51,10 @@ module Tart
     # the error). The compaction entry goes to the session recorder; the
     # chat history is replaced in place with [summary message, kept tail].
     class Loop
+      # I45: the step boundary consumes the Bridge's Result terminal (the
+      # pattern-matching vocabulary of the flow contract).
+      include Dry::Monads::Result::Mixin
+
       # @param chat [RubyLLM::Chat] configured for the endpoint (model,
       #   provider, protocol).
       # @param tools [Hash{String => RubyLLM::Tool}] the selected loadout
@@ -63,16 +77,58 @@ module Tart
       # @param compaction [Hash, Compaction::Settings, nil] compaction
       #   settings ({enabled:, reserve_tokens:, keep_recent_tokens:});
       #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
+      # @param thinking_level [String] the session's thinking level (pi
+      #   DEFAULT_THINKING_LEVEL "medium"); {set_thinking_level} changes
+      #   it mid-session — the next request picks it up (the hook reads it
+      #   at request time; no gem state to reset).
+      # @param model_reasoning [Boolean] the model's reasoning capability
+      #   (pi model.reasoning) — gates whether any reasoning_effort is
+      #   ever sent.
+      # @param thinking_level_map [Hash, nil] the model's thinkingLevelMap
+      #   (pi's Partial Record<level, String|null>, symbolized); nil = the
+      #   map-less rule (pi's ladder without xhigh/max, off sends nothing).
+      # @param compat [Shapes::ModelCompat, nil] the model's pi-compat
+      #   dialect subset (I46); nil = today's default arm (the I36 effort
+      #   wiring, no thinking object/tool_stream/role rewrite/rename).
+      #   {switch_model} swaps it mid-session — the hook reads it at
+      #   request time, same idiom as the level.
+      # @param hooks [Tart::Hooks, nil] the extension seam (I47): when
+      #   present every emitted event routes through {Hooks#emit}
+      #   (registration-order handlers, then the surface sink the Hooks
+      #   holds), the tool batch consults the terminate ledger, and the
+      #   pending nextTurn queue drains after every user message; nil =
+      #   today's direct on_event path, byte-identical.
+      # @param hooks_context [Proc, Hash, nil] the emission context the
+      #   loop hands {Hooks#emit} ({cwd:, mode:, session:, identity:} —
+      #   pi's ctx); a Proc re-reads per event (the boot wiring's seam —
+      #   /new swaps the recorder). nil = the loop's own view.
+      # @param steer_inbox [String, nil] the steering FILE inbox (I48 —
+      #   the async child's `--steer-inbox` dir): drained at the SAME
+      #   consumption points as the in-memory queue (§5.1). Steer request
+      #   files join the queue + log their correlated consumption
+      #   ({requestId, consumedAt} in steer-log.jsonl) + unlink
+      #   (at-least-once); a stop request file interrupts the run exactly
+      #   like a kernel interrupt (:agent_end interrupted: true); a file
+      #   that fails to parse is unlinked and skipped (poison-pill
+      #   safety). nil (interactive parents, tests) = today's behavior.
       def initialize(chat:, tools:, system_prompt: nil, on_event: nil,
         recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
-        identity: Identity::DEFAULT)
+        identity: Identity::DEFAULT, thinking_level: "medium",
+        model_reasoning: false, thinking_level_map: nil, compat: nil,
+        hooks: nil, hooks_context: nil, steer_inbox: nil)
         @chat = chat
         @tools = tools
         @on_event = on_event
+        @hooks = hooks
+        @hooks_context = hooks_context
         @recorder = recorder
         @identity = identity
         @context_window = context_window
         @compaction_settings = Compaction::Settings.resolve(compaction)
+        @thinking_level = thinking_level
+        @model_reasoning = model_reasoning == true
+        @thinking_level_map = thinking_level_map
+        @compat = compat
         @overflow_recovery_attempted = false
         @pre_compaction_messages = {}.compare_by_identity
         @entry_ids = {}.compare_by_identity
@@ -80,6 +136,9 @@ module Tart
         @sink = nil
         @stream_started = false
         @steering_queue = Queue.new
+        @steer_inbox = steer_inbox
+        @wake_opening = false
+        @in_run = false
         @last_error = nil
         @interrupted = false
 
@@ -87,6 +146,7 @@ module Tart
         @chat.with_instructions(system_prompt) if system_prompt
         seed_messages.each { |message| @chat.add_message(message) }
         install_chat_callbacks
+        install_thinking_seam
       end
 
       # Queues a user message. While the agent runs, it is consumed at the
@@ -105,9 +165,70 @@ module Tart
         !@steering_queue.empty?
       end
 
+      # @return [Boolean] whether a run is in flight (I48 — one Loop one
+      #   fiber: #wake no-ops while true, so the completion kick that
+      #   lands mid-run is dropped and the queued notification rides the
+      #   in-flight run's next add_user_message drain instead).
+      def running?
+        @in_run
+      end
+
+      # The subagents completion wake (I48 §5.3 — pi triggerTurn on the
+      # port's existing seams): run-shaped with NO prompt — when no
+      # steering message opens the run, the hooks' pending_next_turn
+      # queue drains AS the turn's opening messages (the §I47 drain path:
+      # user-role wire text, :message_start/:message_end with the
+      # CustomMessage, the session custom_message entry). Empty queue +
+      # empty steering (memory queue AND the file inbox) → returns
+      # immediately with NO model call. NO-OP when a run is in flight
+      # (race-safe: the loop's own running flag guards it — never two
+      # fibers driving one Loop). Must be called on the kernel reactor
+      # fiber, like #run. Returns whether a run was started.
+      def wake
+        return false if @in_run
+
+        pending = @hooks ? @hooks.pending_next_turn : []
+        if pending.empty? && !queued_messages? && !steer_inbox_pending?
+          return false
+        end
+
+        # The peek drained the hooks queue atomically (the seam's only
+        # read is a drain); restore it verbatim so the run's own §I47
+        # drain delivers the messages in order.
+        pending.reverse_each { |item| @hooks.send_next_turn(**item) } if @hooks && !pending.empty?
+
+        @wake_opening = true
+        begin
+          run(nil)
+        ensure
+          @wake_opening = false
+        end
+        true
+      end
+
       # The resolved context window (the compaction threshold's
       # denominator) — the test/launcher readback for the switch seam.
       attr_reader :context_window
+
+      # The session's thinking level (pi agent.state.thinkingLevel) — the
+      # surface's readback ({Render::Chat#apply_thinking_selection} drives
+      # it through {set_thinking_level}).
+      attr_reader :thinking_level
+
+      # The session recorder (pi SessionManager) — the launcher's session-env
+      # readers expose the CURRENT session's id + file through it (I41: the
+      # bash tool's <IDENTITY>_SESSION_ID/_SESSION_FILE; /new and resume
+      # swap the loop, and the readers re-resolve at every spawn).
+      attr_reader :recorder
+
+      # The thinking level's runtime seam (pi setThinkingLevel :5163-5172 →
+      # session state): stored only — the request hook reads it at request
+      # time, so the NEXT request carries the new level (pi's per-request
+      # clampThinkingLevel, streamSimple :749). The surface calls it.
+      def set_thinking_level(level)
+        @thinking_level = level
+        self
+      end
 
       # The model-switch seam (I27, /model + the selector menus): swaps
       # the runtime chat model in place — ruby_llm Chat#with_model
@@ -118,7 +239,17 @@ module Tart
       # the openai provider would otherwise pick :responses; the port's
       # models are assumed, not registry-resolved). Idle-only: the menus
       # open when no turn runs.
-      def switch_model(model_id, provider:, context_window: nil)
+      #
+      # I36: the reasoning facts re-resolve alongside (pi setModel swaps
+      # the Model object, so its reasoning/thinkingLevelMap come from the
+      # switched entry): +model_reasoning:+/+thinking_level_map:+ carry the
+      # switched entry's composed facts ({Settings.thinking_facts}'s rule
+      # — the surface passes them; nil = the entry declares none, the
+      # map-less rule). I46: +compat:+ rides the same wholesale re-resolve
+      # (nil IS "the switched model declares none" — the default arm — not
+      # "keep the previous").
+      def switch_model(model_id, provider:, context_window: nil, model_reasoning: nil, thinking_level_map: nil,
+        compat: nil)
         @chat.with_model(model_id, provider:, protocol: :chat_completions, assume_model_exists: true)
         # pi has no cached window to go stale: setModel swaps the Model
         # object (agent-session.ts:2484) and every check reads
@@ -134,6 +265,13 @@ module Tart
         # nil-disabling it). nil still = threshold disabled, pi's
         # `contextWindow ?? 0`.
         @context_window = Settings.resolve_context_window(explicit: context_window, model: @chat.model)
+        # The facts re-resolve wholesale (pi setModel swaps the Model
+        # object — no stale map survives onto the switched model): the
+        # surface passes fully composed facts, so nil IS "the entry
+        # declares none" (the map-less rule), not "keep the previous".
+        @model_reasoning = model_reasoning == true
+        @thinking_level_map = thinking_level_map
+        @compat = compat
         self
       end
 
@@ -147,6 +285,7 @@ module Tart
         @new_messages = []
         @last_error = nil
         @interrupted = false
+        @in_run = true
         emit(type: :agent_start)
 
         begin
@@ -156,6 +295,8 @@ module Tart
           emit(type: :turn_end, interrupted: true)
           emit(type: :agent_end, interrupted: true, messages: new_messages)
           raise
+        ensure
+          @in_run = false
         end
 
         emit(type: :agent_end, interrupted: false, messages: new_messages) unless @last_error
@@ -224,7 +365,14 @@ module Tart
           if first && prompt
             add_user_message(prompt)
           else
+            before = @new_messages.size
             steering_messages.each { |text| add_user_message(text) }
+            # I48 wake: with no prompt and no steering opening the run, the
+            # pending nextTurn queue IS the opening turn (each pending
+            # rides the §I47 drain path). Nothing added (the queue raced
+            # empty between #wake's check and here) → no model call.
+            drain_next_turn_messages if first && @wake_opening
+            break if first && @wake_opening && @new_messages.size == before
           end
           first = false
           inner_loop
@@ -246,6 +394,15 @@ module Tart
           break if message.nil?
 
           if message.role == :tool
+            # The batch's terminate consult (I47 — pi
+            # shouldTerminateToolBatch, agent-loop.ts:690-691: non-empty AND
+            # every): an all-terminate blocked batch stops the INNER loop;
+            # the outer steering loop is untouched. The ledger clears per
+            # batch (stale ids never leak into the next consult).
+            if @hooks && batch_terminated?
+              @hooks.clear_terminate_ledger
+              return
+            end
             next # tool batch executed; the model responds on the next step
           elsif @chat.complete?
             # pi _handlePostAgentRun checks compaction after EVERY
@@ -400,13 +557,17 @@ module Tart
         summary_chat = nil
         bridge = Bridge.new
         bridge.on_cancel { summary_chat&.cancel }
-        terminal = bridge.run(lambda { |_sink|
+        # Any Failure terminal (a failed call, or a cancelled one) aborts the
+        # compaction: nil, and the run continues (never stops the run).
+        case bridge.run(lambda { |_sink|
           summary_chat = build_summary_chat
           result = summary_chat.ask(prompt)
         }) { |_item| }
-        return nil if terminal.is_a?(Hash) && terminal[:type] == :error
-
-        result
+        in Success
+          result
+        in Failure
+          nil
+        end
       end
 
       def build_summary_chat
@@ -419,7 +580,29 @@ module Tart
                                   assume_model_exists: true)
         chat.with_instructions(Compaction::SUMMARIZATION_SYSTEM_PROMPT)
         chat.with_max_output_tokens(summarization_max_tokens)
+        install_summary_chat_seam(chat)
         chat
+      end
+
+      # The summarization one-shot's dialect (I46): ruby_llm callbacks are
+      # per-Chat-instance (chat.rb :142 — @callbacks starts empty on a
+      # fresh context.chat), so the construction hook never ran here and
+      # today's summary bytes carry NO reasoning_effort and the gem's
+      # max_completion_tokens. pi's summarization rides the SAME dialect
+      # branch (compaction.ts:605-607 — the session level into the request
+      # options), so for a zai-compat model the zai arm installs here too:
+      # the thinking object, the mapped effort, and the max_tokens rename
+      # land on the one-shot (the role rewrite with it — the instruction
+      # renders developer on this protocol). The I36 effort arm stays OFF:
+      # the summary request's compat-less bytes are the zero-change bar's
+      # "today's exact shapes" (pin 8). The fresh chat reads the loop
+      # state at BUILD time — a compaction builds it per call, so a
+      # mid-session switch is already settled (idle-only menus).
+      def install_summary_chat_seam(chat)
+        compat = @compat
+        return unless compat && compat.thinking_format == "zai"
+
+        chat.before_request { |payload| apply_zai_dialect(payload, compat) }
       end
 
       def summarization_max_tokens
@@ -439,7 +622,22 @@ module Tart
         @stream_started = false
         terminal = bridge.run(work_callable) { |item| handle_item(item) }
         @sink = nil
-        record_terminal_error(terminal)
+        # The terminal Result branches by payload class (the flow contract's
+        # no-silent-swallow discipline: every arm explicit):
+        # - Failure(RubyLLM::CancelledError): today's cancelled shape — no
+        #   @last_error, no error emit; the nil message breaks the loop;
+        # - Failure(other): the worker's error lands in @last_error with the
+        #   same assistant message_end error emit as before;
+        # - Success(): the step's message (if any) already arrived as the
+        #   yielded :step item.
+        case terminal
+        in Failure(RubyLLM::CancelledError)
+          # cancelled: today's shape — no @last_error, no error emit
+        in Failure(err)
+          record_terminal_error(err)
+        in Success
+          # the step's message arrived as the yielded :step item
+        end
         @last_message
       end
 
@@ -453,10 +651,12 @@ module Tart
         }
       end
 
-      def record_terminal_error(terminal)
-        return unless terminal.is_a?(Hash) && terminal[:type] == :error
-
-        @last_error = terminal[:error]
+      # The error terminal's recording (the arm that used to sit behind the
+      # terminal-Hash check): the payload becomes @last_error — the loop's
+      # existing error branches (stopped_on_error?, recover_overflow?)
+      # classify it by class.
+      def record_terminal_error(error)
+        @last_error = error
         message = @last_message
         emit(type: :message_end, message:, error: true) if message&.role == :assistant
       end
@@ -469,8 +669,13 @@ module Tart
         true
       end
 
-      # Drains queued steering messages (thread-safe consumer side).
+      # Drains queued steering messages (thread-safe consumer side). The
+      # I48 file inbox (steer_inbox:) folds into the SAME seam: drained at
+      # every consumption point (the outer-loop boundary, the inner loop's
+      # complete branch, and this outer break condition) — a stop request
+      # found here interrupts the run exactly like a kernel interrupt.
       def steering_messages
+        drain_steer_inbox
         messages = []
         loop do
           begin
@@ -482,13 +687,126 @@ module Tart
         messages
       end
 
+      # @return [Boolean] whether any request file waits in the steer
+      #   inbox or the stop-requests inbox (the wake's emptiness check
+      #   reads it).
+      def steer_inbox_pending?
+        return false unless @steer_inbox
+
+        steer_inbox_files(@steer_inbox).any? || steer_inbox_files(stop_inbox_dir).any?
+      end
+
+      # The file inbox drain (I48 §5.1 — pi's control-channel discipline,
+      # consumed child-side): sorted (the ts-padded names make
+      # lexicographic = temporal); each steer file → queue + steer-log
+      # entry + unlink (read → queue → log → unlink: a crash before the
+      # unlink re-delivers — at-least-once, never lost); a stop request
+      # (written to the SIBLING control/stop-requests/ dir per §2.4 —
+      # read at the same consumption points) interrupts the run exactly
+      # like a kernel interrupt (Async::Cancel — run() turns it into the
+      # interrupted :agent_end, the child exits non-zero with the abort
+      # message); a file that fails JSON parse is unlinked and skipped
+      # (poison-pill safety).
+      def drain_steer_inbox
+        return unless @steer_inbox
+
+        steer_inbox_files(@steer_inbox).each do |path|
+          request = parse_request_file(path)
+          if request.nil?
+            File.unlink(path) rescue nil # poison: unlink + skip, never crash the run
+            next
+          end
+          next unless request["type"] == "steer"
+
+          @steering_queue << request["message"].to_s
+          append_steer_consumption(request)
+          File.unlink(path) rescue nil # LAST — a crash before this re-delivers
+        end
+        steer_inbox_files(stop_inbox_dir).each do |path|
+          request = parse_request_file(path)
+          File.unlink(path) rescue nil # the interrupt must not re-fire
+          next unless request.is_a?(Hash) && request["type"] == "stop"
+
+          raise Async::Cancel, "stop request"
+        end
+      end
+
+      # The stop-requests inbox: the SIBLING of the steer-requests dir
+      # (the §2.4 write path), read at the same consumption points.
+      def stop_inbox_dir
+        File.expand_path("../stop-requests", @steer_inbox)
+      end
+
+      def steer_inbox_files(dir)
+        Dir.glob(File.join(dir, "*.json")).sort
+      end
+
+      def parse_request_file(path)
+        JSON.parse(File.read(path))
+      rescue StandardError
+        nil
+      end
+
+      # The correlated-consumption log (T1): {requestId, consumedAt} per
+      # consumed request — the receipt source the parent's steer call
+      # polls for THAT request id (never mere inbox acceptance).
+      def append_steer_consumption(request)
+        log = File.join(File.dirname(@steer_inbox), "steer-log.jsonl")
+        File.open(log, "a") do |io|
+          io.write(JSON.generate({"requestId" => request["id"], "consumedAt" =>
+            (Process.clock_gettime(Process::CLOCK_REALTIME) * 1000).round}))
+          io.write("\n")
+        end
+      rescue StandardError
+        nil # the log never blocks delivery (the message is already queued)
+      end
+
       def add_user_message(text)
         message = @chat.add_message(role: :user, content: text)
         @new_messages << message
         emit(type: :message_start, message:)
         emit(type: :message_end, message:)
         record(message)
+        drain_next_turn_messages
         message
+      end
+
+      # The nextTurn drain (I47 — pi _handleUserPrompt, agent-session.ts
+      # :2086-2095): AFTER the user message is added/emitted/recorded, the
+      # pending queue drains FIFO — each message is a user-role chat
+      # message carrying the text (pi convertToLlm, messages.ts:161-170),
+      # emits :message_start/:message_end carrying a Hooks::CustomMessage
+      # (pi agent-loop.ts:105-126, message_start/end per initial message),
+      # and records a custom_message session entry. Wire order
+      # [system…, user prompt, *customs-as-user].
+      def drain_next_turn_messages
+        return unless @hooks
+
+        @hooks.pending_next_turn.each do |pending|
+          content = pending[:content]
+          chat_message = @chat.add_message(role: :user, content:)
+          @new_messages << chat_message
+          custom = Hooks::CustomMessage.new(role: :custom, custom_type: pending[:custom_type],
+            content:, display: pending[:display])
+          emit(type: :message_start, message: custom)
+          emit(type: :message_end, message: custom)
+          @recorder&.append_custom_message(custom_type: pending[:custom_type], content:, display: pending[:display])
+        end
+      end
+
+      # The batch consult (pi shouldTerminateToolBatch, agent-loop.ts
+      # :690-691): the ids are the PRECEDING assistant message's tool_call
+      # ids; TRUE iff the batch is non-empty AND every call was a
+      # terminate-marked block.
+      def batch_terminated?
+        messages = @chat.messages
+        tool_index = messages.rindex { |message| message.role == :tool }
+        return false unless tool_index
+
+        assistant = messages[0...tool_index].reverse.find { |message| message.role == :assistant }
+        return false unless assistant&.tool_calls.is_a?(Hash)
+
+        @hooks.batch_terminate?(assistant.tool_calls.keys.map(&:to_s))
       end
 
       def install_chat_callbacks
@@ -516,6 +834,120 @@ module Tart
         end
       end
 
+      # The request seam (I36 — pi's thinking wiring, ONE hook installed at
+      # construction; ruby_llm's before_request runs LAST in Protocol#render,
+      # mutating the symbol-keyed payload in place before serialization, on
+      # BOTH the streaming and sync paths):
+      #
+      # (a) the resolved level reaches the wire (pi streamSimple :745-755 +
+      #     the generic branch :969-976): reasoning_effort =
+      #     Models.resolve_reasoning_effort — the map's value for the clamped
+      #     level, else the level; off sends the map's String `off` value or
+      #     NOTHING (non-reasoning models, map-less off). The gem's own
+      #     thinking config is never set (with_thinking is registry-driven
+      #     and unsettable — Thinking::Controls), so this hook owns the
+      #     field outright. Reading @thinking_level at request time makes
+      #     mid-session changes apply to the next request.
+      #
+      # (b) the replay protocol (pi :1340-1352 — assistantMsg[signature],
+      #     the delta-carried field; live-verified for fireworks:
+      #     reasoning_content): recorded assistant messages KEEP their
+      #     thinking (memory, session file, resume — the I05 strip
+      #     deviation is gone), and the request normalization drops
+      #     ruby_llm's duplicate `reasoning` field so the wire carries
+      #     `reasoning_content` ONLY — the shape pi sends, and the shape the
+      #     strict endpoint accepts (the I05 400 class cannot recur through
+      #     the port's own payload).
+      # (c) the zai dialect (I46 — pi's zai arm of the else-if chain,
+      #     openai-completions.ts :880-892): for a model whose compat says
+      #     thinkingFormat "zai" the hook emits pi's exact wire instead of
+      #     the generic effort arm — the thinking object, the map-then-
+      #     level reasoning_effort, tool_stream, the instruction-role
+      #     rewrite, and the max_tokens field rename ({apply_zai_dialect}).
+      #     compat nil (or a non-zai thinkingFormat) runs arm (a)
+      #     BYTE-EXACT — the zero-change bar (fireworks default and every
+      #     compat-less catalog).
+      def install_thinking_seam
+        @chat.before_request do |payload|
+          compat = @compat
+          if compat && compat.thinking_format == "zai"
+            apply_zai_dialect(payload, compat)
+          else
+            effort = Models.resolve_reasoning_effort(@thinking_level,
+              map: @thinking_level_map, reasoning: @model_reasoning)
+            if effort
+              payload[:reasoning_effort] = effort
+            else
+              payload.delete(:reasoning_effort)
+            end
+          end
+          payload[:messages]&.each do |message|
+            message.delete(:reasoning) if message.is_a?(Hash) && message[:role] == "assistant"
+          end
+        end
+      end
+
+      # The zai arm (pi openai-completions.ts :880-892 + :749-755 +
+      # :855-860 + :1233 + :841-848), muting the symbol-keyed payload in
+      # place. Runs on the session chat AND (zai only) the compaction
+      # summarization one-shot — pi's summarization carries the session
+      # level through the same dialect branch (compaction.ts:605-607).
+      def apply_zai_dialect(payload, compat)
+        if @model_reasoning
+          clamped = Models.clamp_thinking_level(@thinking_level, map: @thinking_level_map, reasoning: true)
+          # pi :751 — the CLAMPED level is the input and a clamped "off" is
+          # NO effort: the I36 String-off floor does not apply on this arm
+          # (OQ-5 — the generic off-arm is unreachable for zai-format
+          # models, the zai branch takes the chain first).
+          effort_present = !clamped.nil? && clamped != "off"
+          payload[:thinking] = effort_present ? {type: "enabled", clear_thinking: false} : {type: "disabled"}
+          if effort_present && compat.supports_reasoning_effort == true
+            # pi :889-891 — the map's String value for the clamped level;
+            # a MISSING key sends the level itself (a null value cannot
+            # reach here: supported levels never carry null).
+            mapped = @thinking_level_map&.[](clamped.to_sym)
+            payload[:reasoning_effort] = mapped.is_a?(String) ? mapped : clamped
+          else
+            # no effort (clamped off), or the compat says the endpoint
+            # refuses the field (pi's detected-false default for zai).
+            payload.delete(:reasoning_effort)
+          end
+        else
+          # pi :880 gates the arm on model.reasoning — a non-reasoning
+          # model sends no thinking object and no reasoning_effort (the
+          # generic arms cannot fire for it either).
+          payload.delete(:reasoning_effort)
+        end
+        # pi :855-860 — tool_stream iff zaiToolStream AND the request
+        # carries tools; the tool-less fallback sends tools: [] without
+        # the field (:861-863).
+        if compat.zai_tool_stream == true && payload[:tools].is_a?(Array) && !payload[:tools].empty?
+          payload[:tool_stream] = true
+        end
+        # pi :1233 — the wire role is developer iff the model reasons AND
+        # the compat supports it; nil falls to the DETECTION stand-in (a
+        # zai URL detects false, :1593-1675), so on this arm nil == false.
+        # The gem renders the instruction as developer on this protocol
+        # (format_role, chat.rb :376-383) — the rewrite puts the wire role
+        # back to system. With compat nil: NO rewrite (the default arm
+        # never touches roles).
+        unless @model_reasoning && compat.supports_developer_role == true
+          payload[:messages]&.each do |message|
+            message[:role] = "system" if message.is_a?(Hash) && message[:role] == "developer"
+          end
+        end
+        # pi :841-848 — maxTokensField "max_tokens" renames the gem's
+        # max_completion_tokens (chat.rb :96-99 — the openai slug names it
+        # so) for endpoints that only accept the deprecated field. Today
+        # only the compaction summarization sets max output tokens, so the
+        # rename lands there; "max_completion_tokens" and nil rename
+        # nothing. NO store field is ever added (OQ-4); NO strict on tool
+        # defs (OQ-1 — the five-key subset ends here).
+        if compat.max_tokens_field == "max_tokens" && payload.key?(:max_completion_tokens)
+          payload[:max_tokens] = payload.delete(:max_completion_tokens)
+        end
+      end
+
       def handle_item(item)
         case item[:type]
         when :chunk
@@ -535,7 +967,6 @@ module Tart
           # Tool results are recorded by the :tool_message item (ruby_llm's
           # after_message); the step's own return would double-count them.
           unless message.role == :tool
-            strip_thinking_replay(message)
             @new_messages << message
             emit(type: :message_end, message:) if message.role == :assistant
             record(message)
@@ -553,31 +984,26 @@ module Tart
         end
       end
 
+      # The event sink: hooks present → the seam (registration-order
+      # handlers, then the surface sink the Hooks holds — the loop never
+      # double-delivers through its own on_event); nil → today's direct
+      # path, byte-identical.
       def emit(event)
-        @on_event&.call(event)
+        if @hooks
+          @hooks.emit(event, context: hooks_context)
+        else
+          @on_event&.call(event)
+        end
       end
 
-      # ruby_llm 2.1 replays an assistant reply's thinking on every later
-      # request (protocols/chat_completions/chat.rb format_thinking: both
-      # `reasoning` and `reasoning_content`), which strict OpenAI-compatible
-      # endpoints reject with a schema 400 (fireworks: "Extra inputs are not
-      # permitted, field: 'messages[n].reasoning'") — killing every follow-up
-      # turn after a thinking reply. pi, by contrast, replays the reasoning
-      # field the deltas carried: chat-completions endpoints map deltas to
-      # thinking blocks keyed by signature ∈ {reasoning, reasoning_content,
-      # reasoning_text} (packages/ai/src/api/openai-completions.ts:611-627),
-      # then send the joined thinking back as assistantMsg[signature] — unless
-      # encrypted reasoning_details are preserved (:1340-1351). The port
-      # suppresses it outright (deviation itemized in the iteration record).
-      # Mirrors the gem's own without_native_content
-      # idiom (message.rb:140-146: instance_variable_set on a live message);
-      # narrower than calling without_native_content, which would also strip
-      # tool-call thought signatures (message.rb:316-321).
-      def strip_thinking_replay(message)
-        return unless message.role == :assistant
+      # The emission context (pi's ctx, {cwd:, mode:, session:, identity:}):
+      # built by the boot wiring (a Proc re-read per event — /new swaps the
+      # recorder), defaulting to the loop's own view (the tests/gates).
+      def hooks_context
+        return @hooks_context.call if @hooks_context.is_a?(Proc)
 
-        message.instance_variable_set(:@thinking, nil)
-        message.instance_variable_set(:@raw_reasoning, nil)
+        session = @recorder ? {path: @recorder.path, id: @recorder.id} : nil
+        {cwd: Dir.pwd, mode: nil, session:, identity: @identity}
       end
     end
   end

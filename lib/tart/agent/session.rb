@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../compaction"
+require_relative "../shapes/session"
 
 require "fast/uuid"
 require "json"
@@ -96,13 +97,14 @@ module Tart
       end
 
       # pi loadEntriesFromFile :627: [] unless the file parses and opens with
-      # a valid session header (type "session", String id).
+      # a valid session header (type "session", String id) — the validity
+      # gate rides the typed Shapes::SessionHeader envelope; the entries
+      # themselves load verbatim (the write-path shapes are byte-frozen).
       def load_entries(path)
         return [] unless File.exist?(path)
 
         entries = parse_entries(File.read(path))
-        header = entries.first
-        return [] unless header.is_a?(Hash) && header["type"] == "session" && header["id"].is_a?(String)
+        return [] unless Shapes::SessionHeader.of(entries.first)
 
         entries
       end
@@ -118,6 +120,14 @@ module Tart
       # :1197). +message+ is the serialized message Hash (Message#to_h).
       def message_entry(message, id:, parent_id:, timestamp:)
         {type: "message", id:, parentId: parent_id, timestamp:, message:}
+      end
+
+      # Custom-message entry factory (pi CustomMessageEntry,
+      # session-manager.ts:1339-1360 — the nextTurn injection's record:
+      # display-only text with no chat-message payload; +details+ nil is
+      # omitted like pi's undefined). The memory recall rides this entry.
+      def custom_message_entry(custom_type:, content:, display:, id:, parent_id:, timestamp:)
+        {type: "custom_message", customType: custom_type, content:, display:, id:, parentId: parent_id, timestamp:}
       end
 
       # Compaction entry factory (pi CompactionEntry :91-104 /
@@ -167,28 +177,39 @@ module Tart
       # symbol role); null/missing content is tolerated ("" on the port —
       # module doc for the [] deviation). Compaction entries project to the
       # wrapped summary (see module doc). Other entry types project to
-      # nothing; malformed entries are tolerated, never fatal.
+      # nothing; malformed entries are tolerated, never fatal — every gate
+      # rides the typed envelopes (Shapes::MessageEntry / CompactionEntry),
+      # whose .of nil-skips reproduce the guard chains exactly. Returns the
+      # typed Shapes::ContextMessage; {context_messages} applies to_h at
+      # the gem seam.
       def entry_to_context_message(entry)
-        return compaction_summary_message(entry) if entry.is_a?(Hash) && entry["type"] == "compaction"
-        return nil unless entry.is_a?(Hash) && entry["type"] == "message"
+        compaction = Shapes::CompactionEntry.of(entry)
+        return compaction_summary_message(compaction) if compaction
 
-        message = entry["message"]
-        return nil unless message.is_a?(Hash) && message["role"].is_a?(String)
+        # pi sessionEntryToContextMessages' custom_message case
+        # (session-manager.ts:437-459 → createCustomMessage → messages.ts
+        # convertToLlm :161-170): the recorded recall text rides the wire
+        # again on resume as a user-role message.
+        if entry.is_a?(Hash) && entry["type"] == "custom_message"
+          return Shapes::ContextMessage.new(role: :user, content: entry["content"].to_s)
+        end
 
-        return bash_execution_context_message(message) if message["role"] == "bashExecution"
+        envelope = Shapes::MessageEntry.of(entry)
+        return nil unless envelope
 
-        message = message.transform_keys(&:to_sym)
-        message[:role] = message[:role].to_sym
-        message[:content] = "" if !message.key?(:content) || message[:content].nil?
-        message
+        return bash_execution_context_message(envelope) if envelope.role == "bashExecution"
+
+        Shapes::ContextMessage.new(envelope.message)
       end
 
       # pi convertToLlm's bashExecution case (messages.ts:149-160): the
       # !!-prefixed execution is SKIPPED from context; a plain ! execution
       # rides as a USER message ("Ran `<cmd>`" + the fenced output, the
       # bashExecutionToText bytes — messages.ts:82-97; ruby_llm supports
-      # no bashExecution role).
-      def bash_execution_context_message(message)
+      # no bashExecution role). The per-field guards stay verbatim — the
+      # field reads go through the envelope's open body hash.
+      def bash_execution_context_message(envelope)
+        message = envelope.message
         return nil if message["excludeFromContext"]
 
         text = +"Ran `#{message["command"]}`\n"
@@ -206,18 +227,19 @@ module Tart
         if message["truncated"] && message["fullOutputPath"].is_a?(String) && !message["fullOutputPath"].empty?
           text << "\n\n[Output truncated. Full output: #{message["fullOutputPath"]}]"
         end
-        {role: :user, content: text}
+        Shapes::ContextMessage.new(role: :user, content: text)
       end
 
       # pi's compactionSummary projection (messages.ts:109-121 + :176-184):
       # the summary rides a user message wrapped in the prefix/suffix —
-      # ruby_llm supports no compactionSummary role.
-      def compaction_summary_message(entry)
-        summary = entry["summary"]
+      # ruby_llm supports no compactionSummary role. The summary's String
+      # guard stays here (the envelope's summary field is nominal).
+      def compaction_summary_message(compaction)
+        summary = compaction.summary
         return nil unless summary.is_a?(String)
 
-        {role: :user,
-         content: "#{Compaction::COMPACTION_SUMMARY_PREFIX}#{summary}#{Compaction::COMPACTION_SUMMARY_SUFFIX}"}
+        Shapes::ContextMessage.new(role: :user,
+          content: "#{Compaction::COMPACTION_SUMMARY_PREFIX}#{summary}#{Compaction::COMPACTION_SUMMARY_SUFFIX}")
       end
 
       # The context entries of +path+ projected to chat-ready attribute
@@ -235,14 +257,14 @@ module Tart
       # and everything after the compaction entry; without a compaction
       # entry, the list unchanged.
       def context_entries(entries)
-        compaction_index = entries.rindex { |entry| entry.is_a?(Hash) && entry["type"] == "compaction" }
+        compaction_index = entries.rindex { |entry| Shapes::CompactionEntry.of(entry) }
         return entries unless compaction_index
 
-        compaction = entries[compaction_index]
-        context_entries = [compaction]
+        compaction = Shapes::CompactionEntry.of(entries[compaction_index])
+        context_entries = [entries[compaction_index]]
         found_first_kept = false
         entries[0...compaction_index].each do |entry|
-          found_first_kept ||= entry.is_a?(Hash) && entry["id"] == compaction["firstKeptEntryId"]
+          found_first_kept ||= entry.is_a?(Hash) && entry["id"] == compaction.first_kept_entry_id
           next unless found_first_kept
           next if message_entry_with_role?(entry, "system")
 
@@ -253,12 +275,12 @@ module Tart
       end
 
       def context_messages(path)
-        context_entries(load_entries(path)).filter_map { |entry| entry_to_context_message(entry) }
+        context_entries(load_entries(path)).filter_map { |entry| entry_to_context_message(entry)&.to_h }
       end
 
       def message_entry_with_role?(entry, role)
-        entry.is_a?(Hash) && entry["type"] == "message" &&
-          entry["message"].is_a?(Hash) && entry["message"]["role"] == role
+        envelope = Shapes::MessageEntry.of(entry)
+        envelope&.role == role
       end
 
       # The bashExecution message factory (pi BashExecutionMessage,
@@ -279,7 +301,7 @@ module Tart
         session_files(dir).each do |path|
           header = read_header(path)
           next unless header
-          next if cwd && !cwd_matches?(header["cwd"], cwd)
+          next if cwd && !cwd_matches?(header.cwd, cwd)
 
           return path
         end
@@ -294,7 +316,7 @@ module Tart
         dir = dir_path(cwd, root:)
         session_files(dir).filter_map do |path|
           header = read_header(path)
-          next unless header && cwd_matches?(header["cwd"], cwd)
+          next unless header && cwd_matches?(header.cwd, cwd)
 
           path
         end
@@ -304,12 +326,12 @@ module Tart
       # session.firstMessage): the first user message's text, squashed.
       # nil when the session holds none (setup-only files).
       def preview(path)
-        first = load_entries(path).find do |entry|
-          message_entry_with_role?(entry, "user")
-        end
+        first = load_entries(path)
+          .filter_map { |entry| Shapes::MessageEntry.of(entry) }
+          .find { |envelope| envelope.role == "user" }
         return nil unless first
 
-        content = first["message"]["content"].to_s
+        content = first.message["content"].to_s
         squashed = content.strip.gsub(/\s+/, " ")
         squashed.empty? ? nil : squashed
       end
@@ -328,15 +350,15 @@ module Tart
         []
       end
 
-      # First parsed entry, or nil unless it is a valid session header
-      # (pi readSessionHeaderForDiscovery's discovery path).
+      # First parsed entry as the typed Shapes::SessionHeader, or nil
+      # unless it is a valid session header (pi
+      # readSessionHeaderForDiscovery's discovery path) — the OQ-5 API
+      # move: the header is a struct now; its consumers read attributes.
       def read_header(path)
         return nil unless File.exist?(path)
 
         first = File.open(path) { |file| parse_entry_line(file.gets.to_s) }
-        return nil unless first.is_a?(Hash) && first["type"] == "session" && first["id"].is_a?(String)
-
-        first
+        Shapes::SessionHeader.of(first)
       rescue IOError, SystemCallError
         nil
       end
@@ -374,6 +396,24 @@ module Tart
           @entries = [Session.header(id: @id, cwd: @cwd, parent_session:)]
           @ids = Set.new
           @leaf_id = nil
+          # The fork entry copy (pi forkFrom, session-manager.ts:1847-1853):
+          # a fork is content-complete — every NON-header entry of the
+          # parent appends VERBATIM (ids, parentIds, timestamps unchanged;
+          # merged into @ids so regenerated ids cannot collide) and @leaf_id
+          # threads from the last copied entry, so new appends chain from
+          # the copied tail. A missing/invalid parent reads as []
+          # (load_entries' parse contract): a dangling parentSession link
+          # degrades to the header-only shape, never crashes. The copied
+          # entries persist with the first flush (persist's
+          # conversation-bearing gate holds) — a fork that never turns stays
+          # setup-only.
+          Session.load_entries(parent_session || "").each do |entry|
+            next unless entry.is_a?(Hash) && entry["type"] != "session"
+
+            @ids << entry["id"]
+            @leaf_id = entry["id"]
+            @entries << entry
+          end
           @flushed = false
         end
 
@@ -411,6 +451,27 @@ module Tart
           @leaf_id = entry[:id]
           @entries << entry
           persist(message)
+          entry[:id]
+        end
+
+        # Appends a custom_message entry (pi appendCustomMessageEntry,
+        # agent-session.ts:1144-1160 — the nextTurn injection's record, same
+        # leaf chain). NON-conversation-bearing for the persist gate: a
+        # recall never opens a session file alone (pi _persist's
+        # _hasConversation — only user/assistant/bashExecution open it);
+        # before the first flush the entry waits in @entries and rides the
+        # next conversation-bearing create. Returns the entry id.
+        def append_custom_message(custom_type:, content:, display:)
+          entry = Session.custom_message_entry(
+            custom_type:, content:, display:,
+            id: Session.generate_id(@ids),
+            parent_id: @leaf_id,
+            timestamp: Session.now_iso,
+          )
+          @ids << entry[:id]
+          @leaf_id = entry[:id]
+          @entries << entry
+          persist_custom_message
           entry[:id]
         end
 
@@ -462,6 +523,15 @@ module Tart
             end
             @flushed = true
           end
+        end
+
+        # The custom_message persist arm: appends when flushed, never
+        # creates (a recall never opens a session file alone — see
+        # {append_custom_message}).
+        def persist_custom_message
+          return unless @flushed
+
+          File.write(@path, entry_line(@entries.last), mode: "a")
         end
 
         # The file-creation gate (pi _persist's _hasConversation): user

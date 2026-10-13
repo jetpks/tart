@@ -31,18 +31,6 @@ module Tart
     # An invalid identity value — the launcher maps this to a clean abort.
     Error = Class.new(StandardError)
 
-    class << self
-      # The boot's resolved face, recorded by the launcher ({resolve} call
-      # sites in bin/tart). The one render path that cannot take the
-      # identity threaded — chat.rb's frozen Motd.tart_header_lines call —
-      # reads this (the Theme[] precedent: boot-applied render state).
-      attr_writer :current
-
-      def current
-        @current || TART
-      end
-    end
-
     module_function
 
     def resolve(cli: nil, settings: {}, env: ENV)

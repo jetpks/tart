@@ -43,6 +43,9 @@ module Tart
       # @return [String] pi's success text, or {error:} on failure.
       def execute(path:, content:)
         safe_execute do
+          failure = validate_input(path:, content:)
+          return failure if failure
+
           absolute_path = PathUtils.resolve_to_cwd(path, @cwd)
           FileMutationQueue.with(absolute_path) do
             RubyLLM::Support::Cancellation.check

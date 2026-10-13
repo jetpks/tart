@@ -1,0 +1,144 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# user-bash-stream-probe — the I38 mid-flight capture probe + deterministic
+# GATE for the user-bash streaming render (the I34/I26 tool-pending
+# discipline: the settle runner can only see SETTLED screens, and a user
+# bash runs no model turn — there is no turn edge to hang a capture on).
+#
+# Drives BOTH apps through the probe_user_bash scenario (one !-command
+# emitting a line per second for ~3 s): settles boot, types the command
+# line + Enter, captures plain+styled frame pairs at 0.5 s cadence until 4
+# identical (settled = the spinner is gone).
+#
+#   user-bash-stream-probe [--out DIR] [--gate]
+#
+# Default (evidence) mode: per app, numbered frame pairs
+# (<app>-frame-NN.txt/.styled) plus a digest line per frame on stdout
+# (header row? loader rows? output-row count). Exit 0.
+#
+# --gate (the frozen instrument, I38 AC5): per app, PASS iff
+#   (a) at least one pre-settle frame shows the header row AND the loader
+#       row AND >=1 OUTPUT row (a "probe line N" row that is not the
+#       header line — chunk rows painted before completion, the
+#       iteration's core claim);
+#   (b) the settled frame shows the header row, all three output rows,
+#       and ZERO loader rows;
+#   (c) every loader-bearing frame also carries the header row (the
+#       loader rides the block).
+# Both apps must pass (pi = the oracle control). On pass prints
+# USER_BASH_STREAM_GATE_OK and exits 0; otherwise prints the failing
+# condition's per-frame digest and exits 1.
+#
+# RED at base BY DESIGN (the I34/I35 tripwire precedent): the streaming
+# rows and this probe are the iteration's deliverables. Stdlib only —
+# runs without Bundler.
+
+require "optparse"
+require_relative "../lib/tui_split_rig"
+
+options = {out: "tmp/user-bash-stream-probe-#{Time.now.to_i}", gate: false}
+parser = OptionParser.new do |p|
+  p.on("--out DIR", "output directory (default tmp/user-bash-stream-probe-<ts>)") { |d| options[:out] = d }
+  p.on("--gate", "the I38 deterministic gate: header+loader+output mid-flight, settled block with zero loader rows") do
+    options[:gate] = true
+  end
+end
+parser.parse!(ARGV)
+
+# The header carries the typed command (the `$ <command>` row in both
+# apps); "probe line $i" inside it never matches the OUTPUT regex (a
+# literal $i, not a digit).
+HEADER_MARK = 'for i in 1 2 3'
+OUTPUT_ROW = /\bprobe line [123]\b/
+LOADER_MARK = "Running... (escape/ctrl+c to cancel)"
+
+def digest(plain)
+  {
+    header: plain.lines.any? { |line| line.include?(HEADER_MARK) },
+    loader: plain.lines.count { |line| line.include?(LOADER_MARK) },
+    output: plain.lines.count { |line| line =~ OUTPUT_ROW },
+  }
+end
+
+# The AC5 verdict for one app: (a) a pre-settle frame with header + loader
+# + output; (b) the settled frame (the last capture — the loop exits after
+# 4 identical frames) with the header, all three output rows, zero loader
+# rows; (c) every loader-bearing frame carries the header. Returns nil
+# when all hold, else the digest lines.
+def gate_failure(app, frames)
+  settled = frames.last
+  return ["#{app}: no frames captured"] if settled.nil?
+
+  pre = frames[0...-1]
+  a_ok = pre.any? { |frame| frame[:header] && frame[:loader] >= 1 && frame[:output] >= 1 }
+  b_ok = settled[:header] && settled[:output] >= 3 && settled[:loader].zero?
+  c_ok = frames.select { |frame| frame[:loader] >= 1 }.all? { |frame| frame[:header] }
+  return nil if a_ok && b_ok && c_ok
+
+  lines = []
+  lines << "#{app}: FAIL (a) no pre-settle frame with header + loader row + an output row" unless a_ok
+  unless b_ok
+    lines << "#{app}: FAIL (b) settled frame header=#{settled[:header]} output-rows=#{settled[:output]} " \
+      "loader-rows=#{settled[:loader]} (want header, 3, 0)"
+  end
+  lines << "#{app}: FAIL (c) a loader-bearing frame without the header row" unless c_ok
+  frames.each { |frame| lines << format("  %s frame %02d: header=%s loader=%d output-rows=%d",
+                                        app, frame[:n], frame[:header], frame[:loader], frame[:output]) }
+  lines
+end
+
+scenario = TuiSplitRig::Scenario.load(File.expand_path("../scenarios/probe_user_bash.yml", __dir__))
+runner = TuiSplitRig::Runner.new(scenario:, runs: 1, app: "both", out: File.join(options[:out], "unused"))
+stage = File.expand_path(options[:out])
+FileUtils.mkdir_p(stage)
+
+mock = MockLLMServer.new.script(scenario.responses).start
+gate_failures = []
+begin
+  %w[pi tart].each do |app|
+    mock.rearm!
+    boot = runner.boot_session(app, mock, 1, stage)
+    session = boot.fetch(:session)
+    runner.settle(session, "boot")
+    system("tmux", "send-keys", "-t", session, scenario.prompt, "Enter")
+
+    frame = 0
+    last = nil
+    same = 0
+    frames = []
+    loop do
+      plain = runner.capture(session)
+      styled = runner.capture_styled(session)
+      frame += 1
+      File.write(File.join(stage, "#{app}-frame-#{format('%02d', frame)}.txt"), plain)
+      File.write(File.join(stage, "#{app}-frame-#{format('%02d', frame)}.styled"), styled)
+      facts = digest(plain)
+      puts format("%s frame %02d: header=%s loader-rows=%d output-rows=%d",
+        app, frame, facts[:header], facts[:loader], facts[:output])
+      frames << {n: frame, **facts} if options[:gate]
+
+      same = plain == last ? same + 1 : 0
+      last = plain
+      break if same >= 4 # settled — the command is done (the spinner is gone)
+
+      break if frame >= 40 # hard cap ≈ 20 s
+      sleep 0.5
+    end
+    runner.teardown(session)
+    if options[:gate]
+      failure = gate_failure(app, frames)
+      gate_failures.concat(failure) if failure
+    end
+  end
+ensure
+  mock.stop
+end
+
+puts "frames at #{stage}"
+if options[:gate]
+  gate_failures.each { |line| puts line }
+  exit 1 unless gate_failures.empty?
+
+  puts "USER_BASH_STREAM_GATE_OK"
+end

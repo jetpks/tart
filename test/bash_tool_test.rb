@@ -73,6 +73,23 @@ module Tart
       assert_includes result[:error], "Invalid timeout: must be a finite number of seconds"
     end
 
+    # I43: the timeout gate is the contract rule now — same pinned message
+    # for the non-finite/zero cases, pi's loop wrapper for wrong types.
+    def test_non_finite_and_zero_timeouts_reject_with_the_pinned_message
+      pinned = {error: "Invalid timeout: must be a finite number of seconds"}
+      assert_equal pinned, tool.execute(command: "true", timeout: Float::INFINITY)
+      assert_equal pinned, tool.execute(command: "true", timeout: 0)
+    end
+
+    def test_wrong_typed_timeout_rejects_with_the_wrapper_vocabulary
+      result = tool.execute(command: "true", timeout: "5")
+
+      assert result.is_a?(Hash) && result.key?(:error)
+      assert result[:error].start_with?("Validation failed for tool \"bash\":\n  - timeout: "),
+        result[:error].inspect
+      assert_includes result[:error], "Received arguments:"
+    end
+
     def test_cancellation_kills_process_group_and_propagates
       marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
       cancelled = false
@@ -141,6 +158,56 @@ module Tart
       assert_no_probe(marker)
     end
 
+    # ---- the chunk seam (I38 — pi executeBashWithOperations' onChunk,
+    # bash-executor.ts:96-98: per pipe read, CR-REMOVED text). ----
+
+    # AC3: the joined callback stream equals the returned content after
+    # its CR-strip — the seam hands the same discipline the settled bytes
+    # carry (Grounds 2).
+    def test_run_user_streamed_chunks_join_to_the_returned_content
+      chunks = []
+      outcome = tool.run_user("printf 'alpha\\n'; sleep 0.2; printf 'beta\\r\\ngamma'",
+        on_chunk: ->(text) { chunks << text })
+
+      assert_operator chunks.length, :>=, 2, "both pipe reads fired the seam"
+      assert_equal outcome.content, chunks.join,
+        "the joined callback stream equals the returned content after its CR-strip"
+      refute_includes chunks.join, "\r", "CR removed per chunk, not just at the snapshot"
+    end
+
+    # The seam fires during the run (pi appendOutput + requestRender per
+    # chunk, interactive-mode.ts:7050-7057) — not once at the return.
+    def test_run_user_fires_the_seam_midflight_not_after_the_return
+      seen_after_return = nil
+      returned = false
+      outcome = tool.run_user("printf 'early\\n'; sleep 0.3; printf 'late\\n'",
+        on_chunk: ->(text) { seen_after_return ||= text if returned })
+      returned = true
+
+      assert_includes outcome.content, "early"
+      assert_nil seen_after_return, "chunks fired before run_user returned"
+    end
+
+    # A CR-only chunk strips to nothing — the joined stream is unaffected
+    # (the chat-level append is inert on "").
+    def test_run_user_cr_only_chunk_strips_to_nothing
+      chunks = []
+      tool.run_user("printf 'a\\rb'", on_chunk: ->(text) { chunks << text })
+
+      assert chunks.all? { |text| !text.include?("\r") }, "CR removed per chunk (AC3)"
+      assert_equal "ab", chunks.join
+    end
+
+    # The seam rides run_user alone: the model-facing execute passes
+    # nothing (its render is the I34 pending block — pi's tool path
+    # streams no chunk callback either).
+    def test_execute_takes_no_chunk_callback
+      assert_includes Tools::Bash.instance_method(:run_user).parameters.flatten, :on_chunk,
+        "the on_chunk seam rides run_user"
+      refute_includes Tools::Bash.instance_method(:execute).parameters.flatten, :on_chunk,
+        "execute passes nothing — no callback can fire on the model-facing path"
+    end
+
     # AC3: fast commands pay no poll quantum — exit detection is evented
     # (reaper thread + Queue), so `echo` rounds to Took 0.0s like pi.
     def test_fast_commands_pay_no_poll_quantum
@@ -154,10 +221,137 @@ module Tart
       assert_operator median, :<, 0.05, "durations: #{durations.map { it.round(4) }}"
     end
 
+    # ---- the session-env exposure family (I41 AC3 — pi's
+    # resolveSpawnContext, bash.ts:186-208): the TOOL path composes the
+    # child env (scrub-then-set, per-spawn resolution); run_user keeps
+    # plain inheritance. ----
+
+    # (a) the five vars present with correct sources.
+    def test_session_environment_exposes_pis_five_vars_from_the_readers
+      env = child_env(env_tool(session_env: {
+        "SESSION_ID" => -> { "sess-1" }, "SESSION_FILE" => -> { "/tmp/s-1.jsonl" },
+        "PROVIDER" => -> { "mock" }, "MODEL" => -> { "glm-5.3" },
+        "REASONING_LEVEL" => -> { "high" }
+      }))
+      assert_equal "sess-1", env["PI_SESSION_ID"]
+      assert_equal "/tmp/s-1.jsonl", env["PI_SESSION_FILE"]
+      assert_equal "mock", env["PI_PROVIDER"]
+      assert_equal "glm-5.3", env["PI_MODEL"]
+      assert_equal "high", env["PI_REASONING_LEVEL"]
+    end
+
+    # (b) a nil-ing reader leaves its var UNSET but still scrubs an
+    # inherited value.
+    def test_session_environment_nil_reader_unsets_but_still_scrubs_inherited_value
+      ENV["TART_MODEL"] = "inherited-model"
+      env = child_env(env_tool(identity: "tart",
+        session_env: {"MODEL" => -> { nil }, "SESSION_ID" => -> { "s-1" }}))
+
+      refute env.key?("TART_MODEL"), "the inherited value is scrubbed even though the reader nils"
+      assert_equal "s-1", env["TART_SESSION_ID"], "the truthy readers still expose"
+    ensure
+      ENV.delete("TART_MODEL")
+    end
+
+    # (c) an inherited parent var never reaches the child — the scrub
+    # happens even when NOTHING is exposed.
+    def test_session_environment_inherited_parent_var_never_reaches_the_child
+      ENV["PI_SESSION_ID"] = "parent-leak"
+      env = child_env(env_tool(session_env: {}))
+
+      refute env.key?("PI_SESSION_ID"), "the parent's value leaks past the scrub"
+    ensure
+      ENV.delete("PI_SESSION_ID")
+    end
+
+    # (d) run_user exposes NOTHING and does NOT scrub — pi's user-bash
+    # executor passes no env (bash-executor.ts:48-100): the inherited
+    # values ride unscrubbed, the readers never fire. (Vars the test sets
+    # itself — the parent harness may carry live PI_* of its own.)
+    def test_session_environment_run_user_exposes_nothing_and_never_scrubs
+      ENV["PI_SESSION_ID"] = "parent-leak"
+      ENV["PI_REASONING_LEVEL"] = "parent-level"
+      outcome = env_tool(identity: Identity::PI,
+        session_env: {"SESSION_ID" => -> { "composed" }, "REASONING_LEVEL" => -> { "composed-level" }})
+        .run_user('printf "session=%s level=%s" "$PI_SESSION_ID" "$PI_REASONING_LEVEL"')
+
+      assert_equal "session=parent-leak level=parent-level", outcome.content,
+        "plain inheritance: inherited values ride UNSCRUBBED, the readers never fire"
+    ensure
+      ENV.delete("PI_SESSION_ID")
+      ENV.delete("PI_REASONING_LEVEL")
+    end
+
+    # (e) the child keys follow the identity's namespace. The cross-prefix
+    # vars are neutralized in the parent (the scrub is prefix-scoped — a
+    # foreign-prefix var would legitimately inherit through, pi's rule).
+    def test_session_environment_keys_follow_the_identity_namespace
+      session_vars = %w[PI_SESSION_ID TART_SESSION_ID FOO_SESSION_ID]
+      saved = session_vars.to_h { |key| [key, ENV[key]] }
+      begin
+        saved.each_key { |key| ENV.delete(key) }
+        {
+          Identity::PI => "PI_SESSION_ID",
+          "tart" => "TART_SESSION_ID",
+          "foo" => "FOO_SESSION_ID"
+        }.each do |identity, key|
+          env = child_env(env_tool(identity:, session_env: {"SESSION_ID" => -> { "s-#{identity}" }}))
+          assert_equal "s-#{identity}", env[key]
+          (session_vars - [key]).each do |other|
+            refute env.key?(other), "#{other} set under identity #{identity}"
+          end
+        end
+      ensure
+        saved.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
+      end
+    end
+
+    # (f) values resolve AT SPAWN — a reader whose value changes between
+    # two executes is honored twice (pi's per-command-start resolution).
+    def test_session_environment_values_resolve_at_spawn_time
+      model = "first"
+      exposing = env_tool(session_env: {"MODEL" => -> { model }})
+
+      assert_equal "first", child_env(exposing)["PI_MODEL"]
+      model = "second"
+      assert_equal "second", child_env(exposing)["PI_MODEL"], "the reader re-resolved at the second spawn"
+    end
+
+    # (g) pi-mode parity shape: exactly pi's five key names exposed — the
+    # rest of the parent's PI_* inherits untouched (pi's prefix-scoped
+    # rule: only its own five are scrubbed, bash.ts:187-191).
+    def test_session_environment_pi_mode_shape_is_exactly_pis_five_keys
+      composed = Tools::Bash::SESSION_ENV_SUFFIXES.map { |suffix| "PI_#{suffix}" }
+      env = child_env(env_tool(session_env: {
+        "SESSION_ID" => -> { "s" }, "SESSION_FILE" => -> { "f" }, "PROVIDER" => -> { "p" },
+        "MODEL" => -> { "m" }, "REASONING_LEVEL" => -> { "l" }
+      }))
+
+      assert_equal (ENV.keys.grep(/\API_/) - composed + composed).sort, env.keys.grep(/\API_/).sort,
+        "the parent's PI_* minus the five scrubbed, plus the five composed — nothing else"
+      assert_equal({"PI_SESSION_ID" => "s", "PI_SESSION_FILE" => "f", "PI_PROVIDER" => "p",
+                    "PI_MODEL" => "m", "PI_REASONING_LEVEL" => "l"}, env.slice(*composed))
+    end
+
     private
 
     def tool
       @tool ||= Tools::Bash.new(cwd: @dir)
+    end
+
+    # A bash tool wired with the launcher's exposure seams (identity +
+    # readers, I41).
+    def env_tool(identity: Identity::DEFAULT, session_env: {})
+      Tools::Bash.new(cwd: @dir, identity:, session_env:)
+    end
+
+    # One execute round-trip: the child's `env` output as a hash (only
+    # VAR=VALUE lines parse — inherited multi-line values stay inert).
+    def child_env(exposing_tool)
+      result = exposing_tool.execute(command: "env")
+      raise "env failed: #{result[:error]}" if result.is_a?(Hash)
+
+      result.split("\n").select { |line| line.include?("=") }.to_h { |line| line.split("=", 2) }
     end
 
     # No zombie, no leaked process: nothing matching the unique marker may

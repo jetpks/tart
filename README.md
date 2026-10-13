@@ -48,7 +48,7 @@ a file that fails to parse counts as absent (defaults hold) with a warning.
 | `compaction.enabled` | `true` |
 | `compaction.reserveTokens` | `16384` |
 | `compaction.keepRecentTokens` | `20000` |
-| `defaultTools` | all built-in tools (`read write edit bash find grep ls`) |
+| `defaultTools` | `read bash edit write` (pi's default-4; `+find`-style modifiers append, plain lists replace) |
 | `identity` | `pi` |
 | `thinkingLevel` | `medium` (off/minimal/low/medium/high/xhigh/max) |
 | `modelReasoning` | — (the model's registry capability) |
@@ -71,7 +71,63 @@ provider.
 `defaultTools` takes plain names (replacing the default loadout), `+name`
 (adds), and `-name` (removes), in list order; a project list of only
 modifiers composes onto the user's selection, a project list with a plain
-name replaces it.
+name replaces it. The default is pi's four core tools (`read bash edit
+write`) — `"defaultTools": ["+find"]` appends `find` to it, and
+`["find", "grep", "ls"]` restores the pre-I41 search-tool superset.
+
+### Models
+
+The model catalog loads from `~/.tart/models.json` (pi's shape, JSON
+comments tolerated): `{"providers": {"<provider>": {name, baseUrl,
+apiKey, api, "models": [{id, name, reasoning, contextWindow, maxTokens,
+thinkingLevelMap}]}}}` plus an optional `"default"` boot reference
+(`"<provider/model-id>"`). The boot model resolves the
+identity-namespaced MODEL/PROVIDER env (below) > the models.json default
+> the settings `defaultModel`/`defaultProvider`.
+
+`thinkingLevelMap` maps the thinking levels onto the model's native
+`reasoning_effort` values (`{"off": "low", "low": "low", "medium":
+"medium", ...}`; a `null` marks a level unsupported, and `xhigh`/`max`
+need an explicit entry — without a map they are not offered). The
+selected level reaches the wire as `reasoning_effort` through the map:
+the map's value for the resolved level, else the level itself; a model
+that cannot turn thinking off floors `off` to the map's String `off`
+value (the default fireworks glm floors to `"low"`), and `off` sends
+nothing on models with no such floor. Prior assistant thinking is kept
+in the session and replayed on follow-up requests under
+`reasoning_content` (the field the provider's deltas carried), so later
+turns do not re-think from scratch.
+
+A model entry may also carry `compat` — pi's per-model dialect subset,
+which retargets the request shape for non-standard chat-completions
+endpoints. The carried keys: `thinkingFormat` (pi's eleven-literal
+vocabulary; `"zai"` switches the model to z.ai's dialect — a top-level
+`thinking` object on every request, `reasoning_effort` when the entry
+also sets `"supportsReasoningEffort": true`, `"tool_stream": true` when
+`"zaiToolStream": true` and the request carries tools, `system`
+instruction role unless `"supportsDeveloperRole": true`); and
+`maxTokensField` (`"max_tokens"` renames the summarization request's
+max-token field for endpoints that only accept the deprecated name).
+Unknown compat keys are tolerated and ignored (pi's schema keeps them
+`additionalProperties: true`), so a catalog copied from pi loads clean.
+The fireworks default boot is unchanged: a model without `compat` (or
+with a non-`zai` `thinkingFormat`) wires exactly as before. Note that
+`apiKey` values are passed through verbatim — `$ENV` references are NOT
+expanded; use a literal key or the `<IDENTITY>_API_KEY` environment
+override. A zai provider block looks like:
+
+```json
+{"providers": {"zai": {"name": "Z.AI",
+   "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+   "apiKey": "<key>",
+   "models": [{"id": "glm-5.3", "reasoning": true,
+     "contextWindow": 1000000, "maxTokens": 131072,
+     "thinkingLevelMap": {"off": null, "minimal": null, "low": "low",
+                          "medium": null, "high": "high", "xhigh": null, "max": "max"},
+     "compat": {"supportsDeveloperRole": false, "supportsReasoningEffort": true,
+                "maxTokensField": "max_tokens", "thinkingFormat": "zai",
+                "zaiToolStream": true}}]}}}
+```
 
 ### Skills
 
@@ -145,16 +201,18 @@ backward, Ctrl+A/E home/end, ↑/↓ recall history.
 
 ### Sessions
 
-Interactive runs are recorded by default — one JSONL session file per run
-under `~/.tart/sessions`, holding the header and every user and
-assistant message in order. Resume a previous session with `--resume`: with
-no argument it continues the most recent session for the working directory;
-with a session id or session-file path it continues that one (the resumed
-run records into a new session file linked to the old one):
+Interactive and print runs are recorded by default — one JSONL session file
+per run under the same root (`~/.tart/sessions`), holding the header and
+every user and assistant message in order. Resume a previous session with
+`--resume`: with no argument it continues the most recent session for the
+working directory; with a session id or session-file path it continues that
+one (the resumed run records into a new session file linked to the old one —
+interactive or `-p` alike):
 
 ```sh
 bundle exec ruby bin/tart --resume
 bundle exec ruby bin/tart --resume <session-id>
+bundle exec ruby bin/tart -p "keep going" --resume <session-id>
 ```
 
 #### Compaction
@@ -201,30 +259,44 @@ stdout, exit 0 (1 on error); no TUI anywhere on the path:
 bundle exec ruby bin/tart -p "list the ruby files in this repo"
 ```
 
-Print runs are not recorded (the session store is wired into the interactive
-path only).
+Print runs record like interactive ones: one session file per run under the
+same root, and `--resume` works with `-p` — the continued run seeds the
+recorded context and records into a new parent-linked file. The compaction
+lever applies on print runs too: `<IDENTITY>_CONTEXT_WINDOW` (e.g.
+`PI_CONTEXT_WINDOW`)/`TART_CONTEXT_WINDOW` arms the threshold, and the
+`compaction` settings (`enabled`, `reserveTokens`, `keepRecentTokens`)
+shape it — see Compaction above.
 
 ### Input-line editing
 
-The input line is a single-line editor with a visible cursor (the grapheme at
-the insertion point renders inverse-video; at end-of-input a highlighted
-trailing space), mid-line editing, in-memory history, and word-wise
-operations — the pi `editor.ts`/`input.ts`/`word-navigation.ts` subset
-(single-line; no multi-line editing, undo/kill-ring, or autocomplete):
+The input line is a multi-line editor with a visible cursor (the grapheme at
+the insertion point renders inverse-video; at end-of-line a highlighted
+trailing space): logical lines wrap into visual rows at the box width (pi's
+visual-line model — `editor.ts` wordWrapLine/layoutText), the box grows with
+the content up to pi's visible-window cap (`max(5, floor(rows * 0.3))`, with
+` ↑ N more ` / ` ↓ N more ` borders), and the cursor navigates wrapped rows
+with pi's sticky column. Mid-line editing, in-memory history, the emacs
+kill/yank ring, and word-wise operations come from the pi
+`editor.ts`/`input.ts`/`word-navigation.ts` subset (no undo, no paste-marker
+compaction, autocomplete unchanged):
 
 | Key | Action |
 |---|---|
 | printable characters | insert at the cursor |
-| Left / Right | move the cursor one character (Ctrl+B / Ctrl+F too) |
-| Backspace | delete before the cursor |
-| Delete / Ctrl+D | delete after the cursor |
-| Home / End (Ctrl+A / Ctrl+E) | jump to line start / end |
-| Alt+Left or Alt+B (Ctrl+Left) | jump one word backward |
-| Alt+Right or Alt+F (Ctrl+Right) | jump one word forward |
-| Ctrl+W or Alt+Backspace | delete one word backward |
-| Alt+D or Alt+Delete | delete one word forward |
-| Up / Down | recall previous / next sent message |
-| Enter | send (steers a running agent) |
+| Left / Right | move one character, wrapping across lines (Ctrl+B / Ctrl+F too) |
+| Up / Down | move one visual row (sticky column); recall previous / next sent message at the editor's top/bottom |
+| Backspace | delete before the cursor (merges lines at a line start) |
+| Delete / Ctrl+D | delete after the cursor (merges lines at a line end; exits when empty) |
+| Home / End (Ctrl+A / Ctrl+E) | jump to the logical line's start / end |
+| Alt+Left or Alt+B (Ctrl+Left) | jump one word backward (crosses line starts) |
+| Alt+Right or Alt+F (Ctrl+Right) | jump one word forward (crosses line ends) |
+| Ctrl+W or Alt+Backspace | delete one word backward (the newline at a line start) |
+| Alt+D or Alt+Delete | delete one word forward (the newline at a line end) |
+| Ctrl+U / Ctrl+K | kill to the logical line's start / end (the newline at a boundary merges the lines) |
+| Ctrl+Y / Alt+Y | yank / yank-pop (multi-line ring text splices across lines) |
+| Shift+Enter or Alt+Enter, Ctrl+J | insert a newline |
+| Enter | send (a `\\` before the cursor becomes a newline instead; steers a running agent) |
+| PageUp / PageDown | page the editor's visual rows (sticky column, clamped) |
 
 History is in-memory for the session (most recent first, capped at 100,
 no consecutive duplicates): Up walks older entries, Down returns toward the
@@ -232,6 +304,111 @@ draft you were typing, and a recalled entry is editable and sends as edited.
 Word operations stop at whitespace, punctuation, and word boundaries (pi's
 `word-navigation.ts` semantics — on `hello world|`, Ctrl+W deletes `world`
 and keeps the separator space).
+
+## Memory
+
+The native memory module (the owner's pi memory extension, ported) keeps a
+per-project memory store and recalls it at session start. It is OPT-IN and
+OFF by default: add `"memory": true` to settings.json (user
+`~/.tart/settings.json` or project `<workdir>/.tart/settings.json`) or set
+`<IDENTITY>_MEMORY=1` (pi reads `PI_MEMORY`, tart `TART_MEMORY`). With the
+gate on, every boot runs the same behavior as the owner's pi: the session's
+first turn carries a recall message — `[project memory] index loaded at
+session start; use the memory tool (read/list) for topic files:` followed by
+the first 200 lines / 25KB of the project index (a truncation notice rides
+the tail when anything was cut).
+
+The store lives under `<IDENTITY>_MEMORY_HOME` (pi: `PI_MEMORY_HOME`, tart:
+`TART_MEMORY_HOME`) or `~/.tart/memory`: one directory per project (the git
+root's basename, so every worktree of a repo shares one store; the cwd
+basename outside any repo), containing `MEMORY.md` (the index — one
+`- [topic](slug.md): first line` row per save) and the `<slug>.md` topic
+files. The `memory` tool (declared last on the wire) drives it: `save`
+stores text under a topic (the file carries a `modified:` frontmatter
+header; the index row upserts), `read` returns a topic file, `list` returns
+the index. The two memory guidelines join the system prompt's rules; the
+MOTD's [Extensions] section gains a `memory.ts` row.
+
+## Subagents
+
+The native delegation core: the `subagent` tool drives print-mode
+subprocess children — foreground (blocking) or async detached — with the
+run registry on disk, steering, stop, both timeout kinds, and a completion
+notification that wakes an idle interactive parent. It is OPT-IN and OFF by
+default: add `"subagents": true` to settings.json (user or project) or set
+`<IDENTITY>_SUBAGENTS=1` (pi reads `PI_SUBAGENTS`, tart `TART_SUBAGENTS`).
+With the gate off, nothing changes — no tool on the wire, no watcher, no
+run dirs.
+
+Built-in agents: `worker` (implementation; read/grep/find/ls/bash/edit/
+write), `oracle` (high-context decision consistency; runs from a FORK of
+the parent conversation and needs a recorded parent session — without one
+it runs fresh), `reviewer` (read-only review; read/grep/find/ls). Model
+routing: `model:` accepts `provider/id` or `provider/id:level` (the level
+suffix: off/minimal/low/medium/high/xhigh/max).
+
+Spawning: `subagent({ agent: "worker", task: "..." })` — `async` defaults
+to TRUE: the tool returns the start message immediately (`Async: <agent>
+[<id>]` + guidance) and the parent's turn ends free; the child runs as a
+detached `tart -p` subprocess and survives the parent. Completion arrives
+as a native notification (`Background task <state>: **<agent>**` with the
+result preview, run dir, and session file) and wakes an idle interactive
+parent. `async: false` blocks the tool call until the child finishes and
+returns its output verbatim.
+
+Managing runs: `action: "status"` (the fleet, or one run by `id:` — lines
+`Run:/State:/Mode:/Started:/Updated:/Dir:/Output:`), `action: "steer"` +
+`id:` + `message:` (mode `steer` delivers into the running turn,
+`follow_up` queues, `auto` — the default — picks), and `action: "stop"` +
+`id:`. A steer receipt reports `delivered` only when the CHILD consumed
+that request id (its steer-log entry) — never mere inbox acceptance.
+
+Run dirs live under `~/.tart/subagents/<run-id>/` (`<IDENTITY>_SUBAGENTS_HOME`
+overrides the root): `status.json` (the lifecycle: running → completed |
+failed | stopped, `result.json` written before the terminal flip, the task
+text never recorded — length only), `result.json`, `runner.stdout.log` /
+`runner.stderr.log`, `system-prompt.md`, the child's `sessions/`, and
+`control/{steer-requests,stop-requests}/` (the file inbox the child
+consumes at its turn boundaries).
+
+Timeouts (both recommended explicit for long children — the 30-minute run
+default kills): `timeout_ms` is the run-level deadline (default 1800000;
+0 = unbounded; expiration lands the run stopped + timedOut — enforced on
+BOTH sides, the parent supervisor and the child's own deadline env), and
+`tool_timeout_ms` is the per-tool-call hard deadline (default unset; it
+rides `<IDENTITY>_TOOL_TIMEOUT_MS` and becomes the bash tool's default for
+calls that omit `timeout`).
+
+Print-mode parents drain outstanding children at agent end (notifications
+record on the session, no extra stdout). The child harness is the print
+subprocess itself: `tart -p <task> --tools ... --system-prompt-file ...
+--session-root <run>/sessions --steer-inbox <run>/control/steer-requests`
+under a CLOSED env (no nesting, no MCP). The in-process child option was
+measured (~26ms delegation overhead) and recorded as the rejected-for-now
+alternative: async detach forces a subprocess (a child must survive parent
+exit) and one harness keeps steering/stop/deadline/status identical for
+both modes.
+
+CUT this iteration (profiles/intercom/council and everything beyond the
+owner's working set are the next entry — see the iteration record's OQ-6):
+workflows/chains/parallel, worktree isolation, acceptance gates, missions,
+the fleet UI, bg_wait, MCP-direct agents, external-CLI adapters, nested
+delegation.
+
+## Herdr
+
+When tart runs inside a herdr pane (all three env vars set: `HERDR_ENV=1`,
+`HERDR_SOCKET_PATH`, `HERDR_PANE_ID`), the agent-state reporter publishes
+the session's state to herdr over a UNIX socket — newline-terminated JSON
+requests (`pane.report_agent`, `pane.report_agent_session`; ids
+`herdr:pi[:session]:<epoch_ms>:<rand>`), one attempt at 500ms then one
+retry at 1500ms, every failure swallowed, never blocking the UI, latest
+state winning while a send is in flight. Reports are TUI-only (print mode
+reports nothing) and carry pi-valued wire fields (`source: "herdr:pi"`,
+`agent: "pi"`) plus the session file path. States: `working` while a turn
+runs, `idle` between turns, `blocked` while a herdr:blocked channel count
+is open. The MOTD's [Extensions] section gains a `herdr-agent-state` row
+when the gate is on.
 
 ## Parity rig: tui-split-rig
 

@@ -133,6 +133,21 @@ module TuiSplitRig
       assert_nil scenario.context_window, "the probe needs no window shrink"
     end
 
+    # The I38 user-bash streaming probe's driver (Grounds 7): the
+    # !-command emits a line per second for ~3 s (pre-settle frames carry
+    # the loader + output rows against the 0.5 s cadence); the inert
+    # scripted reply is never requested (a user bash runs no model turn —
+    # the loader constraints make one ride along).
+    def test_loads_the_shipped_probe_user_bash_scenario
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/probe_user_bash.yml"))
+      assert_equal "probe_user_bash", scenario.name
+      assert_equal '!for i in 1 2 3; do echo "probe line $i"; sleep 1; done', scenario.prompt
+      assert_equal 1, scenario.expected_requests
+      assert_equal 1, scenario.responses.size
+      assert_match(/probe line/, scenario.prompt, "the probe's output rows echo the header's loop body")
+      assert_nil scenario.context_window, "the probe needs no window shrink"
+    end
+
     def test_context_window_is_optional_and_defaults_to_nil
       path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
       File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
@@ -231,6 +246,68 @@ module TuiSplitRig
       assert_match(/suppress_usage must be a boolean/, error.message)
     end
 
+    # --- the post-settle keys + the resource staging (I33, s9) ---
+
+    def test_post_settle_keys_default_to_empty_and_load_from_the_shipped_s9
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert_empty Scenario.load(path).post_settle_keys
+
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s9_startup_help.yml"))
+      assert_equal ["C-o"], scenario.post_settle_keys
+      assert scenario.stage_project_resources, "s9 stages the loaded-resource set"
+    end
+
+    def test_post_settle_keys_must_be_a_list_of_strings
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\npost_settle_keys: C-o\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/post_settle_keys must be a list of key strings/, error.message)
+
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\npost_settle_keys: [1, 2]\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/post_settle_keys must be a list of key strings/, error.message)
+    end
+
+    def test_non_boolean_stage_project_resources_is_a_rig_error
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nstage_project_resources: sure\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/stage_project_resources must be a boolean/, error.message)
+    end
+
+    # The staging writes BOTH apps' resource sets byte-identical: AGENTS.md
+    # at the cwd, a project skill + prompt under each config dir, a user
+    # skill in the staged agent dir (pi) / settings root (tart) — with a
+    # DISTINCT user-skill name (the base s9 run: same-name skills fire
+    # both apps' collision diagnostics).
+    def test_stage_project_resources_writes_both_apps_resource_sets
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s9_startup_help.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      home = File.join(Dir.mktmpdir("tui-split-rig-home-"), "tart")
+      sandbox = File.join(Dir.mktmpdir("tui-split-rig-sandbox-"))
+      agent_dir = File.join(Dir.mktmpdir("tui-split-rig-agent-"), "pi")
+      FileUtils.mkdir_p(home)
+
+      runner.stage_project_resources(home:, sandbox:, agent_dir:)
+
+      assert File.file?(File.join(sandbox, "AGENTS.md"))
+      assert_equal File.read(File.join(sandbox, ".pi", "skills", "demo.md")),
+        File.read(File.join(sandbox, ".tart", "skills", "demo.md")), "the project skills are byte-identical"
+      assert_equal File.read(File.join(sandbox, ".pi", "prompts", "demo.md")),
+        File.read(File.join(sandbox, ".tart", "prompts", "demo.md")), "the prompt templates are byte-identical"
+      refute_equal File.read(File.join(sandbox, ".pi", "skills", "demo.md")),
+        File.read(File.join(agent_dir, "skills", "demo-user.md")), "the user skill carries its own name"
+      assert_equal File.read(File.join(agent_dir, "skills", "demo-user.md")),
+        File.read(File.join(home, ".tart", "skills", "demo-user.md")), "the user skills are byte-identical"
+      [File.join(sandbox, ".pi", "skills", "demo.md"), File.join(agent_dir, "skills", "demo-user.md")].each do |path|
+        assert_match(/\A---\nname: /, File.read(path), "valid frontmatter (a missing description blocks the port's load)")
+      end
+    end
+
     # --- the prefix-aware env staging (I32 AC4) ---(
 
     def runner_for(name)
@@ -287,6 +364,106 @@ module TuiSplitRig
       ENV.delete("PI_API_KEY")
       ENV.delete("TART_MODEL")
       ENV.delete("TART_CONTEXT_WINDOW")
+    end
+
+    # --- the memory-recall staging (I47, s11) ---
+
+    # The stage_memory knob (the s11 instrument): a boolean scenario field,
+    # false when absent, a rig error when mistyped.
+    def test_stage_memory_defaults_to_false_and_loads_from_the_shipped_s11
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      refute Scenario.load(path).stage_memory
+
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s11_memory_recall.yml"))
+      assert scenario.stage_memory, "s11 stages the memory-recall set"
+      assert_equal "hello", scenario.prompt
+      assert_equal 1, scenario.expected_requests
+      assert_equal [{type: :stream, content: "Memory recall staged; fixed reply for the scenario."}], scenario.responses
+    end
+
+    def test_non_boolean_stage_memory_is_a_rig_error
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nstage_memory: definitely\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/stage_memory must be a boolean/, error.message)
+    end
+
+    # The staging writes BOTH apps' memory set: pi — the owner's memory.ts
+    # VERBATIM (byte-identical to the rig fixture) in the staged agent
+    # dir's extensions/ + the frozen index under <agentDir>/memory/<key>;
+    # tart — the "memory": true settings row + the same index under
+    # .tart/memory/<key>. The temp sandboxes sit under the macOS temp root
+    # (no .git anywhere above), so the walk falls back to the sandbox
+    # basename — the keys here are literally "pi" and "tart", the frozen
+    # letter's paths.
+    def test_stage_memory_writes_both_apps_memory_set
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s11_memory_recall.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      fixture = File.read(File.join(RIG_ROOT, "fixtures/memory.ts"))
+      index = "- [deploy](deploy.md): deploys via herdr pipeline, stage first\n" \
+              "- [api-notes](api-notes.md): gateway streams SSE, no websockets\n"
+
+      pi_home = File.join(Dir.mktmpdir("tui-split-rig-home-"), "pi")
+      agent_dir = File.join(pi_home, ".pi", "agent")
+      FileUtils.mkdir_p(agent_dir)
+      runner.stage_memory("pi", home: pi_home, sandbox: File.join(Dir.mktmpdir("tui-split-rig-sandbox-"), "pi"), agent_dir:)
+      assert_equal fixture, File.read(File.join(agent_dir, "extensions", "memory.ts")),
+        "the staged extension is the fixture VERBATIM"
+      assert_equal index, File.read(File.join(agent_dir, "memory", "pi", "MEMORY.md"))
+
+      tart_home = File.join(Dir.mktmpdir("tui-split-rig-home-"), "tart")
+      runner.stage_memory("tart", home: tart_home, sandbox: File.join(Dir.mktmpdir("tui-split-rig-sandbox-"), "tart"))
+      assert_equal index, File.read(File.join(tart_home, ".tart", "memory", "tart", "MEMORY.md")),
+        "the index bytes are identical per app"
+      settings = JSON.parse(File.read(File.join(tart_home, ".tart", "settings.json")))
+      assert_equal true, settings.fetch("memory"), "the core lane's gate row"
+    end
+
+    # The project key is memory.ts's OWN rule, mirrored (memory.ts:29-44):
+    # a .git entry (file or dir — worktrees use a file) anywhere ABOVE the
+    # sandbox renames the key to that root's basename — the rig's out dirs
+    # live inside the tart checkout, so the fallback key never survives a
+    # real run (PHASE 0: with a hard-coded key the recall no-ops live).
+    def test_stage_memory_walks_up_for_a_git_root_like_memory_ts
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s11_memory_recall.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      index = "- [deploy](deploy.md): deploys via herdr pipeline, stage first\n" \
+              "- [api-notes](api-notes.md): gateway streams SSE, no websockets\n"
+
+      repo = File.join(Dir.mktmpdir("tui-split-rig-repo-"), "myrepo")
+      FileUtils.mkdir_p(repo)
+      FileUtils.mkdir_p(File.join(repo, "nested"))
+      File.write(File.join(repo, ".git"), "gitdir: elsewhere\n")
+      home = File.join(Dir.mktmpdir("tui-split-rig-home-"), "pi")
+      agent_dir = File.join(home, ".pi", "agent")
+      FileUtils.mkdir_p(agent_dir)
+
+      runner.stage_memory("pi", home:, sandbox: File.join(repo, "nested", "sandbox"), agent_dir:)
+      assert_equal index, File.read(File.join(agent_dir, "memory", "myrepo", "MEMORY.md")),
+        "the key is the walked git root's basename (memory.ts:44)"
+    end
+
+    # The tart merge must not clobber the compaction rows the
+    # context_window lever writes (the s7/s8 family) — deep-merge, existing
+    # rows survive, memory just joins them.
+    def test_stage_memory_merges_into_existing_tart_settings
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s11_memory_recall.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      home = File.join(Dir.mktmpdir("tui-split-rig-home-"), "tart")
+      settings_path = File.join(home, ".tart", "settings.json")
+      FileUtils.mkdir_p(File.dirname(settings_path))
+      File.write(settings_path, JSON.pretty_generate(
+        "compaction" => {"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0}
+      ))
+
+      runner.stage_memory("tart", home:, sandbox: File.join(Dir.mktmpdir("tui-split-rig-sandbox-"), "tart"))
+
+      settings = JSON.parse(File.read(settings_path))
+      assert_equal true, settings.fetch("memory")
+      assert_equal({"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0},
+        settings.fetch("compaction"), "the compaction rows survive the merge")
     end
 
   end

@@ -1,0 +1,19 @@
+# The user-bash streaming probe's driver (I38 — NOT a parity gate): the
+# !-command line is typed and bin/user-bash-stream-probe captures DURING
+# the run (the settle runner only sees settled screens; a user bash runs
+# no model turn, so there is no turn edge to hang a capture on — Grounds
+# 7). One line per second for ~3 s: against the 0.5 s capture cadence the
+# pre-settle frames carry the loader row AND already-emitted output rows,
+# and the spinner's 80 ms advance keeps pre-settle frames mutually
+# distinct (settle detection = spinner gone).
+#
+# The scripted reply is never requested (the user bash involves no model
+# turn; the probe ignores request counts, like the tool-pending probe) —
+# the loader constraints (scenario.rb:62-77: expected_requests positive,
+# responses non-empty) make one inert reply ride along.
+name: probe_user_bash
+prompt: '!for i in 1 2 3; do echo "probe line $i"; sleep 1; done'
+expected_requests: 1
+responses:
+  - type: stream
+    content: "Inert scripted reply — the user bash never requests a model turn."

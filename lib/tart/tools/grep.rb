@@ -49,6 +49,9 @@ module Tart
       # @return [String] formatted matches, or {error:} on failure.
       def execute(pattern:, path: nil, glob: nil, ignore_case: nil, literal: nil, context: nil, limit: nil)
         safe_execute do
+          failure = validate_input(pattern:, path:, glob:, ignore_case:, literal:, context:, limit:)
+          return failure if failure
+
           RubyLLM::Support::Cancellation.check
           rg_path = rg_binary
           raise ArgumentError, "ripgrep (rg) is not available and could not be downloaded" unless rg_path

@@ -48,6 +48,51 @@ module Tart
       assert result.settings.dig("compaction", "enabled")
     end
 
+    # --- I47: the memory gate rows (OQ-1) ---
+
+    def test_memory_gate_rows_default_off_with_the_identity_env_suffix
+      assert_equal false, Settings::DEFAULTS["memory"]
+      assert_equal "MEMORY", Settings::RESOLUTION_ENV["memory"]
+      assert_equal "PI_MEMORY", Identity.env_key("pi", Settings::RESOLUTION_ENV["memory"])
+      assert_equal "TART_MEMORY", Identity.env_key("tart", Settings::RESOLUTION_ENV["memory"])
+    end
+
+    def test_memory_is_a_known_key_and_resolves_env_over_file_over_default
+      result = load_settings
+      assert_empty result.diagnostics, "the memory row is known — no unknown-key warning"
+      assert_equal false, result.settings["memory"]
+
+      write_settings(@user_path, '{"memory": true}')
+      assert_equal true, load_settings.settings["memory"]
+
+      assert_equal "1", Settings.resolve_setting("memory", {}, identity: "pi", env: {"PI_MEMORY" => "1"})
+      assert_equal false, Settings.resolve_setting("memory", {}, identity: "tart", env: {}),
+        "the DEFAULTS tier is false"
+    end
+
+    # --- I48: the subagents gate rows + the thinkingLevel env tier (OQ-1) ---
+
+    def test_subagents_gate_rows_default_off_with_the_identity_env_suffix
+      assert_equal false, Settings::DEFAULTS["subagents"]
+      assert_equal "SUBAGENTS", Settings::RESOLUTION_ENV["subagents"]
+      assert_equal "THINKING_LEVEL", Settings::RESOLUTION_ENV["thinkingLevel"]
+      assert_equal "PI_SUBAGENTS", Identity.env_key("pi", Settings::RESOLUTION_ENV["subagents"])
+      assert_equal "TART_SUBAGENTS", Identity.env_key("tart", Settings::RESOLUTION_ENV["subagents"])
+    end
+
+    def test_subagents_is_a_known_key_and_resolves_env_over_file_over_default
+      result = load_settings
+      assert_empty result.diagnostics, "the subagents row is known — no unknown-key warning"
+      assert_equal false, result.settings["subagents"]
+
+      write_settings(@user_path, '{"subagents": true}')
+      assert_equal true, load_settings.settings["subagents"]
+
+      assert_equal "1", Settings.resolve_setting("subagents", {}, identity: "pi", env: {"PI_SUBAGENTS" => "1"})
+      assert_equal false, Settings.resolve_setting("subagents", {}, identity: "tart", env: {}),
+        "the DEFAULTS tier is false"
+    end
+
     def test_project_deep_merges_over_user
       write_settings(@user_path, '{"compaction": {"reserveTokens": 1000, "keepRecentTokens": 500}}')
       write_settings(@project_path, '{"compaction": {"reserveTokens": 2000}, "defaultModel": "m-project"}')
@@ -275,6 +320,98 @@ module Tart
       assert_equal "medium", Settings.resolve_thinking_level(load_settings.settings)
     end
 
+    # The FILE-declared default (I40, pi settings-manager.ts:758-760 —
+    # getDefaultThinkingLevel is undefined unless a settings FILE declares
+    # the key; the baked built-in never counts). The switch path's default
+    # tier (chat.rb apply_model_selection — pi
+    # _getThinkingLevelForModelSwitch agent-session.ts:2670-2679).
+    def test_declared_thinking_level_reads_the_user_file
+      write_settings(@user_path, '{"thinkingLevel": "xhigh"}')
+
+      assert_equal "xhigh", Settings.declared_thinking_level(root: @root, cwd: @cwd)
+    end
+
+    def test_declared_thinking_level_project_overrides_user
+      write_settings(@user_path, '{"thinkingLevel": "xhigh"}')
+      write_settings(@project_path, '{"thinkingLevel": "low"}')
+
+      assert_equal "low", Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "project over user (the {load} precedence)"
+    end
+
+    def test_declared_thinking_level_user_value_survives_a_keyless_project_file
+      write_settings(@user_path, '{"thinkingLevel": "xhigh"}')
+      write_settings(@project_path, '{"defaultModel": "m-project"}')
+
+      assert_equal "xhigh", Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "per-key deep merge: an unrelated project key never clobbers the user's declaration"
+    end
+
+    def test_declared_thinking_level_is_nil_when_no_file_declares_the_key
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "no files at all — the baked DEFAULTS[thinkingLevel] never counts"
+
+      write_settings(@user_path, '{"defaultModel": "m"}')
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "files without the key — still undeclared (pi's defaultThinkingLevel is undefined)"
+    end
+
+    def test_declared_thinking_level_off_vocabulary_value_reads_as_nil
+      write_settings(@user_path, '{"thinkingLevel": "loud"}')
+
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "pi's settings schema cannot declare an off-vocabulary level"
+    end
+
+    def test_declared_thinking_level_re_reads_across_a_save
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd)
+
+      Settings.save(@root, "thinkingLevel" => "high")
+
+      assert_equal "high", Settings.declared_thinking_level(root: @root, cwd: @cwd),
+        "re-read from disk per call — a mid-session persist is live"
+    end
+
+    # --- the known-models thinkingLevelMap tier + the fact composition (I36) ---
+
+    def test_known_thinking_level_map_reads_the_daily_driver
+      map = Settings.known_thinking_level_map("accounts/fireworks/models/glm-5p3-flash")
+      assert_equal "low", map.fetch(:off), "the owner's override floors off to low"
+      assert_equal "medium", map.fetch(:medium)
+      assert_equal "max", map.fetch(:max)
+      assert_nil Settings.known_thinking_level_map("mock-1"), "unknown ids have no known map"
+      assert_nil Settings.known_thinking_level_map(nil)
+    end
+
+    def test_thinking_facts_catalog_entry_wins
+      entry = Shapes::Model.new(id: "m", name: "m", reasoning: false, context_window: nil,
+        max_tokens: nil, thinking_level_map: {low: "low"}, provider: "glm")
+      facts = Settings.thinking_facts(entry, {"modelReasoning" => true}, model_id: entry.id)
+      assert_equal false, facts.reasoning, "the entry's flag decides over the staged env"
+      assert_equal ({low: "low"}), facts.thinking_level_map
+    end
+
+    def test_thinking_facts_known_tables_when_the_entry_declares_none
+      entry = Shapes::Model.new(id: "accounts/fireworks/models/glm-5p3-flash", name: "glm", reasoning: true,
+        context_window: nil, max_tokens: nil, thinking_level_map: nil, provider: "glm")
+      facts = Settings.thinking_facts(entry, nil, model_id: entry.id)
+      assert_equal true, facts.reasoning
+      assert_equal Settings.known_thinking_level_map(entry.id), facts.thinking_level_map,
+        "a map-less entry falls back to the known table (catalog-entry-first, known-tables-second)"
+    end
+
+    def test_thinking_facts_without_a_catalog_entry
+      model = RubyLLM::Model.default("mock-1", "openai")
+      facts = Settings.thinking_facts(nil, {}, model_id: "mock-1", model: model)
+      assert_equal false, facts.reasoning, "model_reasoning_capable decides (an assumed mock: not reasoning)"
+      assert_nil facts.thinking_level_map, "no known map for the unknown id"
+
+      glm = Settings.thinking_facts(nil, {}, model_id: "accounts/fireworks/models/glm-5p3-flash",
+        model: RubyLLM::Model.default("accounts/fireworks/models/glm-5p3-flash", "openai"))
+      assert glm.reasoning, "the known-models table declares the daily driver reasoning-capable"
+      assert_equal Settings.known_thinking_level_map("accounts/fireworks/models/glm-5p3-flash"), glm.thinking_level_map
+    end
+
     # --- defaultTools ---
 
     def test_default_tools_plain_names_replace_the_base
@@ -285,9 +422,9 @@ module Tart
     end
 
     def test_default_tools_modifiers_apply_in_order_onto_the_base
-      assert_equal %w[read write edit bash find grep ls mcp],
+      assert_equal %w[read bash edit write mcp],
         Settings.selected_tools({"defaultTools" => ["+mcp"]})
-      assert_equal %w[read write edit find grep ls],
+      assert_equal %w[read edit write],
         Settings.selected_tools({"defaultTools" => ["-bash"]})
       # A mixed list: plain names form the selection, modifiers then apply.
       assert_equal %w[grep read], Settings.selected_tools({"defaultTools" => ["grep", "+read", "-bash"]})
@@ -373,6 +510,99 @@ module Tart
       assert compaction["tokensBefore"].is_a?(Integer)
     ensure
       FileUtils.rm_rf(dir)
+    end
+
+    # --- I43: the resolution precedence matrix + the contract corners ---
+
+    # Every carried resolution key × every tier combination × every identity:
+    # env-only / file-only / default-only (none) / env+file (all) — the
+    # env+default and file+default outcomes are the env-only / file-only
+    # rows (the default tier only ever fires with both others empty), so
+    # this table covers the full eight-combination matrix. The resolved
+    # values are today's, exactly (AC2: schema contracts changed no outcome).
+    def test_resolution_precedence_matrix_across_tiers_and_identities
+      Settings::RESOLUTION_ENV.each do |key, suffix|
+        file_value = "file-#{key}"
+        env_value = "env-#{key}"
+        default_value = Settings::DEFAULTS.fetch(key)
+        {
+          {env: false, file: false} => default_value,
+          {env: true, file: false} => env_value,
+          {env: false, file: true} => file_value,
+          {env: true, file: true} => env_value
+        }.each do |tiers, expected|
+          %w[pi tart foo].each do |identity|
+            env_hash = tiers[:env] ? {"#{identity.upcase}_#{suffix}" => env_value} : {}
+            settings = tiers[:file] ? {key => file_value} : {}
+            resolved = Settings.resolve_setting(key, settings, identity:, env: env_hash)
+            if expected.nil?
+              assert_nil resolved, "#{key} env=#{tiers[:env]} file=#{tiers[:file]} under #{identity}"
+            else
+              assert_equal expected, resolved, "#{key} env=#{tiers[:env]} file=#{tiers[:file]} under #{identity}"
+            end
+          end
+        end
+      end
+    end
+
+    # The context-window ladder's fall-through corners: a non-digit env
+    # value (incl. "+5"/"-5"/whitespace — the digit-string contract is
+    # today's /\A\d+\z/) and a non-positive file value read as absent and
+    # the next tier decides.
+    def test_context_window_ladder_falls_through_non_digit_env_and_non_positive_file
+      model = RubyLLM::Model.new(id: "m-1", context_window: 5000)
+
+      ["abc", "-5", "+5", " 5", "5.5", ""].each do |junk|
+        ENV["PI_CONTEXT_WINDOW"] = junk
+        assert_equal 5000, Settings.resolve_context_window(model:), "env #{junk.inspect} falls through"
+      end
+
+      ENV["PI_CONTEXT_WINDOW"] = "007"
+      assert_equal 7, Settings.resolve_context_window(model:), "a digit-string coerces (leading zeros included)"
+      ENV.delete("PI_CONTEXT_WINDOW")
+
+      [0, -1, "5", 5.5].each do |junk|
+        write_settings(@project_path, %({"contextWindow": #{JSON.generate(junk)}}))
+        assert_equal 5000, Settings.resolve_context_window(settings: load_settings.settings, model:),
+          "file #{junk.inspect} falls through to the model"
+      end
+    end
+
+    # The thinking vocabulary: only pi's levels pass; a mistyped value (a
+    # number, not just an off-vocabulary string) falls back / reads as nil.
+    def test_thinking_level_out_of_vocabulary_values
+      assert_equal "medium", Settings.resolve_thinking_level({"thinkingLevel" => 5})
+      assert_equal "medium", Settings.resolve_thinking_level({"thinkingLevel" => nil})
+      write_settings(@user_path, '{"thinkingLevel": 5}')
+      assert_nil Settings.declared_thinking_level(root: @root, cwd: @cwd)
+    end
+
+    # A staged modelReasoning value outside the true|false|"true"|"false"
+    # vocabulary answers false — today's `staged == true || staged ==
+    # "true"` short-circuit, never the registry/table fallback (AC2's
+    # outcome table).
+    def test_model_reasoning_out_of_vocabulary_staged_value_answers_false
+      model = RubyLLM::Model.default("accounts/fireworks/models/glm-5p3-flash", "openai")
+
+      assert_equal false, Settings.model_reasoning_capable({"modelReasoning" => "junk"}, model),
+        "out-of-vocabulary staged short-circuits to false (not the known table's true)"
+      assert_equal false, Settings.model_reasoning_capable({"modelReasoning" => 5}, model)
+    end
+
+    # pi settings-manager.ts:126: settings files are NOT validated — a
+    # malformed value replaces instead of throwing. The schemas are a typed
+    # view, never a gate: type-invalid file values land in Result#settings
+    # verbatim with NO new diagnostics (the diagnostic set is observable).
+    def test_type_invalid_file_values_flow_through_unfiltered
+      write_settings(@user_path,
+        '{"contextWindow": "abc", "thinkingLevel": 5, "apiKey": 7, "compaction": {"enabled": "yes"}, "identity": "pi"}')
+
+      result = load_settings
+      assert_equal "abc", result.settings["contextWindow"]
+      assert_equal 5, result.settings["thinkingLevel"]
+      assert_equal 7, result.settings["apiKey"]
+      assert_equal "yes", result.settings.dig("compaction", "enabled")
+      assert_empty result.diagnostics, "no new diagnostics — the schema is a view, not a gate"
     end
   end
 end

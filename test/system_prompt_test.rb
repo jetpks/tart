@@ -63,12 +63,56 @@ module Tart
       </cwd>
     PROMPT
 
+    # pi's captured <tools> section at the default-4 loadout (see the
+    # derivation note on the test below).
+    GOLDEN_TOOLS = <<~TOOLS.chomp
+      - read: Read file contents
+      - bash: Execute bash commands (ls, grep, find, etc.)
+      - edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call
+      - write: Create or overwrite files
+
+      In addition to the tools above, you may have access to other custom tools depending on the project.
+    TOOLS
+
+    # pi's captured <rules> section at the default-4 loadout — the
+    # loadout-conditional bullet first, then the per-tool guidelines in
+    # DEFAULT_TOOL_NAMES order (see the derivation note on the test below).
+    GOLDEN_RULES = <<~RULES.chomp
+      - Use bash for file operations like ls, rg, find
+      - Use read to examine files instead of cat or sed.
+      - You can inspect PI_* environment variables for current model and session details.
+      - Use edit for precise changes (edits[].oldText must match exactly)
+      - When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls
+      - Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.
+      - Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.
+      - Use write only for new files or complete rewrites.
+      - Be concise in your responses
+      - Show file paths clearly when working with files
+    RULES
+
     # AC2: the composed prompt IS pi's captured system message, byte for
     # byte, at the same tool loadout, cwd normalized.
     def test_pi_mode_composition_is_byte_identical_to_pis_captured_request
       built = Agent::SystemPrompt.build(selected_tools: %w[read bash edit write],
         cwd: "CWD_PLACEHOLDER", docs_paths: DOCS)
       assert_equal PI_CAPTURE.chomp, built
+    end
+
+    # I41 (AC2): the DEFAULT loadout's <tools>/<rules> sections are pi's
+    # captured bytes VERBATIM — DERIVED FROM PI'S CAPTURED REQUEST (the
+    # I32 doctrine, never the port's own output): the oracle app's own
+    # bytes (tmp/i41-base-s8_zero_usage_compaction/run-1/
+    # pi-requests.jsonl, request 1 — Grounds 1's fresh capture),
+    # cross-checked against pi's sources (edit.ts:44 snippet, bash.ts:46).
+    # The loadout-bearing bytes this pin protects: the loadout-conditional
+    # bullet FIRST and the read → bash → edit → write guideline order
+    # (pi's DEFAULT_TOOL_NAMES order, settings-manager.ts:82 — the order
+    # the wire tools array follows too).
+    def test_default_loadout_sections_are_pis_captured_bytes
+      built = Agent::SystemPrompt.build(selected_tools: Settings.selected_tools({}),
+        cwd: "/p", docs_paths: DOCS)
+      assert_equal GOLDEN_TOOLS, built[/<tools>\n(.*?)\n<\/tools>/m, 1]
+      assert_equal GOLDEN_RULES, built[/<rules>\n(.*?)\n<\/rules>/m, 1]
     end
 
     # The <docs> resolver reproduces pi's getPackageDir walk (config.ts
@@ -251,6 +295,42 @@ module Tart
       bare = Agent::SystemPrompt.build(cwd: "/p", docs_paths: DOCS)
       refute_includes bare, "project_context"
       assert_equal [], Agent::ContextFiles.load(cwd: Dir.mktmpdir("tart-ctx-bare-"), agent_dir: Dir.mktmpdir("tart-ctx-bare2-"))
+    end
+    # --- I47: the prompt_guidelines seam (pi system-prompt.ts:121) ---
+
+    def test_prompt_guidelines_sit_after_the_tool_bullets_and_before_be_concise
+      built = Agent::SystemPrompt.build(
+        selected_tools: %w[read bash edit write],
+        cwd: "/tmp/p",
+        prompt_guidelines: [
+          "Use the memory tool to save durable facts, user preferences, and corrections worth carrying to " \
+            "future sessions \u2014 never secrets and never one-off task state.",
+          "Use the memory tool list/read actions to recall saved topics on demand instead of guessing what was " \
+            "remembered."
+        ]
+      )
+      rules = built[/.*<rules>\n(.*?)\n<\/rules>/m, 1].lines.map(&:strip)
+
+      first = rules.index { |line| line.start_with?("- Use the memory tool to save durable facts") }
+      refute_nil first, "the first guideline bullet is present"
+      assert rules[first + 1].start_with?("- Use the memory tool list/read actions"), "the second bullet follows"
+      assert_equal "- Be concise in your responses", rules[first + 2], "before the conciseness bullet"
+
+      plain = Agent::SystemPrompt.build(selected_tools: %w[read bash edit write], cwd: "/tmp/p")
+      refute_includes plain, "memory", "empty guidelines = today's bytes (the no-memory prompt never says memory)"
+    end
+
+    def test_prompt_guidelines_dedup_and_trim_like_the_other_rules
+      built = Agent::SystemPrompt.build(
+        selected_tools: %w[read],
+        cwd: "/tmp/p",
+        prompt_guidelines: ["  twice  ", "twice", "Use read to examine files instead of cat or sed."]
+      )
+      rules = built[/.*<rules>\n(.*?)\n<\/rules>/m, 1].lines.map(&:strip)
+
+      assert_equal 1, rules.count("- twice"), "the duplicate trims and dedups"
+      assert_equal 1, rules.count("- Use read to examine files instead of cat or sed."),
+        "a per-tool bullet repeated as a guideline dedups"
     end
   end
 end

@@ -39,6 +39,11 @@ module Tart
       # observed (pi checks signal.aborted between events).
       CHECKPOINT_INTERVAL = 0.05
 
+      # The session-env suffixes the TOOL path scrubs + exposes (pi's five,
+      # docs/environment-variables.md "Shell Tool Session Environment");
+      # the child keys are <IDENTITY>_<SUFFIX> under the resolved face.
+      SESSION_ENV_SUFFIXES = %w[SESSION_ID SESSION_FILE PROVIDER MODEL REASONING_LEVEL].freeze
+
       attr_reader :cwd, :details
 
       # The raw execution outcome (pi bash-executor.ts BashResult shape —
@@ -47,9 +52,34 @@ module Tart
       BashOutcome = Struct.new(:content, :exit_code, :cancelled, :truncation, :full_output_path,
                                keyword_init: true)
 
-      def initialize(cwd:)
+      # @param cwd [String] working directory.
+      # @param identity [String] the resolved face — the child env keys ride
+      #   its namespace (pi PI_*, tart TART_*, foo FOO_*).
+      # @param session_env [Hash{String => Proc}] SUFFIX → reader, resolved
+      #   AT SPAWN (pi resolves per command start — a mid-session model
+      #   switch or level change reaches the next command); a nil reader
+      #   value leaves its var unset. The launcher wires the live readers
+      #   ({Tools::Registry.build} threads it here).
+      def initialize(cwd:, identity: Identity::DEFAULT, session_env: {}, env: ENV)
         @cwd = cwd
+        @identity = identity
+        @session_env = session_env
         @details = nil
+        # I48 (OQ-8): the subagents child spawn carries
+        # <IDENTITY>_TOOL_TIMEOUT_MS (T2's second kind); when set to a
+        # positive integer it is the DEFAULT timeout for calls that omit
+        # one (explicit call values always win; unset = today, no
+        # default). The env speaks MILLISECONDS, the bash timeout param
+        # SECONDS — converted here. Read ONCE per construction; an
+        # invalid value is ignored with a warn — the env never crashes a
+        # child boot.
+        raw = env[Identity.env_key(identity, "TOOL_TIMEOUT_MS")]
+        millis = raw&.match(/\A\d+\z/) ? Integer(raw, 10) : nil
+        unless millis.nil? || millis.positive?
+          warn "tart: ignoring invalid #{Identity.env_key(identity, "TOOL_TIMEOUT_MS")}=#{raw.inspect}"
+          millis = nil
+        end
+        @env_default_timeout = millis && millis / 1000.0
       end
 
       description DESCRIPTION
@@ -65,7 +95,18 @@ module Tart
       # bash-executor.ts:146-158). No timeout: pi's user bash runs until
       # done or esc-cancelled. An aborted command still returns the
       # output it produced so far (bash-executor.ts:135-141).
-      def run_user(command)
+      #
+      # @param on_chunk [Proc, nil] +call(text)+ per pipe read, the text
+      #   CR-REMOVED — the same rule the returned content applies, applied
+      #   per chunk (pi executeBashWithOperations fires onChunk with the
+      #   sanitized text, bash-executor.ts:96-98; the port's sanitize is
+      #   the CR strip alone — ANSI stays the itemized cut, so mid-flight
+      #   bytes agree with the settled ones). pi's executor skips empty
+      #   sanitized text; the port's strip-only rule makes an empty call a
+      #   no-op downstream, so the seam fires per read unconditionally.
+      #   Fires from the reader threads — push-only work (the bridge
+      #   queue), never render state.
+      def run_user(command, on_chunk: nil)
         raise Errno::ENOENT, "Working directory does not exist: #{@cwd}\nCannot execute bash commands." unless
           File.exist?(@cwd)
 
@@ -79,7 +120,7 @@ module Tart
         cancelled = false
         outcome =
           begin
-            spawn_and_stream(command, output, nil)
+            spawn_and_stream(command, output, nil, on_chunk:)
           rescue RubyLLM::CancelledError, Async::Cancel
             cancelled = true
             {exit_code: nil}
@@ -95,12 +136,19 @@ module Tart
       #   reports as error results with a status line appended.
       def execute(command:, timeout: nil)
         safe_execute do
-          timeout_seconds = resolve_timeout(timeout)
+          # I48 (OQ-8): an omitted call timeout falls back to the
+          # <IDENTITY>_TOOL_TIMEOUT_MS default (read at construction);
+          # an explicit value — including an invalid one, which the
+          # schema validation rejects below — always wins.
+          timeout = @env_default_timeout if timeout.nil? && @env_default_timeout
+          failure = validate_input(command:, timeout:)
+          return failure if failure
+
           raise Errno::ENOENT, "Working directory does not exist: #{@cwd}\nCannot execute bash commands." unless
             File.exist?(@cwd)
 
           started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          output, outcome = spawn_and_accumulate(command, timeout_seconds)
+          output, outcome = spawn_and_accumulate(command, timeout)
           wall_time_seconds = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at).round(1)
           snapshot = finish_output(output)
 
@@ -136,21 +184,32 @@ module Tart
       # returns the accumulator with the raw outcome — the caller finishes
       # and snapshots (the tool's model-facing assembly and the user-bash
       # executor's BashResult assembly differ).
-      def spawn_and_accumulate(command, timeout_seconds)
+      def spawn_and_accumulate(command, timeout)
         output = OutputAccumulator.new(temp_file_prefix: "tart-bash")
-        outcome = spawn_and_stream(command, output, timeout_seconds)
+        # No on_chunk: the model-facing execute render is the I34 pending
+        # block — pi's tool path streams no chunk callback either.
+        outcome = spawn_and_stream(command, output, timeout, env: session_env_for_spawn)
         [output, outcome]
       end
 
-      def resolve_timeout(timeout)
-        return if timeout.nil?
-        raise ArgumentError, "Invalid timeout: must be a finite number of seconds" unless
-          timeout.is_a?(Numeric) && timeout.finite? && timeout.positive?
-
-        timeout
+      # pi resolveSpawnContext (bash.ts:186-208): a COPY of the parent env
+      # with THIS identity's five keys scrubbed FIRST — inherited parent
+      # values never leak, even when a reader nils; the scrub is
+      # prefix-scoped (pi deletes only its own five PI_*, so a port nested
+      # in a real pi parent still sees the parent's PI_*). Then each truthy
+      # reader value sets <IDENTITY>_<SUFFIX>. run_user never calls this
+      # (pi's user-bash executor passes no env and never scrubs).
+      def session_env_for_spawn
+        env = ENV.to_h
+        SESSION_ENV_SUFFIXES.each { |suffix| env.delete(Identity.env_key(@identity, suffix)) }
+        @session_env.each do |suffix, reader|
+          value = reader.call
+          env[Identity.env_key(@identity, suffix)] = value if value
+        end
+        env
       end
 
-      def spawn_and_stream(command, output, timeout_seconds)
+      def spawn_and_stream(command, output, timeout_seconds, on_chunk: nil, env: nil)
         out_rd, out_wr = IO.pipe
         err_rd, err_wr = IO.pipe
         pid = nil
@@ -158,13 +217,23 @@ module Tart
         timed_out = false
 
         begin
-          pid = Process.spawn("/bin/bash", "-c", command, chdir: @cwd, pgroup: true,
-                              in: File::NULL, out: out_wr, err: out_wr)
+          if env
+            # The tool path: the composed hash IS the child env —
+            # unsetenv_others makes the scrub real (no inherited copy
+            # bleeds through).
+            pid = Process.spawn(env, "/bin/bash", "-c", command, chdir: @cwd, pgroup: true,
+                                in: File::NULL, out: out_wr, err: out_wr, unsetenv_others: true)
+          else
+            # Plain inheritance: run_user (pi's user-bash executor, no env).
+            pid = Process.spawn("/bin/bash", "-c", command, chdir: @cwd, pgroup: true,
+                                in: File::NULL, out: out_wr, err: out_wr)
+          end
           out_wr.close
           err_wr.close
 
           # One reader per output pipe (pi: one fiber per pipe).
-          readers = [Thread.new { drain_pipe(out_rd, output) }, Thread.new { drain_pipe(err_rd, output) }]
+          readers = [Thread.new { drain_pipe(out_rd, output, on_chunk) },
+                     Thread.new { drain_pipe(err_rd, output, on_chunk) }]
 
           deadline = timeout_seconds && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
 
@@ -239,13 +308,17 @@ module Tart
         end
       end
 
-      def drain_pipe(io, output)
+      def drain_pipe(io, output, on_chunk)
         loop do
           io.wait_readable(0.1) or next
           data = io.read_nonblock(65_536, exception: false)
           break if data.nil? # EOF
 
           output.append(data)
+          # The chunk seam (pi onChunk per pipe data event): CR-REMOVED —
+          # commutes with the string-buffer join and with tail-truncation's
+          # line accounting, so mid-flight rows agree with the settled block.
+          on_chunk&.call(data.gsub("\r", ""))
         end
       rescue StandardError
         nil
