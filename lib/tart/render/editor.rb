@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "undo_stack"
+
 module Tart
   module Render
     # The input editor (pi's Editor, components/editor.ts 1.1.0): a
@@ -48,6 +50,13 @@ module Tart
       # column within the row text.
       LayoutRow = Struct.new(:text, :has_cursor, :cursor_pos, keyword_init: true)
 
+      # The undo snapshot (pi EditorSnapshot, editor.ts:225-229, minus
+      # its pastes/pasteCounter halves — the large-paste marker registry
+      # is a recorded I35 cut, itemized; the port's snapshot is exactly
+      # pi's EditorState triple). {UndoStack#push} deep-copies, so a
+      # snapshot is detached from the live buffer the moment it stacks.
+      Snapshot = Struct.new(:lines, :cursor_line, :cursor_col, keyword_init: true)
+
       # @return [Array<String>] the logical lines (always ≥ 1; pi
       #   EditorState.lines).
       # @return [Integer] the cursor's logical line / column (pi
@@ -79,6 +88,7 @@ module Tart
         @history_draft = nil
         @kill_ring = KillRing.new
         @last_action = nil
+        @undo_stack = UndoStack.new # pi undoStack field, editor.ts:368
       end
 
       # The joined buffer (pi getText, editor.ts:1088) — the
@@ -99,8 +109,12 @@ module Tart
 
       # The clear op (the escape bash-mode clear and the ctrl+c app.clear —
       # both Chat branches ran exactly these lines at base; the window
-      # reset is pi submitValue's scrollOffset = 0, editor.ts:921).
+      # reset is pi submitValue's scrollOffset = 0, editor.ts:921). pi
+      # setText's push-if-content-differs (editor.ts:1120-1124) makes
+      # these clears UNDOABLE — only the submit surface clears the stack
+      # (Chat#submit → clear_undo_stack, pi submitValue :1373).
       def clear
+        push_undo_snapshot unless input.empty?
         @lines = [""]
         @cursor_line = 0
         set_cursor_col(0)
@@ -114,6 +128,7 @@ module Tart
       # verbatim base behavior). Flat-string line-0 contract: the slash
       # token only ever lives on line 0 ({slash_token} gates to it).
       def replace_token(lead, text, cursor)
+        push_undo_snapshot # pi pushes at every applyCompletion site (editor.ts:772/793/2244/2395) — undoable
         @lines[0] = "#{@lines[0][0, lead]}#{text}"
         @cursor_line = 0
         set_cursor_col(cursor)
@@ -129,6 +144,13 @@ module Tart
       # windows.
       def insert(text)
         exit_history_browsing
+        # pi's fish-style coalescing (:1209-1212): push iff the char is
+        # whitespace or the previous action wasn't typing — consecutive
+        # word-chars are ONE undo unit, each space its own (captured
+        # pre-space). The port's insert is single-char through
+        # insert_printable; multi-char text (test setups) follows the
+        # same whitespace rule.
+        push_undo_snapshot if text.match?(WHITESPACE) || @last_action != :type_word
         line = @lines[@cursor_line]
         @lines[@cursor_line] = "#{line[0, @cursor_col]}#{text}#{line[@cursor_col..]}"
         set_cursor_col(@cursor_col + text.length)
@@ -145,6 +167,7 @@ module Tart
       def insert_paste(text)
         exit_history_browsing
         @last_action = nil # pi handlePaste editor.ts:1263
+        push_undo_snapshot # pi handlePaste editor.ts:1265 — unconditional, before the filters
         filtered = self.class.normalize_text(text).each_char.select do |char|
           char == "\n" || char.ord >= 32
         end.join
@@ -156,6 +179,7 @@ module Tart
       def add_new_line
         exit_history_browsing
         @last_action = nil
+        push_undo_snapshot # pi addNewLine editor.ts:1333
         line = @lines[@cursor_line]
         @lines[@cursor_line] = line[0, @cursor_col]
         @lines.insert(@cursor_line + 1, line[@cursor_col..])
@@ -170,10 +194,12 @@ module Tart
         exit_history_browsing
         @last_action = nil
         if @cursor_col.positive?
+          push_undo_snapshot # pi handleBackspace editor.ts:1384
           line = @lines[@cursor_line]
           @lines[@cursor_line] = line[0, @cursor_col - 1] + line[@cursor_col..]
           set_cursor_col(@cursor_col - 1)
         elsif @cursor_line.positive?
+          push_undo_snapshot # pi handleBackspace editor.ts:1430
           merge_with_previous_line
         end
       end
@@ -185,8 +211,10 @@ module Tart
         @last_action = nil
         line = @lines[@cursor_line]
         if @cursor_col < line.length
+          push_undo_snapshot # pi handleForwardDelete editor.ts:1786
           @lines[@cursor_line] = line[0, @cursor_col] + line[(@cursor_col + 1)..]
         elsif @cursor_line < @lines.length - 1
+          push_undo_snapshot # pi handleForwardDelete editor.ts:1800
           @lines[@cursor_line] = line + @lines.delete_at(@cursor_line + 1)
         end
       end
@@ -327,12 +355,14 @@ module Tart
       def delete_to_line_start
         exit_history_browsing
         if @cursor_col.positive?
+          push_undo_snapshot # pi deleteToStartOfLine editor.ts:1631 — before the ring push
           line = @lines[@cursor_line]
           @kill_ring.push(line[0, @cursor_col], prepend: true, accumulate: @last_action == :kill)
           @last_action = :kill
           @lines[@cursor_line] = line[@cursor_col..]
           set_cursor_col(0)
         elsif @cursor_line.positive?
+          push_undo_snapshot # pi deleteToStartOfLine editor.ts:1642
           kill_newline_merge_previous
         end
       end
@@ -343,10 +373,12 @@ module Tart
         exit_history_browsing
         line = @lines[@cursor_line]
         if @cursor_col < line.length
+          push_undo_snapshot # pi deleteToEndOfLine editor.ts:1666 — before the ring push
           @kill_ring.push(line[@cursor_col..], prepend: false, accumulate: @last_action == :kill)
           @last_action = :kill
           @lines[@cursor_line] = line[0, @cursor_col]
         elsif @cursor_line < @lines.length - 1
+          push_undo_snapshot # pi deleteToEndOfLine editor.ts:1676
           @kill_ring.push("\n", prepend: false, accumulate: @last_action == :kill)
           @last_action = :kill
           @lines[@cursor_line] = line + @lines.delete_at(@cursor_line + 1)
@@ -360,6 +392,7 @@ module Tart
       def yank
         return if @kill_ring.length.zero?
 
+        push_undo_snapshot # pi yank editor.ts:2001 — right after the empty-ring guard
         text = @kill_ring.peek
         exit_history_browsing
         insert_multiline(text)
@@ -373,6 +406,7 @@ module Tart
       def yank_pop
         return unless @last_action == :yank && @kill_ring.length > 1
 
+        push_undo_snapshot # pi yankPop editor.ts:2017 — right after the guard
         yanked = @kill_ring.peek
         exit_history_browsing
         delete_yanked_text(yanked)
@@ -390,10 +424,14 @@ module Tart
         exit_history_browsing
         line = @lines[@cursor_line]
         if @cursor_col.zero?
-          kill_newline_merge_previous if @cursor_line.positive?
+          if @cursor_line.positive?
+            push_undo_snapshot # pi deleteWordBackwards editor.ts:1700
+            kill_newline_merge_previous
+          end
           return
         end
 
+        push_undo_snapshot # pi deleteWordBackwards editor.ts:1713 — before the ring push
         was_kill = @last_action == :kill
         target = self.class.find_word_backward(line, @cursor_col)
         @kill_ring.push(line[target...@cursor_col], prepend: true, accumulate: was_kill)
@@ -409,6 +447,7 @@ module Tart
         line = @lines[@cursor_line]
         if @cursor_col >= line.length
           if @cursor_line < @lines.length - 1
+            push_undo_snapshot # pi deleteWordForward editor.ts:1745
             @kill_ring.push("\n", prepend: false, accumulate: @last_action == :kill)
             @last_action = :kill
             @lines[@cursor_line] = line + @lines.delete_at(@cursor_line + 1)
@@ -416,6 +455,7 @@ module Tart
           return
         end
 
+        push_undo_snapshot # pi deleteWordForward editor.ts:1756 — before the ring push
         was_kill = @last_action == :kill
         target = self.class.find_word_forward(line, @cursor_col)
         @kill_ring.push(line[@cursor_col...target], prepend: false, accumulate: was_kill)
@@ -435,6 +475,34 @@ module Tart
         return unless event.text? && !(event.modifiers & %w[ctrl alt]).any?
 
         insert(event.code)
+      end
+
+      # --- undo (pi undoStack + undo(), editor.ts:2116-2134) ---
+
+      # pi undo(): exit history browsing FIRST, pop, empty → no-op, then
+      # restore the state triple by DIRECT assignment (pi Object.assign —
+      # no set_cursor_col; the sticky column nils explicitly below). The
+      # kill-ring windows break (@last_action niled — the accumulate and
+      # yank-pop windows close) but the ring itself is never snapshotted
+      # and never cleared: undo restores text, never ring contents. The
+      # render window stays alone (@scroll_offset/@last_width untouched —
+      # pi touches neither; the window re-clamps at the next render).
+      def undo
+        exit_history_browsing
+        snapshot = @undo_stack.pop
+        return if snapshot.nil?
+
+        @lines = snapshot.lines
+        @cursor_line = snapshot.cursor_line
+        @cursor_col = snapshot.cursor_col
+        @last_action = nil # pi — undo closes the kill-accumulate and yank-pop windows
+        @preferred_visual_col = nil
+      end
+
+      # pi submitValue's undoStack.clear() (editor.ts:1373) — the ONLY
+      # stack-clear site; Chat#submit calls this right after {clear}.
+      def clear_undo_stack
+        @undo_stack.clear
       end
 
       # --- history ---
@@ -914,6 +982,15 @@ module Tart
         set_cursor_col(previous.length)
       end
 
+      # pi pushUndoSnapshot (editor.ts:2116-2119): the LIVE state fields
+      # go into the snapshot (lines, cursor_line, cursor_col) and the
+      # stack's push deep-copies — the mutation that follows can't reach
+      # it. pi's snapshot also carries pastes/pasteCounter (editor.ts
+      # :225-229) — cut with the large-paste marker feature, itemized.
+      def push_undo_snapshot
+        @undo_stack.push(Snapshot.new(lines: @lines, cursor_line: @cursor_line, cursor_col: @cursor_col))
+      end
+
       def navigate_history(direction)
         @last_action = nil # pi navigateHistory editor.ts:475
         return if @history.empty?
@@ -921,7 +998,10 @@ module Tart
         new_index = @history_index - direction
         return if new_index < -1 || new_index >= @history.size
 
-        @history_draft = [@lines.dup, @cursor_line, @cursor_col] if @history_index == -1 && new_index >= 0
+        if @history_index == -1 && new_index >= 0
+          push_undo_snapshot # pi navigateHistory editor.ts:465 — before the draft capture
+          @history_draft = [@lines.dup, @cursor_line, @cursor_col]
+        end
         @history_index = new_index
         if @history_index == -1
           lines, line, col = @history_draft || [[""], 0, 0]
