@@ -374,6 +374,24 @@ module Tart
           @entries = [Session.header(id: @id, cwd: @cwd, parent_session:)]
           @ids = Set.new
           @leaf_id = nil
+          # The fork entry copy (pi forkFrom, session-manager.ts:1847-1853):
+          # a fork is content-complete — every NON-header entry of the
+          # parent appends VERBATIM (ids, parentIds, timestamps unchanged;
+          # merged into @ids so regenerated ids cannot collide) and @leaf_id
+          # threads from the last copied entry, so new appends chain from
+          # the copied tail. A missing/invalid parent reads as []
+          # (load_entries' parse contract): a dangling parentSession link
+          # degrades to the header-only shape, never crashes. The copied
+          # entries persist with the first flush (persist's
+          # conversation-bearing gate holds) — a fork that never turns stays
+          # setup-only.
+          Session.load_entries(parent_session || "").each do |entry|
+            next unless entry.is_a?(Hash) && entry["type"] != "session"
+
+            @ids << entry["id"]
+            @leaf_id = entry["id"]
+            @entries << entry
+          end
           @flushed = false
         end
 

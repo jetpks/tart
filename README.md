@@ -170,16 +170,18 @@ backward, Ctrl+A/E home/end, ↑/↓ recall history.
 
 ### Sessions
 
-Interactive runs are recorded by default — one JSONL session file per run
-under `~/.tart/sessions`, holding the header and every user and
-assistant message in order. Resume a previous session with `--resume`: with
-no argument it continues the most recent session for the working directory;
-with a session id or session-file path it continues that one (the resumed
-run records into a new session file linked to the old one):
+Interactive and print runs are recorded by default — one JSONL session file
+per run under the same root (`~/.tart/sessions`), holding the header and
+every user and assistant message in order. Resume a previous session with
+`--resume`: with no argument it continues the most recent session for the
+working directory; with a session id or session-file path it continues that
+one (the resumed run records into a new session file linked to the old one —
+interactive or `-p` alike):
 
 ```sh
 bundle exec ruby bin/tart --resume
 bundle exec ruby bin/tart --resume <session-id>
+bundle exec ruby bin/tart -p "keep going" --resume <session-id>
 ```
 
 #### Compaction
@@ -226,8 +228,13 @@ stdout, exit 0 (1 on error); no TUI anywhere on the path:
 bundle exec ruby bin/tart -p "list the ruby files in this repo"
 ```
 
-Print runs are not recorded (the session store is wired into the interactive
-path only).
+Print runs record like interactive ones: one session file per run under the
+same root, and `--resume` works with `-p` — the continued run seeds the
+recorded context and records into a new parent-linked file. The compaction
+lever applies on print runs too: `<IDENTITY>_CONTEXT_WINDOW` (e.g.
+`PI_CONTEXT_WINDOW`)/`TART_CONTEXT_WINDOW` arms the threshold, and the
+`compaction` settings (`enabled`, `reserveTokens`, `keepRecentTokens`)
+shape it — see Compaction above.
 
 ### Input-line editing
 

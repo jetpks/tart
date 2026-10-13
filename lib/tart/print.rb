@@ -42,12 +42,31 @@ module Tart
     # @param identity [String] the resolved face (Tart::Identity) — forwarded
     #   to the loop, whose env tier (<IDENTITY>_CONTEXT_WINDOW) follows it
     #   (I41 AC4; the interactive path already threads it).
+    # @param recorder [Session::Recorder, nil] the optional session recorder
+    #   (pi's SessionManager, message subset): every message this run adds is
+    #   appended to the session file in order; +nil+ = off. The launcher
+    #   constructs one ALWAYS on print runs (I42: a print run records; a
+    #   resumed one records into the fork).
+    # @param seed_messages [Array<Hash, RubyLLM::Message>] prior context
+    #   messages to seed the chat with before the run (resume:
+    #   Agent::Session.context_messages) — the model sees them on the wire,
+    #   they are never re-recorded as new messages.
+    # @param context_window [Integer, nil] the model's context window,
+    #   overriding the resolution order <IDENTITY>_CONTEXT_WINDOW →
+    #   chat.model.context_window → nil (nil/<= 0 disables the threshold
+    #   trigger only; the overflow trigger always fires). The launcher keeps
+    #   nil so the loop's env tier resolves <IDENTITY>_CONTEXT_WINDOW itself.
+    # @param compaction [Hash, Compaction::Settings, nil] compaction
+    #   settings ({enabled:, reserve_tokens:, keep_recent_tokens:});
+    #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
     # @return [Integer] the exit code (pi's runPrintMode return).
     def run(prompt:, chat:, tools:, system_prompt: nil, on_event: nil,
+            recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
             stdout: $stdout, stderr: $stderr, thinking_level: Settings::DEFAULTS.fetch("thinkingLevel"),
             model_reasoning: false, thinking_level_map: nil, identity: Identity::DEFAULT)
       stdout.sync = true
       agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,
+        recorder:, seed_messages:, context_window:, compaction:,
         thinking_level:, model_reasoning:, thinking_level_map:, identity:)
       Core::Loop.new(session: NullSession.new).run { agent.run(prompt) }
       return error_exit(agent, stderr) if agent.last_error || agent.interrupted?
