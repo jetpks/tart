@@ -33,6 +33,11 @@ Gem::Specification.new do |spec|
   # family — settings resolution, models.json, mcp.json, tool inputs).
   spec.add_dependency "dry-schema", "~> 1.16"
   spec.add_dependency "dry-validation", "~> 1.11"
+  # Typed internal shapes (I44 dry-rb-shapes: the lib/tart/shapes family —
+  # the Model catalog, the resolved-settings view, the session-entry read
+  # path). dry-types is declared directly: the shapes files require it.
+  spec.add_dependency "dry-struct", "~> 1.8"
+  spec.add_dependency "dry-types", "~> 1.9"
   # RFC 9562 uuid generation (pi createSessionId :264 / generateId :275).
   spec.add_dependency "fast-uuid", "~> 0.1.0"
   # LLM conversation loop (BRIEF §2: >= 2.1.0).

@@ -3,6 +3,8 @@
 require "json"
 require "fileutils"
 require_relative "agent/session"
+require_relative "shapes/types"
+require_relative "shapes/model"
 
 module Tart
   module Settings
@@ -35,6 +37,12 @@ module Tart
     ROOT_KEY = "settings.json"
     CONFIG_DIR = ".tart"
 
+    # pi's runtime default thinking level (defaults.ts:3,
+    # model-resolver.ts:646) — the single source of the DEFAULTS row below;
+    # the render-side fallbacks read this constant. Typed at load: the
+    # literal must speak Strict::String, or the boot fails right here.
+    DEFAULT_THINKING_LEVEL = Shapes::Types::Strict::String["medium"].freeze
+
     DEFAULTS = {
       "identity" => Identity::DEFAULT,
       "defaultModel" => "accounts/fireworks/models/glm-5p3-flash",
@@ -42,7 +50,7 @@ module Tart
       "apiBase" => "https://api.fireworks.ai/inference/v1",
       "apiKey" => nil,
       "contextWindow" => nil,
-      "thinkingLevel" => "medium",
+      "thinkingLevel" => DEFAULT_THINKING_LEVEL,
       "compaction" => {"enabled" => true, "reserveTokens" => 16_384, "keepRecentTokens" => 20_000},
       # Footer model-metadata staging (rarely set; nil = resolve from the
       # model, see {model_reasoning_capable}).
@@ -73,17 +81,23 @@ module Tart
       "modelReasoning" => "MODEL_REASONING"
     }.freeze
 
-    MODEL_CONTEXT_WINDOWS = {
-      "accounts/fireworks/models/glm-5p3-flash" => 1_048_573
-    }.freeze
+    # The known-models tables (I08/I36), typed at load via the Shapes map
+    # types: each literal is type-checked HERE — a malformed value fails
+    # with a MapError at require time, never mid-boot. CONTENTS are
+    # byte-identical to the pre-shapes literals (unit-pinned key-for-key)
+    # and the applied Hashes are frozen exactly as before, inner maps too.
+
+    MODEL_CONTEXT_WINDOWS = Shapes::Types::Strict::Hash.map(
+      Shapes::Types::Strict::String, Shapes::Types::Strict::Integer
+    )["accounts/fireworks/models/glm-5p3-flash" => 1_048_573].freeze
 
     # The known reasoning-capable models (same assumed-model class as
     # {MODEL_CONTEXT_WINDOWS}: ids RubyLLM's registry has no entry for,
     # but the owner's daily-driver catalog declares reasoning — pi's
     # footer shows the level for them, so the port must too).
-    MODEL_REASONING = {
-      "accounts/fireworks/models/glm-5p3-flash" => true
-    }.freeze
+    MODEL_REASONING = Shapes::Types::Strict::Hash.map(
+      Shapes::Types::Strict::String, Shapes::Types::Strict::Bool
+    )["accounts/fireworks/models/glm-5p3-flash" => true].freeze
 
     # The known thinkingLevelMaps (the same known-models tier, I36): the
     # owner's daily-driver glm — the owner's effective pi map (the pi
@@ -91,12 +105,16 @@ module Tart
     # the port's wire matches the live pi sessions. Symbol keys — the
     # parsed :thinking_level_map shape. Unknown model ids resolve to nil
     # (pi's map-less rule, {Models.supported_thinking_levels}).
-    THINKING_LEVEL_MAPS = {
+    THINKING_LEVEL_MAPS = Shapes::Types::Strict::Hash.map(
+      Shapes::Types::Strict::String,
+      Shapes::Types::Strict::Hash.map(Shapes::Types::Strict::Symbol,
+        Shapes::Types::Strict::String | Shapes::Types::Strict::Nil)
+    )[
       "accounts/fireworks/models/glm-5p3-flash" => {
         off: "low", minimal: "low", low: "low", medium: "medium",
         high: "high", xhigh: "xhigh", max: "max"
-      }.freeze
-    }.freeze
+      }
+    ].each_value(&:freeze).freeze
 
     Diagnostic = Struct.new(:type, :message, :path, keyword_init: true)
 
@@ -269,16 +287,18 @@ module Tart
 
     # The thinking facts for one model (I36), composed catalog-entry-first,
     # known-tables-second — ONE helper for the interactive boot, print
-    # mode, and the switch path: reasoning = the entry's flag when a
-    # catalog entry exists, else {model_reasoning_capable}; the level map
-    # = the entry's map when present, else the known table (keyed by
-    # +model_id+). +entry+ nil (no catalog match) and +settings+ nil (the
-    # switch path — the entry always decides) are both legal.
+    # mode, and the switch path. Returns the typed Shapes::ThinkingFacts:
+    # reasoning = the entry's flag when a catalog entry exists, else
+    # {model_reasoning_capable}; the level map = the entry's map when
+    # present, else the known table (keyed by +model_id+). +entry+ is the
+    # catalog's typed model (Shapes::Model — nil when there is no catalog
+    # match) and +settings+ nil (the switch path — the entry always
+    # decides) is legal.
     def thinking_facts(entry, settings = nil, model_id: nil, model: nil, identity: Identity::DEFAULT)
-      {
-        reasoning: entry ? entry.fetch(:reasoning, false) : model_reasoning_capable(settings, model, identity:),
-        thinking_level_map: (entry && entry[:thinking_level_map]) || known_thinking_level_map(model_id)
-      }
+      Shapes::ThinkingFacts.new(
+        reasoning: entry ? entry.reasoning : model_reasoning_capable(settings, model, identity:),
+        thinking_level_map: entry&.thinking_level_map || known_thinking_level_map(model_id)
+      )
     end
 
     # pi mergeDefaultTools (:119-125): overrides win wholesale unless it is

@@ -198,9 +198,14 @@ module Tart
       settings = result.settings
       report_diagnostics(result.diagnostics)
       identity = resolve_identity(options, settings)
+      # The resolved-settings view (Shapes::ResolvedSettings): built once
+      # per boot, right after the identity settles; the launcher's settings
+      # reads below go through it (the Settings helpers themselves keep
+      # their signatures — this is the consumer view).
+      resolved = Shapes::ResolvedSettings.from_load(result, identity:)
       models = Models.load
       warn "tart: #{models.error}" if models.error
-      require_api_key(settings, models, identity:)
+      require_api_key(settings, models, identity:, resolved:)
       skills = Skills.load(cwd: workdir)
       context_files = Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root)
 
@@ -217,7 +222,7 @@ module Tart
       seed_messages = resume_path ? Agent::Session.context_messages(resume_path) : []
 
       boot = Models.resolve_boot_model(models, settings, identity:)
-      chat = build_chat(settings, models, boot, identity:)
+      chat = build_chat(models, boot, identity:, resolved:)
       thinking = boot_thinking_kwargs(settings, models, boot, chat, identity:)
       exit Print.run(
         prompt: options[:print],
@@ -244,6 +249,9 @@ module Tart
       # point). Resolved before any env-tier read so the namespace is
       # settled (the load order: file → identity → env overrides).
       identity = resolve_identity(options, settings)
+      # The resolved-settings view (Shapes::ResolvedSettings): built once
+      # per boot; require_api_key / footer_data / build_chat read it.
+      resolved = Shapes::ResolvedSettings.from_load(result, identity:)
       skills = Skills.load(cwd: workdir)
       prompts = Prompts.load(cwd: workdir)
       mcp_servers = Mcp::Config.load(mcp_config_path)
@@ -251,7 +259,7 @@ module Tart
       # boot-model resolution's middle layer; a load/parse/schema
       # failure sets its error (surfaced below, never a crash).
       models = Models.load
-      require_api_key(settings, models, identity:)
+      require_api_key(settings, models, identity:, resolved:)
       # The discovered context files (pi's contextFiles: the system-prompt
       # sources + the agents files) — the system prompt's <project_context>
       # section and the MOTD's [Context] section share the load (I33).
@@ -286,8 +294,8 @@ module Tart
           # models.json "default" > Settings — I27), so a ctrl+s persisted
           # default is honored by the next /new too.
           boot = Models.resolve_boot_model(models, settings, identity:)
-          chat = build_chat(settings, models, boot, identity:)
-          facts = footer_data(workdir, settings, boot:, chat:, identity:, models:)
+          chat = build_chat(models, boot, identity:, resolved:)
+          facts = footer_data(workdir, settings, boot:, chat:, identity:, models:, resolved:)
           surface.footer_data = facts
           surface.agent = Agent::Loop.new(
             chat:,
@@ -301,7 +309,7 @@ module Tart
             identity:,
             thinking_level: facts.fetch(:thinking_level),
             model_reasoning: facts.fetch(:reasoning),
-            thinking_level_map: facts[:thinking_level_map]
+            thinking_level_map: facts.fetch(:thinking_level_map)
           )
         end
 
@@ -389,11 +397,11 @@ module Tart
     end
 
     # The boot provider's key (I27): identity-namespaced env > the
-    # models.json provider config > the Settings key.
-    def require_api_key(settings, models = nil, identity: Identity::DEFAULT)
+    # models.json provider config > the resolved-settings view's key.
+    def require_api_key(settings, models, identity:, resolved:)
       boot = Models.resolve_boot_model(models, settings, identity:)
-      key = ENV[Identity.env_key(identity, "API_KEY")] || models&.provider(boot[:provider])&.fetch(:api_key, nil) ||
-        Settings.resolve_setting("apiKey", settings, identity:)
+      key = ENV[Identity.env_key(identity, "API_KEY")] || models&.provider(boot.provider)&.api_key ||
+        resolved.api_key
       abort "#{Identity.env_prefix(identity)}API_KEY is not set (see --help)." if key.nil?
     end
 
@@ -410,31 +418,35 @@ module Tart
     # · default badge source stays UNCLAMPED (+default_thinking_level+: pi
     # badges getDefaultThinkingLevel() ?? DEFAULT raw — thinking-selector
     # .ts:71-72; an out-of-set default marks NO row).
-    def footer_data(workdir, settings, boot: nil, chat:, identity: Identity::DEFAULT, models: nil)
-      # Optional +boot+: the in-launcher call sites resolve the boot pair
-      # per session; the legacy (settings, chat) shape resolves it from
-      # settings alone.
-      boot ||= {provider: Settings.resolve_setting("defaultProvider", settings),
-                id: Settings.resolve_setting("defaultModel", settings)}
+    def footer_data(workdir, settings, boot: nil, chat:, identity: Identity::DEFAULT, models: nil, resolved: nil)
+      # Optional +resolved+: the in-launcher call sites thread the
+      # resolved-settings view built once per boot; the legacy (settings,
+      # chat) shape builds it from the merged hash on the spot. Optional
+      # +boot+: ditto per session — the legacy shape resolves the boot
+      # pair from the view alone.
+      resolved ||= Shapes::ResolvedSettings.from_load(settings, identity:)
+      boot ||= Shapes::ModelRef.new(provider: resolved.default_provider, id: resolved.default_model)
       facts = Settings.thinking_facts(models && resolve_boot_entry(models, boot),
-        settings, model_id: boot[:id], model: chat.model, identity:)
+        settings, model_id: boot.id, model: chat.model, identity:)
       # No provider label: pi prefixes the provider only when MORE THAN
       # one provider is available (footer.ts:246-258) — the port resolves
       # a single static provider, so the segment is the bare model (the
       # owner's live "(openai) " finding). I27: the boot pair is threaded
       # (the /model selector's default badge + degenerate catalog), the
       # model id from the boot resolution (env > models.json > settings).
-      level = Settings.resolve_thinking_level(settings)
+      # The badge level is the resolved-settings view's (the same
+      # resolve_thinking_level outcome, built once per boot).
+      level = resolved.thinking_level
       {
         cwd: workdir,
-        model: boot[:id],
-        default_provider: boot[:provider],
-        reasoning: facts[:reasoning],
-        thinking_level_map: facts[:thinking_level_map],
+        model: boot.id,
+        default_provider: boot.provider,
+        reasoning: facts.reasoning,
+        thinking_level_map: facts.thinking_level_map,
         context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
         auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
-        thinking_level: Models.clamp_thinking_level(level, map: facts[:thinking_level_map],
-          reasoning: facts[:reasoning]),
+        thinking_level: Models.clamp_thinking_level(level, map: facts.thinking_level_map,
+          reasoning: facts.reasoning),
         default_thinking_level: level
       }
     end
@@ -445,17 +457,17 @@ module Tart
     # sdk.ts:271-279; ONE clamp, both boots).
     def boot_thinking_kwargs(settings, models, boot, chat, identity:)
       facts = Settings.thinking_facts(resolve_boot_entry(models, boot),
-        settings, model_id: boot[:id], model: chat.model, identity:)
-      {model_reasoning: facts[:reasoning], thinking_level_map: facts[:thinking_level_map],
+        settings, model_id: boot.id, model: chat.model, identity:)
+      {model_reasoning: facts.reasoning, thinking_level_map: facts.thinking_level_map,
        thinking_level: Models.clamp_thinking_level(Settings.resolve_thinking_level(settings),
-         map: facts[:thinking_level_map], reasoning: facts[:reasoning])}
+         map: facts.thinking_level_map, reasoning: facts.reasoning)}
     end
 
     # The catalog entry for a boot pair (the I28 cross-resolve): the boot
     # provider is a WIRE slug for env/settings boots while catalog keys
     # are endpoint keys — canonical pair resolve first, then the bare id.
     def resolve_boot_entry(models, boot)
-      models.resolve("#{boot[:provider]}/#{boot[:id]}") || models.resolve(boot[:id].to_s)
+      models.resolve("#{boot.provider}/#{boot.id}") || models.resolve(boot.id.to_s)
     end
 
     def report_diagnostics(diagnostics, surface: nil)
@@ -506,19 +518,19 @@ module Tart
 
     # The chat (I27): the boot model pair resolves identity-namespaced env
     # > models.json "default" > Settings ({Models.resolve_boot_model});
-    # the resolved provider's models.json config (baseUrl/apiKey/api)
-    # slots between the env overrides and the Settings keys — the
-    # identity-namespaced API_KEY/API_BASE keep working against it.
-    def build_chat(settings, models, boot, identity: Identity::DEFAULT)
-      provider = models.provider(boot[:provider])
+    # the resolved provider's models.json config (endpoint block) slots
+    # between the env overrides and the resolved-settings view's keys —
+    # the identity-namespaced API_KEY/API_BASE keep working against it.
+    def build_chat(models, boot, identity:, resolved:)
+      provider = models.provider(boot.provider)
       context = RubyLLM.context do |config|
-        config.openai_api_key = ENV[Identity.env_key(identity, "API_KEY")] || provider&.fetch(:api_key, nil) || Settings.resolve_setting("apiKey", settings, identity:)
-        config.openai_api_base = ENV[Identity.env_key(identity, "API_BASE")] || provider&.fetch(:base_url, nil) || Settings.resolve_setting("apiBase", settings, identity:)
+        config.openai_api_key = ENV[Identity.env_key(identity, "API_KEY")] || provider&.api_key || resolved.api_key
+        config.openai_api_base = ENV[Identity.env_key(identity, "API_BASE")] || provider&.base_url || resolved.api_base
         config.request_timeout = 120
         config.max_retries = 1
       end
       context.chat(
-        model: boot[:id], provider: Models.wire_provider(boot[:provider]),
+        model: boot.id, provider: Models.wire_provider(boot.provider),
         protocol: :chat_completions, assume_model_exists: true
       )
     end
@@ -533,8 +545,8 @@ module Tart
       {
         "SESSION_ID" => -> { surface.agent&.recorder&.id },
         "SESSION_FILE" => -> { surface.agent&.recorder&.path },
-        "PROVIDER" => -> { surface.current_model_ref[:provider] },
-        "MODEL" => -> { surface.current_model_ref[:id] },
+        "PROVIDER" => -> { surface.current_model_ref&.provider },
+        "MODEL" => -> { surface.current_model_ref&.id },
         "REASONING_LEVEL" => -> { surface.agent&.thinking_level }
       }
     end
@@ -551,8 +563,8 @@ module Tart
       {
         "SESSION_ID" => -> { recorder&.id },
         "SESSION_FILE" => -> { recorder&.path },
-        "PROVIDER" => -> { boot[:provider] },
-        "MODEL" => -> { boot[:id] },
+        "PROVIDER" => -> { boot.provider },
+        "MODEL" => -> { boot.id },
         "REASONING_LEVEL" => -> { level }
       }
     end
@@ -583,7 +595,7 @@ module Tart
     def find_session_by_id(workdir, id)
       Agent::Session.list(cwd: workdir).find do |path|
         File.basename(path, ".jsonl").end_with?("_#{id}") ||
-          Agent::Session.read_header(path)&.fetch("id", nil) == id
+          Agent::Session.read_header(path)&.id == id
       end
     end
 

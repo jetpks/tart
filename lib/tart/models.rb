@@ -4,6 +4,7 @@ require "json"
 require_relative "agent/session"
 require_relative "settings"
 require_relative "schemas/models"
+require_relative "shapes/model"
 
 module Tart
   module Models
@@ -30,19 +31,37 @@ module Tart
     # provider.rb:608-611).
     WIRE_PROVIDER = "openai"
 
-    # The catalog shape: one hash per provider (key → config) and one
-    # frozen hash per model entry — {provider:, id:, name:, reasoning:,
-    # context_window:, max_tokens:} once flattened ({model_entries}).
+    # The catalog shape: the typed providers (Shapes::Provider — the
+    # endpoint block plus its typed models) keyed by the models.json key,
+    # and the flattened typed model entries ({model_entries}).
     Config = Struct.new(:providers, :default, :error, keyword_init: true) do
-      # Every model entry across providers, tagged with its provider key.
+      # Every model entry across providers. The LOADED catalog (build via
+      # {Models.build_providers}) carries typed Shapes::Provider values and
+      # yields typed Shapes::Model entries; a HAND-BUILT config fed the
+      # legacy raw-hash provider shape keeps today's raw merged-hash
+      # entries (the frozen discovery-shape contract the /model dispatch
+      # pins — no re-shaping of values the config was handed verbatim).
       def model_entries
-        providers.flat_map { |key, provider| provider.fetch(:models).map { |model| model.merge(provider: key) } }
+        providers.flat_map do |key, provider|
+          if provider.is_a?(Shapes::Provider)
+            provider.models
+          else
+            provider[:models].map { |model| model.merge(provider: key) }
+          end
+        end
       end
 
-      # The provider's config hash (build_chat's baseUrl/apiKey/api seam),
-      # or nil for an unknown key.
+      # The provider's typed config (build_chat's endpoint seam), or nil
+      # for an unknown key.
       def provider(key)
         providers[key]
+      end
+
+      # The entry's catalog field — the typed attribute read, with the
+      # raw-hash read preserved for legacy-fed entries (see
+      # {model_entries}).
+      def entry_field(entry, field)
+        entry.respond_to?(field) ? entry.public_send(field) : entry.fetch(field)
       end
 
       # Exact model-reference match (pi findExactModelReferenceMatch,
@@ -54,17 +73,19 @@ module Tart
         return nil if needle.empty?
 
         entries = model_entries
-        canonical = entries.select { |entry| "#{entry[:provider]}/#{entry[:id]}".downcase == needle }
+        canonical = entries.select { |entry| "#{entry_field(entry, :provider)}/#{entry_field(entry, :id)}".downcase == needle }
         return canonical.first if canonical.size == 1
         return nil if canonical.size > 1
 
         provider_key, id = needle.split("/", 2)
         if id && !id.empty?
-          scoped = entries.select { |entry| entry[:provider].downcase == provider_key && entry[:id].downcase == id }
+          scoped = entries.select do |entry|
+            entry_field(entry, :provider).downcase == provider_key && entry_field(entry, :id).downcase == id
+          end
           return scoped.first if scoped.size == 1
         end
 
-        bare = entries.select { |entry| entry[:id].downcase == needle }
+        bare = entries.select { |entry| entry_field(entry, :id).downcase == needle }
         bare.size == 1 ? bare.first : nil
       end
     end
@@ -124,39 +145,46 @@ module Tart
     # models.json outranks the shipped fireworks default.
     def resolve_boot_model(config, settings, identity: Identity::DEFAULT, env: ENV)
       if (model = env[Identity.env_key(identity, "MODEL")])
-        return {provider: env[Identity.env_key(identity, "PROVIDER")] || settings["defaultProvider"], id: model}
+        return Shapes::ModelRef.new(provider: env[Identity.env_key(identity, "PROVIDER")] || settings["defaultProvider"], id: model)
       end
       if (provider = env[Identity.env_key(identity, "PROVIDER")])
-        return {provider:, id: settings["defaultModel"]}
+        return Shapes::ModelRef.new(provider:, id: settings["defaultModel"])
       end
       if config&.default && (entry = config.resolve(config.default))
-        return {provider: entry[:provider], id: entry[:id]}
+        return Shapes::ModelRef.new(provider: entry.provider, id: entry.id)
       end
 
-      {provider: settings["defaultProvider"], id: settings["defaultModel"]}
+      Shapes::ModelRef.new(provider: settings["defaultProvider"], id: settings["defaultModel"])
     end
 
     def build_providers(parsed)
-      parsed.fetch("providers").transform_values do |provider|
-        {
+      parsed.fetch("providers").to_h do |key, provider|
+        [key, Shapes::Provider.new(
           name: provider["name"],
           base_url: provider["baseUrl"],
           api_key: provider["apiKey"],
           api: provider["api"],
-          models: (provider["models"] || []).map { |model| build_model(model) }
-        }
+          models: (provider["models"] || []).map { |model| build_model(model, provider: key) }
+        )]
       end
     end
 
-    def build_model(model)
-      {
+    # The typed catalog entry (Shapes::Model) — the provider KEY feeds the
+    # +provider:+ attribute at build (the merged-hash shape's last key).
+    # The to_h of the built struct is DECLARED equal to today's entry hash
+    # (key order included — the shapes unit pin); the load path only ever
+    # constructs from schema-VALID parsed files, so the strict types never
+    # see the rejected input classes and {load} still never raises.
+    def build_model(model, provider:)
+      Shapes::Model.new(
         id: model.fetch("id"),
         name: model["name"] || model["id"],
         reasoning: model["reasoning"] == true,
         context_window: model["contextWindow"],
         max_tokens: model["maxTokens"],
-        thinking_level_map: build_thinking_level_map(model["thinkingLevelMap"])
-      }
+        thinking_level_map: build_thinking_level_map(model["thinkingLevelMap"]),
+        provider:
+      )
     end
 
     # pi ThinkingLevelMap (model-schema.ts:14-15 — Partial Record<level,

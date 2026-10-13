@@ -70,7 +70,7 @@ module Tart
 
       assert_nil config.error
       assert_equal({provider: "glm", id: "m", name: "m", reasoning: true, context_window: 200_000, max_tokens: nil,
-                    thinking_level_map: {off: nil, low: "low", madeup: "x"}}, config.model_entries.first,
+                    thinking_level_map: {off: nil, low: "low", madeup: "x"}}, config.model_entries.first.to_h,
         "the entry hash shape and the I36 symbolization ride the schema path unchanged")
     end
 

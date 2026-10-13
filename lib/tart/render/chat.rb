@@ -18,6 +18,8 @@ require_relative "viewport"
 require_relative "slash_source"
 require_relative "transcript"
 require_relative "../models"
+require_relative "../shapes/model"
+require_relative "../shapes/session"
 
 module Tart
   module Render
@@ -579,15 +581,19 @@ module Tart
           entries = Agent::Session.load_entries(path)
           @transcript_state.replay_entries(entries)
           # The resumed session's last assistant text is ctrl+x's fallback
-          # (pi getLastAssistantText reads the loaded messages).
+          # (pi getLastAssistantText reads the loaded messages). The entry
+          # gates ride the typed envelopes (the same nil-skip table the
+          # loader guards had).
           @last_assistant_text = entries.filter_map { |entry|
-            message = entry.is_a?(Hash) && entry["message"]
-            next unless message.is_a?(Hash) && message["role"] == "assistant" &&
-              message["content"].is_a?(String) && !message["content"].strip.empty?
+            envelope = Shapes::MessageEntry.of(entry)
+            next unless envelope && envelope.role == "assistant"
 
-            message["content"].strip
+            text = envelope.message["content"]
+            next unless text.is_a?(String) && !text.strip.empty?
+
+            text.strip
           }.last
-          compactions = entries.count { |entry| entry.is_a?(Hash) && entry["type"] == "compaction" }
+          compactions = entries.count { |entry| Shapes::CompactionEntry.of(entry) }
           if compactions.positive?
             times = compactions == 1 ? "1 time" : "#{compactions} times"
             @transcript_state.enqueue_scrollback("Session compacted #{times}", fg: Theme[:dim])
@@ -1565,10 +1571,13 @@ module Tart
         data = data.merge(thinking_level: @thinking_level) if @thinking_level
         return data unless @runtime_model
 
-        data = data.merge(model: @runtime_model[:id])
-        data = data.merge(context_window: @runtime_model[:context_window]) if @runtime_model[:context_window]
-        data = data.merge(thinking_level_map: @runtime_model[:thinking_level_map]) if @runtime_model.key?(:thinking_level_map)
-        @runtime_model[:reasoning].nil? ? data : data.merge(reasoning: @runtime_model[:reasoning])
+        data = data.merge(model: @runtime_model.id)
+        data = data.merge(context_window: @runtime_model.context_window) if @runtime_model.context_window
+        # The typed entry always carries the map key (nil when the entry
+        # declares none) — the overlay rides on every switch, as the
+        # catalog-shaped row always did.
+        data = data.merge(thinking_level_map: @runtime_model.thinking_level_map)
+        data.merge(reasoning: @runtime_model.reasoning)
       end
 
       # The transcript buffer's display lines — completed content plus the
@@ -1730,7 +1739,7 @@ module Tart
       def cycle_thinking_level
         return unless reasoning_capable?
 
-        current = @mutex.synchronize { thinking_level || Settings::DEFAULTS.fetch("thinkingLevel") }
+        current = @mutex.synchronize { thinking_level || Settings::DEFAULT_THINKING_LEVEL }
         levels = available_thinking_levels
         index = levels.index(current) || -1
         next_level = levels[(index + 1) % levels.size]
@@ -1765,7 +1774,7 @@ module Tart
         # the sealed constructor's preselect falls to index 0
         # (buildSelectList :101-107) — the I27-era display floor is gone
         # with the I40 boot/switch clamps.
-        current = thinking_level || Settings::DEFAULTS.fetch("thinkingLevel")
+        current = thinking_level || Settings::DEFAULT_THINKING_LEVEL
         default = default_thinking_level
         levels.map do |level|
           description = ModelMenu::LEVEL_DESCRIPTIONS.fetch(level)
@@ -1784,8 +1793,8 @@ module Tart
         @mutex.synchronize do
           @menu = ModelMenu.model(
             entries: model_menu_entries, current: current_model_ref, default: default_model_ref, seed:,
-            on_select: ->(item) { close_menu; apply_model_selection(item, persist: false) },
-            on_select_as_default: ->(item) { close_menu; apply_model_selection(item, persist: true) }
+            on_select: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: false) },
+            on_select_as_default: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: true) }
           )
         end
       end
@@ -1851,31 +1860,39 @@ module Tart
       # overlay carries the refresh. persist:true rides the SAME re-clamp
       # (pi setModel {persist} is one path).
       def apply_model_selection(entry, persist:)
-        status = persist ? "Default model: #{entry[:provider]}/#{entry[:id]}" : "Model: #{entry[:id]}"
+        # The menu and /model paths deliver the typed entry; the direct-
+        # switch keyword shape (provider:/id:/... — one positional Hash)
+        # rides the struct's own type gate before the seam reads it. The
+        # map key is supplied explicitly: the declared-optional attribute
+        # still requires its key at construction, and the legacy shape
+        # may omit it.
+        entry = Shapes::Model.new(**entry,
+          thinking_level_map: entry.fetch(:thinking_level_map, nil)) unless entry.is_a?(Shapes::Model)
+        status = persist ? "Default model: #{entry.provider}/#{entry.id}" : "Model: #{entry.id}"
         # The wire provider is the models.json key mapped onto the port's
         # carried seam (Models.wire_provider — the loop's with_model
         # needs a native slug); the window + the composed reasoning facts
         # re-resolve in the loop seam (the entry's flag/map, the known
         # tables when the entry declares none — Settings.thinking_facts).
-        facts = Settings.thinking_facts(entry, model_id: entry[:id])
+        facts = Settings.thinking_facts(entry, model_id: entry.id)
         # The cwd resolution is the launcher-facts-else-process idiom the
         # MOTD/commands sections already use (@footer_data[:cwd] || Dir.pwd).
         level = Settings.declared_thinking_level(root: @settings_root,
           cwd: @footer_data&.fetch(:cwd, nil) || Dir.pwd) ||
           (@thinking_level || @footer_data&.fetch(:thinking_level, nil))
-        effective = Models.clamp_thinking_level(level, map: facts[:thinking_level_map],
-          reasoning: facts[:reasoning])
+        effective = Models.clamp_thinking_level(level, map: facts.thinking_level_map,
+          reasoning: facts.reasoning)
         @mutex.synchronize do
           @runtime_model = entry
           @thinking_level = effective
           @transcript_state.enqueue_status(status)
         end
-        @agent&.switch_model(entry[:id], provider: Models.wire_provider(entry[:provider]),
-          context_window: entry[:context_window],
-          model_reasoning: facts[:reasoning],
-          thinking_level_map: facts[:thinking_level_map])
+        @agent&.switch_model(entry.id, provider: Models.wire_provider(entry.provider),
+          context_window: entry.context_window,
+          model_reasoning: facts.reasoning,
+          thinking_level_map: facts.thinking_level_map)
         @agent&.set_thinking_level(effective)
-        Settings.save(@settings_root, "defaultProvider" => entry[:provider], "defaultModel" => entry[:id]) if persist
+        Settings.save(@settings_root, "defaultProvider" => entry.provider, "defaultModel" => entry.id) if persist
         @kernel.request_draw
       end
 
@@ -1889,13 +1906,19 @@ module Tart
       end
 
       # The boot entry from the launcher facts (footer_data): the
-      # resolved model/provider/window/reasoning/level-map.
+      # resolved model/provider/window/reasoning/level-map, as the typed
+      # Shapes::Model. max_tokens carries none (completeness only — the
+      # footer facts hold no such value, Grounds OQ-4); reasoning floors
+      # a missing fact to false (today's nil read the same everywhere it
+      # was consumed).
       def boot_model_entry
         data = @footer_data || {}
         model = data.fetch(:model, nil) || "no-model"
-        {provider: data.fetch(:default_provider, "openai"), id: model, name: model,
-         reasoning: data[:reasoning], context_window: data[:context_window],
-         thinking_level_map: data[:thinking_level_map]}
+        Shapes::Model.new(
+          provider: data.fetch(:default_provider, "openai"), id: model, name: model,
+          reasoning: data[:reasoning] == true, context_window: data[:context_window],
+          max_tokens: nil, thinking_level_map: data[:thinking_level_map]
+        )
       end
 
       # The ✓ current marker's ref: the runtime switch, else the boot
@@ -1925,9 +1948,10 @@ module Tart
       # runtime pair is a wire pair.
       def boot_model_ref
         data = @footer_data || {}
-        ref = {provider: data.fetch(:default_provider, "openai"), id: data[:model]}
-        entry = @models&.resolve("#{ref[:provider]}/#{ref[:id]}") || @models&.resolve(ref[:id].to_s)
-        entry ? {provider: entry[:provider], id: entry[:id]} : ref
+        ref = Shapes::ModelRef.new(provider: data.fetch(:default_provider, "openai"),
+          id: data.fetch(:model, nil) || "no-model")
+        entry = @models&.resolve("#{ref.provider}/#{ref.id}") || @models&.resolve(ref.id.to_s)
+        entry ? Shapes::ModelRef.new(provider: entry.provider, id: entry.id) : ref
       end
 
       # The settings-resolved thinking level (the · default badge) — the
@@ -1939,7 +1963,7 @@ module Tart
       def default_thinking_level
         data = @footer_data || {}
         data.fetch(:default_thinking_level, nil) || data.fetch(:thinking_level, nil) ||
-          Settings::DEFAULTS.fetch("thinkingLevel")
+          Settings::DEFAULT_THINKING_LEVEL
       end
 
       public :set_thinking_level, :cycle_thinking_level, :current_model_ref

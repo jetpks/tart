@@ -173,10 +173,10 @@ module Tart
 
       entry = Agent::Session.load_entries(recorder.path).last
       projected = Agent::Session.entry_to_context_message(entry)
-      assert_equal :user, projected[:role]
+      assert_equal :user, projected.role
       # pi's bytes: the raw output (its trailing newline included)
       # fenced between the code markers.
-      assert_equal "Ran `echo hi`\n```\nhi\n\n```", projected[:content]
+      assert_equal "Ran `echo hi`\n```\nhi\n\n```", projected.content
     end
 
     def test_bash_execution_context_text_variants
@@ -188,7 +188,7 @@ module Tart
       # keys), exactly what a resume reads.
       text = lambda do |message|
         entry = Agent::Session.message_entry(message, id: "e", parent_id: nil, timestamp: "t")
-        Agent::Session.entry_to_context_message(JSON.parse(JSON.generate(entry)))[:content]
+        Agent::Session.entry_to_context_message(JSON.parse(JSON.generate(entry))).content
       end
 
       assert_equal "Ran `x`\n(no output)", text.call(build.call(output: "")),
@@ -424,6 +424,60 @@ module Tart
       message = RubyLLM::Message.new(role: :user, content: "hi")
       recorder.append_message(message)
       assert recorder.persisted?, "the file exists once a user message landed"
+    end
+
+    # The shapes-family additive pins (I44): the wrap tolerance rows ride
+    # the REAL loaded-file path, the projection output stays today's Hash
+    # shape (the .to_h-at-the-gem-seam rule), and read_header returns the
+    # typed header with the discovery reads intact.
+    def test_shapes_wraps_tolerance_rows_on_the_load_path
+      path = File.join(@dir, "tolerant.jsonl")
+      File.write(path, [
+        '{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/tmp"}',
+        "not json at all",
+        '{"type":"usage","id":"e0","parentId":null,"timestamp":"t"}',
+        '{"type":"message","id":"e1","parentId":null,"timestamp":"t","message":"nope"}',
+        '{"type":"message","id":"e2","parentId":null,"timestamp":"t","message":{"content":"role-less"}}',
+        '{"type":"message","id":"e3","parentId":null,"timestamp":"t","message":{"role":"user","content":null}}'
+      ].join("\n"))
+
+      assert_equal({role: :user, content: ""}, Agent::Session.context_messages(path).first,
+        "every malformed class projects to nothing; the one good row carries null content as the empty string")
+    end
+
+    def test_context_messages_output_stays_the_recorded_hash_shape
+      path = File.join(@dir, "shape.jsonl")
+      File.write(path, [
+        '{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/tmp"}',
+        '{"type":"message","id":"e1","parentId":null,"timestamp":"t","message":{"role":"user","content":"q"}}',
+        '{"type":"message","id":"e2","parentId":"e1","timestamp":"t","message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","name":"ls","arguments":{"path":"."}}]}}',
+        '{"type":"message","id":"e3","parentId":"e2","timestamp":"t","message":{"role":"tool","tool_call_id":"call_1","content":"fixture.txt"}}'
+      ].join("\n"))
+
+      messages = Agent::Session.context_messages(path)
+      messages.each { |message| assert_instance_of Hash, message, "the add_message seam consumes plain hashes" }
+      assert_equal({role: :user, content: "q"}, messages[0])
+      assert_equal({role: :assistant, content: "", tool_calls: [{"id" => "call_1", "name" => "ls",
+        "arguments" => {"path" => "."}}]}, messages[1],
+        "the open body rides whole, in the recorded key order (the wire shape)")
+      assert_equal({role: :tool, tool_call_id: "call_1", content: "fixture.txt"}, messages[2])
+    end
+
+    def test_read_header_returns_the_typed_header
+      path = File.join(@dir, "headed.jsonl")
+      File.write(path, [
+        '{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/tmp","parentSession":"/old"}',
+        '{"type":"message","id":"e1","parentId":null,"timestamp":"t","message":{"role":"user","content":"hi"}}'
+      ].join("\n"))
+
+      header = Agent::Session.read_header(path)
+      assert_instance_of Shapes::SessionHeader, header
+      assert_equal "abc", header.id
+      assert_equal "/tmp", header.cwd
+      assert_equal "3", header.version.to_s, "the metadata rides nominal"
+      assert_equal "/old", header.parentSession
+      assert_equal "/old", header["parentSession"], "the discovery reads stay (string-keyed, nil-safe)"
+      assert_nil Agent::Session.read_header(File.join(@dir, "absent.jsonl"))
     end
 
     private
