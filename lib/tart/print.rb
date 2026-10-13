@@ -62,7 +62,7 @@ module Tart
     # @return [Integer] the exit code (pi's runPrintMode return).
     def run(prompt:, chat:, tools:, system_prompt: nil, on_event: nil,
             recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
-            stdout: $stdout, stderr: $stderr, thinking_level: Settings::DEFAULTS.fetch("thinkingLevel"),
+            stdout: $stdout, stderr: $stderr, thinking_level: Settings::DEFAULT_THINKING_LEVEL,
             model_reasoning: false, thinking_level_map: nil, identity: Identity::DEFAULT)
       stdout.sync = true
       agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,

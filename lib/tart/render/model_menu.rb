@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "text"
+require_relative "../shapes/model"
 
 module Tart
   module Render
@@ -61,31 +62,49 @@ module Tart
       end
 
       # pi showModelSelector (:5342-5361) + ModelSelectorComponent: the
-      # entries are the models.json catalog flattened; +current+ and
-      # +default+ are {provider:, id:} refs for the ✓ marker and the
-      # · default badge; +seed+ pre-fills the search (/model
-      # <unknown-arg>, pi's initialSearchInput). Sort (pi sortModels):
-      # current first, default second, then by provider. Reductions,
-      # itemized: no catalog network refresh, no scoped/all tab toggle,
-      # no isDefaultSearch query boost, no /login hint line.
+      # entries are the models.json catalog flattened (typed Shapes::Model
+      # structs); +current+ and +default+ are the boot/runtime refs for
+      # the ✓ marker and the · default badge; +seed+ pre-fills the search
+      # (/model <unknown-arg>, pi's initialSearchInput). Sort (pi
+      # sortModels): current first, default second, then by provider. The
+      # UI rows stay plain Hashes (render data) built FROM the entry — the
+      # typed entry rides along so the switch seam reads the struct, not
+      # a re-hash. Hand-built callers may feed the legacy raw-hash entry
+      # and ref shapes (the frozen menu-surface pins) — every read ducks
+      # through {entry_attr}/{ref_key}. Reductions, itemized: no catalog
+      # network refresh, no scoped/all tab toggle, no isDefaultSearch
+      # query boost, no /login hint line.
       def self.model(entries:, current:, default:, seed: nil, on_select:, on_select_as_default:)
         current_key = ref_key(current)
         default_key = ref_key(default)
         items = entries.sort_by do |entry|
           key = ref_key(entry)
           rank = key == current_key ? 0 : (default_key && key == default_key ? 1 : 2)
-          [rank, entry[:provider], entry[:id]]
+          [rank, entry_attr(entry, :provider), entry_attr(entry, :id)]
         end.map do |entry|
-          entry.merge(value: entry[:id], label: entry[:id],
-            current: current_key == ref_key(entry), default: default_key == ref_key(entry))
+          {entry:, value: entry_attr(entry, :id), label: entry_attr(entry, :id),
+           provider: entry_attr(entry, :provider), id: entry_attr(entry, :id),
+           name: entry_attr(entry, :name),
+           current: current_key == ref_key(entry), default: default_key == ref_key(entry)}
         end
         new(variant: :model, items:, query_seed: seed,
           search_text: ->(item) { "#{item[:provider]} #{item[:provider]}/#{item[:id]} #{item[:provider]} #{item[:id]} #{item[:name]}" },
           on_select:, on_select_as_default:)
       end
 
+      # The entry's field — the typed attribute read, with the raw-hash
+      # read preserved for legacy-fed entries (the menu renders whatever
+      # shape the holder handed it).
+      def self.entry_attr(entry, field)
+        entry.respond_to?(field) ? entry.public_send(field) : entry.fetch(field)
+      end
+
+      # The ✓/· marker key for a ref — Model and ModelRef both answer;
+      # the legacy two-key hash ref reads the same pair.
       def self.ref_key(ref)
-        ref ? "#{ref[:provider]}/#{ref[:id]}".downcase : nil
+        return nil unless ref
+
+        "#{entry_attr(ref, :provider)}/#{entry_attr(ref, :id)}".downcase
       end
 
       # The visible window's selection index and the query — the Chat

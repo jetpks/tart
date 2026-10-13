@@ -67,9 +67,10 @@ module Tart
       assert_equal "glm/glm-5.3", config.default
       entry = config.model_entries.first
       assert_equal ({provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
-                     context_window: 200_000, max_tokens: 8192, thinking_level_map: nil}), entry
-      assert_equal "https://example.test/v1", config.provider("glm").fetch(:base_url)
-      assert_equal "k-catalog", config.provider("glm").fetch(:api_key)
+                     context_window: 200_000, max_tokens: 8192, thinking_level_map: nil}), entry.to_h,
+        "the typed entry's to_h IS today's entry hash (key order included)"
+      assert_equal "https://example.test/v1", config.provider("glm").base_url
+      assert_equal "k-catalog", config.provider("glm").api_key
     end
 
     def test_jsonc_comments_and_trailing_commas_are_tolerated
@@ -119,25 +120,26 @@ module Tart
     # --- resolve (pi findExactModelReferenceMatch, reduced) ---
 
     def catalog
+      typed_model = lambda do |provider, id, name, reasoning, context_window|
+        Shapes::Model.new(id: id, name: name, reasoning: reasoning, context_window: context_window,
+          max_tokens: nil, thinking_level_map: nil, provider: provider)
+      end
       Models::Config.new(
         providers: {
-          "glm" => {name: nil, base_url: nil, api_key: nil, api: nil,
-                    models: [{provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
-                              context_window: 200_000, max_tokens: nil},
-                             {provider: "glm", id: "air", name: "Air", reasoning: false,
-                              context_window: nil, max_tokens: nil}]},
-          "zai" => {name: nil, base_url: nil, api_key: nil, api: nil,
-                    models: [{provider: "zai", id: "glm-5.3", name: "GLM 5.3 (zai)", reasoning: true,
-                              context_window: nil, max_tokens: nil}]}
+          "glm" => Shapes::Provider.new(name: nil, base_url: nil, api_key: nil, api: nil,
+                                        models: [typed_model.call("glm", "glm-5.3", "GLM 5.3", true, 200_000),
+                                                 typed_model.call("glm", "air", "Air", false, nil)]),
+          "zai" => Shapes::Provider.new(name: nil, base_url: nil, api_key: nil, api: nil,
+                                        models: [typed_model.call("zai", "glm-5.3", "GLM 5.3 (zai)", true, nil)])
         },
         default: nil, error: nil
       )
     end
 
     def test_resolve_canonical_and_provider_scoped_and_bare
-      assert_equal "glm", catalog.resolve("GLM/GLM-5.3").fetch(:provider), "the canonical ref is case-insensitive"
-      assert_equal "zai", catalog.resolve("zai/glm-5.3").fetch(:provider), "the provider prefix disambiguates"
-      assert_equal "Air", catalog.resolve("air").fetch(:name), "a unique bare id matches"
+      assert_equal "glm", catalog.resolve("GLM/GLM-5.3").provider, "the canonical ref is case-insensitive"
+      assert_equal "zai", catalog.resolve("zai/glm-5.3").provider, "the provider prefix disambiguates"
+      assert_equal "Air", catalog.resolve("air").name, "a unique bare id matches"
     end
 
     def test_resolve_ambiguity_and_unknowns_are_no_match
@@ -154,48 +156,48 @@ module Tart
 
     def test_boot_resolves_env_over_all
       boot = Models.resolve_boot_model(catalog, settings, env: {"PI_MODEL" => "m-env", "PI_PROVIDER" => "p-env"})
-      assert_equal ({provider: "p-env", id: "m-env"}), boot
+      assert_equal ({provider: "p-env", id: "m-env"}), boot.to_h
     end
 
     def test_boot_env_model_alone_keeps_the_settings_provider
       boot = Models.resolve_boot_model(catalog, settings, env: {"PI_MODEL" => "m-env"})
-      assert_equal ({provider: "settings-provider", id: "m-env"}), boot
+      assert_equal ({provider: "settings-provider", id: "m-env"}), boot.to_h
     end
 
     def test_boot_env_provider_alone_keeps_the_settings_model
       boot = Models.resolve_boot_model(catalog, settings, env: {"PI_PROVIDER" => "p-env"})
-      assert_equal ({provider: "p-env", id: "settings-model"}), boot
+      assert_equal ({provider: "p-env", id: "settings-model"}), boot.to_h
     end
 
     # The env keys ride the identity's namespace (I32 AC4).
     def test_boot_env_keys_follow_the_identity
       tart = Models.resolve_boot_model(catalog, settings, identity: "tart",
         env: {"TART_MODEL" => "m-env", "TART_PROVIDER" => "p-env"})
-      assert_equal ({provider: "p-env", id: "m-env"}), tart
+      assert_equal ({provider: "p-env", id: "m-env"}), tart.to_h
       foo = Models.resolve_boot_model(catalog, settings, identity: "foo", env: {"FOO_MODEL" => "m-foo"})
-      assert_equal ({provider: "settings-provider", id: "m-foo"}), foo
+      assert_equal ({provider: "settings-provider", id: "m-foo"}), foo.to_h
       # A pi-key boot under identity tart is NOT read — the namespaces
       # don't bleed.
       assert_equal ({provider: "settings-provider", id: "settings-model"}),
-        Models.resolve_boot_model(catalog, settings, identity: "tart", env: {"PI_MODEL" => "m-env"})
+        Models.resolve_boot_model(catalog, settings, identity: "tart", env: {"PI_MODEL" => "m-env"}).to_h
     end
 
     def test_boot_resolves_the_models_json_default_over_settings
       write_models(CATALOG)
       config = load_models
       boot = Models.resolve_boot_model(config, settings, env: {})
-      assert_equal ({provider: "glm", id: "glm-5.3"}), boot
+      assert_equal ({provider: "glm", id: "glm-5.3"}), boot.to_h
     end
 
     def test_boot_falls_through_to_settings_without_a_default
       write_models('{"providers": {"glm": {"models": [{"id": "glm-5.3"}]}}}')
       boot = Models.resolve_boot_model(load_models, settings, env: {})
-      assert_equal ({provider: "settings-provider", id: "settings-model"}), boot
+      assert_equal ({provider: "settings-provider", id: "settings-model"}), boot.to_h
     end
 
     def test_boot_resolves_settings_alone_when_no_catalog
       boot = Models.resolve_boot_model(Models.load(root: @root), settings, env: {})
-      assert_equal ({provider: "settings-provider", id: "settings-model"}), boot
+      assert_equal ({provider: "settings-provider", id: "settings-model"}), boot.to_h
     end
 
     # --- thinkingLevelMap (I36): parse, validate, resolve —
@@ -210,13 +212,13 @@ module Tart
       JSON
 
       entry = load_models.model_entries.first
-      assert_equal ({off: nil, low: "low", madeup: "x"}), entry[:thinking_level_map],
+      assert_equal ({off: nil, low: "low", madeup: "x"}), entry.thinking_level_map,
         "symbolized keys, null kept, unknown level keys tolerated (pi's Partial-Record default)"
     end
 
     def test_thinking_level_map_absent_is_nil
       write_models('{"providers": {"glm": {"models": [{"id": "m"}]}}}')
-      assert_nil load_models.model_entries.first[:thinking_level_map]
+      assert_nil load_models.model_entries.first.thinking_level_map
     end
 
     def test_thinking_level_map_schema_violations_surface_an_error
@@ -347,7 +349,7 @@ module Tart
       config = load_models
       assert_nil config.error
       assert_equal Settings::THINKING_LEVEL_MAPS.fetch("accounts/fireworks/models/glm-5p3-flash"),
-        config.model_entries.first[:thinking_level_map],
+        config.model_entries.first.thinking_level_map,
         "the owner's override map round-trips symbolized through the contract path"
     end
   end

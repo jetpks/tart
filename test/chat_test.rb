@@ -2242,14 +2242,16 @@ module Tart
     # switch seams — pi showSelector/app.model.select/app.models.save ---
 
     def model_catalog
+      typed_model = lambda do |provider, id, name, reasoning, context_window|
+        Shapes::Model.new(id: id, name: name, reasoning: reasoning, context_window: context_window,
+          max_tokens: nil, thinking_level_map: nil, provider: provider)
+      end
       Models::Config.new(
         providers: {
-          "glm" => {name: "GLM", base_url: nil, api_key: nil, api: nil,
-                    models: [{provider: "glm", id: "glm-5.3", name: "GLM 5.3", reasoning: true,
-                              context_window: 200_000, max_tokens: nil}]},
-          "zai" => {name: "Z.ai", base_url: nil, api_key: nil, api: nil,
-                    models: [{provider: "zai", id: "glm-5-air", name: "Air", reasoning: false,
-                              context_window: 130_000, max_tokens: nil}]}
+          "glm" => Shapes::Provider.new(name: "GLM", base_url: nil, api_key: nil, api: nil,
+                                        models: [typed_model.call("glm", "glm-5.3", "GLM 5.3", true, 200_000)]),
+          "zai" => Shapes::Provider.new(name: "Z.ai", base_url: nil, api_key: nil, api: nil,
+                                        models: [typed_model.call("zai", "glm-5-air", "Air", false, 130_000)])
         },
         default: nil, error: nil
       )
@@ -2405,9 +2407,10 @@ module Tart
     def mock_native_catalog
       Models::Config.new(
         providers: {
-          "mock" => {name: "Mock", base_url: nil, api_key: nil, api: nil,
-                     models: [{provider: "mock", id: "mock-1", name: "Mock 1", reasoning: true,
-                               context_window: 33_000, max_tokens: nil}]}
+          "mock" => Shapes::Provider.new(name: "Mock", base_url: nil, api_key: nil, api: nil,
+                                         models: [Shapes::Model.new(id: "mock-1", name: "Mock 1", reasoning: true,
+                                             context_window: 33_000, max_tokens: nil, thinking_level_map: nil,
+                                             provider: "mock")])
         },
         default: nil, error: nil
       )
