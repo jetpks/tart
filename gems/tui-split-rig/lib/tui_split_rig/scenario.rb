@@ -35,6 +35,16 @@ module TuiSplitRig
 #                              # skills/; tart: staged settings root
 #                              # skills/), one project prompt template —
 #                              # byte-identical per app (s9). Default: false.
+#   stage_memory: true         # optional: stage the memory-recall set (s11)
+#                              # — pi: the owner's memory.ts VERBATIM (the
+#                              # rig fixture) into the staged agent dir
+#                              # (user-dir extensions auto-load, no settings
+#                              # row) + the frozen index at
+#                              # <agentDir>/memory/pi/MEMORY.md; tart: the
+#                              # {"memory" => true} settings row merged into
+#                              # the staged settings.json + the same index
+#                              # at .tart/memory/tart/MEMORY.md. Default:
+#                              # false.
   #   env:                       # optional per-app env overrides (the
   #     tart:                    # runner layers them over its staged
   #       TART_IDENTITY: tart    # env — the branding/staging seam)
@@ -46,7 +56,7 @@ module TuiSplitRig
     APPS = %w[pi tart].freeze
 
     attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage,
-                :post_settle_keys, :stage_project_resources
+                :post_settle_keys, :stage_project_resources, :stage_memory
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -81,6 +91,7 @@ module TuiSplitRig
       @suppress_usage = parse_suppress_usage(data)
       @post_settle_keys = parse_post_settle_keys(data)
       @stage_project_resources = parse_stage_project_resources(data)
+      @stage_memory = parse_stage_memory(data)
     end
 
     # The optional scenario context window (s7's compaction lever): a
@@ -123,6 +134,17 @@ module TuiSplitRig
       return false if raw.nil?
 
       raise Error, "#{@path}: stage_project_resources must be a boolean" unless raw == true || raw == false
+
+      raw
+    end
+
+    # The optional memory-recall staging knob (the s11 instrument): a
+    # boolean or absent.
+    def parse_stage_memory(data)
+      raw = data["stage_memory"]
+      return false if raw.nil?
+
+      raise Error, "#{@path}: stage_memory must be a boolean" unless raw == true || raw == false
 
       raw
     end
