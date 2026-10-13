@@ -54,7 +54,11 @@ module Tart
       "compaction" => {"enabled" => true, "reserveTokens" => 16_384, "keepRecentTokens" => 20_000},
       # Footer model-metadata staging (rarely set; nil = resolve from the
       # model, see {model_reasoning_capable}).
-      "modelReasoning" => nil
+      "modelReasoning" => nil,
+      # The native memory module's gate (I47 — OQ-1): opt-in, default off —
+      # ZERO observable change for every existing config (no tool, no
+      # injection, no MOTD row). The env tier reads <IDENTITY>_MEMORY.
+      "memory" => false
     }.freeze
 
     # pi's ThinkingLevel vocabulary (model-schema.ts:2-3, agent types.ts:349).
@@ -78,7 +82,8 @@ module Tart
       "defaultProvider" => "PROVIDER",
       "apiBase" => "API_BASE",
       "apiKey" => "API_KEY",
-      "modelReasoning" => "MODEL_REASONING"
+      "modelReasoning" => "MODEL_REASONING",
+      "memory" => "MEMORY"
     }.freeze
 
     # The known-models tables (I08/I36), typed at load via the Shapes map

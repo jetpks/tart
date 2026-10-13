@@ -263,5 +263,70 @@ module Tart
       File.delete(skill_file)
       assert_equal "/skill:greet", @handler.expand_skill("/skill:greet")
     end
+
+    # --- I47: registered commands (pi registerCommand) ---
+
+    def registered_handler(hooks)
+      Commands::Handler.new(
+        skills: @skills,
+        settings: {},
+        output: ->(text) { @calls[:output] << text },
+        spawn: ->(&block) { block.call },
+        agent: -> { @agent },
+        reset: -> { @calls[:reset] += 1 },
+        quit: -> { @calls[:quit] += 1 },
+        hooks:
+      )
+    end
+
+    def test_registered_command_dispatches_in_registration_order
+      hooks = Hooks.new
+      seen = []
+      hooks.register_command("alpha", description: "first") { seen << :alpha }
+      hooks.register_command("beta", description: "second", args: true) { |args| seen << [:beta, args] }
+      handler = registered_handler(hooks)
+
+      assert handler.dispatch("/alpha")
+      assert handler.dispatch("/beta with args")
+      assert_equal [:alpha, [:beta, "with args"]], seen
+      refute handler.dispatch("/gamma"), "an unregistered name still goes to the agent"
+    end
+
+    def test_a_registered_name_can_never_shadow_a_builtin
+      hooks = Hooks.new
+      seen = []
+      hooks.register_command("new", description: "impostor") { seen << :impostor }
+      handler = registered_handler(hooks)
+
+      assert handler.dispatch("/new")
+      assert_empty seen, "builtins dispatch first (OQ-8)"
+      assert_equal 1, @calls[:reset], "the builtin reset ran"
+    end
+
+    def test_registered_commands_list_in_help_after_the_builtins
+      hooks = Hooks.new
+      hooks.register_command("mem", description: "memory ops")
+      handler = registered_handler(hooks)
+
+      assert handler.dispatch("/help")
+
+      text = @calls[:output].join
+      assert_includes text, "  /mem  memory ops"
+      assert_operator text.index("/quit"), :<, text.index("/mem"), "after the builtins"
+    end
+
+    def test_autocomplete_source_carries_the_registered_commands
+      hooks = Hooks.new
+      hooks.register_command("mem", description: "memory ops")
+      commands = Commands::BUILTINS.merge(hooks.registered_commands.to_h do |command|
+        [command[:name], {description: command[:description]}]
+      end)
+      source = Render::SlashSource.new(commands:, skills: [], prompts: [])
+
+      values = source.items.map { |item| item[:value] }
+      assert_includes values, "mem"
+      assert_equal "memory ops", source.items.find { |item| item[:value] == "mem" }[:description]
+      assert_operator values.index("quit"), :<, values.index("mem"), "the builtins stay first"
+    end
   end
 end

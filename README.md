@@ -305,6 +305,45 @@ Word operations stop at whitespace, punctuation, and word boundaries (pi's
 `word-navigation.ts` semantics — on `hello world|`, Ctrl+W deletes `world`
 and keeps the separator space).
 
+## Memory
+
+The native memory module (the owner's pi memory extension, ported) keeps a
+per-project memory store and recalls it at session start. It is OPT-IN and
+OFF by default: add `"memory": true` to settings.json (user
+`~/.tart/settings.json` or project `<workdir>/.tart/settings.json`) or set
+`<IDENTITY>_MEMORY=1` (pi reads `PI_MEMORY`, tart `TART_MEMORY`). With the
+gate on, every boot runs the same behavior as the owner's pi: the session's
+first turn carries a recall message — `[project memory] index loaded at
+session start; use the memory tool (read/list) for topic files:` followed by
+the first 200 lines / 25KB of the project index (a truncation notice rides
+the tail when anything was cut).
+
+The store lives under `<IDENTITY>_MEMORY_HOME` (pi: `PI_MEMORY_HOME`, tart:
+`TART_MEMORY_HOME`) or `~/.tart/memory`: one directory per project (the git
+root's basename, so every worktree of a repo shares one store; the cwd
+basename outside any repo), containing `MEMORY.md` (the index — one
+`- [topic](slug.md): first line` row per save) and the `<slug>.md` topic
+files. The `memory` tool (declared last on the wire) drives it: `save`
+stores text under a topic (the file carries a `modified:` frontmatter
+header; the index row upserts), `read` returns a topic file, `list` returns
+the index. The two memory guidelines join the system prompt's rules; the
+MOTD's [Extensions] section gains a `memory.ts` row.
+
+## Herdr
+
+When tart runs inside a herdr pane (all three env vars set: `HERDR_ENV=1`,
+`HERDR_SOCKET_PATH`, `HERDR_PANE_ID`), the agent-state reporter publishes
+the session's state to herdr over a UNIX socket — newline-terminated JSON
+requests (`pane.report_agent`, `pane.report_agent_session`; ids
+`herdr:pi[:session]:<epoch_ms>:<rand>`), one attempt at 500ms then one
+retry at 1500ms, every failure swallowed, never blocking the UI, latest
+state winning while a send is in flight. Reports are TUI-only (print mode
+reports nothing) and carry pi-valued wire fields (`source: "herdr:pi"`,
+`agent: "pi"`) plus the session file path. States: `working` while a turn
+runs, `idle` between turns, `blocked` while a herdr:blocked channel count
+is open. The MOTD's [Extensions] section gains a `herdr-agent-state` row
+when the gate is on.
+
 ## Parity rig: tui-split-rig
 
 `gems/tui-split-rig/bin/tui-split-rig` is the scripted side-by-side parity

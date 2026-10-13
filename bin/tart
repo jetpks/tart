@@ -224,12 +224,24 @@ module Tart
       boot = Models.resolve_boot_model(models, settings, identity:)
       chat = build_chat(models, boot, identity:, resolved:)
       thinking = boot_thinking_kwargs(settings, models, boot, chat, identity:)
+      # The seam boots in print mode too (pi loads the modules regardless of
+      # mode): one Hooks per boot (no base sink — text mode prints nothing
+      # but the final response), the settings-gated memory register, the
+      # herdr register, then the session_start emission (pi's default
+      # reason "startup"); the TUI-only gate roots nothing here.
+      hooks = Hooks.new
+      memory_on = memory_enabled?(settings, identity)
+      Memory.register(hooks:, identity:) if memory_on
+      Herdr.register(hooks:)
+      hooks.emit({"type" => "session_start", "reason" => "startup"},
+        context: {cwd: workdir, mode: "print", session: session_ref(recorder), identity:})
       exit Print.run(
         prompt: options[:print],
         chat:,
         tools: build_tools(workdir, settings,
-          identity:, session_env: print_session_env(recorder, boot, thinking.fetch(:thinking_level))),
-        system_prompt: system_prompt(workdir, settings, skills.skills, identity, context_files:),
+          identity:, session_env: print_session_env(recorder, boot, thinking.fetch(:thinking_level)), hooks:),
+        system_prompt: system_prompt(workdir, settings, skills.skills, identity, context_files:,
+          prompt_guidelines: memory_on ? Memory::PROMPT_GUIDELINES : []),
         recorder:,
         seed_messages:,
         # The compaction knobs MUST reach the loop (the interactive path
@@ -237,6 +249,7 @@ module Tart
         # tier resolves <IDENTITY>_CONTEXT_WINDOW itself.
         compaction: Settings.compaction_kwargs(settings),
         identity:,
+        hooks:,
         **thinking
       )
     end
@@ -276,17 +289,33 @@ module Tart
 
       TUI.run(viewport: :fullscreen, bracketed_paste: true) do |session|
         kernel = Core::Loop.new(session:)
+        # The seam (I47): ONE Hooks per boot — the surface sink inside;
+        # constructed before the surface (the autocomplete's registered-
+        # command merge reads it) with the sink lambda closing over the
+        # surface local (events only flow once the loop runs). The module
+        # rows join the MOTD's [Extensions] list per §5: memory.ts when
+        # the settings gate is on, herdr-agent-state iff its env gate is
+        # on (pi's compact label = the module's display label, OQ-2).
+        memory_on = memory_enabled?(settings, identity)
+        surface = nil # the forward ref the sink lambda closes over (assigned below)
+        hooks = Hooks.new(on_event: ->(event) { surface.on_agent_event(event) })
+        extensions = mcp_servers.keys.dup
+        extensions << "memory.ts" if memory_on
+        extensions << "herdr-agent-state" if Herdr.enabled?(ENV)
         surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
-          mcp_servers:, resume: resume_path, identity:, models:, context_files:)
+          mcp_servers:, resume: resume_path, identity:, models:, context_files:, extensions:, hooks:)
+        Memory.register(hooks:, identity:) if memory_on
+        Herdr.register(hooks:)
         tools = build_tools(workdir, settings, mcp_servers:,
-          identity:, session_env: session_env_readers(surface))
-        prompt = system_prompt(workdir, settings, skills.skills, identity, context_files:)
+          identity:, session_env: session_env_readers(surface), hooks:)
+        prompt = system_prompt(workdir, settings, skills.skills, identity, context_files:,
+          prompt_guidelines: memory_on ? Memory::PROMPT_GUIDELINES : [])
 
         # /new's reset seam: a fresh session is a new recorder (new session
         # file, no parent) plus a fresh Agent::Loop on the same settings,
         # system prompt, skills, and tools. The surface then clears itself
         # and re-renders the MOTD + accent line (Chat#new_session).
-        start_session = lambda do |resume_target|
+        start_session = lambda do |resume_target, reason|
           recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_target)
           current_recorder = recorder
           seed_messages = resume_target ? Agent::Session.context_messages(resume_target) : []
@@ -301,7 +330,10 @@ module Tart
             chat:,
             tools:,
             system_prompt: prompt,
-            on_event: ->(event) { surface.on_agent_event(event) },
+            hooks:,
+            # The emission context re-reads per event — /new swaps the
+            # recorder, the lambda re-resolves the current one.
+            hooks_context: -> { {cwd: workdir, mode: "tui", session: session_ref(current_recorder), identity:} },
             recorder:,
             seed_messages:,
             context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
@@ -312,6 +344,12 @@ module Tart
             thinking_level_map: facts.fetch(:thinking_level_map),
             compat: resolve_boot_entry(models, boot)&.compat
           )
+          # The session_start emission (pi extensions/types.ts:744 —
+          # reasons startup|new|resume; fork/reload have no port surface):
+          # the boot's fresh session is "startup", /new is "new", every
+          # resume (picker or CLI) is "resume".
+          hooks.emit({"type" => "session_start", "reason" => reason},
+            context: {cwd: workdir, mode: "tui", session: session_ref(recorder), identity:})
         end
 
         # The resume seam (item 2/3): the picker's enter and the CLI
@@ -319,7 +357,7 @@ module Tart
         # (pi switchSession), then the surface replays the recorded
         # entries + the "Resumed session" status (Chat#resume_session).
         resume = lambda do |path|
-          start_session.call(path)
+          start_session.call(path, "resume")
           surface.resume_session(path)
         end
 
@@ -328,8 +366,9 @@ module Tart
           settings: settings,
           output: ->(text) { surface.command_line(text) },
           spawn: ->(&block) { kernel.async(&block) },
+          hooks:,
           agent: -> { surface.agent },
-          reset: lambda { start_session.call(nil); surface.new_session },
+          reset: lambda { start_session.call(nil, "new"); surface.new_session },
           thinking: ->(arg) { surface.set_thinking_level(arg) },
           thinking_menu: -> { surface.open_thinking_menu },
           models:,
@@ -348,7 +387,7 @@ module Tart
         )
         surface.on_resume = resume
         resume.call(resume_path) if resume_path
-        start_session.call(nil) unless resume_path
+        start_session.call(nil, "startup") unless resume_path
         report_diagnostics(result.diagnostics, surface:)
         surface.command_line(models.error) if models.error
         skills.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
@@ -404,6 +443,22 @@ module Tart
       key = ENV[Identity.env_key(identity, "API_KEY")] || models&.provider(boot.provider)&.api_key ||
         resolved.api_key
       abort "#{Identity.env_prefix(identity)}API_KEY is not set (see --help)." if key.nil?
+    end
+
+    # The memory gate (I47 — OQ-1): the resolved settings row or the
+    # <IDENTITY>_MEMORY env tier, default off — the env tier speaks "1"/
+    # "true" like the other staged toggles.
+    def memory_enabled?(settings, identity)
+      resolved = Settings.resolve_setting("memory", settings, identity:)
+      resolved == true || resolved == "true" || resolved == "1"
+    end
+
+    # The session ref herdr carries on every request (pi's sessionManager
+    # ref — agent_session_path preferred over agent_session_id).
+    def session_ref(recorder)
+      return nil unless recorder
+
+      {"agent_session_path" => recorder.path, "agent_session_id" => recorder.id}
     end
 
     # Footer facts (AC4): the I10 resolved window is the context-usage
@@ -488,15 +543,18 @@ module Tart
     # I04-era terse string. The loadout is the settings-resolved one (the
     # same list Tools::Registry builds from). +context_files+ is the
     # launcher's single ContextFiles.load (shared with the MOTD's
-    # [Context] section, I33).
-    def system_prompt(workdir, settings, skills, identity, context_files:)
+    # [Context] section, I33). +prompt_guidelines+ (I47) threads the
+    # memory module's two bullets when its gate is on (pi
+    # system-prompt.ts:121).
+    def system_prompt(workdir, settings, skills, identity, context_files:, prompt_guidelines: [])
       Agent::SystemPrompt.build(
         selected_tools: Settings.selected_tools(settings),
         cwd: workdir,
         context_files: context_files,
         docs_paths: Agent::SystemPrompt.pi_docs_paths,
         skills: skills,
-        identity: identity
+        identity: identity,
+        prompt_guidelines:
       )
     end
 
@@ -506,16 +564,28 @@ module Tart
     # of silently degenerating the /model menu to the boot model (the
     # defect the post-integration probe caught: the launcher wired the
     # catalog into build_chat/the handler/footer_data but not here).
-    def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:, context_files: [])
+    def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:,
+                      context_files: [], extensions: nil, hooks: nil)
       Render::Chat.new(
         session:, kernel:,
         # Autocomplete sources (AC1): the builtin slash commands + the
+        # seam's registered commands (I47 — registration order after the
+        # builtins; a registered name can never shadow a builtin) + the
         # loaded skills + the prompt templates (the same catalog the
         # Commands::Handler routes).
-        autocomplete: Render::SlashSource.new(commands: Commands::BUILTINS, skills: skills,
-          prompts: prompts),
+        autocomplete: Render::SlashSource.new(
+          commands: Commands::BUILTINS.merge((hooks&.registered_commands || []).to_h do |command|
+            [command[:name], {description: command[:description]}]
+          end),
+          skills: skills,
+          prompts: prompts
+        ),
         motd: resume.nil?,
-        identity:, prompts:, skills:, context_files:, extensions: mcp_servers.keys,
+        identity:, prompts:, skills:, context_files:,
+        # The [Extensions] compact list: the loaded MCP server names plus
+        # the active module rows (I47 §5 — merged, sorted comma-joined by
+        # the section renderer).
+        extensions: extensions || mcp_servers.keys,
         models:
       )
     end
@@ -574,9 +644,9 @@ module Tart
     end
 
     def build_tools(workdir, settings, mcp_servers: Mcp::Config.load(mcp_config_path),
-                    identity: Identity::DEFAULT, session_env: {})
+                    identity: Identity::DEFAULT, session_env: {}, hooks: nil)
       Tools::Registry.build(selected: Settings.selected_tools(settings), cwd: workdir,
-        mcp_servers:, identity:, session_env:)
+        mcp_servers:, identity:, session_env:, hooks:)
     rescue Mcp::Config::ConfigError => e
       abort "tart: #{e.message}"
     end

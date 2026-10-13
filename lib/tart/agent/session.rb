@@ -122,6 +122,14 @@ module Tart
         {type: "message", id:, parentId: parent_id, timestamp:, message:}
       end
 
+      # Custom-message entry factory (pi CustomMessageEntry,
+      # session-manager.ts:1339-1360 — the nextTurn injection's record:
+      # display-only text with no chat-message payload; +details+ nil is
+      # omitted like pi's undefined). The memory recall rides this entry.
+      def custom_message_entry(custom_type:, content:, display:, id:, parent_id:, timestamp:)
+        {type: "custom_message", customType: custom_type, content:, display:, id:, parentId: parent_id, timestamp:}
+      end
+
       # Compaction entry factory (pi CompactionEntry :91-104 /
       # appendCompaction :1260-1285), the port's field subset (no fromHook
       # or systemMessage field). +usage+ is the summarization call's pi
@@ -177,6 +185,14 @@ module Tart
       def entry_to_context_message(entry)
         compaction = Shapes::CompactionEntry.of(entry)
         return compaction_summary_message(compaction) if compaction
+
+        # pi sessionEntryToContextMessages' custom_message case
+        # (session-manager.ts:437-459 → createCustomMessage → messages.ts
+        # convertToLlm :161-170): the recorded recall text rides the wire
+        # again on resume as a user-role message.
+        if entry.is_a?(Hash) && entry["type"] == "custom_message"
+          return Shapes::ContextMessage.new(role: :user, content: entry["content"].to_s)
+        end
 
         envelope = Shapes::MessageEntry.of(entry)
         return nil unless envelope
@@ -438,6 +454,27 @@ module Tart
           entry[:id]
         end
 
+        # Appends a custom_message entry (pi appendCustomMessageEntry,
+        # agent-session.ts:1144-1160 — the nextTurn injection's record, same
+        # leaf chain). NON-conversation-bearing for the persist gate: a
+        # recall never opens a session file alone (pi _persist's
+        # _hasConversation — only user/assistant/bashExecution open it);
+        # before the first flush the entry waits in @entries and rides the
+        # next conversation-bearing create. Returns the entry id.
+        def append_custom_message(custom_type:, content:, display:)
+          entry = Session.custom_message_entry(
+            custom_type:, content:, display:,
+            id: Session.generate_id(@ids),
+            parent_id: @leaf_id,
+            timestamp: Session.now_iso,
+          )
+          @ids << entry[:id]
+          @leaf_id = entry[:id]
+          @entries << entry
+          persist_custom_message
+          entry[:id]
+        end
+
         # The session's context projection (pi SessionManager
         # .buildContextEntries :475-513): the latest compaction entry, the
         # kept entries from its firstKeptEntryId onward (system messages
@@ -486,6 +523,15 @@ module Tart
             end
             @flushed = true
           end
+        end
+
+        # The custom_message persist arm: appends when flushed, never
+        # creates (a recall never opens a session file alone — see
+        # {append_custom_message}).
+        def persist_custom_message
+          return unless @flushed
+
+          File.write(@path, entry_line(@entries.last), mode: "a")
         end
 
         # The file-creation gate (pi _persist's _hasConversation): user
