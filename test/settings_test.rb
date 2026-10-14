@@ -28,6 +28,13 @@ module Tart
       @server&.stop
     end
 
+    # The wire-model duck (the gem Model's full keyword contract; the
+    # replaced client's assumed-model stand-in — no reasoning, no window).
+    def wire_model(id, context_window: nil)
+      Fast::Completions::Model.new(id: id, reasoning: false,
+        context_window: context_window || 0, max_tokens: context_window || 0)
+    end
+
     def write_settings(path, json)
       FileUtils.mkpath(File.dirname(path))
       File.write(path, json)
@@ -240,7 +247,7 @@ module Tart
     # available-model snapshot spans >1 provider (footer.ts:246-258) —
     # the port's static snapshot is one, the prefix never fires.
     def test_reasoning_resolves_staged_over_model
-      model = RubyLLM::Model.default("mock-1", "openai") # an assumed model: no reasoning
+      model = wire_model("mock-1") # an assumed model: no reasoning
       refute Settings.model_reasoning_capable({}, model)
 
       assert Settings.model_reasoning_capable({"modelReasoning" => true}, model)
@@ -251,10 +258,10 @@ module Tart
     # An assumed model falls back to the known-models table (the owner's
     # daily-driver glm — pi's footer shows its level, so the port's must).
     def test_assumed_model_reasoning_reads_the_known_table
-      model = RubyLLM::Model.default("accounts/fireworks/models/glm-5p3-flash", "openai")
+      model = wire_model("accounts/fireworks/models/glm-5p3-flash")
       assert Settings.model_reasoning_capable({}, model), "the daily-driver model is reasoning-capable"
 
-      unknown = RubyLLM::Model.default("totally-unknown", "openai")
+      unknown = wire_model("totally-unknown")
       refute Settings.model_reasoning_capable({}, unknown)
     end
 
@@ -262,18 +269,21 @@ module Tart
       # A registry entry (real model) — when the entry lists reasoning —
       # carries the reasoning capability (pi reads state.model?.reasoning,
       # footer.ts:233-244).
-      model = RubyLLM.models.find("gpt-5.6")
-      assert_equal model.supports?(:reasoning), Settings.model_reasoning_capable({}, model)
+      # The resolution chain without the registry premise: the wire model
+      # carries the reasoning flag natively; the known-tables outcome
+      # table stays the no-entry pin.
+      model = Fast::Completions::Model.new(id: "gpt-5.6", reasoning: true, context_window: 0, max_tokens: 0)
+      assert Settings.model_reasoning_capable({}, model), "the model's own reasoning flag decides"
       refute Settings.model_reasoning_capable({}, nil)
     end
 
     # --- context window: kwarg → env → settings → model → registry table ---
 
     def test_context_window_resolution_order
-      model = RubyLLM::Model.new(id: "m-1", context_window: 5000)
-      # The registry-default table is the last resort for a model the
-      # pinned ruby_llm registry misses (context_window nil, live-verified).
-      windowless = RubyLLM::Model.new(id: "accounts/fireworks/models/glm-5p3-flash", context_window: nil)
+      model = wire_model("m-1", context_window: 5000)
+      # The known-tables tier is the last resort for a model with no
+      # declared window (the placeholder's zero reads as nil on the view).
+      windowless = wire_model("accounts/fireworks/models/glm-5p3-flash")
 
       assert_equal 9, Settings.resolve_context_window(explicit: 9, model:)
       ENV["PI_CONTEXT_WINDOW"] = "99"
@@ -281,19 +291,16 @@ module Tart
       ENV.delete("PI_CONTEXT_WINDOW")
       assert_equal 5000, Settings.resolve_context_window(model:)
       assert_equal 1_048_573, Settings.resolve_context_window(model: windowless)
-      assert_nil Settings.resolve_context_window(model: RubyLLM::Model.new(id: "unknown-model"))
+      assert_nil Settings.resolve_context_window(model: wire_model("unknown-model"))
 
       write_settings(@project_path, '{"contextWindow": 12345}')
       assert_equal 12_345, Settings.resolve_context_window(settings: load_settings.settings, model: windowless)
     end
 
     def test_default_chat_resolves_the_registry_default_out_of_the_box
-      context = RubyLLM.context do |config|
-        config.openai_api_key = "k"
-        config.openai_api_base = "http://localhost:1/v1"
-      end
-      chat = context.chat(model: "accounts/fireworks/models/glm-5p3-flash", provider: "openai",
-                          protocol: :chat_completions, assume_model_exists: true)
+      chat = Agent::Chat.new(
+        client: Fast::Completions::Client.new(base_url: "http://localhost:1/v1", api_key: "k"),
+        model_id: "accounts/fireworks/models/glm-5p3-flash", provider_key: "openai")
 
       assert_equal 1_048_573,
         Settings.resolve_context_window(settings: load_settings.settings, model: chat.model)
@@ -401,13 +408,13 @@ module Tart
     end
 
     def test_thinking_facts_without_a_catalog_entry
-      model = RubyLLM::Model.default("mock-1", "openai")
+      model = wire_model("mock-1")
       facts = Settings.thinking_facts(nil, {}, model_id: "mock-1", model: model)
       assert_equal false, facts.reasoning, "model_reasoning_capable decides (an assumed mock: not reasoning)"
       assert_nil facts.thinking_level_map, "no known map for the unknown id"
 
       glm = Settings.thinking_facts(nil, {}, model_id: "accounts/fireworks/models/glm-5p3-flash",
-        model: RubyLLM::Model.default("accounts/fireworks/models/glm-5p3-flash", "openai"))
+        model: wire_model("accounts/fireworks/models/glm-5p3-flash"))
       assert glm.reasoning, "the known-models table declares the daily driver reasoning-capable"
       assert_equal Settings.known_thinking_level_map("accounts/fireworks/models/glm-5p3-flash"), glm.thinking_level_map
     end
@@ -477,11 +484,9 @@ module Tart
       ])
       dir = Dir.mktmpdir("tart-settings-session-")
       recorder = Agent::Session::Recorder.new(cwd: dir, root: @root)
-      chat = RubyLLM.context do |config|
-        config.openai_api_key = "k"
-        config.openai_api_base = @server.url
-      end.chat(model: "accounts/fireworks/models/glm-5p3-flash", provider: "openai",
-               protocol: :chat_completions, assume_model_exists: true)
+      chat = Agent::Chat.new(
+        client: Fast::Completions::Client.new(base_url: @server.url, api_key: "k"),
+        model_id: "accounts/fireworks/models/glm-5p3-flash", provider_key: "openai")
 
       window = Settings.resolve_context_window(settings: load_settings.settings, model: chat.model)
       assert_equal 1_048_573, window
@@ -550,7 +555,7 @@ module Tart
     # today's /\A\d+\z/) and a non-positive file value read as absent and
     # the next tier decides.
     def test_context_window_ladder_falls_through_non_digit_env_and_non_positive_file
-      model = RubyLLM::Model.new(id: "m-1", context_window: 5000)
+      model = wire_model("m-1", context_window: 5000)
 
       ["abc", "-5", "+5", " 5", "5.5", ""].each do |junk|
         ENV["PI_CONTEXT_WINDOW"] = junk
@@ -582,7 +587,7 @@ module Tart
     # "true"` short-circuit, never the registry/table fallback (AC2's
     # outcome table).
     def test_model_reasoning_out_of_vocabulary_staged_value_answers_false
-      model = RubyLLM::Model.default("accounts/fireworks/models/glm-5p3-flash", "openai")
+      model = wire_model("accounts/fireworks/models/glm-5p3-flash")
 
       assert_equal false, Settings.model_reasoning_capable({"modelReasoning" => "junk"}, model),
         "out-of-vocabulary staged short-circuits to false (not the known table's true)"

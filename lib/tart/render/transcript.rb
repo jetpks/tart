@@ -43,7 +43,7 @@ module Tart
       # finalize pairs against, the queued {MarkedRegion} (identity — the
       # drain links it to its expandable registration), and the
       # registration hash once the region reached the buffer. nil = no
-      # tool mid-flight (execution is sequential — ruby_llm 2.1.0
+      # tool mid-flight (execution is sequential — the wire turn runs one batch
       # tool_concurrency defaults false).
       PendingTool = Struct.new(:tool, :region, :registration)
 
@@ -229,7 +229,7 @@ module Tart
       # identically; the finalize swaps the builder for the real one).
       # A second enqueue while one is live appends sanely and SUPERSEDES
       # the registration (unreachable under sequential execution —
-      # ruby_llm tool_concurrency defaults false; the superseded block
+      # the executor runs the batch concurrently on the reactor; the superseded block
       # renders on as a plain expandable until its own end appends).
       def enqueue_pending_tool_block(name, args)
         args = {} unless args.is_a?(Hash)

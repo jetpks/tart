@@ -26,7 +26,29 @@ module Tart
         self.class.pi_name
       end
 
+      # The compaction estimate's schema reader — the wire's parameters
+      # (the gem's verbatim declaration), one reader for the estimate and
+      # the tests.
+      def parameters_schema
+        self.class.parameters
+      end
+
+      # The execution seam (the replaced client's Tool#call contract — the
+      # batch executor and the ToolGate land here): the provider's parsed
+      # arguments speak string keys, the schema speaks symbols; the
+      # +tool_call+ duck rides only when #execute declares the keyword
+      # (the replaced client's execute_accepts_tool_call? idiom).
+      def call(tool_call: nil, **arguments)
+        normalized = arguments.transform_keys(&:to_sym)
+        normalized[:tool_call] = tool_call if tool_call && execute_accepts_tool_call?
+        execute(**normalized)
+      end
+
       private
+
+      def execute_accepts_tool_call?
+        method(:execute).parameters.any? { |(_kind, param)| param == :tool_call }
+      end
 
       # The I43 input-validation seam — ONE idiom for all seven built-ins:
       # the tool's contract is looked up by wire name ({Schemas::Tools}),
@@ -41,7 +63,7 @@ module Tart
 
       def safe_execute
         yield
-      rescue RubyLLM::CancelledError
+      rescue Fast::Completions::CancelledError
         raise
       rescue StandardError => e
         {error: e.message}

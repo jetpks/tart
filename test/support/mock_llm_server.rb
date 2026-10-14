@@ -4,7 +4,7 @@ require "socket"
 require "json"
 
 # A hermetic mock OpenAI-compatible endpoint over TCP (127.0.0.1, ephemeral
-# port): the real ruby_llm client (Faraday/net_http, custom-endpoint
+# port): the real fast-completions client (fiber-native on the caller's
 # registration via openai_api_base, protocol :chat_completions) talks to it.
 #
 # Defined at TOP LEVEL (not nested in Tart::Test) so non-minitest callers —
@@ -20,7 +20,7 @@ require "json"
 #   last +script+ call, so ONE server instance can serve pi and tart in the
 #   same run with byte-identical responses.
 #
-# Wire details (verified against ruby_llm 2.1.0 gem source):
+# Wire details (the chat-completions wire shape):
 # - POST {api_base}/chat/completions; `stream: true` +
 #   `stream_options: {include_usage: true}` when the caller streams.
 # - Streaming reply: HTTP 200, `Content-Type: text/event-stream`,
@@ -33,7 +33,7 @@ require "json"
 # Scripting: pass a list of response specs, each either
 #   {type: :stream, content: "text", tool_calls: [{id:, name:, arguments: hash_or_string}]}
 #   {type: :stream, reasoning_content: "thinking"}  (a `reasoning_content` delta
-#     before the content deltas — thinking-model wire shape, ruby_llm
+#     before the content deltas — thinking-model wire shape, the delta
 #     protocols/chat_completions/streaming.rb build_chunk)
 #   {type: :stream, chunks: [delta_hashes...]}   (raw deltas, full control)
 #   {type: :message, content: "text"}            (non-streaming JSON)
@@ -172,22 +172,25 @@ class MockLLMServer
     }
     payload[:usage] = {prompt_tokens: 10, completion_tokens: 5, total_tokens: 15} unless @suppress_usage
     out = JSON.generate(payload)
-    io.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: #{out.bytesize}\r\n\r\n#{out}")
+    io.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n" \
+      "Content-Length: #{out.bytesize}\r\n\r\n#{out}")
   end
 
   # The body openai-compatible endpoints return on a schema rejection;
-  # ruby_llm's error middleware raises on the status before any stream
+  # the client maps the status to its error class before any stream
   # is read.
   def respond_error(io, spec)
     payload = {error: {message: spec[:message], type: "invalid_request_error"}}
     out = JSON.generate(payload)
     status = spec[:status] || 400
-    io.write("HTTP/1.1 #{status} Bad Request\r\nContent-Type: application/json\r\nContent-Length: #{out.bytesize}\r\n\r\n#{out}")
+    io.write("HTTP/1.1 #{status} Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n" \
+      "Content-Length: #{out.bytesize}\r\n\r\n#{out}")
   end
 
   def respond_stream(io, spec)
     deltas = spec[:type] == :slow_stream ? slow_deltas(spec) : deltas_for(spec)
-    io.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+    io.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n" \
+      "Transfer-Encoding: chunked\r\n\r\n")
     deltas.each do |delta|
       write_sse(io, delta)
     end
@@ -262,19 +265,14 @@ module Tart
       # Tart::Test::MockLLMServer; the class above is the one definition.
       MockLLMServer = ::MockLLMServer
 
-      # A ruby_llm chat pointed at a MockLLMServer — the real client on the
-      # custom-endpoint path, hermetically.
+      # The gem Client + the tart Chat pointed at a MockLLMServer — the
+      # real client on the wire, hermetically.
       class TestChat
         class << self
           def build(server, tools: [], system_prompt: nil, request_timeout: 10)
-            context = RubyLLM.context do |config|
-              config.openai_api_key = "test-key"
-              config.openai_api_base = server.url
-              config.request_timeout = request_timeout
-              config.max_retries = 0
-            end
-            chat = context.chat(model: "tart-test-model", provider: "openai",
-                                protocol: :chat_completions, assume_model_exists: true)
+            client = Fast::Completions::Client.new(base_url: server.url, api_key: "test-key",
+                                                   timeout: request_timeout)
+            chat = Agent::Chat.new(client:, model_id: "tart-test-model", provider_key: "mock")
             chat.with_tools(*tools) unless tools.empty?
             chat.with_instructions(system_prompt) if system_prompt
             chat

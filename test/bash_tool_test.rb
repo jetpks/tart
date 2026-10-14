@@ -92,30 +92,37 @@ module Tart
 
     def test_cancellation_kills_process_group_and_propagates
       marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
-      cancelled = false
-      checkpoint = -> { raise RubyLLM::CancelledError, "cancelled" if cancelled }
-
       error = nil
       watcher = Thread.new do
         begin
           Async do
-            # The watch and the tool run share ONE fiber (the checkpoint is
-            # fiber-local — Grounds §3 probe4): the de-bridged tool runs on
-            # a reactor fiber, so the watch wraps it INSIDE the reactor.
-            RubyLLM::Support::Cancellation.watch(checkpoint) do
-              tool.execute(command: "echo #{marker}; sleep 30")
+            # The interrupt cancels the tool's TASK (the gem checkpoints
+            # read the task state — no flag pairing anywhere): the cancel
+            # lands at the execute's next cooperative wait and propagates
+            # through the tool's group-kill rescue.
+            child = Async::Task.current.async do
+              begin
+                tool.execute(command: "echo #{marker}; sleep 30")
+              rescue Async::Cancel => e
+                error = e
+                raise
+              end
+            end
+            sleep 0.3 # let the command start
+            child.cancel # the interrupt
+            begin
+              child.wait
+            rescue Async::Cancel
+              nil # a cancelled child's wait is quiet in async 2.x
             end
           end.wait
-        rescue RubyLLM::CancelledError => e
-          error = e
+        rescue Async::Cancel
+          nil
         end
       end
-
-      sleep 0.3 # let the command start
-      cancelled = true # the interrupt: chat.cancel flips the flag
       watcher.join(10)
 
-      assert_instance_of RubyLLM::CancelledError, error
+      assert_instance_of Async::Cancel, error
       assert_no_probe(marker)
     end
 

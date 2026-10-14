@@ -36,9 +36,9 @@ module Tart
       server = mock_server([{type: :error, status: 400, message: "Extra inputs are not permitted"}])
       agent, events = run_agent_on_kernel(server, "hi")
 
-      assert_kind_of RubyLLM::BadRequestError, agent.last_error
+      assert_kind_of Fast::Completions::BadRequestError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
-      assert_kind_of RubyLLM::BadRequestError, end_event[:error]
+      assert_kind_of Fast::Completions::BadRequestError, end_event[:error]
       assert_equal %i[user], agent.new_messages.map(&:role)
     end
 
@@ -47,24 +47,20 @@ module Tart
                              message: "This model maximum context length is 8 tokens"}])
       agent, events = run_agent_on_kernel(server, "hi", compaction: {enabled: false})
 
-      assert_kind_of RubyLLM::ContextLengthExceededError, agent.last_error
+      assert_kind_of Fast::Completions::ContextLengthExceededError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
-      assert_kind_of RubyLLM::ContextLengthExceededError, end_event[:error]
+      assert_kind_of Fast::Completions::ContextLengthExceededError, end_event[:error]
     end
 
     def test_dead_endpoint_classifies_as_connection_failed
-      chat = RubyLLM.context do |config|
-        config.openai_api_key = "test"
-        config.openai_api_base = "http://127.0.0.1:1/v1"
-        config.request_timeout = 2
-        config.max_retries = 0
-      end.chat(model: "tart-test-model", provider: "openai",
-              protocol: :chat_completions, assume_model_exists: true)
+      chat = Agent::Chat.new(
+        client: Fast::Completions::Client.new(base_url: "http://127.0.0.1:1/v1", api_key: "test", timeout: 2),
+        model_id: "tart-test-model", provider_key: "openai")
       agent, events = run_agent_on_kernel_with_chat(chat)
 
-      assert_kind_of Faraday::ConnectionFailed, agent.last_error
+      assert_kind_of Fast::Completions::ConnectionError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
-      assert_kind_of Faraday::ConnectionFailed, end_event[:error]
+      assert_kind_of Fast::Completions::ConnectionError, end_event[:error]
     end
 
     # -- the MCP call-surface taxonomy (public API) ---------------------------

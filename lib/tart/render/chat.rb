@@ -1882,9 +1882,9 @@ module Tart
           thinking_level_map: entry.fetch(:thinking_level_map, nil),
           compat: entry.fetch(:compat, nil)) unless entry.is_a?(Shapes::Model)
         status = persist ? "Default model: #{entry.provider}/#{entry.id}" : "Model: #{entry.id}"
-        # The wire provider is the models.json key mapped onto the port's
-        # carried seam (Models.wire_provider — the loop's with_model
-        # needs a native slug); the window + the composed reasoning facts
+        # The provider key rides the switch as METADATA (the wire model's
+        # provider attribute — the dialect rides the model by
+        # construction); the window + the composed reasoning facts
         # re-resolve in the loop seam (the entry's flag/map, the known
         # tables when the entry declares none — Settings.thinking_facts).
         facts = Settings.thinking_facts(entry, model_id: entry.id)
@@ -1900,7 +1900,7 @@ module Tart
           @thinking_level = effective
           @transcript_state.enqueue_status(status)
         end
-        @agent&.switch_model(entry.id, provider: Models.wire_provider(entry.provider),
+        @agent&.switch_model(entry.id, provider: entry.provider,
           context_window: entry.context_window,
           model_reasoning: facts.reasoning,
           thinking_level_map: facts.thinking_level_map,

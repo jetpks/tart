@@ -9,7 +9,7 @@ module Tart
   # The JSONL session store (AC1/AC2): recording an agent turn to a session
   # file, parsing it back, resume seeding (the model sees prior turns on the
   # wire), and most-recent-session-for-cwd selection — against the real
-  # ruby_llm client over the local mock endpoint.
+  # fast-completions client over the local mock endpoint.
   class SessionTest < Test
     def setup
       @server = MockLLMServer.new.start
@@ -234,7 +234,7 @@ module Tart
     # (appendCompaction's `firstKeptEntryId ?? id`).
     def test_recorder_appends_compaction_entries
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
-      recorder.append_message(RubyLLM::Message.new(role: :user, content: "hi"))
+      recorder.append_message(Agent::Message.user("hi"))
       id = recorder.append_compaction(summary: "the summary", first_kept_entry_id: nil,
         tokens_before: 42, details: {"readFiles" => ["a.rb"], "modifiedFiles" => []})
 
@@ -256,7 +256,7 @@ module Tart
     # usage — JSON drops undefined).
     def test_recorder_persists_the_summarization_usage_on_the_compaction_entry
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
-      recorder.append_message(RubyLLM::Message.new(role: :user, content: "hi"))
+      recorder.append_message(Agent::Message.user("hi"))
       recorder.append_compaction(summary: "the summary", first_kept_entry_id: nil, tokens_before: 42,
         details: {}, usage: {"input" => 10, "output" => 5, "totalTokens" => 15})
       recorder.append_compaction(summary: "second", first_kept_entry_id: nil, tokens_before: 1, details: {})
@@ -267,19 +267,28 @@ module Tart
       refute entries[3].key?("usage")
     end
 
-    # AC3 (I30): the gem's Tokens readers map onto pi's Usage (types.ts
-    # :446) camelCase persisted shape — unreported counts drop,
-    # totalTokens is the component sum (the gem carries no total reader);
-    # nothing reported persists nothing (pi's usage-undefined entries).
-    def test_compaction_usage_maps_the_gem_tokens_to_pis_usage_shape
-      tokens = RubyLLM::Tokens.new(input: 10, output: 5, cache_read: 4, cache_write: 2,
-        thinking: 3, cache_write_by_ttl: {"5m" => 1, "1h" => 2})
+    # AC3 (I30): the gem's Usage readers map onto pi's Usage (types.ts
+    # :446) camelCase persisted shape — nothing unreported persists; the
+    # 1h-ttl cache-write sub-key died with the replaced client; the
+    # cache-write zero persists (the recorded parser default) while an
+    # unreported cache-read drops; totalTokens is the gem's NATIVE total
+    # (OQ-9); nothing reported persists nothing (pi's usage-undefined
+    # entries).
+    def test_compaction_usage_maps_the_gem_usage_to_pis_usage_shape
+      usage = Fast::Completions::Usage.new(input: 10, output: 5, cache_read: 4,
+        cache_write: 2, reasoning: 3, total_tokens: 24)
       assert_equal(
         {"input" => 10, "output" => 5, "cacheRead" => 4, "cacheWrite" => 2,
-         "cacheWrite1h" => 2, "reasoning" => 3, "totalTokens" => 21},
-        Agent::Session.compaction_usage(tokens))
+         "reasoning" => 3, "totalTokens" => 24},
+        Agent::Session.compaction_usage(usage))
 
-      assert_nil Agent::Session.compaction_usage(RubyLLM::Tokens.new)
+      # The frozen parser asymmetry: the reported zero cache WRITE
+      # persists, an unreported (zero) cache READ drops.
+      mocked = Fast::Completions::Usage.new(input: 10, output: 5, total_tokens: 15)
+      assert_equal({"input" => 10, "output" => 5, "cacheWrite" => 0, "totalTokens" => 15},
+        Agent::Session.compaction_usage(mocked))
+
+      assert_nil Agent::Session.compaction_usage(Fast::Completions::Usage::ZERO)
       assert_nil Agent::Session.compaction_usage(nil)
     end
 
@@ -289,9 +298,9 @@ module Tart
     # shape load_entries reads back.
     def test_recorder_context_entries_projects_the_kept_tail
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
-      recorder.append_message(RubyLLM::Message.new(role: :user, content: "old question"))
-      recorder.append_message(RubyLLM::Message.new(role: :system, content: "prompt state"))
-      kept_id = recorder.append_message(RubyLLM::Message.new(role: :assistant, content: "kept answer"))
+      recorder.append_message(Agent::Message.user("old question"))
+      recorder.append_message(Agent::Message.new(role: :system, content: "prompt state"))
+      kept_id = recorder.append_message(Agent::Message.new(role: :assistant, content: "kept answer"))
       recorder.append_compaction(summary: "the summary", first_kept_entry_id: kept_id,
         tokens_before: 1, details: {})
 
@@ -421,7 +430,7 @@ module Tart
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
       refute recorder.persisted?, "a setup-only session leaves no file"
 
-      message = RubyLLM::Message.new(role: :user, content: "hi")
+      message = Agent::Message.user("hi")
       recorder.append_message(message)
       assert recorder.persisted?, "the file exists once a user message landed"
     end

@@ -126,16 +126,32 @@ module Tart
             end
           end
           begin
-            RubyLLM::Support::Cancellation.watch(
-              -> { raise RubyLLM::CancelledError if @cancel_flag }
-            ) do
+            # D10 — the Esc belt: the gem ships Cancellation.check
+            # (task-cancelled) with no watch/flag pairing. The belt is a
+            # tart-local flag→task bridge: a watchdog child polls the flag
+            # and cancels THIS task, so the Async::Cancel lands inside
+            # run_user's cooperative waits exactly where the replaced
+            # client's fiber-local raise used to — and the tool's gem
+            # checkpoints (task-cancelled) cover the boundaries between
+            # waits. Same observable, both escape pins and the I50
+            # drainer-wait Cancel guards hold.
+            worker = Async::Task.current
+            watchdog = Async::Task.current.async do
+              sleep 0.02 until @cancel_flag
+              worker.cancel
+            end
+            raise Fast::Completions::CancelledError, "user bash cancelled" if @cancel_flag
+
+            begin
               @slot[:outcome] = tool.run_user(command, on_chunk: ->(text) { chunks << text })
+            ensure
+              watchdog.stop
             end
           rescue StandardError => e
             # The worker-error arm (invariant (c)): recorded here, rendered
             # by finish as the error line. A CancelledError never lands here
             # (run_user owns the cancelled shape — the partial outcome).
-            @slot[:error] = e unless e.is_a?(RubyLLM::CancelledError)
+            @slot[:error] = e unless e.is_a?(Fast::Completions::CancelledError)
           ensure
             chunks << :done
             begin

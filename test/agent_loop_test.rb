@@ -9,7 +9,7 @@ require "json"
 
 module Tart
   # The agent loop on the I02 kernel (AC1/AC3): multi-turn tool round-trip
-  # against the real ruby_llm client over a local mock OpenAI-compatible
+  # against the real fast-completions client over a local mock OpenAI-compatible
   # endpoint, kernel-interrupt cancellation, schema gating, unconditional
   # tool execution (pi's agent-loop.ts:832 — no permissions system).
   class AgentLoopTest < Test
@@ -117,7 +117,7 @@ module Tart
       error_event = events.find { |e| e[:type] == :agent_end }
       assert error_event, "the run must reach agent_end"
       assert error_event[:error], "the worker's error must surface on agent_end"
-      assert_kind_of RubyLLM::BadRequestError, agent.last_error
+      assert_kind_of Fast::Completions::BadRequestError, agent.last_error
       assert_includes agent.last_error.message, "Extra inputs"
       assert_equal %i[user], agent.new_messages.map(&:role)
     end
@@ -126,8 +126,8 @@ module Tart
     # a thinking reply's assistant message KEEPS its thinking (the I05
     # strip_thinking_replay deviation is gone), and follow-up request
     # bodies replay it under `reasoning_content` — the field the provider's
-    # deltas carried (live-verified for fireworks) — with ruby_llm's
-    # duplicate `reasoning` field ABSENT (the request-seam normalization).
+    # deltas carried (live-verified for fireworks) — with the replaced
+    # client's duplicate `reasoning` field ABSENT (the request-seam normalization).
     # The tool-result continuation completes (the I05 400 class cannot
     # recur through the port's own payload shape).
     def test_followup_requests_replay_the_assistant_reasoning_content
@@ -149,7 +149,7 @@ module Tart
       assert_equal "I should list the files", replayed["reasoning_content"],
         "the thinking replays under the delta-carried signature (pi's assistantMsg[signature])"
       assistants.each do |message|
-        refute message.key?("reasoning"), "ruby_llm's duplicate `reasoning` field must be absent"
+        refute message.key?("reasoning"), "the replaced client's duplicate `reasoning` field must be absent"
       end
       assert_equal "done", result.last.content
       types = events.map { |e| e[:type] }
@@ -484,8 +484,9 @@ module Tart
       assert_equal "developer", summary_request["messages"].first["role"]
       assert summary_request.key?("max_completion_tokens"), "today's max-token key unchanged"
       refute summary_request.key?("max_tokens")
-      refute summary_request.key?("reasoning_effort"),
-        "today's one-shot carries no reasoning_effort (no hook there)"
+      assert_equal "medium", summary_request["reasoning_effort"],
+        "the one-shot rides the same wire model + session level (D6 — pi compaction.ts:605-607; " \
+        "the no-hook premise died with the seam)"
     end
 
     # Pin 9 — the switch seam: switch_model(compat:) swaps the dialect
@@ -724,6 +725,78 @@ module Tart
       assert_nil agent.last_error
     end
 
+    # AC1 (the probe6 ARM A residual CLOSED — Grounds D2): a kernel-style
+    # interrupt ~0.1 s into a two-call 0.5 s sleep batch ABORTS the run —
+    # the batch join re-raises instead of waiting out natural completion
+    # (waiting would surface the agent_end ≈0.4 s after the cancel).
+    def test_cancel_during_tool_batch_aborts_fast
+      @server.script(BATCH_SCRIPT.map(&:dup))
+      agent, stamped = stamped_agent_on_kernel(tools: {"sleep" => SleepTool.new})
+
+      cancel_at = nil
+      Async do |root|
+        turn = root.async do
+          begin
+            agent.run("sleep twice")
+          rescue Async::Cancel
+            nil # run() re-raises after the interrupted bookkeeping
+          end
+        end
+        root.async do
+          sleep 0.1 # ~0.1 s into the 0.5 s batch
+          cancel_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          turn.stop
+        end
+        begin
+          turn.wait
+        rescue Async::Cancel
+          nil
+        end
+      end
+
+      assert agent.interrupted?, "the interrupt surfaced through run()"
+      end_event = stamped_events(stamped, :agent_end).last
+      refute_nil end_event, "the interrupted agent_end landed"
+      assert end_event[:interrupted], "the interrupted flag rides agent_end"
+      span = end_event[:_at] - cancel_at
+      assert_operator span, :<, 0.2,
+        "the batch ABORTED (natural completion is ≈0.4 s after the cancel); span=#{span.round(2)}s"
+    end
+
+    # AC1 (the frozen recorded bytes — Grounds D5): the adapter's recorded
+    # projection is the recorded empirical hash, nil/0 conventions included,
+    # and the tool-result entry rides its own shape. The next wire-bodies
+    # baseline hangs off these bytes.
+    def test_recorded_message_shape_matches_the_frozen_bytes
+      File.write(File.join(@dir, "fixture.txt"), "x")
+      @server.script([
+        {type: :stream, content: "the frozen reply"},
+        {type: :stream, tool_calls: [{id: "call_1", name: "ls", arguments: {path: "."}}]},
+        {type: :message, content: "the listing is above"},
+      ])
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: File.join(@dir, "root"))
+      tools = Tools::Registry.build(selected: %w[ls], cwd: @dir)
+      agent, = agent_on_kernel(tools:, recorder:)
+      agent.push_message("list them again")
+      run_agent(agent, "list the files")
+
+      entries = Agent::Session.load_entries(recorder.path)
+      assistants = entries.select { |entry| entry.dig("message", "role") == "assistant" }
+      frozen = {"role" => "assistant", "tool_calls" => {}, "finish_reason" => "stop",
+                "input_tokens" => 10, "output_tokens" => 5, "cache_write_tokens" => 0}
+      assert_equal frozen.merge("content" => "the frozen reply"),
+        assistants[0]["message"],
+        "the recorded assistant hash is the frozen empirical bytes (exact keys, nil/0 conventions)"
+      calls_entry = assistants.find { |entry| entry.dig("message", "finish_reason") == "tool_calls" }
+      refute_nil calls_entry, "the tool-call turn recorded"
+      assert_equal ["call_1"], calls_entry.dig("message", "tool_calls").keys
+      assert_equal frozen.merge("content" => "the listing is above"),
+        assistants.last["message"]
+      tool_entry = entries.find { |entry| entry.dig("message", "role") == "tool" }
+      assert_equal "call_1", tool_entry.dig("message", "tool_call_id")
+      assert_includes tool_entry.dig("message", "content"), "fixture.txt"
+    end
+
     def agent_on_kernel(session: ScriptedSession.new, tools: empty_tools,
                         on_event: nil, script_enabled: true, **loop_kwargs)
       events = []
@@ -789,7 +862,7 @@ module Tart
     end
 
     # The model-switch seam (I27 AC3): the same chat object re-resolves
-    # model + provider in place (ruby_llm Chat#with_model — live-verified
+    # model + provider in place (the Chat's apply_facts rebuilds the wire model
     # chat.rb:609), and the context window re-resolves (the compaction
     # threshold's denominator follows the switched model).
     def test_switch_model_swaps_the_runtime_chat_and_re_resolves_the_window
@@ -1141,7 +1214,7 @@ module Tart
       run_agent(agent, "new question")
 
       assert_equal 3, @server.captured_requests.size, "no third LLM call for the same turn"
-      assert_kind_of RubyLLM::ContextLengthExceededError, agent.last_error
+      assert_kind_of Fast::Completions::ContextLengthExceededError, agent.last_error
       error_end = events.find { |e| e[:type] == :agent_end }
       assert error_end[:error], "the second overflow must surface on agent_end"
     end
@@ -1177,9 +1250,9 @@ module Tart
       agent, events = agent_on_kernel
       run_agent(agent, "hi")
 
-      assert_kind_of RubyLLM::BadRequestError, agent.last_error
+      assert_kind_of Fast::Completions::BadRequestError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
-      assert_kind_of RubyLLM::BadRequestError, end_event[:error]
+      assert_kind_of Fast::Completions::BadRequestError, end_event[:error]
     end
 
     def test_context_length_error_classifies_with_compaction_disabled
@@ -1188,25 +1261,21 @@ module Tart
       agent, events = agent_on_kernel(compaction: {enabled: false})
       run_agent(agent, "hi")
 
-      assert_kind_of RubyLLM::ContextLengthExceededError, agent.last_error
+      assert_kind_of Fast::Completions::ContextLengthExceededError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
-      assert_kind_of RubyLLM::ContextLengthExceededError, end_event[:error]
+      assert_kind_of Fast::Completions::ContextLengthExceededError, end_event[:error]
     end
 
     def test_dead_endpoint_classifies_as_connection_failed
-      chat = RubyLLM.context do |config|
-        config.openai_api_key = "test"
-        config.openai_api_base = "http://127.0.0.1:1/v1"
-        config.request_timeout = 2
-        config.max_retries = 0
-      end.chat(model: "tart-test-model", provider: "openai",
-              protocol: :chat_completions, assume_model_exists: true)
+      chat = Agent::Chat.new(
+        client: Fast::Completions::Client.new(base_url: "http://127.0.0.1:1/v1", api_key: "test", timeout: 2),
+        model_id: "tart-test-model", provider_key: "openai")
       agent, events = agent_on_kernel_with_chat(chat)
       run_agent(agent, "hi")
 
-      assert_kind_of Faraday::ConnectionFailed, agent.last_error
+      assert_kind_of Fast::Completions::ConnectionError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
-      assert_kind_of Faraday::ConnectionFailed, end_event[:error]
+      assert_kind_of Fast::Completions::ConnectionError, end_event[:error]
     end
 
     # --- I47 seam pins (the hooks-semantics gate drives the same surface) ---
@@ -1489,8 +1558,8 @@ module Tart
       chat = TestChat.build(@server, system_prompt: "test prompt")
       agent = Agent::Loop.new(chat:, tools: {}, on_event: sink, compaction:,
                               seed_messages: [
-                                RubyLLM::Message.new(role: :user, content: "old question"),
-                                RubyLLM::Message.new(role: :assistant, content: "old answer"),
+                                Agent::Message.user("old question"),
+                                Agent::Message.new(role: :assistant, content: "old answer"),
                               ])
       [agent, events]
     end
@@ -1522,9 +1591,20 @@ end
 # The de-bridge pins' load (top-level: the gem derives the wire tool name
 # from the class name — a namespace-less name stays "sleep"; a nested class
 # would carry a tart-- prefix the mock script would have to match).
-class SleepTool < RubyLLM::Tool
+class SleepTool < Fast::Completions::Tool
   description "Sleeps half a second"
-  parameter :label, type: "string", description: "the label"
+
+  # The replaced client's schema DSL: one verbatim declaration (the
+  # executor's ToolCall lands on #call, the SafeExecute idiom).
+  parameters({"type" => "object",
+              "properties" => {"label" => {"type" => "string", "description" => "the label"}},
+              "required" => ["label"]})
+
+  def name = "sleep"
+
+  def call(tool_call: nil, **arguments)
+    execute(label: arguments[:label] || arguments["label"])
+  end
 
   def execute(label:)
     sleep 0.5

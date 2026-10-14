@@ -3,7 +3,6 @@
 require_relative "test_helper"
 require "tmpdir"
 require "json"
-require "base64"
 require "fileutils"
 
 module Tart
@@ -80,7 +79,7 @@ module Tart
       result = Tools::Write.new(cwd: @dir).execute(path: "out1.txt", content:)
 
       assert_equal test_case["value"]["message"], result
-      assert_equal test_case["value"]["written_base64"], Base64.strict_encode64(File.binread(File.join(@dir, "out1.txt"))),
+      assert_equal test_case["value"]["written_base64"], [File.binread(File.join(@dir, "out1.txt"))].pack("m0"),
         "write must be byte-verbatim (no newline/whitespace fixup)"
     end
 
@@ -145,7 +144,7 @@ module Tart
 
         assert_equal golden["message"], result,
           "edit golden '#{name}': success message must match pi"
-        assert_equal golden["written_base64"], Base64.strict_encode64(File.binread(File.join(@dir, relative_path))),
+        assert_equal golden["written_base64"], [File.binread(File.join(@dir, relative_path))].pack("m0"),
           "edit golden '#{name}': written file bytes must match pi exactly (§5 verbatim parity)"
         next unless golden["details"]
 
@@ -279,7 +278,7 @@ module Tart
       end
     end
 
-    # Tools report constructed errors as {error:} results (the ruby_llm
+    # Tools report constructed errors as {error:} results (the tool
     # contract); raised exceptions pass their message through.
     def error_message_from(result)
       return result[:error] if result.is_a?(Hash) && result.key?(:error)

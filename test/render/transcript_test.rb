@@ -210,7 +210,7 @@ module Tart
 
       # A second enqueue while one is live appends sanely and SUPERSEDES
       # the registration (unreachable under sequential execution —
-      # ruby_llm tool_concurrency defaults false; the documented caveat):
+      # the executor's batch is the only concurrency; the documented caveat):
       # the superseded block renders on under the pending bg (its end
       # falls back to the append below it), the live one replaces.
       def test_second_pending_supersedes_and_the_stale_end_appends

@@ -43,8 +43,6 @@ Gem::Specification.new do |spec|
   spec.add_dependency "dry-types", "~> 1.9"
   # RFC 9562 uuid generation (pi createSessionId :264 / generateId :275).
   spec.add_dependency "fast-uuid", "~> 0.1.0"
-  # LLM conversation loop (BRIEF §2: >= 2.1.0).
-  spec.add_dependency "ruby_llm", "~> 2.1"
   # Pinned exactly: the poller thread's GVL-releasing poll_event is verified
   # for 1.5.0 only (I01 seam spike finding).
   spec.add_dependency "ratatui_ruby", "1.5.0"

@@ -6,6 +6,7 @@ require_relative "../herdr"
 require_relative "../memory"
 require_relative "../models"
 require_relative "../settings"
+require_relative "chat"
 require_relative "session"
 require_relative "status"
 require_relative "system_prompt"
@@ -13,24 +14,25 @@ require_relative "system_prompt"
 module Tart
   module Agent
     # The agent loop (port of pi's agent-loop.ts runAgentLoop/runLoop shape,
-    # mapped onto ruby_llm 2.1 and the I02 kernel).
+    # mapped onto the fast-completions gem via {Chat} and the I02 kernel).
     #
     # pi's shape, preserved:
     # - outer loop: continues while queued user (steering/follow-up) messages
     #   arrive after the agent would stop;
-    # - inner loop: model turn, then tool-call batches (ruby_llm's
-    #   pending-tool-call execution on #step), until the model answers
-    #   without tool calls; tools execute unconditionally (pi's
-    #   agent-loop.ts:832 — no permissions system);
+    # - inner loop: model turn, then tool-call batches (the Chat's batch
+    #   executor on #step), until the model answers without tool calls; tools
+    #   execute unconditionally (pi's agent-loop.ts:832 — no permissions
+    #   system);
     # - an aborted turn emits turn_end/agent_end and stops.
     #
     # Kernel mapping: the loop runs as the work block (task subtree) on
     # {Core::Loop}; a kernel interrupt (Ctrl+C or the INT trap net) cancels
     # the in-flight turn — the Async::Cancel lands at the turn fiber's
     # current wait (the streaming HTTP read, or a tool's cooperative wait —
-    # probe3: Net::HTTP over TLS is fiber-scheduler-cooperative), the chat
-    # is cancelled at the ladder (tools kill their subprocess groups at
-    # their checkpoints), and the cancel propagates.
+    # the gem's client is fiber-native on the caller's reactor), the Chat
+    # converts the gem's CancelledError back to Async::Cancel (Grounds D3),
+    # tools kill their subprocess groups at their checkpoints, and the
+    # cancel propagates.
     #
     # Events (minimal surface, pi's AgentEvent vocabulary plus the
     # compaction events): :agent_start, :turn_start, :message_start,
@@ -44,22 +46,24 @@ module Tart
     # Compaction (pi's auto-compaction, agent-session.ts:3007-3219): after
     # a completed turn, provider-reported context usage over the model's
     # context window minus the reserve compacts ("threshold"); a step that
-    # fails with RubyLLM::ContextLengthExceededError omits the attempt (the
-    # gem never appends the failed response), compacts and retries the turn
-    # once ("overflow", latched — a second consecutive overflow surfaces as
-    # the error). The compaction entry goes to the session recorder; the
-    # chat history is replaced in place with [summary message, kept tail].
+    # fails with Fast::Completions::ContextLengthExceededError omits the
+    # attempt (the chat never appends the failed response), compacts and
+    # retries the turn once ("overflow", latched — a second consecutive
+    # overflow surfaces as the error). The compaction entry goes to the
+    # session recorder; the chat history is replaced in place with [summary
+    # message, kept tail].
     class Loop
-      # @param chat [RubyLLM::Chat] configured for the endpoint (model,
-      #   provider, protocol).
-      # @param tools [Hash{String => RubyLLM::Tool}] the selected loadout
-      #   ({Tools::Registry.build}); disabled tools are never registered.
+      # @param chat [Tart::Agent::Chat] the conversation object (client +
+      #   model id wired by the caller — bin/tart build_chat / TestChat).
+      # @param tools [Hash{String => Fast::Completions::Tool}] the selected
+      #   loadout ({Tools::Registry.build}); disabled tools are never
+      #   registered.
       # @param system_prompt [String, nil] set as the chat's instructions.
       # @param on_event [Proc, nil] called with each event Hash.
       # @param recorder [Session::Recorder, nil] the optional session
       #   recorder (pi's SessionManager, message subset): every message this
       #   run adds is appended to the session file in order; +nil+ = off.
-      # @param seed_messages [Array<Hash, RubyLLM::Message>] prior context
+      # @param seed_messages [Array<Hash, Message>] prior context
       #   messages to seed the chat with before the run (resume:
       #   Agent::Session.context_messages) — the model sees them on the
       #   wire, they are never re-recorded as new messages.
@@ -74,8 +78,8 @@ module Tart
       #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
       # @param thinking_level [String] the session's thinking level (pi
       #   DEFAULT_THINKING_LEVEL "medium"); {set_thinking_level} changes
-      #   it mid-session — the next request picks it up (the hook reads it
-      #   at request time; no gem state to reset).
+      #   it mid-session — the next request picks it up (the Chat carries it
+      #   onto the wire at request time; no cached state).
       # @param model_reasoning [Boolean] the model's reasoning capability
       #   (pi model.reasoning) — gates whether any reasoning_effort is
       #   ever sent.
@@ -83,10 +87,9 @@ module Tart
       #   (pi's Partial Record<level, String|null>, symbolized); nil = the
       #   map-less rule (pi's ladder without xhigh/max, off sends nothing).
       # @param compat [Shapes::ModelCompat, nil] the model's pi-compat
-      #   dialect subset (I46); nil = today's default arm (the I36 effort
-      #   wiring, no thinking object/tool_stream/role rewrite/rename).
-      #   {switch_model} swaps it mid-session — the hook reads it at
-      #   request time, same idiom as the level.
+      #   dialect subset (I46); nil = the default dialect (the gem's plain
+      #   openai arm). {switch_model} swaps it mid-session — apply_facts
+      #   rebuilds the wire model with the new facts wholesale.
       # @param hooks [Tart::Hooks, nil] the extension seam (I47): when
       #   present every emitted event routes through {Hooks#emit}
       #   (registration-order handlers, then the surface sink the Hooks
@@ -136,11 +139,20 @@ module Tart
         @last_error = nil
         @interrupted = false
 
-        @chat.with_tools(*tools.values).with_tool_options(concurrency: :fibers) unless tools.empty?
+        @chat.with_tools(*tools.values) unless tools.empty?
         @chat.with_instructions(system_prompt) if system_prompt
         seed_messages.each { |message| @chat.add_message(message) }
         install_chat_callbacks
-        install_thinking_seam
+        # The facts ride the WIRE MODEL (D6): the constructor kwargs thread
+        # into the gem Model (reasoning flag, level map, dialect) — no
+        # request seam, no payload mutation. The window runs the loop's
+        # resolution chain first; unresolvable, the known-tables tier, then
+        # pi's zero placeholder (the threshold-disabled shape).
+        @chat.apply_facts(model_reasoning: @model_reasoning,
+          thinking_level_map: @thinking_level_map, compat: @compat,
+          context_window: resolved_context_window ||
+            Settings::MODEL_CONTEXT_WINDOWS.fetch(@chat.model_id, 0))
+        @chat.thinking_level = @thinking_level
       end
 
       # Queues a user message. While the agent runs, it is consumed at the
@@ -215,24 +227,22 @@ module Tart
       # swap the loop, and the readers re-resolve at every spawn).
       attr_reader :recorder
 
-      # The thinking level's runtime seam (pi setThinkingLevel :5163-5172 →
-      # session state): stored only — the request hook reads it at request
-      # time, so the NEXT request carries the new level (pi's per-request
-      # clampThinkingLevel, streamSimple :749). The surface calls it.
+      # The thinking level's session state (pi setThinkingLevel :5163-5172 →
+      # session state): stored on the loop (the surface readback) and on
+      # the Chat — the request carries it at stream time, so the NEXT
+      # request applies the new level (pi's per-request clampThinkingLevel,
+      # streamSimple :749; the gem resolves the effort through the model's
+      # map). The surface calls it.
       def set_thinking_level(level)
         @thinking_level = level
+        @chat.thinking_level = level
         self
       end
 
-      # The model-switch seam (I27, /model + the selector menus): swaps
-      # the runtime chat model in place — ruby_llm Chat#with_model
-      # (live-verified, chat.rb:609: re-resolves provider + connection)
-      # — and re-resolves the context window the compaction math uses.
-      # The provider/protocol/assumption kwargs match the launcher's
-      # build_chat (+provider+ is the WIRE slug — Models.wire_provider;
-      # the openai provider would otherwise pick :responses; the port's
-      # models are assumed, not registry-resolved). Idle-only: the menus
-      # open when no turn runs.
+      # The model-switch seam (I27, /model + the selector menus): swaps the
+      # runtime wire model in place — the Chat rebuilds it through
+      # {Chat#apply_facts} with the NEW facts — and re-resolves the context
+      # window the compaction math uses.
       #
       # I36: the reasoning facts re-resolve alongside (pi setModel swaps
       # the Model object, so its reasoning/thinkingLevelMap come from the
@@ -240,32 +250,33 @@ module Tart
       # switched entry's composed facts ({Settings.thinking_facts}'s rule
       # — the surface passes them; nil = the entry declares none, the
       # map-less rule). I46: +compat:+ rides the same wholesale re-resolve
-      # (nil IS "the switched model declares none" — the default arm — not
-      # "keep the previous").
+      # (nil IS "the switched model declares none" — the default dialect —
+      # not "keep the previous").
       def switch_model(model_id, provider:, context_window: nil, model_reasoning: nil, thinking_level_map: nil,
         compat: nil)
-        @chat.with_model(model_id, provider:, protocol: :chat_completions, assume_model_exists: true)
         # pi has no cached window to go stale: setModel swaps the Model
         # object (agent-session.ts:2484) and every check reads
         # model.contextWindow live (:2965). The port's cache re-resolves
         # instead, through the boot chain's resolution (Settings
         # .resolve_context_window, settings tier excluded — the loop holds
-        # no settings; bin/tart resolves them at boot): the catalog-
-        # declared window, else TART_CONTEXT_WINDOW, else the switched
-        # chat's model (the gem's registry resolution — under the boot
-        # path's assume_model_exists a mock lands on Model.default with no
-        # context_window), else the known-models table (I30: a table entry
-        # with no declared window keeps the threshold armed instead of
-        # nil-disabling it). nil still = threshold disabled, pi's
+        # no settings; bin/tart resolves them at boot): the explicit kwarg,
+        # else <IDENTITY>_CONTEXT_WINDOW, else the known-models table (I30:
+        # a table entry with no declared window keeps the threshold armed
+        # instead of nil-disabling it). nil still = threshold disabled, pi's
         # `contextWindow ?? 0`.
-        @context_window = Settings.resolve_context_window(explicit: context_window, model: @chat.model)
-        # The facts re-resolve wholesale (pi setModel swaps the Model
-        # object — no stale map survives onto the switched model): the
-        # surface passes fully composed facts, so nil IS "the entry
-        # declares none" (the map-less rule), not "keep the previous".
         @model_reasoning = model_reasoning == true
         @thinking_level_map = thinking_level_map
         @compat = compat
+        @chat.apply_facts(model_id: model_id, provider_key: provider,
+          model_reasoning: @model_reasoning, thinking_level_map: @thinking_level_map,
+          compat: @compat, context_window: context_window)
+        @context_window = Settings.resolve_context_window(explicit: context_window, model: @chat.model)
+        # The wire model re-builds once more with the RESOLVED window (its
+        # max-tokens fallback reads it); apply_facts is idempotent.
+        @chat.apply_facts(model_id: model_id, provider_key: provider,
+          model_reasoning: @model_reasoning, thinking_level_map: @thinking_level_map,
+          compat: @compat,
+          context_window: @context_window || Settings::MODEL_CONTEXT_WINDOWS.fetch(model_id, 0))
         self
       end
 
@@ -275,7 +286,7 @@ module Tart
       # HTTP I/O and tool execution are fiber-scheduler-cooperative, so the
       # reactor keeps scheduling while the step runs.
       #
-      # @return [Array<RubyLLM::Message>] the messages added by this run.
+      # @return [Array<Message>] the messages added by this run.
       def run(prompt = nil)
         @new_messages = []
         @last_error = nil
@@ -303,13 +314,13 @@ module Tart
         @interrupted
       end
 
-      # @return [RubyLLM::Error, StandardError, nil] the error that stopped
+      # @return [Fast::Completions::Error, StandardError, nil] the error that stopped
       #   the last run, if any (pi's stopReason "error").
       def last_error
         @last_error
       end
 
-      # @return [Array<RubyLLM::Message>] messages added by the last run.
+      # @return [Array<Message>] messages added by the last run.
       def new_messages
         @new_messages.dup
       end
@@ -422,12 +433,12 @@ module Tart
       # a context-overflow step failure compacts and retries the turn once;
       # the second consecutive overflow surfaces as the error
       # (_overflowRecoveryAttempted, :3040). The latch resets on a clean
-      # assistant response (:1168-1171). The gem never appends a failed
-      # response to chat.messages (chat.rb: provider_completion raises
-      # before record_generated_message), so the overflowing attempt is
-      # already omitted. False here lets stopped_on_error? surface it.
+      # assistant response (:1168-1171). The chat never appends a failed
+      # response to its history (the request raises before any append), so
+      # the overflowing attempt is already omitted. False here lets
+      # stopped_on_error? surface it.
       def recover_overflow?
-        return false unless @last_error.is_a?(RubyLLM::ContextLengthExceededError)
+        return false unless @last_error.is_a?(Fast::Completions::ContextLengthExceededError)
         return false if @overflow_recovery_attempted
 
         @overflow_recovery_attempted = true
@@ -459,9 +470,10 @@ module Tart
       end
 
       # Explicit kwarg → <IDENTITY>_CONTEXT_WINDOW → chat.model.context_
-      # window → nil. The gem's assume_model_exists resolution lands on
-      # Model.default, which carries no context_window (models.rb:210,
-      # model.rb:65-75) — nil disables the threshold trigger only. The env
+      # window → nil. The Chat's model view reads the placeholder's
+      # zero window as nil (the gem Model cannot carry one — the view is
+      # the nil-rule seam), so an unresolvable window disables the
+      # threshold trigger only. The env
       # tier speaks the identity's namespace (AC4); +identity+ defaults to
       # pi — the launcher threads the resolved face (print.rb's frozen
       # construction cannot).
@@ -504,7 +516,8 @@ module Tart
         keep_from = preparation.first_kept_index
         system_messages = @chat.messages.select { |message| message.role == :system }
         kept = @chat.messages[keep_from..] || []
-        summary_message = @chat.add_message(role: :user, content: compaction_summary_content(summary))
+        summary_message = Message.user(compaction_summary_content(summary))
+        @chat.add_message(summary_message)
         @chat.messages = [*system_messages, summary_message, *kept]
 
         # pi CompactionResult.estimatedTokensAfter (agent-session.ts:2850):
@@ -543,70 +556,34 @@ module Tart
       # min(floor(0.8 * reserve_tokens), model max) (:683-686); the gem's
       # model.max_output_tokens is the model max (model.rb:36). Runs INLINE
       # on the turn fiber (cooperative I/O — a kernel interrupt cancels it
-      # natively, the Cancel arm re-raises). nil (compaction aborted) when
-      # the call fails. The full reply Message is returned — its usage is
-      # pi's CompactionResult.usage (compaction.ts:1085).
+      # natively: the Chat's CancelledError→Async::Cancel conversion
+      # unwinds the stream, this frame never swallows a Cancel). nil
+      # (compaction aborted) when the call fails. The full reply Message is
+      # returned — its usage is pi's CompactionResult.usage (compaction.ts
+      # :1085).
       def summarize(preparation)
         prompt = Compaction.summarization_prompt(preparation.messages_to_summarize,
           previous_summary: preparation.previous_summary)
-        summary_chat = build_summary_chat
-        summary_chat.ask(prompt)
-      rescue Async::Cancel
-        # Belt-and-braces (Grounds §3 probe3 ARM2): the flag stops any
-        # surviving request at its next checkpoint; the Cancel itself is
-        # re-raised — run()'s rescue owns the interrupted bookkeeping.
-        summary_chat.cancel
-        raise
-      rescue RubyLLM::CancelledError, StandardError
+        summary_chat = @chat.summary_chat(instructions: Compaction::SUMMARIZATION_SYSTEM_PROMPT,
+          max_output_tokens: summarization_max_tokens)
+        summary_chat.add_message(Message.user(prompt))
+        summary_chat.step
+      rescue Fast::Completions::CancelledError, StandardError
         nil # compaction aborts, the run continues (today's ANY-Failure rule)
-      end
-
-      def build_summary_chat
-        # The protocol must ride along: the gem has no public reader for it
-        # (chat.rb stores @protocol, no attr_reader), and a summary chat
-        # built without it speaks the default protocol — never matching
-        # the endpoint the main chat was built for.
-        chat = @chat.context.chat(model: @chat.model&.id, provider: @chat.provider&.slug,
-                                  protocol: @chat.instance_variable_get(:@protocol),
-                                  assume_model_exists: true)
-        chat.with_instructions(Compaction::SUMMARIZATION_SYSTEM_PROMPT)
-        chat.with_max_output_tokens(summarization_max_tokens)
-        install_summary_chat_seam(chat)
-        chat
-      end
-
-      # The summarization one-shot's dialect (I46): ruby_llm callbacks are
-      # per-Chat-instance (chat.rb :142 — @callbacks starts empty on a
-      # fresh context.chat), so the construction hook never ran here and
-      # today's summary bytes carry NO reasoning_effort and the gem's
-      # max_completion_tokens. pi's summarization rides the SAME dialect
-      # branch (compaction.ts:605-607 — the session level into the request
-      # options), so for a zai-compat model the zai arm installs here too:
-      # the thinking object, the mapped effort, and the max_tokens rename
-      # land on the one-shot (the role rewrite with it — the instruction
-      # renders developer on this protocol). The I36 effort arm stays OFF:
-      # the summary request's compat-less bytes are the zero-change bar's
-      # "today's exact shapes" (pin 8). The fresh chat reads the loop
-      # state at BUILD time — a compaction builds it per call, so a
-      # mid-session switch is already settled (idle-only menus).
-      def install_summary_chat_seam(chat)
-        compat = @compat
-        return unless compat && compat.thinking_format == "zai"
-
-        chat.before_request { |payload| apply_zai_dialect(payload, compat) }
       end
 
       def summarization_max_tokens
         reserve = @compaction_settings.reserve_tokens
-        model_max = @chat.model&.max_output_tokens
+        model_max = @chat.model&.max_tokens
         cap = model_max.is_a?(Integer) && model_max.positive? ? model_max : Float::INFINITY
         [(reserve * 0.8).floor, cap].min
       end
 
-      # One ruby_llm #step INLINE on the turn fiber (the de-bridged seam —
-      # probe1/probe3: the faraday :net_http I/O is fiber-scheduler-
-      # cooperative). Returns the step's message (assistant message or tool
-      # result), or nil when the step produced no message (chat pause).
+      # One Chat #step INLINE on the turn fiber (the de-bridged seam — the
+      # gem's client is fiber-native: the streaming I/O runs on THIS
+      # reactor fiber). Returns the step's message (assistant message or
+      # tool result), or nil when the step produced no message (chat
+      # pause).
       def step_on_reactor
         @last_message = nil
         @stream_started = false
@@ -614,31 +591,15 @@ module Tart
         handle_item({type: :step, message:}) if message
         @last_message
       rescue Async::Cancel
-        # Belt-and-braces (Grounds §3 probe3 ARM2): the flag stops any
-        # surviving stream at its next chunk boundary. The Cancel itself is
-        # re-raised — run()'s rescue owns the interrupted bookkeeping
-        # (loop.rb's run rescue) and Core::Loop teardown relies on the raise.
-        @chat.cancel
-        # The Bridge-era consumer of that flag — the worker thread's stream
-        # callback, raising at the next chunk boundary (probe3 ARM2) — died
-        # with the Bridge: the cancelled step's stream unwinds with THIS
-        # fiber, and the gem's only consumer is the NEXT operation's first
-        # checkpoint (raise_if_cancelled! clears the flag as it raises,
-        # chat.rb:1193-1199). Left standing, the residue would spuriously
-        # cancel the run AFTER the interrupt (esc → resubmit). So the belt
-        # sets the flag and this unwind consumes it immediately — the gem's
-        # own checkpoint, whose clear-on-raise IS the documented reuse
-        # contract ("the next cancellation checkpoint ... clears the flag so
-        # the chat can be reused").
-        begin
-          @chat.send(:raise_if_cancelled!)
-        rescue RubyLLM::CancelledError
-          nil # consumed — the flag is clear for the next run
-        end
+        # The cancelled step's stream unwinds with THIS fiber (the Chat's
+        # D3 conversion re-raised it); run()'s rescue owns the interrupted
+        # bookkeeping and Core::Loop teardown relies on the raise. No belt:
+        # nothing lingers (the I50 5th pin's fresh-request contract).
         raise
-      rescue RubyLLM::CancelledError
-        # cancelled: today's shape — no @last_error, no error emit; the nil
-        # message breaks the loop.
+      rescue Fast::Completions::CancelledError
+        # Defensive arm (D3 — the Chat converts, so this is rare): the
+        # cancelled shape — no @last_error, no error emit; the nil message
+        # breaks the loop.
         nil
       rescue StandardError => e
         # The step's error lands in @last_error with the same assistant
@@ -759,7 +720,8 @@ module Tart
       end
 
       def add_user_message(text)
-        message = @chat.add_message(role: :user, content: text)
+        message = Message.user(text)
+        @chat.add_message(message)
         @new_messages << message
         emit(type: :message_start, message:)
         emit(type: :message_end, message:)
@@ -781,7 +743,8 @@ module Tart
 
         @hooks.pending_next_turn.each do |pending|
           content = pending[:content]
-          chat_message = @chat.add_message(role: :user, content:)
+          chat_message = Message.user(content)
+          @chat.add_message(chat_message)
           @new_messages << chat_message
           custom = Hooks::CustomMessage.new(role: :custom, custom_type: pending[:custom_type],
             content:, display: pending[:display])
@@ -807,143 +770,27 @@ module Tart
       end
 
       def install_chat_callbacks
+        # The Chat's hook seams re-register the executor's observable
+        # events: attribution rides the tool_call id through the per-task
+        # closures (the executor closes over ITS call — no Thread/fiber-
+        # local pairing anywhere).
         @chat.before_tool_call do |tool_call|
-          # ruby_llm calls after_tool_result with the result only (chat.rb:
-          # run_callbacks(:after_tool_result, result)); pair the call back by
-          # fiber-local storage — Thread#[] is FIBER-local on CRuby (Grounds
-          # §3 probe4: sibling tool fibers isolate, no stomp), and before/after
-          # run on the SAME fiber per call, in both of ToolConcurrency's
-          # modes (under :fibers, inside the tool's own task fiber).
-          Thread.current[:tart_tool_call] = tool_call
-          # I17: arm the per-execution clock (monotonic — pi's
-          # performance.now() delta, nested-tool-calls.ts:82).
-          Thread.current[:tart_tool_started_at] = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           handle_item({type: :tool_execution_start, tool_call:})
         end
-        @chat.after_tool_result do |result|
-          duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) -
-                     Thread.current[:tart_tool_started_at]
-          handle_item({type: :tool_execution_end,
-                       tool_call: Thread.current[:tart_tool_call], result:, duration:})
+        @chat.after_tool_result do |tool_call, result, duration:|
+          handle_item({type: :tool_execution_end, tool_call:, result:, duration:})
         end
         @chat.after_message do |message|
-          # Tool result messages appear atomically; streamed assistant
-          # messages get their events from the chunk flow and step handling.
-          handle_item({type: :tool_message, message:}) if message.role == :tool
-        end
-      end
-
-      # The request seam (I36 — pi's thinking wiring, ONE hook installed at
-      # construction; ruby_llm's before_request runs LAST in Protocol#render,
-      # mutating the symbol-keyed payload in place before serialization, on
-      # BOTH the streaming and sync paths):
-      #
-      # (a) the resolved level reaches the wire (pi streamSimple :745-755 +
-      #     the generic branch :969-976): reasoning_effort =
-      #     Models.resolve_reasoning_effort — the map's value for the clamped
-      #     level, else the level; off sends the map's String `off` value or
-      #     NOTHING (non-reasoning models, map-less off). The gem's own
-      #     thinking config is never set (with_thinking is registry-driven
-      #     and unsettable — Thinking::Controls), so this hook owns the
-      #     field outright. Reading @thinking_level at request time makes
-      #     mid-session changes apply to the next request.
-      #
-      # (b) the replay protocol (pi :1340-1352 — assistantMsg[signature],
-      #     the delta-carried field; live-verified for fireworks:
-      #     reasoning_content): recorded assistant messages KEEP their
-      #     thinking (memory, session file, resume — the I05 strip
-      #     deviation is gone), and the request normalization drops
-      #     ruby_llm's duplicate `reasoning` field so the wire carries
-      #     `reasoning_content` ONLY — the shape pi sends, and the shape the
-      #     strict endpoint accepts (the I05 400 class cannot recur through
-      #     the port's own payload).
-      # (c) the zai dialect (I46 — pi's zai arm of the else-if chain,
-      #     openai-completions.ts :880-892): for a model whose compat says
-      #     thinkingFormat "zai" the hook emits pi's exact wire instead of
-      #     the generic effort arm — the thinking object, the map-then-
-      #     level reasoning_effort, tool_stream, the instruction-role
-      #     rewrite, and the max_tokens field rename ({apply_zai_dialect}).
-      #     compat nil (or a non-zai thinkingFormat) runs arm (a)
-      #     BYTE-EXACT — the zero-change bar (fireworks default and every
-      #     compat-less catalog).
-      def install_thinking_seam
-        @chat.before_request do |payload|
-          compat = @compat
-          if compat && compat.thinking_format == "zai"
-            apply_zai_dialect(payload, compat)
+          # Tool result messages appear atomically (the executor's append
+          # path); the batch's assistant-with-calls rides ITS append — the
+          # step's return is the LAST tool result under the frozen step
+          # contract, so this append is the assistant's only recording
+          # signal. Streamed final assistants keep the step-return path.
+          if message.role == :tool
+            handle_item({type: :tool_message, message:})
           else
-            effort = Models.resolve_reasoning_effort(@thinking_level,
-              map: @thinking_level_map, reasoning: @model_reasoning)
-            if effort
-              payload[:reasoning_effort] = effort
-            else
-              payload.delete(:reasoning_effort)
-            end
+            handle_item({type: :step, message:})
           end
-          payload[:messages]&.each do |message|
-            message.delete(:reasoning) if message.is_a?(Hash) && message[:role] == "assistant"
-          end
-        end
-      end
-
-      # The zai arm (pi openai-completions.ts :880-892 + :749-755 +
-      # :855-860 + :1233 + :841-848), muting the symbol-keyed payload in
-      # place. Runs on the session chat AND (zai only) the compaction
-      # summarization one-shot — pi's summarization carries the session
-      # level through the same dialect branch (compaction.ts:605-607).
-      def apply_zai_dialect(payload, compat)
-        if @model_reasoning
-          clamped = Models.clamp_thinking_level(@thinking_level, map: @thinking_level_map, reasoning: true)
-          # pi :751 — the CLAMPED level is the input and a clamped "off" is
-          # NO effort: the I36 String-off floor does not apply on this arm
-          # (OQ-5 — the generic off-arm is unreachable for zai-format
-          # models, the zai branch takes the chain first).
-          effort_present = !clamped.nil? && clamped != "off"
-          payload[:thinking] = effort_present ? {type: "enabled", clear_thinking: false} : {type: "disabled"}
-          if effort_present && compat.supports_reasoning_effort == true
-            # pi :889-891 — the map's String value for the clamped level;
-            # a MISSING key sends the level itself (a null value cannot
-            # reach here: supported levels never carry null).
-            mapped = @thinking_level_map&.[](clamped.to_sym)
-            payload[:reasoning_effort] = mapped.is_a?(String) ? mapped : clamped
-          else
-            # no effort (clamped off), or the compat says the endpoint
-            # refuses the field (pi's detected-false default for zai).
-            payload.delete(:reasoning_effort)
-          end
-        else
-          # pi :880 gates the arm on model.reasoning — a non-reasoning
-          # model sends no thinking object and no reasoning_effort (the
-          # generic arms cannot fire for it either).
-          payload.delete(:reasoning_effort)
-        end
-        # pi :855-860 — tool_stream iff zaiToolStream AND the request
-        # carries tools; the tool-less fallback sends tools: [] without
-        # the field (:861-863).
-        if compat.zai_tool_stream == true && payload[:tools].is_a?(Array) && !payload[:tools].empty?
-          payload[:tool_stream] = true
-        end
-        # pi :1233 — the wire role is developer iff the model reasons AND
-        # the compat supports it; nil falls to the DETECTION stand-in (a
-        # zai URL detects false, :1593-1675), so on this arm nil == false.
-        # The gem renders the instruction as developer on this protocol
-        # (format_role, chat.rb :376-383) — the rewrite puts the wire role
-        # back to system. With compat nil: NO rewrite (the default arm
-        # never touches roles).
-        unless @model_reasoning && compat.supports_developer_role == true
-          payload[:messages]&.each do |message|
-            message[:role] = "system" if message.is_a?(Hash) && message[:role] == "developer"
-          end
-        end
-        # pi :841-848 — maxTokensField "max_tokens" renames the gem's
-        # max_completion_tokens (chat.rb :96-99 — the openai slug names it
-        # so) for endpoints that only accept the deprecated field. Today
-        # only the compaction summarization sets max output tokens, so the
-        # rename lands there; "max_completion_tokens" and nil rename
-        # nothing. NO store field is ever added (OQ-4); NO strict on tool
-        # defs (OQ-1 — the five-key subset ends here).
-        if compat.max_tokens_field == "max_tokens" && payload.key?(:max_completion_tokens)
-          payload[:max_tokens] = payload.delete(:max_completion_tokens)
         end
       end
 
@@ -963,7 +810,7 @@ module Tart
           # A clean assistant response resets the overflow-recovery latch
           # (pi agent-session.ts:1168-1171).
           @overflow_recovery_attempted = false if message.role == :assistant
-          # Tool results are recorded by the :tool_message item (ruby_llm's
+          # Tool results are recorded by the :tool_message item (the Chat's
           # after_message); the step's own return would double-count them.
           unless message.role == :tool
             @new_messages << message

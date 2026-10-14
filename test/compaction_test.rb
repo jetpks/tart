@@ -20,13 +20,13 @@ module Tart
     end
 
     def test_calculate_context_tokens_sums_the_gems_tokens_accessors
-      tokens = RubyLLM::Tokens.new(input: 100, output: 20, cache_read: 7, cache_write: 3)
+      tokens = Agent::Tokens.new(input: 100, output: 20, cache_read: 7, cache_write: 3)
       assert_equal 130, Compaction.calculate_context_tokens(tokens)
-      assert_equal 0, Compaction.calculate_context_tokens(RubyLLM::Tokens.new)
+      assert_equal 0, Compaction.calculate_context_tokens(Agent::Tokens.new)
     end
 
     def test_estimate_context_tokens_uses_last_assistant_usage_plus_trailing_estimate
-      used = RubyLLM::Message.new(role: :assistant, content: "a", tokens: RubyLLM::Tokens.new(input: 50, output: 10))
+      used = Agent::Message.new(role: :assistant, content: "a", tokens: Agent::Tokens.new(input: 50, output: 10))
       messages = [
         llm_message(:user, "hello"),
         used,
@@ -49,8 +49,8 @@ module Tart
     end
 
     def test_estimate_tokens_covers_assistant_thinking_and_tool_call_arguments
-      call = RubyLLM::ToolCall.new(id: "call_1", name: "read", arguments: {path: "a.rb"})
-      assistant = RubyLLM::Message.new(role: :assistant, content: "abcd", thinking: "efgh",
+      call = Agent::ToolCall.new(id: "call_1", name: "read", arguments: {path: "a.rb"})
+      assistant = Agent::Message.new(role: :assistant, content: "abcd", thinking: "efgh",
                                        tool_calls: {"call_1" => call})
       # 4 (text) + 4 (thinking) + 4 (name) + 16 (JSON args) = 28 chars / 4.
       assert_equal 7, Compaction.estimate_tokens(assistant)
@@ -82,7 +82,7 @@ module Tart
       assert_equal bare + tool_tokens, Compaction.full_estimate(messages, tools: tools)[:tokens]
       assert_equal bare + tool_tokens, Compaction.estimate_context_tokens(messages, tools: tools)[:tokens]
 
-      used = RubyLLM::Message.new(role: :assistant, content: "a", tokens: RubyLLM::Tokens.new(input: 50, output: 10))
+      used = Agent::Message.new(role: :assistant, content: "a", tokens: Agent::Tokens.new(input: 50, output: 10))
       history = [llm_message(:system, "prompt"), used, llm_message(:user, "x" * 40)]
       estimate = Compaction.estimate_context_tokens(history, tools: tools)
       assert_equal 60, estimate[:usage_tokens]
@@ -107,8 +107,8 @@ module Tart
     # fallback to the estimate; the stale pre-compaction guard INSIDE the
     # fallback only.
     def test_trigger_tokens_reads_the_just_completed_messages_direct_usage_first
-      used = RubyLLM::Message.new(role: :assistant, content: "done",
-        tokens: RubyLLM::Tokens.new(input: 120, output: 10))
+      used = Agent::Message.new(role: :assistant, content: "done",
+        tokens: Agent::Tokens.new(input: 120, output: 10))
       messages = [llm_message(:user, "x" * 40), used]
 
       # The direct usage wins even when the same message sits in the stale
@@ -119,9 +119,9 @@ module Tart
     end
 
     def test_trigger_tokens_zero_direct_usage_falls_back_to_the_estimate
-      used = RubyLLM::Message.new(role: :assistant, content: "a",
-        tokens: RubyLLM::Tokens.new(input: 100, output: 20))
-      fresh = RubyLLM::Message.new(role: :assistant, content: "y" * 8)
+      used = Agent::Message.new(role: :assistant, content: "a",
+        tokens: Agent::Tokens.new(input: 100, output: 20))
+      fresh = Agent::Message.new(role: :assistant, content: "y" * 8)
       messages = [llm_message(:user, "x" * 40), used, fresh]
 
       # The just-completed message carries no usage (pi's error stop-reason
@@ -133,9 +133,9 @@ module Tart
     end
 
     def test_trigger_tokens_stale_guard_trips_inside_the_fallback
-      used = RubyLLM::Message.new(role: :assistant, content: "a",
-        tokens: RubyLLM::Tokens.new(input: 100, output: 20))
-      fresh = RubyLLM::Message.new(role: :assistant, content: "y" * 8)
+      used = Agent::Message.new(role: :assistant, content: "a",
+        tokens: Agent::Tokens.new(input: 100, output: 20))
+      fresh = Agent::Message.new(role: :assistant, content: "y" * 8)
       messages = [llm_message(:user, "x" * 40), used, fresh]
 
       # The last usage message is a KEPT pre-compaction message — its usage
@@ -196,7 +196,7 @@ module Tart
 
     def test_prepare_splits_at_the_cut_and_excludes_system_from_the_summary
       settings = Compaction::Settings.resolve(keep_recent_tokens: 1)
-      system = RubyLLM::Message.new(role: :system, content: "prompt")
+      system = Agent::Message.new(role: :system, content: "prompt")
       messages = [system, llm_message(:user, "old"), tool_call_message("call"), llm_message(:tool, "result"),
                   llm_message(:assistant, "final")]
       preparation = Compaction.prepare(messages, settings)
@@ -232,10 +232,10 @@ module Tart
     end
 
     def test_serialize_conversation_prefixes_and_truncation
-      call = RubyLLM::ToolCall.new(id: "call_1", name: "read", arguments: {path: "a.rb"})
+      call = Agent::ToolCall.new(id: "call_1", name: "read", arguments: {path: "a.rb"})
       messages = [
         llm_message(:user, "please look"),
-        RubyLLM::Message.new(role: :assistant, content: "checking", thinking: "hmm",
+        Agent::Message.new(role: :assistant, content: "checking", thinking: "hmm",
                              tool_calls: {"call_1" => call}),
         llm_message(:tool, "x" * 2050),
         llm_message(:user, "go on"),
@@ -274,7 +274,7 @@ module Tart
     private
 
     def llm_message(role, content)
-      RubyLLM::Message.new(role:, content:)
+      Agent::Message.new(role:, content:)
     end
 
     # The loop's identity-keyed pre-compaction message set
@@ -286,19 +286,21 @@ module Tart
     end
 
     # An assistant message making one tool call (tool results follow it in
-    # the flat list, as ruby_llm builds them).
+    # the flat list, as the executor appends them).
     def tool_call_message(content, name: "read", path: "x.rb")
-      call = RubyLLM::ToolCall.new(id: "call_1", name:, arguments: {path:})
-      RubyLLM::Message.new(role: :assistant, content:, tool_calls: {"call_1" => call})
+      call = Agent::ToolCall.new(id: "call_1", name:, arguments: {path:})
+      Agent::Message.new(role: :assistant, content:, tool_calls: {"call_1" => call})
     end
 
     # A registered-shape tool with known bytes: name/description/parameters,
     # the fields the wire definition carries.
     def probe_tool(name, description, schema)
-      Class.new(RubyLLM::Tool) do
+      Class.new(Fast::Completions::Tool) do
         description description
         parameters schema
         define_singleton_method(:tool_name) { name }
+        define_method(:name) { name }
+        define_method(:parameters_schema) { self.class.parameters }
       end.new
     end
   end

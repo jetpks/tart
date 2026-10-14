@@ -9,7 +9,7 @@ module Tart
     # (trailing-whitespace strip per line, smart-quote/dash/space folding),
     # unchanged-line byte preservation, line-ending detect/restore, BOM
     # preservation, and display-diff context truncation.
-    class Edit < RubyLLM::Tool
+    class Edit < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "edit"
@@ -59,8 +59,8 @@ module Tart
       # pi's prepareEditArguments hook: some models send edits as a JSON
       # string, a single edit object, or legacy top-level oldText/newText.
       # The agent loop normalizes arguments before execution (pi: agent-loop
-      # prepareToolCallArguments); the port does it in #call, which ruby_llm
-      # invokes for every model-issued call.
+      # prepareToolCallArguments); the port does it in #call, which the
+      # executor invokes for every model-issued call.
       def call(tool_call: nil, **arguments)
         super(tool_call:, **self.class.normalize_arguments(arguments))
       end
@@ -109,7 +109,7 @@ module Tart
           absolute_path = PathUtils.resolve_to_cwd(path, @cwd)
 
           FileMutationQueue.with(absolute_path) do
-            RubyLLM::Support::Cancellation.check
+            Fast::Completions::Cancellation.check
             # pi checks access R_OK|W_OK via fs/promises: a missing file
             # surfaces as ENOENT, an unreadable/unwritable one as EACCES.
             begin
@@ -118,10 +118,10 @@ module Tart
             rescue SystemCallError => e
               raise ArgumentError, "Could not edit file: #{path}. Error code: #{e.class.name.delete_prefix('Errno::')}."
             end
-            RubyLLM::Support::Cancellation.check
+            Fast::Completions::Cancellation.check
 
             raw_content = File.binread(absolute_path).force_encoding(Encoding::UTF_8)
-            raise_if_cancelled
+            check_cancelled
 
             # Strip BOM before matching; the model will not include an
             # invisible BOM in oldText.
@@ -129,12 +129,12 @@ module Tart
             original_ending = EditDiff.detect_line_ending(bom[:text])
             normalized_content = EditDiff.normalize_to_lf(bom[:text])
             result = EditDiff.apply_edits_to_normalized_content(normalized_content, edits, path)
-            raise_if_cancelled
+            check_cancelled
 
             final_content = bom[:bom] + EditDiff.restore_line_endings(result[:new_content], original_ending)
             final_content = EditDiff.strip_trailing_whitespace(final_content) if @strip_trailing_whitespace
             File.binwrite(absolute_path, final_content)
-            raise_if_cancelled
+            check_cancelled
 
             diff_result = EditDiff.generate_diff_string(result[:base_content], result[:new_content])
             patch = EditDiff.generate_unified_patch(path, result[:base_content], result[:new_content])
@@ -156,8 +156,8 @@ module Tart
         end
       end
 
-      def raise_if_cancelled
-        RubyLLM::Support::Cancellation.check
+      def check_cancelled
+        Fast::Completions::Cancellation.check
       end
     end
   end

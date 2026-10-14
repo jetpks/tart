@@ -8,7 +8,7 @@ require_relative "../tools/support/truncate"
 
 module Tart
   module Mcp
-    # One MCP tool wrapped as a RubyLLM::Tool for the loadout (pi's
+    # One MCP tool wrapped as a Fast::Completions::Tool for the loadout (pi's
     # extensions/mcp/tools.ts createMcpToolDefinition + convertMcpResult):
     #
     # - wire name mcp__<server>__<tool> (createMcpToolName: sanitize, cap at
@@ -20,7 +20,7 @@ module Tart
     #   newlines, middle-truncated at 20KB with the full text saved to a temp
     #   file (pi's limitMcpContent); isError results become {error:} results;
     #   a content-less result falls back to its structuredContent as JSON.
-    class Tool < RubyLLM::Tool
+    class Tool < Fast::Completions::Tool
       include Dry::Monads::Result::Mixin
 
       EXPOSURE = "direct"
@@ -54,11 +54,26 @@ module Tart
         @description
       end
 
-      # The server's input schema, through the gem's schema pipeline
-      # (stringified, $schema/title metadata stripped). Declared per instance:
-      # the schema is the server's, not the class's.
+      # The server's input schema, stringified with the schema metadata
+      # stripped — the replaced client's schema-pipeline semantics, inlined
+      # (deep stringification, then the $schema/title metadata keys dropped
+      # at the top level). Declared per instance: the schema is the
+      # server's, not the class's.
       def parameters_schema
-        RubyLLM::Tool::SchemaDefinition.new(schema: @input_schema).json_schema
+        schema = deep_stringify_keys(@input_schema)
+        schema.reject { |key, _| %w[$schema title].include?(key) }
+      end
+
+      # The wire declaration (the codec reads the instance): the same
+      # stringified schema.
+      def parameters
+        parameters_schema
+      end
+
+      # The execution seam (the batch executor lands here): the MCP wire
+      # speaks string keys — the provider's parsed arguments ride verbatim.
+      def call(tool_call: nil, **arguments)
+        execute(**arguments)
       end
 
       # @return [String] the model-facing text, or {error:} on failure (house
@@ -73,7 +88,7 @@ module Tart
         result = outcome.value!
         text = model_facing_text(result)
         result["isError"] ? {error: text} : text
-      rescue RubyLLM::CancelledError
+      rescue Fast::Completions::CancelledError
         raise
       rescue StandardError => e
         {error: e.message}
@@ -102,6 +117,15 @@ module Tart
         schema = {"type" => "object", "properties" => {}}.merge(schema.to_h)
         schema["type"] ||= "object"
         schema
+      end
+
+      def deep_stringify_keys(value)
+        case value
+        when Hash then value.each_with_object({}) { |(key, val), out| out[key.to_s] = deep_stringify_keys(val) }
+        when Array then value.map { |item| deep_stringify_keys(item) }
+        when Symbol then value.to_s
+        else value
+        end
       end
 
       def model_facing_text(result)

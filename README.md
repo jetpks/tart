@@ -2,7 +2,7 @@
 
 A Ruby port of the [pi](https://github.com/earendil-works/pi) coding-agent harness — the parts we use — on the socketry async stack.
 
-- **LLM layer:** [ruby_llm](https://rubyllm.com/) (harness-driven tool loop, model registry, MCP client)
+- **LLM layer:** [fast-completions](https://github.com/earendil-works/pi) (the fiber-native chat-completions wire — pi-faithful codec, tool + cancellation surface) under the port's own conversation object (`Tart::Agent::Chat`), MCP client, and agent loop
 - **TUI layer:** [ratatui_ruby](https://www.ratatui-ruby.dev/) (fullscreen chat surface, native Rust rendering)
 - **Concurrency:** the [async](https://github.com/socketry/async) gem — one fiber-scheduler reactor for TTY input, LLM SSE streaming, and subprocess execution
 
@@ -61,8 +61,8 @@ naming the valid values. Structural behavior (transcript padding, blank-line
 spacers, footer format) is identity-independent. `modelReasoning` stages the
 footer's reasoning capability (`model • <level>` only for
 reasoning-capable models — the env form is `TART_MODEL_REASONING`; unset,
-the fact resolves off the model's registry entry, RubyLLM's, then a
-known-models table for assumed models — the daily-driver fireworks glm is
+the fact resolves off the wire model's own reasoning flag, then a
+known-models table for models with none — the daily-driver fireworks glm is
 declared reasoning-capable). The footer's model segment never carries a
 provider prefix: pi prefixes only when its available-model snapshot spans
 >1 provider (footer.ts:246-258), and the port's snapshot is a single
@@ -231,9 +231,9 @@ Settings (defaults: enabled, `reserve_tokens` 16384, `keep_recent_tokens`
 20000) are injectable on `Agent::Loop` via the `compaction:` kwarg;
 `enabled: false` disables the threshold trigger. The context window resolves
 from `TART_CONTEXT_WINDOW` (tokens), then the settings' `contextWindow`,
-then the model registry's `context_window`, then the port's registry-default
-table (the pinned ruby_llm registry misses the default fireworks model; its
-catalog window is 1048573 — so the default chat compacts out of the box);
+then the wire model's `context_window`, then the port's known-tables tier
+(the default fireworks model has no pi-catalog row; its known-table window
+is 1048573 — so the default chat compacts out of the box);
 unset/0 disables the threshold trigger only — the overflow recovery always
 fires.
 

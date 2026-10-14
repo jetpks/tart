@@ -2,6 +2,8 @@
 
 require "open3"
 
+require_relative "../agent/message"
+
 module Tart
   module Render
     # The footer state machine extracted from the chat surface (I24 wave
@@ -71,7 +73,8 @@ module Tart
       # context numerator; pi's getSessionStats over session entries,
       # reduced to what the event surface carries: assistant messages).
       # Takes an assistant message (reads its +tokens+) or a bare
-      # RubyLLM::Tokens (the replay's reseed from recorded counts).
+      # usage duck ({Agent::Tokens} — the replay's reseed from recorded
+      # counts).
       def accumulate_usage(message)
         tokens = message.respond_to?(:tokens) ? message.tokens : message
         return if tokens.nil?
@@ -85,16 +88,13 @@ module Tart
       end
 
       # Footer usage reseeds from the replayed assistant entry's recorded
-      # token counts (Message#to_h merges Tokens#to_h — input_tokens,
+      # token counts (Message#to_h merges the usage keys — input_tokens,
       # output_tokens, cache_read_tokens, cache_write_tokens). Entries
       # carry usage only when the provider reported it; interrupted turns
       # may carry none (gap, itemized) — all-nil entries are skipped so
       # the boot state stays intact.
       def reseed_usage(message)
-        tokens = RubyLLM::Tokens.new(
-          input: message["input_tokens"], output: message["output_tokens"],
-          cache_read: message["cache_read_tokens"], cache_write: message["cache_write_tokens"]
-        )
+        tokens = Agent::Message.tokens_from(message)
         return if [tokens.input, tokens.output, tokens.cache_read, tokens.cache_write].all?(&:nil?)
 
         accumulate_usage(tokens)
