@@ -598,6 +598,132 @@ module Tart
       refute kernel.poller&.thread&.alive?, "no orphan poller after interrupt"
     end
 
+    # ---- the de-bridge pins (I50 — the gate's -n anchors; names EXACT) -----
+
+    # AC3: with :fibers tool concurrency (armed at Loop#initialize), two
+    # 0.5 s sleep tools in ONE scripted batch OVERLAP on the reactor: the
+    # batch's wall span (first start → last end) is < 0.9 s — the Bridge-era
+    # base ran tools sequentially, span ≈ 1.0 s (this pin is the designed
+    # RED at base), and both :tool messages land.
+    def test_fibers_tool_concurrency_overlaps_two_interleaved_tools
+      @server.script(BATCH_SCRIPT.map(&:dup))
+      agent, stamped = stamped_agent_on_kernel(tools: {"sleep" => SleepTool.new})
+      run_agent(agent, "sleep twice")
+
+      starts = stamped_events(stamped, :tool_execution_start)
+      ends = stamped_events(stamped, :tool_execution_end)
+      assert_equal 2, starts.size, "both calls started"
+      assert_equal 2, ends.size, "both calls ended"
+      span = ends.map { |e| e[:_at] }.max - starts.map { |e| e[:_at] }.min
+      assert_operator span, :<, 0.9,
+        "the two tool executions must OVERLAP on the reactor (sequential span ≈ 1.0 s); got #{span.round(2)}s"
+      assert_equal 2, agent.new_messages.count { |m| m.role == :tool }, "two :tool messages land"
+    end
+
+    # AC3 (attribution — Grounds §3 probe4 ARM B): each :tool_execution_end
+    # pairs its OWN call by tool_call id (distinct ids, one start per id)
+    # and its duration is that tool's OWN runtime (0.4–0.75 s) — the
+    # Thread.current keying is fiber-local, so interleaved fibers do not
+    # cross-attribute.
+    def test_tool_event_attribution_under_interleaved_fibers_tools
+      @server.script(BATCH_SCRIPT.map(&:dup))
+      agent, stamped = stamped_agent_on_kernel(tools: {"sleep" => SleepTool.new})
+      run_agent(agent, "sleep twice")
+
+      starts = stamped_events(stamped, :tool_execution_start)
+      ends = stamped_events(stamped, :tool_execution_end)
+      start_ids = starts.map { |e| e[:tool_call].id }
+      assert_equal 2, start_ids.uniq.size, "distinct tool_call ids"
+      assert_equal start_ids.sort, ends.map { |e| e[:tool_call].id }.sort,
+        "every end pairs a start by tool_call id — no cross-attribution"
+      ends.each do |event|
+        assert_instance_of Float, event[:duration]
+        assert event[:duration].between?(0.4, 0.75),
+          "each duration is its OWN tool's 0.5 s runtime, got #{event[:duration].round(2)}s"
+      end
+    end
+
+    # AC2 (the interrupt gate): an interrupt during a live stream ABORTS the
+    # in-flight request (the Async::Cancel lands in the streaming HTTP read
+    # — probe3 ARM1; the full scripted stream would run ≈ 4 s) and emits NO
+    # error terminal: interrupted? true, last_error nil, agent_end carries
+    # interrupted: true and no :error key, no message_end with error: true.
+    def test_interrupt_mid_stream_aborts_request_no_error_terminal
+      @server.script([{type: :slow_stream, content: "x" * 40}])
+      agent, events = agent_on_kernel
+
+      wall = nil
+      Async do |root|
+        turn = root.async do
+          t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          begin
+            agent.run("long stream")
+          ensure
+            wall = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+          end
+        end
+        root.async do
+          sleep 0.3 # mid-stream (40 chars × 0.1 s pauses)
+          turn.stop
+        end
+        begin
+          turn.wait
+        rescue Async::Cancel
+          nil # run() re-raises the Cancel after the interrupted bookkeeping
+        end
+      end
+
+      assert_operator wall, :<, 2.0, "the request ABORTED (the full stream runs ≈ 4 s); wall=#{wall.round(2)}s"
+      assert agent.interrupted?
+      assert_nil agent.last_error
+      end_event = events.find { |e| e[:type] == :agent_end }
+      assert end_event, "the run reached agent_end"
+      assert end_event[:interrupted], "the agent_end carries interrupted: true"
+      refute end_event.key?(:error), "NO error key on the interrupted agent_end"
+      refute events.any? { |e| e[:type] == :message_end && e[:error] == true },
+        "no message_end with error: true — the cancelled shape"
+    end
+
+    # AC2 (the belt's residue contract — Grounds §6 OQ-3): the interrupt's
+    # chat.cancel flag must not outlive the interrupt. At base the Bridge
+    # worker's stream consumed the flag at its next chunk boundary (probe3
+    # ARM2); de-bridged, the unwind consumes it (the Cancel arm) — the NEXT
+    # run on the same chat makes a FRESH request and completes.
+    def test_run_after_an_interrupt_makes_a_fresh_request
+      @server.script([{type: :slow_stream, content: "x" * 40}])
+      agent, = agent_on_kernel
+
+      Async do |root|
+        turn = root.async do
+          begin
+            agent.run("long stream")
+          rescue Async::Cancel
+            nil # run() re-raises after the interrupted bookkeeping
+          end
+        end
+        root.async do
+          sleep 0.3 # mid-stream
+          turn.stop
+        end
+        begin
+          turn.wait
+        rescue Async::Cancel
+          nil
+        end
+      end
+
+      assert agent.interrupted?
+      assert_nil agent.last_error
+
+      @server.script([{type: :message, content: "fresh answer"}])
+      result = run_agent(agent, "still there")
+
+      assert_equal "fresh answer", result.last.content, "the next run completed"
+      assert_equal 2, @server.captured_requests.size,
+        "the post-interrupt run made a FRESH request (the cancel flag did not survive)"
+      assert_nil agent.last_error
+    end
+
     def agent_on_kernel(session: ScriptedSession.new, tools: empty_tools,
                         on_event: nil, script_enabled: true, **loop_kwargs)
       events = []
@@ -1324,6 +1450,35 @@ module Tart
 
     private
 
+    # The two-interleaved-tools batch (the de-bridge pins drive it): one
+    # streamed response carrying TWO tool calls, then the completion.
+    BATCH_SCRIPT = [
+      {type: :stream, tool_calls: [
+        {id: "call_a", name: "sleep", arguments: {label: "a"}},
+        {id: "call_b", name: "sleep", arguments: {label: "b"}}
+      ]},
+      {type: :message, content: "done"}
+    ].freeze
+
+    # agent_on_kernel with a monotonic stamp per event (the overlap/attribution
+    # pins' clock — the event hashes themselves stay unmodified).
+    def stamped_agent_on_kernel(tools:)
+      stamped = []
+      stamped_mutex = Mutex.new
+      sink = lambda do |event|
+        stamped_mutex.synchronize do
+          stamped << event.merge(_at: Process.clock_gettime(Process::CLOCK_MONOTONIC))
+        end
+      end
+      chat = TestChat.build(@server, tools: tools.values, system_prompt: "test prompt")
+      agent = Agent::Loop.new(chat:, tools:, on_event: sink)
+      [agent, stamped]
+    end
+
+    def stamped_events(stamped, type)
+      stamped.select { |e| e[:type] == type }
+    end
+
     # Overflow scripts need more than one summary-able message in the
     # history: the seed turns stand in for prior context (the overflowing
     # attempt itself is never appended by the gem).
@@ -1361,5 +1516,18 @@ module Tart
       sink = ->(event) { events_mutex.synchronize { events << event } }
       [Agent::Loop.new(chat:, tools: {}, on_event: sink), events]
     end
+  end
+end
+
+# The de-bridge pins' load (top-level: the gem derives the wire tool name
+# from the class name — a namespace-less name stays "sleep"; a nested class
+# would carry a tart-- prefix the mock script would have to match).
+class SleepTool < RubyLLM::Tool
+  description "Sleeps half a second"
+  parameter :label, type: "string", description: "the label"
+
+  def execute(label:)
+    sleep 0.5
+    "slept #{label}"
   end
 end

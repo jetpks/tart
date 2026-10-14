@@ -18,13 +18,13 @@ module Tart
     end
 
     def test_output_streams_and_normal_exit
-      result = tool.execute(command: "echo out; echo err >&2")
+      result = execute_tool(command: "echo out; echo err >&2")
       assert_includes result, "out"
       assert_includes result, "err"
     end
 
     def test_non_zero_exit_is_an_error_result_with_status_line
-      result = tool.execute(command: "exit 3")
+      result = execute_tool(command: "exit 3")
       assert result.key?(:error)
       assert_includes result[:error], "Command exited with code 3"
     end
@@ -34,7 +34,7 @@ module Tart
       command = "echo #{marker}; sleep 30"
 
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      result = tool.execute(command:, timeout: 1)
+      result = execute_tool(command:, timeout: 1)
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
 
       assert result.key?(:error), "a timed-out command must be an error result"
@@ -48,7 +48,7 @@ module Tart
       command = "trap '' TERM; echo #{marker}; sleep 30"
 
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      result = tool.execute(command:, timeout: 1)
+      result = execute_tool(command:, timeout: 1)
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
 
       assert result.key?(:error)
@@ -61,14 +61,14 @@ module Tart
     def test_child_in_its_own_group_dies_with_the_parent_command
       # A backgrounded grandchild in the group must not survive the kill.
       marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
-      result = tool.execute(command: "#{marker}-grandchild & sleep 30", timeout: 1)
+      result = execute_tool(command: "#{marker}-grandchild & sleep 30", timeout: 1)
 
       assert result.key?(:error)
       assert_no_probe(marker)
     end
 
     def test_invalid_timeout_rejected
-      result = tool.execute(command: "true", timeout: -1)
+      result = execute_tool(command: "true", timeout: -1)
       assert result.key?(:error)
       assert_includes result[:error], "Invalid timeout: must be a finite number of seconds"
     end
@@ -77,12 +77,12 @@ module Tart
     # for the non-finite/zero cases, pi's loop wrapper for wrong types.
     def test_non_finite_and_zero_timeouts_reject_with_the_pinned_message
       pinned = {error: "Invalid timeout: must be a finite number of seconds"}
-      assert_equal pinned, tool.execute(command: "true", timeout: Float::INFINITY)
-      assert_equal pinned, tool.execute(command: "true", timeout: 0)
+      assert_equal pinned, execute_tool(command: "true", timeout: Float::INFINITY)
+      assert_equal pinned, execute_tool(command: "true", timeout: 0)
     end
 
     def test_wrong_typed_timeout_rejects_with_the_wrapper_vocabulary
-      result = tool.execute(command: "true", timeout: "5")
+      result = execute_tool(command: "true", timeout: "5")
 
       assert result.is_a?(Hash) && result.key?(:error)
       assert result[:error].start_with?("Validation failed for tool \"bash\":\n  - timeout: "),
@@ -97,11 +97,18 @@ module Tart
 
       error = nil
       watcher = Thread.new do
-        RubyLLM::Support::Cancellation.watch(checkpoint) do
-          tool.execute(command: "echo #{marker}; sleep 30")
+        begin
+          Async do
+            # The watch and the tool run share ONE fiber (the checkpoint is
+            # fiber-local — Grounds §3 probe4): the de-bridged tool runs on
+            # a reactor fiber, so the watch wraps it INSIDE the reactor.
+            RubyLLM::Support::Cancellation.watch(checkpoint) do
+              tool.execute(command: "echo #{marker}; sleep 30")
+            end
+          end.wait
+        rescue RubyLLM::CancelledError => e
+          error = e
         end
-      rescue RubyLLM::CancelledError => e
-        error = e
       end
 
       sleep 0.3 # let the command start
@@ -113,7 +120,7 @@ module Tart
     end
 
     def test_output_truncation_shows_tail_and_spills_full_output
-      result = tool.execute(command: "seq 1 3000")
+      result = execute_tool(command: "seq 1 3000")
       assert_includes result, "[Showing lines 1001-3000 of 3000"
       assert_includes result, "Full output: #{tool.details[:full_output_path]}"
       assert File.exist?(tool.details[:full_output_path])
@@ -124,7 +131,7 @@ module Tart
     # no error wrapping. ----
 
     def test_run_user_reports_non_zero_exit_without_error_wrapping
-      outcome = tool.run_user("echo out; exit 3")
+      outcome = run_user_tool("echo out; exit 3")
 
       assert_equal 3, outcome.exit_code
       refute outcome.cancelled, "a non-zero exit REPORTS — it does not raise into an error result"
@@ -134,7 +141,7 @@ module Tart
     end
 
     def test_run_user_carries_truncation_details_and_spills
-      outcome = tool.run_user("seq 1 2100")
+      outcome = run_user_tool("seq 1 2100")
 
       assert outcome.truncation.truncated
       assert_match(%r{/tart-bash-[0-9a-f]{16}\.log\z}, outcome.full_output_path,
@@ -158,6 +165,39 @@ module Tart
       assert_no_probe(marker)
     end
 
+    # I50 de-bridge AC4: a cancelled bash run leaves NO zombie. The tool
+    # task is stopped mid-run (the escape-cancel shape); a stopped task
+    # takes its child reaper task with it (async stop_children), the group
+    # -KILL guarantees the child's death, and SOMEONE reaps (the surviving
+    # reaper, else the rescue's bounded self-reap) — the pid is GONE from
+    # the process table after the unwind: reaped, not zombie.
+    def test_cancelled_bash_run_leaves_no_zombie
+      pid_file = File.join(@dir, "child-pid")
+      outcome = nil
+      Async do |root|
+        task = root.async { tool.execute(command: "echo $$ > #{pid_file}; sleep 5") }
+        wait_until { File.exist?(pid_file) } # the command is running
+        task.stop # the escape-cancel path
+        begin
+          outcome = task.wait
+        rescue Async::Cancel
+          outcome = :cancelled
+        end
+      end
+
+      pid = File.read(pid_file).strip
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+      state = nil
+      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+        state = `ps -o stat= -p #{pid} 2>/dev/null`.to_s.strip
+        break if state.empty?
+
+        refute state.start_with?("Z"), "the killed child is a ZOMBIE (stat=#{state.inspect})"
+        sleep 0.05
+      end
+      assert_empty state, "the killed child must be reaped (gone from the process table)"
+    end
+
     # ---- the chunk seam (I38 — pi executeBashWithOperations' onChunk,
     # bash-executor.ts:96-98: per pipe read, CR-REMOVED text). ----
 
@@ -166,7 +206,7 @@ module Tart
     # carry (Grounds 2).
     def test_run_user_streamed_chunks_join_to_the_returned_content
       chunks = []
-      outcome = tool.run_user("printf 'alpha\\n'; sleep 0.2; printf 'beta\\r\\ngamma'",
+      outcome = run_user_tool("printf 'alpha\\n'; sleep 0.2; printf 'beta\\r\\ngamma'",
         on_chunk: ->(text) { chunks << text })
 
       assert_operator chunks.length, :>=, 2, "both pipe reads fired the seam"
@@ -180,7 +220,7 @@ module Tart
     def test_run_user_fires_the_seam_midflight_not_after_the_return
       seen_after_return = nil
       returned = false
-      outcome = tool.run_user("printf 'early\\n'; sleep 0.3; printf 'late\\n'",
+      outcome = run_user_tool("printf 'early\\n'; sleep 0.3; printf 'late\\n'",
         on_chunk: ->(text) { seen_after_return ||= text if returned })
       returned = true
 
@@ -192,7 +232,7 @@ module Tart
     # (the chat-level append is inert on "").
     def test_run_user_cr_only_chunk_strips_to_nothing
       chunks = []
-      tool.run_user("printf 'a\\rb'", on_chunk: ->(text) { chunks << text })
+      run_user_tool("printf 'a\\rb'", on_chunk: ->(text) { chunks << text })
 
       assert chunks.all? { |text| !text.include?("\r") }, "CR removed per chunk (AC3)"
       assert_equal "ab", chunks.join
@@ -209,11 +249,11 @@ module Tart
     end
 
     # AC3: fast commands pay no poll quantum — exit detection is evented
-    # (reaper thread + Queue), so `echo` rounds to Took 0.0s like pi.
+    # (reaper task + Queue), so `echo` rounds to Took 0.0s like pi.
     def test_fast_commands_pay_no_poll_quantum
       durations = Array.new(10) do
         t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        result = tool.execute(command: "echo pty-tester")
+        result = execute_tool(command: "echo pty-tester")
         assert_includes result, "pty-tester"
         Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
       end
@@ -271,9 +311,9 @@ module Tart
     def test_session_environment_run_user_exposes_nothing_and_never_scrubs
       ENV["PI_SESSION_ID"] = "parent-leak"
       ENV["PI_REASONING_LEVEL"] = "parent-level"
-      outcome = env_tool(identity: Identity::PI,
-        session_env: {"SESSION_ID" => -> { "composed" }, "REASONING_LEVEL" => -> { "composed-level" }})
-        .run_user('printf "session=%s level=%s" "$PI_SESSION_ID" "$PI_REASONING_LEVEL"')
+      outcome = run_user_tool('printf "session=%s level=%s" "$PI_SESSION_ID" "$PI_REASONING_LEVEL"',
+        tool: env_tool(identity: Identity::PI,
+          session_env: {"SESSION_ID" => -> { "composed" }, "REASONING_LEVEL" => -> { "composed-level" }}))
 
       assert_equal "session=parent-leak level=parent-level", outcome.content,
         "plain inheritance: inherited values ride UNSCRUBBED, the readers never fire"
@@ -335,6 +375,21 @@ module Tart
 
     private
 
+    # The de-bridged tool runs ON a reactor fiber in production (the reaper
+    # task and the scheduler's process_wait live there — I50), so the test
+    # drives it the same way. Assertions unchanged.
+    def execute_tool(command:, timeout: nil, tool: self.tool)
+      on_reactor { tool.execute(command:, timeout:) }
+    end
+
+    def run_user_tool(command, on_chunk: nil, tool: self.tool)
+      on_reactor { tool.run_user(command, on_chunk:) }
+    end
+
+    def on_reactor
+      Async { yield }.wait
+    end
+
     def tool
       @tool ||= Tools::Bash.new(cwd: @dir)
     end
@@ -348,7 +403,7 @@ module Tart
     # One execute round-trip: the child's `env` output as a hash (only
     # VAR=VALUE lines parse — inherited multi-line values stay inert).
     def child_env(exposing_tool)
-      result = exposing_tool.execute(command: "env")
+      result = execute_tool(command: "env", tool: exposing_tool)
       raise "env failed: #{result[:error]}" if result.is_a?(Hash)
 
       result.split("\n").select { |line| line.include?("=") }.to_h { |line| line.split("=", 2) }
