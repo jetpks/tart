@@ -65,7 +65,13 @@ module TuiSplitRig
 #                              # the staged settings.json + the same index
 #                              # at .tart/memory/tart/MEMORY.md. Default:
 #                              # false.
-  #   env:                       # optional per-app env overrides (the
+  #   resize: [80, 40]           # optional (I56): the [width, height] pair the
+#                              # pane is resized to AFTER the boot settle and
+#                              # BEFORE the paste/prompt block (tmux
+#                              # resize-window — resize-PANE does not move a
+#                              # manual-size session). The SIGWINCH instrument
+#                              # (s16). Default: none (today's behavior).
+#   env:                       # optional per-app env overrides (the
   #     tart:                    # runner layers them over its staged
   #       TART_IDENTITY: tart    # env — the branding/staging seam)
   #
@@ -76,7 +82,8 @@ module TuiSplitRig
     APPS = %w[pi tart].freeze
 
     attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage,
-                :post_settle_keys, :mid_run_keys, :stage_project_resources, :stage_memory, :paste, :submit
+                :post_settle_keys, :mid_run_keys, :stage_project_resources, :stage_memory, :paste, :submit,
+                :resize
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -110,6 +117,7 @@ module TuiSplitRig
       end
       @paste = parse_paste(data)
       @submit = parse_submit(data)
+      @resize = parse_resize(data)
       @env = parse_env(data)
       @context_window = parse_context_window(data)
       @suppress_usage = parse_suppress_usage(data)
@@ -148,6 +156,20 @@ module TuiSplitRig
       return true if raw.nil?
 
       raise Error, "#{@path}: submit must be a boolean" unless raw == true || raw == false
+
+      raw
+    end
+
+    # The resize knob (the s16 instrument, I56): a [width, height] pair of
+    # positive integers or absent → nil. Validated at load like the other
+    # knobs — everything else is a rig error.
+    def parse_resize(data)
+      raw = data["resize"]
+      return nil if raw.nil?
+
+      unless raw.is_a?(Array) && raw.length == 2 && raw.all? { |value| value.is_a?(Integer) && value.positive? }
+        raise Error, "#{@path}: resize must be a [width, height] pair of positive integers"
+      end
 
       raw
     end

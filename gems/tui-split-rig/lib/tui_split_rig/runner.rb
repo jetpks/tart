@@ -121,6 +121,16 @@ module TuiSplitRig
 
       boot = settle(session, "boot")
       alive = session_exists?(session)
+      # The scenario's resize knob (the s16 instrument, I56): after the boot
+      # settle, BEFORE the paste/prompt block — resize-window moves a
+      # manual-size session (resize-PANE does not, Grounds §1), then a
+      # re-settle. The no-knob path stays byte-frozen (every pre-I56
+      # scenario's flow identical).
+      if alive && @scenario.resize
+        width, height = @scenario.resize
+        tmux("resize-window", "-t", session, "-x", width.to_s, "-y", height.to_s)
+        settle(session, "resize")
+      end
       if alive && @scenario.paste
         # The paste knob (I55, s14/s15): the text rides a token-scoped tmux
         # buffer; paste-buffer -p wraps it in the bracketed-paste pair the

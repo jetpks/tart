@@ -1,0 +1,20 @@
+# S16 — the SIGWINCH parity scenario (I56): one tiny text turn at the boot
+# geometry, then the pane is resized 120→80 AFTER the boot settle and
+# BEFORE the prompt (resize: [80, 40] — the resize knob; tmux
+# resize-window, the only call that moves a manual-size session). The
+# settled capture must carry BOTH apps' header re-wrapped at the new
+# width: the hints pair wrapping word-led (` ctrl+o more`) and the
+# onboarding pair wrapping (` extend Pi.`). Width 80 is calibrated: the
+# hints row wraps (content 84 > 78) AND the onboarding wraps (88 > 78)
+# while the staged footer path still fits 80 cols — at narrower widths the
+# truncated footer cwd rows escape the parity-run-path class anchor
+# (Grounds §7). RED at the pre-I56 base BY DESIGN: the base header rows
+# are boot-width-frozen and clip (the candidate list IS this iteration's
+# work list — the s9 precedent).
+name: s16_resize_wrap
+prompt: "hello"
+expected_requests: 1
+resize: [80, 40]
+responses:
+  - type: stream
+    content: "The mock reply is fixed and short for the spike."

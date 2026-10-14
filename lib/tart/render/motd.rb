@@ -111,27 +111,52 @@ module Tart
       end
 
       # pi keyHint over {PI_HINTS}: dim key + muted description, the
-      # separator inside every description run but the last.
+      # separator a SEPARATE muted span (pi's compactInstructions joins
+      # the hints with its own theme.fg("muted", " · ") segment —
+      # interactive-mode.ts:1049-1056; keybinding-hints.ts:42-44). The
+      # split is load-bearing for the wrap: the re-issued SGR rides the
+      # separator's leading space (utils.ts:941 trim sees the code), so
+      # {Text.wrap_spans} keeps it on a break — the `␣␣· / commands…`
+      # continuation (pi-w50.txt row 3). Effective runs are unchanged
+      # (adjacent same-style runs merge in the rig's styled walk).
       def pi_hint_spans
         PI_HINTS.flat_map.with_index do |(key, description), index|
-          tail = index == PI_HINTS.length - 1 ? " #{description}" : " #{description} · "
-          [TUI.span(key, fg: Theme[:dim]), TUI.span(tail, fg: Theme[:muted])]
+          spans = [TUI.span(key, fg: Theme[:dim]), TUI.span(" #{description}", fg: Theme[:muted])]
+          spans << TUI.span(" · ", fg: Theme[:muted]) unless index == PI_HINTS.length - 1
+          spans
         end
       end
 
-      # One random art piece's lines (empty collection → no logo lines).
-      def motd_logo_lines
-        file = Dir[File.join(LOGOS_DIR, "*.txt")].sample
-        file ? File.readlines(file, chomp: true) : []
+      # One art piece's lines — the LADDER (I56, Grounds §4, owner-directed):
+      # the WIDEST piece by max-row CELL width (TUI.text_width over every
+      # row — never String#length, the art is multibyte: rebel is 104
+      # bytes, 40 cells) whose pad + widest row fits +width+; ties break
+      # name-ascending (at 40 cells: mono-12 over rebel); below the
+      # smallest piece the WORDMARK row (the identity name). Deterministic
+      # per width — the random-per-boot presentation is retired; the pick
+      # re-runs at boot, /new, and the resize rebuild, never across a
+      # ctrl+o flip (the I33 byte-restore property). Stateless as today.
+      def motd_logo_lines(width, wordmark:)
+        pad = Panel::OUTPUT_PAD.length
+        fit = Dir[File.join(LOGOS_DIR, "*.txt")].sort.filter_map do |file|
+          rows = File.readlines(file, chomp: true)
+          next if rows.empty?
+
+          max_cell = rows.map { |row| TUI.text_width(row) }.max
+          [File.basename(file, ".txt"), rows, max_cell] if max_cell + pad <= width
+        end.min_by { |name, _, max_cell| [-max_cell, name] }
+        fit ? fit[1] : [wordmark]
       end
 
-      # The tart FAMILY's header: the owner's art collection, the identity
-      # name + version line, then the hints — the compact line collapsed,
-      # one row per bound key expanded ({TART_EXPANDED_HINTS}). The face
+      # The tart FAMILY's header: the owner's art collection (the ladder
+      # pick threaded by the caller — {Chat#enqueue_motd_header} sets it
+      # from the width at enqueue/re-pick time), the identity name +
+      # version line, then the hints — the compact line collapsed, one
+      # row per bound key expanded ({TART_EXPANDED_HINTS}). The face
       # threads explicitly from Chat's @identity (I33 — the frozen call
       # carries no identity argument at base): tart renders "tart", foo
       # "foo", always with Tart::VERSION.
-      def tart_header_lines(width, name, expanded:, logo_lines: motd_logo_lines)
+      def tart_header_lines(width, name, expanded:, logo_lines: motd_logo_lines(width, wordmark: name))
         content_width = width - Panel::OUTPUT_PAD.length * 2
         lines = logo_lines.map { |line| TUI.line("#{Panel::OUTPUT_PAD}#{line}") }
         lines << TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(name), TUI.span(" v#{Tart::VERSION}", fg: Theme[:dim])])
@@ -152,22 +177,44 @@ module Tart
       # blocks). The separating space renders PLAIN (pi: the mark's spans,
       # a plain space, THEN the dim hints span — the -e capture's byte
       # proof: the port dimmed the space).
-      def pi_header_lines(expanded:)
+      #
+      # I56: +width+ (the FULL viewport width, threaded by the caller —
+      # the latch during a resize rebuild) — EVERY row wraps through the
+      # {Text.wrap_spans} port at the content width (width −
+      # 2·{OUTPUT_PAD}; pi Text.render's contentWidth = width − paddingX·2,
+      # text.ts:78-88), each wrapped row re-prefixed by the pad (pi's
+      # leftMargin per wrapped row). The mark row's spans and the hint
+      # spans flatten to ONE wrap input — pi wraps the concatenated line
+      # (the mark's internal space and the separator are part of the
+      # token stream). Rows that fit pass through single-row (the frozen
+      # 120-col bytes).
+      def pi_header_lines(expanded:, width:)
+        content_width = width - Panel::OUTPUT_PAD.length * 2
         top, bottom = pi_mark
-        rows = [TUI.line([TUI.span(Panel::OUTPUT_PAD), *top, TUI.span(" "), TUI.span("v#{Identity::ORACLE_VERSION}", fg: Theme[:dim])])]
-        rows << if expanded
+        rows = wrap_header_row([*top, TUI.span(" "), TUI.span("v#{Identity::ORACLE_VERSION}", fg: Theme[:dim])], content_width)
+        rows.concat(if expanded
           first_key, first_description = PI_EXPANDED_HINTS.first
-          TUI.line([TUI.span(Panel::OUTPUT_PAD), *bottom, TUI.span(" "),
+          wrap_header_row([*bottom, TUI.span(" "),
             TUI.span(first_key, fg: Theme[:dim]),
-            TUI.span(" #{first_description}", fg: Theme[:muted])])
+            TUI.span(" #{first_description}", fg: Theme[:muted])], content_width)
         else
-          TUI.line([TUI.span(Panel::OUTPUT_PAD), *bottom, TUI.span(" "), *pi_hint_spans])
+          wrap_header_row([*bottom, TUI.span(" "), *pi_hint_spans], content_width)
+        end)
+        if expanded
+          rows.concat(PI_EXPANDED_HINTS.drop(1).flat_map do |key, description|
+            wrap_header_row([TUI.span(key, fg: Theme[:dim]), TUI.span(" #{description}", fg: Theme[:muted])], content_width)
+          end)
         end
-        rows.concat(PI_EXPANDED_HINTS.drop(1).map { |key, description| key_hint_row(key, description) }) if expanded
-        rows << TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(PI_NOTICE_LINE, fg: Theme[:dim])]) unless expanded
+        rows.concat(wrap_header_row([TUI.span(PI_NOTICE_LINE, fg: Theme[:dim])], content_width)) unless expanded
         rows << Panel.blank_line
-        rows << TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(PI_ONBOARDING_LINE, fg: Theme[:dim])])
+        rows.concat(wrap_header_row([TUI.span(PI_ONBOARDING_LINE, fg: Theme[:dim])], content_width))
         rows
+      end
+
+      # One header row through the span wrap, the pad re-prefixed per
+      # wrapped row (pi Text.render's leftMargin — text.ts:82-88).
+      def wrap_header_row(spans, content_width)
+        Text.wrap_spans(spans, content_width).map { |wrapped| TUI.line([TUI.span(Panel::OUTPUT_PAD), *wrapped]) }
       end
 
       # pi piLogoLines (pi-logo.ts:26-30): 4 cells wide, 2 lines tall —
