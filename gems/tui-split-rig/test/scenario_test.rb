@@ -466,5 +466,75 @@ module TuiSplitRig
         settings.fetch("compaction"), "the compaction rows survive the merge")
     end
 
+    # --- the paste/submit knobs (I55, s14/s15) ---
+
+    # The canonical calibration block (Grounds §4): 12 short ASCII lines,
+    # no trailing newline — the byte-exact s14/s15 content.
+    PASTE_BLOCK = (<<~BLOCK).chomp.freeze
+      line alpha one
+      line bravo two
+      line charlie three
+      line delta four
+      line echo five
+      line foxtrot six
+      line golf seven
+      line hotel eight
+      line india nine
+      line juliet ten
+      line kilo eleven
+      line lima twelve
+    BLOCK
+
+    def test_paste_knob_defaults_to_nil_and_loads_from_the_shipped_s14
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 0\nresponses:\n  - type: stream\n    content: x\n")
+      assert_nil Scenario.load(path).paste, "no paste knob — today's behavior"
+
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s14_paste_marker_display.yml"))
+      assert_equal PASTE_BLOCK, scenario.paste, "the byte-exact calibrated block"
+      assert_equal "", scenario.prompt
+      refute scenario.submit, "s14 is paste-only: no Enter"
+      assert_equal 0, scenario.expected_requests, "the display flow makes no requests"
+    end
+
+    def test_paste_knob_non_string_is_a_rig_error
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\npaste: [not, a, string]\nexpected_requests: 0\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/paste must be a string/, error.message)
+    end
+
+    def test_submit_knob_defaults_to_true_and_loads_from_the_shipped_s15
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert Scenario.load(path).submit, "submit defaults TRUE — today's behavior"
+
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s15_paste_marker_submit.yml"))
+      assert_equal PASTE_BLOCK, scenario.paste
+      assert scenario.submit, "s15 submits (the default — no submit key in the file)"
+      assert_equal 1, scenario.expected_requests
+      assert_equal [{type: :stream, content: "copy that, twelve lines"}], scenario.responses
+    end
+
+    def test_submit_knob_non_boolean_is_a_rig_error
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nsubmit: maybe\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/submit must be a boolean/, error.message)
+    end
+
+    def test_expected_requests_zero_is_accepted_and_negative_rejected
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 0\nresponses:\n  - type: stream\n    content: x\n")
+      scenario = Scenario.load(path)
+      assert_equal 0, scenario.expected_requests, "paste-only flows make zero requests (I55)"
+
+      File.write(path, "name: s\nprompt: p\nexpected_requests: -1\nresponses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/expected_requests must be a non-negative integer/, error.message)
+    end
+
   end
 end

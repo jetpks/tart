@@ -984,14 +984,18 @@ module Tart
       # routes through the commands module before any agent call —
       # /skill:<name> expands (unknown skill passes through as plain text),
       # builtins dispatch busy-or-not, and text matching nothing falls
-      # through to the agent as a plain message. I54: the I13-era !busy?
+      # through to the agent as a plain message. The text is the editor's
+      # EXPANDED read (pi submitValue expands markers before onSubmit,
+      # editor.ts:1364-1377 — the marker is display-only; the wire, the
+      # session, the history, and the queues all get the full content).
+      # I54: the I13-era !busy?
       # gates DROP (pi's builtin if-chain precedes its streaming branch,
       # :3200-3365 — builtins dispatch mid-turn; /compact and /new take
       # the abort-first arm below). The idle submit echoes at submit and
       # runs; a busy submit steers with NO echo — the user message renders
       # AT DELIVERY (pi :3503-3507, the message_start event).
       def submit
-        text = @editor.input.dup.strip # pi onSubmit trims (interactive-mode.ts:3201)
+        text = @editor.expanded_text.dup.strip # pi submitValue expands BEFORE the trim (editor.ts:1364-1377)
         @autocomplete.cancel
         return if text.empty?
 
@@ -1049,7 +1053,7 @@ module Tart
       # if-chain) and neither does the !-bash intercept — the text queues
       # verbatim (post-expansion). NO submit echo: the delivery arm echoes.
       def submit_follow_up
-        text = @editor.input.dup.strip
+        text = @editor.expanded_text.dup.strip # pi handleFollowUp reads getExpandedText (interactive-mode.ts:4476)
         return if text.empty?
 
         return submit unless busy? # pi :4497-4504 — idle alt+enter = Enter

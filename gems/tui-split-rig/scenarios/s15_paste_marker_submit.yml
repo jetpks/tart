@@ -1,0 +1,28 @@
+# S15 — the marker is display-only, SUBMIT (I55): the same 12-line paste,
+# then Enter — submitValue expands the markers BEFORE onSubmit, so request
+# 1's user content is the EXACT 12-line text in BOTH apps (pi serializes
+# the content as a parts array — the gate extracts it shape-normally, the
+# live-calibrated I54-s12 precedent), zero marker bytes on the wire, the
+# settled screens show the EXPANDED user echo with no marker row, and
+# tart's session JSONL records the expanded text (backlog item f's pin —
+# the session keeps the full content, never the marker). One request per
+# app; green-at-base-class (Grounds §4.6 — regression cover for the wire).
+name: s15_paste_marker_submit
+prompt: ""
+paste: |-
+  line alpha one
+  line bravo two
+  line charlie three
+  line delta four
+  line echo five
+  line foxtrot six
+  line golf seven
+  line hotel eight
+  line india nine
+  line juliet ten
+  line kilo eleven
+  line lima twelve
+expected_requests: 1
+responses:
+  - type: stream
+    content: "copy that, twelve lines"
