@@ -168,6 +168,46 @@ module TuiSplitRig
       assert_match(/missing required field 'prompt'/, error.message)
     end
 
+    # The resize knob (I56, s16): a positive-integer pair or absent → nil;
+    # everything else is a rig error at load.
+    def test_resize_knob_parses_a_positive_pair_and_defaults_to_nil
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresize: [80, 40]\nresponses:\n  - type: stream\n    content: x\n")
+      assert_equal [80, 40], Scenario.load(path).resize
+
+      plain = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(plain, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert_nil Scenario.load(plain).resize, "absent by default — the no-knob path is byte-frozen"
+    end
+
+    def test_resize_knob_rejects_non_positive_and_non_pair_shapes
+      bad_shapes = [
+        "resize: 80\n",                    # not a pair
+        "resize: [80]\n",                  # one element
+        "resize: [80, 40, 20]\n",          # three elements
+        "resize: [0, 40]\n",               # non-positive width
+        "resize: [80, -1]\n",              # non-positive height
+        "resize: [\"80\", 40]\n",          # non-integer width
+        "resize: [80, 40.5]\n",            # non-integer height
+      ]
+      bad_shapes.each do |resize_line|
+        path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+        File.write(path, "name: s\nprompt: p\nexpected_requests: 1\n#{resize_line}responses:\n  - type: stream\n    content: x\n")
+        error = assert_raises(Error) { Scenario.load(path) }
+        assert_match(/resize must be a \[width, height\] pair of positive integers/, error.message)
+      end
+    end
+
+    # The shipped s16 instrument: the 120→80 mid-run resize with the s1
+    # reply — the scenario the SIGWINCH parity rides.
+    def test_resize_knob_loads_the_shipped_s16_resize_wrap_scenario
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s16_resize_wrap.yml"))
+      assert_equal "s16_resize_wrap", scenario.name
+      assert_equal [80, 40], scenario.resize
+      assert_equal 1, scenario.expected_requests
+      assert_equal [{type: :stream, content: "The mock reply is fixed and short for the spike."}], scenario.responses
+    end
+
     def test_absent_scenario_file_raises_a_rig_error
       assert_raises(Error) { Scenario.load("/nonexistent/scenario.yml") }
     end

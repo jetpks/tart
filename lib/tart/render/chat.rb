@@ -178,6 +178,12 @@ module Tart
         # screen (motd: false, or the /resume screen) — the rebuild
         # restores none.
         @header_enqueued = false
+        # The tart art pick (I56 — the ladder at enqueue/re-pick time; nil
+        # until the first header enqueue) and the resize latch (the event
+        # dims driving the ONE post-SIGWINCH compose; {render_frame}
+        # clears it after {build_widget}).
+        @logo_lines = nil
+        @resize_dims = nil
         # The /resume session picker (item 2, pi SessionSelectorComponent
         # reduced): nil = closed; open it holds the {Picker} over the
         # launcher-built [{path:, label:}] list (newest first).
@@ -415,6 +421,11 @@ module Tart
           @motd_pending = false
           @transcript_state.flush_scrollback
           widget = build_widget
+          # One-frame latch semantics (I56): the resize event's dims drove
+          # THIS compose; the draw's autoresize has refreshed the gem area
+          # by the next frame (Grounds §2) — subsequent frames compose
+          # from the session area again.
+          @resize_dims = nil
         end
         # Keep frames deadline-paced while the agent works (spinner, live
         # region) OR a user-bash run streams (the bash loader's glyph must
@@ -427,14 +438,41 @@ module Tart
 
       # Kernel event sink (every dispatched event, native or synthetic).
       # Ctrl+C never reaches here — the kernel owns it (interrupt). Mouse
-      # events route to the surface's wheel-scroll/selection machinery;
-      # resize is ignored (the kernel marks the frame dirty either way and
-      # the next frame recomposes from the session's fresh viewport).
+      # events route to the surface's wheel-scroll/selection machinery.
+      # I56: resize events latch the event's dims and re-compose — the gem's
+      # viewport_area answers the LAST DRAWN frame's area outside draw (ext
+      # terminal/query.rs:118-124; Grounds §2), so the first post-SIGWINCH
+      # frame must compose from the EVENT's own width/height; the kernel's
+      # dirty-mark alone would draw at the stale area with no follow-up.
       def on_event(event, _source = nil)
         return handle_mouse(event) if event.respond_to?(:mouse?) && event.mouse?
+        return handle_resize(event) if event.respond_to?(:resize?) && event.resize?
+
         return unless event.key? || event.paste?
 
         edit_input(event)
+      end
+
+      # The SIGWINCH arm (I56): latch the event dims as the compose-time
+      # geometry (one frame — {render_frame} clears the latch after
+      # {build_widget}; on a real terminal the draw's autoresize refreshes
+      # the gem area by then), re-pick the header art at the new width and
+      # rebuild the resize-live header block in place, then request the
+      # draw. No header enqueued (motd: false — the /resume screens) → no
+      # art re-pick, no rebuild; the latch still sets (the editor reflow
+      # works headless too). The predicate form mirrors the mouse arm (the
+      # base Event answers every ? predicate via method_missing — the
+      # respond_to? guard is what separates the classes).
+      def handle_resize(event)
+        rebuilt = false
+        @mutex.synchronize do
+          @resize_dims = [event.width, event.height]
+          if @header_enqueued
+            @logo_lines = Motd.motd_logo_lines(event.width, wordmark: @identity)
+            rebuilt = @transcript_state.rebuild_live_expandables
+          end
+        end
+        @kernel.request_draw if rebuilt
       end
 
       # Agent event sink (I03 event surface). Runs on the agent fiber.
@@ -690,18 +728,23 @@ module Tart
       # The header-container block: the identity's header content between
       # its Spacers, built at the CURRENT global toggle state (pi
       # getStartupExpansionState = verbose || toolOutputExpanded; the port
-      # has no --verbose, cut, itemized). Registered so the flip and the
-      # compaction rebuild re-invoke the builder. The tart art samples
-      # ONCE per block (the flip must restore the collapsed bytes exactly;
-      # a /new re-enqueue samples fresh art — the sanctioned presentation).
+      # has no --verbose, cut, itemized). Registered RESIZE-LIVE (I56 —
+      # the SIGWINCH rebuild sweeps only this block). The tart art comes
+      # from the LADDER at the current width (I56 — deterministic per
+      # width; the random sample is retired): the pick re-runs at boot,
+      # /new, and the compaction re-enqueue (all through here, at the
+      # then-current {viewport_width} — the latch during a resize), and
+      # is re-set ONLY by {handle_resize}; the ctrl+o flip path never
+      # re-picks (the I33 byte-restore property — the builder closes over
+      # the ivar, not the ladder).
       def enqueue_motd_header
         @header_enqueued = true
-        logo_lines = Motd.motd_logo_lines
-        @transcript_state.push_expandable(->(expanded) { motd_header_rows(expanded, logo_lines) })
+        @logo_lines = Motd.motd_logo_lines(viewport_width, wordmark: @identity)
+        @transcript_state.push_expandable(->(expanded) { motd_header_rows(expanded) }, resize_live: true)
       end
 
-      def motd_header_rows(expanded, logo_lines)
-        header = @identity == Identity::PI ? Motd.pi_header_lines(expanded:) : Motd.tart_header_lines(viewport_width, @identity, expanded:, logo_lines:)
+      def motd_header_rows(expanded)
+        header = @identity == Identity::PI ? Motd.pi_header_lines(expanded:, width: viewport_width) : Motd.tart_header_lines(viewport_width, @identity, expanded:, logo_lines: @logo_lines)
         [Panel.blank_line, *header, Panel.blank_line]
       end
 
@@ -762,6 +805,8 @@ module Tart
       end
 
       def viewport_width
+        return @resize_dims[0] if @resize_dims
+
         area = @session.viewport_area
         area ? area.width : 80
       end
@@ -1236,8 +1281,11 @@ module Tart
       end
 
       # The session viewport's height (the 24 fallback matches
-      # {viewport_width}'s 80 — the headless defaults' shape).
+      # {viewport_width}'s 80 — the headless defaults' shape). The resize
+      # latch prefers the event's height for the one latched frame (I56).
       def screen_height
+        return @resize_dims[1] if @resize_dims
+
         area = @session.viewport_area
         area ? area.height : 24
       end
@@ -1442,8 +1490,7 @@ module Tart
       # spacer and the editor (createChatViewport :969-976 — document →
       # pendingMessages → status → widgetsAbove → editor).
       def build_widget
-        area = @session.viewport_area
-        height = area ? area.height : 24
+        height = screen_height
         editor_rows = editor_area_rows(height)
         transcript_rows = transcript_area_rows(height)
         spacer_rows = dock_spacer_rows(height)

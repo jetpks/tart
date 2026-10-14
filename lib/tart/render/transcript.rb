@@ -28,8 +28,12 @@ module Tart
       # the CURRENT toggle state + the builder (re-invoked with the new
       # state at the ctrl+o toggle; the drain records the transcript
       # range). pi's expandable tool children — and, since I33, the MOTD
-      # header block + the loaded-resource sections.
-      MarkedRegion = Struct.new(:rows, :builder)
+      # header block + the loaded-resource sections. I56: +resize_live+
+      # marks the blocks the SIGWINCH rebuild sweeps (the header only —
+      # tool blocks / the compaction panel / custom blocks stay
+      # boot-width; the whole-transcript re-wrap is the PARKED
+      # divergence, Grounds §6).
+      MarkedRegion = Struct.new(:rows, :builder, :resize_live)
 
       # A persistent status waiting for the flush (pi showStatus,
       # interactive-mode.ts:3824-3842): a Spacer(1) + dim one-pad text row
@@ -348,7 +352,7 @@ module Tart
           case item
           when MarkedRegion
             registered = {start: @transcript.size, size: item.rows.length,
-                          builder: item.builder}
+                          builder: item.builder, resize_live: item.resize_live}
             @expandable_blocks << registered
             @transcript.concat(item.rows)
             # The pending block's drain links the region to its registry
@@ -393,6 +397,34 @@ module Tart
           registered[:size] = rows.length
         end
         true
+      end
+
+      # The resize rebuild's state half (I56): re-invoke every
+      # resize_live-registered builder at the CURRENT toggle state and
+      # splice in place — exactly {set_tool_output_expanded}'s arithmetic
+      # (the ascending-start walk carrying the row DELTA) WITHOUT the
+      # state flip and WITHOUT touching non-live registrations. Tool
+      # blocks / the compaction panel / the resource sections stay
+      # boot-width (Grounds §6: a full sweep would re-wrap the expandable
+      # tool rows while their neighbors stay boot-width — an inconsistent
+      # half-state). Returns whether anything rebuilt.
+      def rebuild_live_expandables
+        delta = 0
+        rebuilt = false
+        @expandable_blocks.each do |registered|
+          if registered[:resize_live]
+            start = registered[:start] + delta
+            rows = registered[:builder].call(@tool_output_expanded)
+            @transcript[start, registered[:size]] = rows
+            delta += rows.length - registered[:size]
+            registered[:start] = start
+            registered[:size] = rows.length
+            rebuilt = true
+          else
+            registered[:start] += delta # the rows stay; the range moves
+          end
+        end
+        rebuilt
       end
 
       # The /new + resume shared reset's component half (the coordinator's
@@ -785,9 +817,11 @@ module Tart
       # {MarkedRegion} (the drain records its transcript range for the
       # ctrl+o toggle's in-place rebuild). Public — the coordinator's MOTD
       # header + resource-section blocks ride the same registry (I33, pi
-      # BuiltInHeader/setToolsExpanded's container sweep).
-      def push_expandable(builder)
-        @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder)
+      # BuiltInHeader/setToolsExpanded's container sweep). +resize_live+
+      # defaults false — every pre-I56 caller byte-identical (I56: only
+      # the header registers live).
+      def push_expandable(builder, resize_live: false)
+        @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder, resize_live)
       end
 
       public :push_expandable

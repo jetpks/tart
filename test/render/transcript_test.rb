@@ -259,7 +259,49 @@ module Tart
           "the replay dispatches through the append path — final blocks only"
         refute_includes bgs, Theme[:tool_pending_bg], "zero pending-bg spans on the replay path"
       end
-    end
+
+      # --- I56: the resize-live rebuild ---
+
+      # rebuild_live_expandables re-invokes ONLY the resize_live-flagged
+      # builders at the CURRENT toggle state and splices in place with the
+      # flip's start/delta arithmetic: the live block's rows replace in
+      # place, content BELOW shifts by the height delta, and non-live
+      # registrations (a tool block) keep their rows byte-identical.
+      def test_rebuild_live_expandables_replaces_the_live_block_and_shifts_later_rows
+        live_rows = 1 # the live block's row count (the rebuild's height delta lever)
+        @transcript.push_expandable(->(expanded) { live_rows.times.map { |i| TUI.line("header r#{i} expanded=#{expanded}") } },
+          resize_live: true)
+        @transcript.push_expandable(->(expanded) { [TUI.line("tool expanded=#{expanded}")] })
+        @transcript.enqueue_scrollback("below the fold", fg: Theme[:dim])
+        flush
+
+        assert_equal ["header r0 expanded=false", "tool expanded=false", "below the fold"], texts
+
+        live_rows = 2 # the rebuilt block is one row TALLER
+        assert @transcript.rebuild_live_expandables, "the rebuild reports a live block rebuilt"
+
+        assert_equal ["header r0 expanded=false", "header r1 expanded=false", "tool expanded=false", "below the fold"],
+          texts, "the live block replaced in place at the current expand state; later content intact"
+        assert_equal 4, @transcript.lines.size, "the height delta shifted the rows below"
+
+        @transcript.set_tool_output_expanded(true)
+        @transcript.rebuild_live_expandables
+        assert_equal ["header r0 expanded=true", "header r1 expanded=true", "tool expanded=true", "below the fold"],
+          texts, "the rebuild reads the CURRENT toggle state (no flip of its own)"
+      end
+
+      # resize_live defaults FALSE — every pre-I56 push_expandable caller
+      # byte-identical — and rebuild_live_expandables no-ops (returns
+      # false, rows untouched) when only non-live blocks are registered.
+      def test_rebuild_live_expandables_defaults_false_and_no_ops_without_live_blocks
+        @transcript.push_expandable(->(_expanded) { [TUI.line("tool block")] })
+        flush
+
+        refute @transcript.rebuild_live_expandables, "no live blocks → nothing rebuilt"
+        assert_equal ["tool block"], texts, "the rows are untouched"
+        assert_equal 1, @transcript.lines.size
+      end
+      end
     # --- I47: the custom-message block (pi CustomMessageComponent's
     # default rendering — the Grounds section-6 staged-pi capture is the
     # row-shape oracle) ---
@@ -306,6 +348,49 @@ module Tart
       flush
 
       assert_empty @transcript.lines, "display false renders nothing (pi's display gate)"
+    end
+
+    # --- I56: the resize-live rebuild ---
+
+    # rebuild_live_expandables re-invokes ONLY the resize_live-flagged
+    # builders at the CURRENT toggle state and splices in place with the
+    # flip's start/delta arithmetic: the live block's rows replace in
+    # place, content BELOW shifts by the height delta, and non-live
+    # registrations (a tool block) keep their rows byte-identical.
+    def test_rebuild_live_expandables_replaces_the_live_block_and_shifts_later_rows
+      generation = "a"
+      @transcript.push_expandable(->(expanded) { [TUI.line("header #{generation} expanded=#{expanded}")] },
+        resize_live: true)
+      @transcript.push_expandable(->(expanded) { [TUI.line("tool expanded=#{expanded}")] })
+      @transcript.enqueue_scrollback("below the fold", fg: Theme[:dim])
+      flush
+
+      assert_equal ["header a expanded=false", "tool expanded=false", "below the fold"], texts
+
+      generation = "bb" # the rebuilt header is one row TALLER
+      assert @transcript.rebuild_live_expandables, "the rebuild reports a live block rebuilt"
+
+      assert_equal ["header bb expanded=false", "tool expanded=false", "below the fold"], texts,
+        "the live block replaced in place at the current expand state; later content intact"
+      assert_equal 4, @transcript.lines.size, "the height delta shifted the rows below"
+
+      @transcript.set_tool_output_expanded(true)
+      generation = "cc"
+      @transcript.rebuild_live_expandables
+      assert_equal ["header cc expanded=true", "tool expanded=true", "below the fold"], texts,
+        "the rebuild reads the CURRENT toggle state (no flip of its own)"
+    end
+
+    # resize_live defaults FALSE — every pre-I56 push_expandable caller
+    # byte-identical — and rebuild_live_expandables no-ops (returns
+    # false, rows untouched) when only non-live blocks are registered.
+    def test_rebuild_live_expandables_defaults_false_and_no_ops_without_live_blocks
+      @transcript.push_expandable(->(_expanded) { [TUI.line("tool block")] })
+      flush
+
+      refute @transcript.rebuild_live_expandables, "no live blocks → nothing rebuilt"
+      assert_equal ["tool block"], texts, "the rows are untouched"
+      assert_equal 1, @transcript.lines.size
     end
   end
 end

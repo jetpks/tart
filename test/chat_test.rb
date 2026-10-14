@@ -1668,7 +1668,7 @@ module Tart
         assert_equal "", lines.first, "the header container opens with its Spacer(1)"
         art = Dir[File.join(Render::Motd::LOGOS_DIR, "*.txt")].map { |f| File.readlines(f, chomp: true) }
         assert art.any? { |piece| (piece.map { |line| " #{line}" } - lines).empty? },
-          "a random logo piece from the owner's collection renders in full (padded)"
+          "the ladder's pick at this width renders in full (padded) — deterministic per width since I56 (the widest fitting piece; random-per-boot art retired), not a random sample"
         assert_includes lines, " tart v#{Tart::VERSION}", "the version line renders Tart::VERSION (padded)"
         assert_includes lines.join, "/ commands", "the hints line carries the port's real keys"
         refute_includes lines.join, "! ", "no `!` hint on the FROZEN compact line (the expanded header lists it — I33)"
@@ -1814,6 +1814,155 @@ module Tart
           "the header rebuilt EXPANDED (pi's live header rides the toggle)"
         assert_includes lines.join, " drop files to attach"
       end
+    end
+
+    # --- I56: the SIGWINCH path (the compose latch + the resize-live
+    # rebuild; the mechanism pins) ---
+
+    # AC1: a synthetic resize event (the headless terminal's synchronous
+    # resize cannot see the defect — the gem's viewport_area answers the
+    # LAST DRAWN frame's area outside draw) latches the event dims for
+    # ONE compose: the next frame's editor input rows wrap at the EVENT
+    # width with no key event between, and the SECOND frame recomposes
+    # from the session area (the latch cleared after build_widget). No
+    # header enqueued (motd: false) — the arm no-ops its rebuild safely.
+    def test_sigwinch_latches_the_event_dims_for_one_frame
+      with_chat(width: 60, screen_height: 16) do |chat, session|
+        "aaaa bbbb cccc dddd".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        draw(chat, session)
+        assert_equal "aaaa bbbb cccc dddd", session.buffer_content[12].rstrip,
+          "one input row at the session width (3-row box: border 11, input 12, border 13)"
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 14, height: 16))
+        draw(chat, session)
+        assert_equal "aaaa bbbb", session.buffer_content[11].rstrip, "frame 1: the input re-wrapped"
+        assert_equal "cccc dddd", session.buffer_content[12].rstrip, "frame 1: at the EVENT width — no cursor/key event between"
+
+        draw(chat, session)
+        assert_equal "aaaa bbbb cccc dddd", session.buffer_content[12].rstrip,
+          "frame 2 recomposes from the session area (one-frame latch)"
+      end
+    end
+
+    # AC1 (the editor half): the editor input reflows on the resize event
+    # alone — the latch supplies the true width to the per-frame recompute
+    # (editor.rb needs nothing). Pinned at the row-break level.
+    def test_editor_input_reflows_on_resize_without_cursor_movement
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        "the quick brown fox jumped".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        draw(chat, session)
+        assert_includes session.buffer_content[8].rstrip, "the quick brown fox jumped",
+          "single input row at the session width"
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 16, height: 12))
+        draw(chat, session)
+        assert_equal "the quick", session.buffer_content[6].rstrip,
+          "the input re-wrapped at the event width with zero key events"
+        assert_equal "brown fox", session.buffer_content[7].rstrip
+        assert_equal "jumped", session.buffer_content[8].rstrip, "the box grew with the wrap"
+      end
+    end
+
+    # AC1+AC2: the SIGWINCH rebuild — the header block re-wraps to the
+    # live-oracle bytes at the latched width IN PLACE (the resize-live
+    # rebuild), and the rebuild happens ONCE: the second frame keeps the
+    # rebuilt rows (composed from the session area, no re-wrap).
+    def test_sigwinch_rebuilds_the_header_block_at_the_new_width
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          footer_data: {cwd: @dir})
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join, "! bash · ctrl+o more", "single-row hints at 120"
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 50, height: 40))
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert_equal " ▀▀█  v#{Identity::ORACLE_VERSION}", lines[1]
+        assert_equal " █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit", lines[2], "the hints row re-wrapped"
+        assert_equal "  · / commands · ! bash · ctrl+o more", lines[3], "the whitespace-break continuation"
+        assert_equal " Press ctrl+o to show full startup help and", lines[4], "the notice re-wrapped"
+        assert_equal " loaded resources.", lines[5]
+        assert_equal " Pi can explain its own features and look up its", lines[7], "the onboarding re-wrapped"
+        assert_equal " docs. Ask it how to use or extend Pi.", lines[8]
+
+        draw(chat, session)
+        assert_equal lines, chat.transcript_lines, "the second frame keeps the rebuilt rows (no re-wrap)"
+      end
+    end
+
+    # AC3 (the flip interaction): the resize re-picks the ladder piece at
+    # the new width, and the ctrl+o flip NEVER re-picks — a flip and a
+    # flip back restore the post-resize collapsed bytes EXACTLY (the I33
+    # byte-restore property over the rebuilt block).
+    def test_flip_after_resize_keeps_the_art_stable
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          identity: "tart", footer_data: {cwd: @dir})
+        draw(chat, session)
+        boot_lines = chat.transcript_lines
+        assert_equal logo_lines("slant-relief"), boot_art(boot_lines),
+          "the ladder picks slant-relief at 120 (deterministic per width)"
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 50, height: 40))
+        draw(chat, session)
+        resized = chat.transcript_lines
+        assert_equal logo_lines("twisted"), boot_art(resized),
+          "the rebuild re-picked the art at the latched width (twisted at 50)"
+        assert_includes resized.join, " commands · pgup/pgdn scroll",
+          "the hints re-wrapped at the latched width too"
+
+        # The flip at the RESIZED width: the headless session's area stays
+        # 120, so each flip rides a fresh resize event (the latch is the
+        # width source — on a real terminal the area IS 50 here). The
+        # ctrl+o path never re-picks the art: the flip and the flip back
+        # restore the post-resize collapsed bytes EXACTLY (the I33
+        # byte-restore property over the rebuilt block).
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 50, height: 40))
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        expanded = chat.transcript_lines
+        assert_equal logo_lines("twisted"), boot_art(expanded), "the flip never re-picks the art"
+        assert_includes expanded.join, " !! to run bash (no context)", "the header flipped EXPANDED"
+        refute_includes expanded.join, "pgup/pgdn scroll", "no compact hints row expanded"
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 50, height: 40))
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"]))
+        draw(chat, session)
+        assert_equal resized, chat.transcript_lines[0, resized.size],
+          "the flip back restores the post-resize collapsed bytes exactly"
+      end
+    end
+
+    # The tart family's compact hints re-wrap at the latched width (the
+    # port's own Text.wrap presentation): multi-row at a narrow width,
+    # single-row wide.
+    def test_tart_hints_rewrap_at_the_resized_width
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          identity: "tart", footer_data: {cwd: @dir})
+        draw(chat, session)
+        assert_includes chat.transcript_lines.join, Render::Motd::HINTS_LINE,
+          "the compact hints render single-row at 120"
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 50, height: 40))
+        draw(chat, session)
+        lines = chat.transcript_lines
+        hints_i = lines.index { |line| line.include?("ctrl+c interrupt/quit") }
+        refute_nil hints_i
+        assert_equal " commands · pgup/pgdn scroll", lines[hints_i + 1],
+          "the hints wrapped at the latched width (content 48): the tail row continues below"
+      end
+    end
+
+    # The boot header's art rows (the ladder pick rendered with its pad;
+    # the block sits between the leading Spacer and the version row).
+    def boot_art(lines)
+      version_i = lines.index { |line| line.include?("v#{Tart::VERSION}") }
+      lines[1...version_i].map(&:rstrip)
+    end
+
+    def logo_lines(name)
+      File.readlines(File.join(Render::Motd::LOGOS_DIR, "#{name}.txt"), chomp: true).map { |line| " #{line}".rstrip }
     end
 
     # AC4: the persistent statuses render as pi's showStatus — a blank row
@@ -4952,11 +5101,17 @@ module Tart
         lines = chat.transcript_lines
         joined = lines.join("\n")
         refute_includes joined, "✻ compacted", "the dim line is replaced by the rebuild"
-        assert_includes joined, Render::Motd::PI_NOTICE_LINE,
+        # The header rebuilds at the CURRENT width (I56 — the header is
+        # width-aware at every enqueue): at content 58 the notice and the
+        # onboarding wrap — the two-row pairs from the wrap port.
+        assert_includes joined, " Press ctrl+o to show full startup help and loaded",
           "the header survives the rebuild (pi's headerContainer, the chatContainer clear's untouched sibling)"
-        assert_includes joined, Render::Motd::PI_ONBOARDING_LINE, "the onboarding row survives with it"
+        assert_includes joined, " resources.", "the notice's wrapped continuation row"
+        assert_includes joined, " Pi can explain its own features and look up its docs. Ask",
+          "the onboarding row survives with it"
+        assert_includes joined, " it how to use or extend Pi."
         refute_includes joined, "[Context]", "the port-only resource listings are NOT resurrected"
-        header_y = lines.index { |line| line.include?(Render::Motd::PI_NOTICE_LINE) }
+        header_y = lines.index { |line| line.include?(" Press ctrl+o to show full startup help and loaded") }
         assert_operator header_y, :<, lines.rindex { |line| line.include?("kept reply") },
           "the header rides ABOVE the kept entries (pi's container order)"
         assert_includes joined, " hello", "the kept user entry re-renders through the replay machinery"

@@ -30,6 +30,66 @@ module Tart
       assert_equal [""], Render::Text.wrap("", 5)
     end
 
+    # --- the span-aware wrapSingleLine port (I56 AC2) ---
+
+    # pi wrapSingleLine over the span vocabulary against the live-oracle
+    # shapes (tmp/resize-calib/stage3/pi-w*.txt): the whitespace-break
+    # class keeps the separator's leading space on the continuation (the
+    # separator is its own muted segment — the re-issued SGR survives
+    # trim, utils.ts:941), the word-break class leads with the word, a
+    # fitting row passes through as the SAME object (the frozen 120-col
+    # bytes), and an over-long word hard-breaks at exactly width cells.
+    def test_wrap_spans_reproduces_the_pi_artifact_rows
+      dim = ->(text) { TUI.span(text, fg: Theme[:dim]) }
+      muted = ->(text) { TUI.span(text, fg: Theme[:muted]) }
+      # The collapsed hint row's content spans (motd.rb's segment
+      # structure: keyHint + a separate muted ` · ` separator).
+      row = [
+        TUI.span("█▀", fg: Theme[:logoBlue]), TUI.span(" "), TUI.span("█", fg: Theme[:logoYellow]),
+        TUI.span(" "), dim.("escape"), muted.(" interrupt"), muted.(" · "),
+        dim.("ctrl+c/ctrl+d"), muted.(" clear/exit"), muted.(" · "),
+        dim.("/"), muted.(" commands"), muted.(" · "),
+        dim.("!"), muted.(" bash"), muted.(" · "),
+        dim.("ctrl+o"), muted.(" more")
+      ]
+      text = ->(r) { r.map { |s| s.content }.join }
+
+      assert_equal ["█▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit",
+                    " · / commands · ! bash · ctrl+o more"],
+        Render::Text.wrap_spans(row, 48).map { |r| text.(r) },
+        "w50's whitespace-break class: the separator's leading space rides the continuation"
+      assert_equal ["█▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit ·",
+                    "/ commands · ! bash · ctrl+o more"],
+        Render::Text.wrap_spans(row, 50).map { |r| text.(r) },
+        "w52's separator-carrying class"
+      assert_equal ["█▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash ·",
+                    "ctrl+o more"],
+        Render::Text.wrap_spans(row, 78).map { |r| text.(r) },
+        "w80's word-break class: no leading space"
+      assert_equal [row], Render::Text.wrap_spans(row, 84),
+        "a fitting row passes through as the same object"
+
+      # The continuation's runs re-open per source segment: the muted ` · `
+      # (leading space inside), the dim key.
+      cont = Render::Text.wrap_spans(row, 48)[1]
+      assert_equal [" · ", "/", " commands", " · ", "!", " bash", " · ", "ctrl+o", " more"],
+        cont.map { |s| s.content }
+      assert_equal Theme[:muted], cont[0].style.fg
+      assert_equal Theme[:dim], cont[1].style.fg
+    end
+
+    def test_wrap_spans_hard_breaks_over_long_words_and_never_leads_with_whitespace
+      word = [TUI.span("#{"a" * 9}/g.md")]
+      broken = Render::Text.wrap_spans(word, 10)
+      assert broken.all? { |r| TUI.text_width(r.map(&:content).join) <= 10 }, "every row fits width"
+      assert_equal "#{"a" * 9}/g.md", broken.map { |r| r.map(&:content).join }.join, "the rows rejoin the word"
+
+      plain = [TUI.span("aaaa bbbb")]
+      assert_equal ["aaaa", "bbbb"], Render::Text.wrap_spans(plain, 5).map { |r| r.map(&:content).join }
+      assert_equal ["", "aaaa"], Render::Text.wrap_spans([TUI.span(" aaaa")], 4).map { |r| r.map(&:content).join },
+        "a plain whitespace token never starts a continuation"
+    end
+
     # --- footer formatting (AC4, pi footer.ts) ---
 
     def test_format_tokens_compacts_counts_like_pi
