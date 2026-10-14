@@ -266,7 +266,10 @@ module Tart
         result = tool.call(**tool_call.arguments, tool_call: tool_call)
         duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
         @after_tool_result_hooks.each { |hook| hook.call(tool_call, result, duration:) }
-        Message.tool(tool_call_id: tool_call.id, content: result_content(result))
+        # The details side channel rides the recorded/replayed message, not
+        # the wire (I57 P3 — the wire tool message stays exactly
+        # {role, content, tool_call_id}; the conversion reads content only).
+        Message.tool(tool_call_id: tool_call.id, content: result_content(result), details: tool_call.details)
       end
 
       def append_tool_result(result)

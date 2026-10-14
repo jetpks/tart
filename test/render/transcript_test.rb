@@ -301,6 +301,109 @@ module Tart
         assert_equal ["tool block"], texts, "the rows are untouched"
         assert_equal 1, @transcript.lines.size
       end
+
+      # --- I57: the generic-family live-settle bg cure + the edit family ---
+
+      # AC1 (the root-cause cure): the LIVE settle of a generic tool used
+      # to compose bg-less rows (the nil-key forwarding suppressed
+      # generic_panel_rows' default); now the finalize arm paints exactly
+      # like the replay arm — success #254131, pads included.
+      def test_generic_bg_live_settle_paints_the_success_bg
+        @transcript.finalize_tool_block("grep", {}, "hit", nil)
+        flush
+
+        assert_equal ["", "", "  ⎿ grep: hit", ""], texts, "the generic shape is unchanged (pads are blank text)"
+        assert_equal [Theme[:tool_success_bg]], bgs, "the pad + content rows ride the result bg"
+      end
+
+      # The error arm: a failed generic settle paints toolErrorBg.
+      def test_generic_bg_live_settle_paints_the_error_bg
+        @transcript.finalize_tool_block("grep", {}, { error: "boom" }, nil)
+        flush
+
+        assert_equal Theme[:tool_error_bg], bgs.first, "the error bg"
+        assert_includes texts[2], "⎿ grep: boom"
+      end
+
+      # The pending arm's bytes are UNCHANGED by the cure (explicit bg).
+      def test_generic_bg_pending_arm_stays_byte_frozen
+        @transcript.enqueue_pending_tool_block("grep", {})
+        flush
+
+        assert_equal ["", "  ⎿ grep", ""], texts.drop(1), "the pending shape"
+        assert_equal [Theme[:tool_pending_bg]], bgs, "the pending bg only"
+      end
+
+      # AC2/AC4: the edit dispatch settles from the call's details — the
+      # pending block replaced IN PLACE with the EditBlock family (no ⎿
+      # row, the diff from the details, the success bg).
+      def test_edit_block_dispatch_settles_from_the_call_details
+        args = { "path" => "f.txt" }
+        @transcript.enqueue_pending_tool_block("edit", args)
+        flush
+        pending_size = @transcript.lines.size
+
+        details = { diff: "-1 line two bravo\n+1 line two charlie", patch: "", firstChangedLine: 1 }
+        @transcript.finalize_tool_block("edit", args, "Successfully replaced 1 block(s) in f.txt.", nil,
+                                        details: details)
+        flush
+
+        assert_operator @transcript.lines.size, :>, pending_size, "the diff rows landed"
+        joined = texts.join("\n")
+        assert_includes joined, " edit f.txt", "the header"
+        assert_includes joined, "-1 line two bravo", "the removed row"
+        assert_includes joined, "+1 line two charlie", "the added row"
+        refute_includes joined, "⎿ edit:", "the generic defect row is gone"
+        assert_includes bgs, Theme[:tool_success_bg], "the success bg"
+      end
+
+      # The replay arm: the recorded details string-key hash renders the
+      # same family from the recorded session.
+      def test_edit_block_replay_renders_from_the_recorded_details
+        entries = [
+          { "type" => "message", "message" => { "role" => "user", "content" => "write then edit" } },
+          { "type" => "message", "message" => { "role" => "assistant", "content" => nil,
+                                                "tool_calls" => { "c1" => { "id" => "c1", "name" => "edit",
+                                                                            "arguments" => { "path" => "f.txt" } } } } },
+          { "type" => "message", "message" => { "role" => "tool", "content" => "ok", "tool_call_id" => "c1",
+                                                "details" => { "diff" => "-1 a bravo", "patch" => "",
+                                                               "firstChangedLine" => 1 } } },
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        joined = texts.join("\n")
+        assert_includes joined, " edit f.txt"
+        assert_includes joined, "-1 a bravo"
+        assert_includes bgs, Theme[:tool_success_bg]
+      end
+
+      # Sessions recorded pre-I57 (no details) replay HEADER-ONLY.
+      def test_edit_block_replay_without_recorded_details_renders_header_only
+        entries = [
+          { "type" => "message", "message" => { "role" => "assistant", "content" => nil,
+                                                "tool_calls" => { "c1" => { "id" => "c1", "name" => "edit",
+                                                                            "arguments" => { "path" => "f.txt" } } } } },
+          { "type" => "message", "message" => { "role" => "tool", "content" => "ok", "tool_call_id" => "c1" } },
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        joined = texts.join("\n")
+        assert_includes joined, " edit f.txt"
+        refute_includes joined, "⎿ edit:", "still the edit family, not the generic row"
+        assert_equal 4, @transcript.lines.size, "spacer + pad + header + pad"
+      end
+
+      # AC3: the pending edit block — the header alone under the pending
+      # bg (the preview cut, Grounds §6).
+      def test_edit_block_pending_renders_the_header_under_the_pending_bg
+        @transcript.enqueue_pending_tool_block("edit", { "path" => "f.txt" })
+        flush
+
+        assert_equal ["", "", " edit f.txt", ""], texts, "the 4-row pending frame"
+        assert_equal [Theme[:tool_pending_bg]], bgs, "the pending bg only"
+      end
       end
     # --- I47: the custom-message block (pi CustomMessageComponent's
     # default rendering — the Grounds section-6 staged-pi capture is the

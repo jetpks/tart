@@ -86,7 +86,7 @@ module TuiSplitRig
       command = app == "pi" ? pi_command(home, agent_dir) : tart_command(sandbox, home, mock.port)
       tmux("kill-session", "-t", session) if session_exists?(session)
       tmux("new-session", "-d", *GEOMETRY, "-c", sandbox, "-s", session, command)
-      {session:, home:, sandbox:}
+      {session:, home:, sandbox:, agent_dir:}
     end
 
     # The token-scoped tmux session name (I27): unique per runner, app,
@@ -116,8 +116,8 @@ module TuiSplitRig
     end
 
     def run_app(app, mock, n, stage)
-      boot = boot_session(app, mock, n, stage)
-      session = boot[:session]
+      staged = boot_session(app, mock, n, stage)
+      session = staged[:session]
 
       boot = settle(session, "boot")
       alive = session_exists?(session)
@@ -181,6 +181,8 @@ module TuiSplitRig
       request_log = File.join(stage, "#{app}-requests.jsonl")
       File.write(request_log, requests.map { |r| JSON.generate(r) }.join("\n") << "\n")
 
+      # `completed` is computed BEFORE the replay leg (I57): the re-boot
+      # expects no requests and must not move the counts.
       completed = alive && !reply[:timed_out] && requests.size == @scenario.expected_requests
 
       result = {
@@ -191,7 +193,34 @@ module TuiSplitRig
         "reply_settle_ms" => reply[:ms], "reply_timed_out" => reply[:timed_out],
       }
       teardown(session)
+      capture_replay(app, staged, n, stage, mock, result) if @scenario.replay
       result
+    end
+
+    # The replay knob's leg (I57, s17): AFTER the completed computation
+    # and the primary teardown, re-boot the app on its RECORDED session —
+    # pi `--continue` (no picker, the most recent session for the cwd);
+    # tart the `-r` flag APPENDED AFTER the workdir positional
+    # (OptionParser's optional [ID] placeholder greedily eats a following
+    # token — `bin/tart -r <workdir>` mis-parses, probed live in the I57
+    # calibration). Same staged home/sandbox, a fresh token-scoped
+    # session name, a settle, the replay captures, teardown. NO prompt is
+    # sent; no requests are expected; `completed` is untouched.
+    def capture_replay(app, staged, n, stage, mock, result)
+      session = session_name(app, n)
+      command = if app == "pi"
+        "#{pi_command(staged[:home], staged[:agent_dir])} --continue"
+      else
+        "#{tart_command(staged[:sandbox], staged[:home], mock.port)} -r"
+      end
+      tmux("kill-session", "-t", session) if session_exists?(session)
+      tmux("new-session", "-d", *GEOMETRY, "-c", staged[:sandbox], "-s", session, command)
+      settle(session, "replay")
+      File.write(File.join(stage, "#{app}.replay.capture"), session_exists?(session) ? capture(session) : "")
+      File.write(File.join(stage, "#{app}.replay.capture.styled"), session_exists?(session) ? capture_styled(session) : "")
+      teardown(session)
+      result["replay_capture"] = File.join(stage, "#{app}.replay.capture")
+      result["replay_styled_capture"] = File.join(stage, "#{app}.replay.capture.styled")
     end
 
     # Stages the pi agent dir with the mock provider (I01-verified shape);

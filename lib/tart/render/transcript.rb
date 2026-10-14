@@ -62,6 +62,11 @@ module Tart
       WRITE_TOOL = "write".freeze
       READ_TOOL = "read".freeze
 
+      # The edit tool (I57): pi does NOT render edit through the generic
+      # family — it registers the diff-display renderer family
+      # (renderers/edit.ts), so edit dispatches to {EditBlock}.
+      EDIT_TOOL = "edit".freeze
+
       # @param width_reader [Proc] +call+ → Integer — the surface's
       #   viewport width ({Chat#viewport_width}): the width the enqueue
       #   family wraps to, read fresh per call (the resize-fresh value).
@@ -201,14 +206,16 @@ module Tart
 
       # The per-tool block dispatch (pi's per-tool renderCall/renderResult,
       # I18): bash owns the shell shapes (I17 — carries the duration),
-      # write/read their file-tool shapes, everything else the generic ⎿
-      # line. Shared by the live and replay paths (I17's shape-sharing
-      # ruling); +duration+ is nil on replay (the recorded gap). The
-      # finalize replaces the pending block with exactly these rows
-      # (same dispatch, same builders) — the settled bytes never moved.
-      def enqueue_tool_block(name, args, result, duration)
+      # write/read their file-tool shapes, edit the diff-display family
+      # (I57 — {EditBlock}, fed the per-call details side channel),
+      # everything else the generic ⎿ line. Shared by the live and replay
+      # paths (I17's shape-sharing ruling); +duration+ is nil on replay
+      # (the recorded gap). The finalize replaces the pending block with
+      # exactly these rows (same dispatch, same builders) — the settled
+      # bytes never moved.
+      def enqueue_tool_block(name, args, result, duration, details: nil)
         args = {} unless args.is_a?(Hash)
-        builder = tool_block_builder(name, args, result, duration)
+        builder = tool_block_builder(name, args, result, duration, details)
         @chat_started = true
         if builder
           push_expandable(builder)
@@ -253,13 +260,15 @@ module Tart
       # registration (the replay path never engages the pending
       # machinery; also the superseded-registration case) this falls
       # back to today's append.
-      def finalize_tool_block(name, args, result, duration)
+      def finalize_tool_block(name, args, result, duration, details: nil)
         args = {} unless args.is_a?(Hash)
         pending = @pending_tool
-        return enqueue_tool_block(name, args, result, duration) unless pending && pending.tool == [name, args]
+        unless pending && pending.tool == [name, args]
+          return enqueue_tool_block(name, args, result, duration, details:)
+        end
 
         @pending_tool = nil
-        builder = tool_block_builder(name, args, result, duration)
+        builder = tool_block_builder(name, args, result, duration, details)
         final_rows = builder ? builder.(@tool_output_expanded) : generic_tool_rows(name, result)
         if pending.registration
           replace_flushed_pending(pending.registration, final_rows, builder)
@@ -328,14 +337,19 @@ module Tart
       # markdown block ({replay_assistant}) — the old
       # strip-thinkings-before-record is gone.
       def replay_entries(entries, update_footer: true, populate_history: true)
-        results = entries.filter_map do |entry|
+        messages = entries.filter_map do |entry|
           next unless entry.is_a?(Hash) && entry["type"] == "message"
           message = entry["message"]
           next unless message.is_a?(Hash) && message["role"] == "tool" && message["tool_call_id"]
 
-          [message["tool_call_id"], message["content"]]
+          [message["tool_call_id"], message]
         end.to_h
-        entries.each { |entry| replay_entry(entry, results, update_footer:, populate_history:) }
+        results = messages.transform_values { |message| message["content"] }
+        # The recorded details side channel (I57 — pi records it on the
+        # toolResult; the replay re-renders the diff from it). Absent on
+        # sessions recorded pre-I57 → the header-only block.
+        recorded_details = messages.transform_values { |message| message["details"] }
+        entries.each { |entry| replay_entry(entry, results, recorded_details, update_footer:, populate_history:) }
       end
 
       # Completed lines move into the transcript buffer (pi: completed
@@ -642,7 +656,7 @@ module Tart
         rows
       end
 
-      def replay_entry(entry, results, update_footer:, populate_history:)
+      def replay_entry(entry, results, recorded_details, update_footer:, populate_history:)
         return unless entry.is_a?(Hash)
 
         case entry["type"]
@@ -652,7 +666,7 @@ module Tart
 
           case message["role"]
           when "user" then replay_user(message, populate_history:)
-          when "assistant" then replay_assistant(message, results, update_footer:)
+          when "assistant" then replay_assistant(message, results, recorded_details, update_footer:)
           when "bashExecution" then replay_user_bash(message)
           end
         when "compaction"
@@ -694,7 +708,7 @@ module Tart
         )
       end
 
-      def replay_assistant(message, results, update_footer:)
+      def replay_assistant(message, results, recorded_details, update_footer:)
         content = message["content"]
         has_content = content.is_a?(String) && !content.strip.empty?
         reasoning = message["thinking"]
@@ -718,8 +732,10 @@ module Tart
           # The replay dispatches through the same per-tool shapes (I18):
           # call lines from the recorded arguments, outputs from the
           # recorded results, NO duration — the recorded entries carry
-          # none (the frozen contract's replay gap, never invented).
-          enqueue_tool_block(call["name"], call["arguments"], results[call["id"]], nil)
+          # none (the frozen contract's replay gap, never invented). The
+          # recorded details ride their side channel (I57).
+          enqueue_tool_block(call["name"], call["arguments"], results[call["id"]], nil,
+                             details: recorded_details[call["id"]])
         end
       end
 
@@ -742,8 +758,10 @@ module Tart
       # failed call renders toolErrorBg — the s4 capture, Tools::Bash
       # bash.rb:126), write/read their file-tool shapes (I18 —
       # write_block_rows/read_block_rows' formatWriteResult/formatReadResult
-      # paths), everything else the generic ⎿ line.
-      def tool_block_builder(name, args, result, duration)
+      # paths), edit the diff-display family (I57 — a CONSTANT builder:
+      # pi's edit renderers ignore setExpanded, the rebuild is
+      # byte-identical), everything else the generic ⎿ line.
+      def tool_block_builder(name, args, result, duration, details = nil)
         case name
         when BASH_TOOL
           error = result.is_a?(Hash) && result[:error]
@@ -752,6 +770,8 @@ module Tart
           ->(expanded) { FileBlocks.write_block_rows(args, result, viewport_width, expanded:) }
         when READ_TOOL
           ->(expanded) { FileBlocks.read_block_rows(args, result, viewport_width, expanded:) }
+        when EDIT_TOOL
+          ->(_expanded) { EditBlock.edit_block_rows(args, result, details, viewport_width) }
         end
       end
 
@@ -760,20 +780,27 @@ module Tart
       # tool-execution.ts:271-277): the settled family truncated to the
       # call — Spacer blank (PLAIN), the pending-bg pad, the family's
       # CALL rows, the closing pending-bg pad. No output rows, no Took
-      # row, no expand hint — nothing exists to show yet.
+      # row, no expand hint — nothing exists to show yet. The edit family
+      # renders the header alone (the preview cut, Grounds §6).
       def pending_tool_rows(name, args)
         case name
         when BASH_TOOL then BashBlock.pending_block_rows(args["command"], viewport_width)
         when WRITE_TOOL then FileBlocks.pending_write_block_rows(args, viewport_width)
         when READ_TOOL then FileBlocks.pending_read_block_rows(args, viewport_width)
+        when EDIT_TOOL then EditBlock.pending_edit_block_rows(args, viewport_width)
         else generic_tool_rows(name, nil, bg: Theme[:tool_pending_bg])
         end
       end
 
       # The generic family's plain region (the arm {enqueue_tool_block}
       # composes — the constructor's Spacer, then the bg'd contentText
-      # panel); +bg:+ overrides the result-derived bg (the pending shape).
-      def generic_tool_rows(name, result, bg: nil)
+      # panel); the bg default IS the result-derived panel bg (I57 P1 —
+      # the root-cause cure: an absent key used to forward an explicit
+      # nil, suppressing generic_panel_rows' identical default and
+      # settling every live generic block bg-less while the replay arm
+      # painted). The pending arm overrides explicitly; its bytes are
+      # unchanged.
+      def generic_tool_rows(name, result, bg: Panel.tool_panel_bg(result))
         [Panel.blank_line, *ToolBlock.generic_panel_rows(name, result, viewport_width, bg:)]
       end
 

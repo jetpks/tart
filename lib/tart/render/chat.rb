@@ -8,6 +8,7 @@ require_relative "panel"
 require_relative "bash_block"
 require_relative "file_blocks"
 require_relative "tool_block"
+require_relative "edit_block"
 require_relative "editor"
 require_relative "kill_ring"
 require_relative "autocomplete"
@@ -542,9 +543,13 @@ module Tart
             # the per-tool block dispatch's rows (pi's per-tool renderers
             # — bash owns the shell shapes, I17 — the frozen
             # :tool_execution_end contract carries `duration:`; write/read
-            # their file-tool shapes, I18; the rest the generic ⎿ line).
+            # their file-tool shapes, I18; edit the diff-display family
+            # fed the call's details side channel, I57 — the respond_to?
+            # guard keeps the recorded ToolCall-shape doubles without the
+            # member inert; the rest the generic ⎿ line).
             # No live pending (the replay path) falls back to the append.
-            @transcript_state.finalize_tool_block(call.name, call.arguments, event[:result], event[:duration])
+            @transcript_state.finalize_tool_block(call.name, call.arguments, event[:result], event[:duration],
+                                                  details: call.respond_to?(:details) ? call.details : nil)
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after
             # prepare succeeds): the border shows pi's per-reason label
