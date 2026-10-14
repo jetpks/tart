@@ -345,6 +345,17 @@ module Tart
       resolved = Shapes::ResolvedSettings.from_load(result, identity:)
       skills = Skills.load(cwd: workdir)
       prompts = Prompts.load(cwd: workdir)
+      # I49: the workflow-template tier (gate-on only — D7). The six
+      # builtin council/workflow prompts merge in LOWEST (user/project
+      # same-name templates win) BEFORE build_surface, so autocomplete,
+      # /-expansion, and the MOTD [Prompts] tier pick them up through the
+      # existing surfaces; the gate off = the load result untouched, zero
+      # template bytes anywhere (the frozen digests hold). The print boot
+      # never merges (no surface to serve).
+      if subagents_enabled?(settings, identity)
+        prompts = Prompts::Result.new(templates: Subagents.merge_workflow_templates(prompts.templates),
+                                      diagnostics: prompts.diagnostics)
+      end
       mcp_servers = Mcp::Config.load(mcp_config_path)
       # The models.json catalog (I27): the /model menu's entries and the
       # boot-model resolution's middle layer; a load/parse/schema
