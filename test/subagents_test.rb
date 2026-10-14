@@ -119,9 +119,100 @@ module Tart
     def test_unknown_agent_names_the_three
       manager = new_manager
       error = assert_raises(ArgumentError) { manager.spawn_run(agent: "scout", task: "x", async: true) }
-      assert_includes error.message, "oracle"
-      assert_includes error.message, "reviewer"
-      assert_includes error.message, "worker"
+      # I49 re-pin: the unknown-agent raise lives in Profiles.resolve now —
+      # the merged-table listing (builtins + discovered) + the closest-match
+      # sentence (pi formatUnknownAgentError's shape; "scout" has no close
+      # match in the base table, so the Did-you-mean sentence is omitted).
+      assert_includes error.message, "unknown agent \"scout\"."
+      assert_includes error.message, "Available agents: oracle, reviewer, worker."
+      refute_includes error.message, "Did you mean"
+      refute_includes error.message, "Built-in agents:", "the I48 wording retired"
+    end
+
+    # --- I49: the profile tier at the spawn seam + the channel wiring ---
+
+    def test_spawn_resolves_a_staged_profile_model_tools_and_prompt
+      agents = File.join(@home, ".tart", "agents")
+      FileUtils.mkdir_p(agents)
+      File.write(File.join(agents, "scout.md"), <<~MD)
+        ---
+        description: staged profile scout
+        tools: read, grep, find, ls
+        model: mock/scout-model:low
+        thinking: low
+        ---
+
+        You are the staged scout. Look around.
+      MD
+      @server.script([{type: :stream, content: "scout answer"}])
+      manager = new_manager(root: File.join(@home, ".tart"))
+      run = manager.spawn_run(agent: "scout", task: "t", async: false, timeout_ms: 0, tool_timeout_ms: 0)
+
+      assert_equal :completed, run[:state]
+      _, env = manager.spawn_argv_and_env(run)
+      assert_equal "scout-model", env["PI_MODEL"], "the profile model routed"
+      assert_equal "mock", env["PI_PROVIDER"]
+      assert_equal "low", env["PI_THINKING_LEVEL"], "the :level suffix overrode thinking"
+      assert_equal "scout", env["PI_SUBAGENTS_AGENT"]
+      argv, = manager.spawn_argv_and_env(run)
+      assert_equal "read,grep,find,ls,contact_supervisor", argv[argv.index("--tools") + 1],
+                   "the profile's tool order preserved + the bridge union last"
+      prompt_file = File.read(File.join(run[:dir], "system-prompt.md"))
+      assert_includes prompt_file, "You are the staged scout. Look around."
+      assert prompt_file.end_with?(Subagents::Supervisor::BRIDGE_INSTRUCTION)
+    end
+
+    def test_call_model_wins_over_the_profile_model
+      agents = File.join(@home, ".tart", "agents")
+      FileUtils.mkdir_p(agents)
+      File.write(File.join(agents, "scout.md"), <<~MD)
+        ---
+        model: mock/profile-model:low
+        ---
+
+        Scout body.
+      MD
+      @server.script([{type: :stream, content: "ok"}])
+      manager = new_manager(root: File.join(@home, ".tart"))
+      run = manager.spawn_run(agent: "scout", task: "t", async: false, model: "mock/call-model:high",
+                             timeout_ms: 0, tool_timeout_ms: 0)
+
+      _, env = manager.spawn_argv_and_env(run)
+      assert_equal "call-model", env["PI_MODEL"], "the call model beat the profile"
+      assert_equal "high", env["PI_THINKING_LEVEL"]
+    end
+
+    def test_manager_root_kwarg_and_supervisor_channel_accessor
+      @server.script([{type: :stream, content: "x"}])
+      manager = new_manager
+      assert_equal Agent::Session.default_root, manager.root, "the additive root kwarg defaults"
+      assert_nil manager.supervisor_channel, "a bare Manager carries no channel"
+
+      staged = File.join(@home, ".tart")
+      rooted = new_manager(root: staged)
+      assert_equal staged, rooted.root
+
+      # register() arms the channel (same hooks; started, then stoppable).
+      hooks = Hooks.new
+      registered = Subagents.register(hooks:, cwd: @cwd, env: default_env,
+                                      home: File.join(@home, "subagents"), root: staged)
+      @managers << registered
+      channel = registered.supervisor_channel
+      refute_nil channel, "register assigns + arms the channel"
+      assert_equal File.join(@home, "subagents"), channel.home
+      assert_equal "No pending supervisor requests.", channel.pending_text
+      channel.stop
+      assert_equal "No pending supervisor requests.", channel.pending_text, "stop is idempotent"
+    end
+
+    def test_bridged_tools_validate_through_the_registry
+      # The intercom tool resolves through TOOL_CLASSES (D6) without
+      # entering Tools::ALL (no default-loadout byte moves).
+      loadout = Tools::Registry.build(selected: %w[read contact_supervisor], cwd: @cwd)
+      assert_equal "contact_supervisor", loadout["contact_supervisor"].name
+      assert_includes Tools::ContactSupervisor::DESCRIPTION,
+                      "Contact the parent/supervisor session"
+      assert_equal %w[read edit write bash find grep ls], Tools::ALL
     end
 
     # --- AC2/AC4: the manager with a REAL subprocess child ---
@@ -179,17 +270,23 @@ module Tart
       %w[--tools --system-prompt-file --session-root --steer-inbox].each do |flag|
         assert_includes argv, flag, "argv flag #{flag}"
       end
-      assert_equal "read,grep,find,ls,bash,edit,write", argv[argv.index("--tools") + 1]
+      assert_equal "read,grep,find,ls,bash,edit,write,contact_supervisor", argv[argv.index("--tools") + 1]
+      # I49 D5: the bridge unions contact_supervisor LAST into every
+      # gate-on child's allowlist (the builtin table's own lists hold
+      # byte-identical — the union happens at spawn, never in the table).
+      assert argv[argv.index("--tools") + 1].end_with?(",contact_supervisor"),
+             "the intercom tool is the argv tools tail"
       assert_equal File.join(run[:dir], "system-prompt.md"), argv[argv.index("--system-prompt-file") + 1]
       assert_equal File.join(run[:dir], "sessions"), argv[argv.index("--session-root") + 1]
       assert_equal File.join(run[:dir], "control", "steer-requests"), argv[argv.index("--steer-inbox") + 1]
       refute_includes argv, "--resume", "a :fresh agent never resumes"
 
       # The CLOSED env (OQ-7): exactly the §4 key set, nil keys omitted,
-      # NO subagents gate row (children never nest), NO MCP config.
+      # NO subagents gate row (children never nest), NO MCP config. I49
+      # adds exactly TWO keys: the intercom channel dir + the agent label.
       sanctioned = %w[PATH HOME PI_IDENTITY PI_API_KEY PI_API_BASE PI_MODEL PI_PROVIDER
                       PI_MODEL_REASONING PI_THINKING_LEVEL PI_CONTEXT_WINDOW PI_TOOL_TIMEOUT_MS
-                      PI_RUN_DEADLINE_MS PI_SUBAGENTS_HOME]
+                      PI_RUN_DEADLINE_MS PI_SUBAGENTS_HOME PI_SUPERVISOR_CHANNEL PI_SUBAGENTS_AGENT]
       assert_empty(env.keys - sanctioned, "spawn env closure violated: #{(env.keys - sanctioned).inspect}")
       assert env.key?("PATH")
       assert env.key?("HOME")
@@ -199,6 +296,19 @@ module Tart
       refute env.key?("PI_SUBAGENTS"), "children must not carry the gate row"
       refute env.key?("TART_MCP_CONFIG")
       refute env.key?("PI_RUN_DEADLINE_MS"), "timeout 0 = unbounded: the deadline env is omitted"
+      # I49: the channel dir exists unconditionally (the run-dir mkdir
+      # always creates it), the agent label feeds the surfaced ask.
+      assert_equal File.join(run[:dir], "control"), env["PI_SUPERVISOR_CHANNEL"]
+      assert_equal "worker", env["PI_SUBAGENTS_AGENT"]
+      # The channel dirs exist on disk from the spawn's mkdir.
+      assert File.directory?(File.join(run[:dir], "control", "supervisor-requests"))
+      assert File.directory?(File.join(run[:dir], "control", "supervisor-replies"))
+      # I49 D5: system-prompt.md carries the agent prompt + the bridge
+      # instruction appended (pi applyIntercomBridgeToAgent).
+      prompt_file = File.read(File.join(run[:dir], "system-prompt.md"))
+      assert_includes prompt_file, "You are `worker`"
+      assert prompt_file.end_with?(Subagents::Supervisor::BRIDGE_INSTRUCTION),
+             "the bridge instruction is the prompt tail"
     end
 
     def test_fork_agent_prepends_the_preamble_and_resumes_the_parent_session

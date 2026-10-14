@@ -5,6 +5,9 @@ require "fileutils"
 
 require_relative "tools/subagent"
 require_relative "subagents/manager"
+require_relative "subagents/profiles"
+require_relative "subagents/supervisor"
+require_relative "subagents/workflows"
 
 module Tart
   # The native delegation core (I48): the opt-in `subagent` tool driving
@@ -208,20 +211,29 @@ module Tart
     module_function
 
     # The boot wiring's single entry (called ONLY when the resolved
-    # settings gate is on — OQ-1): builds the {Manager}, registers the
-    # `subagent` tool via the I47 seam (declared LAST — the
-    # registered-tools merge order), and threads the interactive wake
-    # seams (kernel + the agent callable — a callable because /new and
-    # resume swap the loop). Print boots pass neither kernel nor agent:
-    # their parent-side completion path is the agent-end drain (§5.4).
+    # settings gate is on — OQ-1): builds the {Manager}, constructs and
+    # ARMS the {SupervisorChannel} (I49 — the same kernel/agent objects as
+    # the Manager; the Manager carries it for #shutdown and the tool's
+    # reply/pending actions), registers the `subagent` tool via the I47
+    # seam (declared LAST — the registered-tools merge order), and threads
+    # the interactive wake seams (kernel + the agent callable — a callable
+    # because /new and resume swap the loop). Print boots pass neither
+    # kernel nor agent: their parent-side completion path is the agent-end
+    # drain (§5.4) and the channel queues without a wake.
     # Returns the Manager.
     #
     # +identity:+ is optional (default "pi") so the runs-root resolution
     # ({home}) reads the RESOLVED face's namespace; the launcher threads
     # it (PHASE 0: an additive defaulted kwarg beside the frozen seven).
-    def register(hooks:, kernel: nil, agent: nil, cwd:, env: ENV, home: nil, identity: Identity::DEFAULT)
+    # +root:+ (I49) threads the profile tier's user-scan root; nil = the
+    # Manager's default ({Agent::Session.default_root}).
+    def register(hooks:, kernel: nil, agent: nil, cwd:, env: ENV, home: nil, identity: Identity::DEFAULT,
+                 root: nil)
       manager = Manager.new(cwd:, home: home || self.home(env:, identity:), env:, identity:,
-                            hooks:, kernel:, agent:)
+                            hooks:, kernel:, agent:, root: root || Agent::Session.default_root)
+      channel = SupervisorChannel.new(home: manager.home, hooks:, kernel:, agent:)
+      channel.start
+      manager.supervisor_channel = channel
       hooks.register_tool(Tools::Subagent.new(manager:))
       manager
     end

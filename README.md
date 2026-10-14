@@ -368,8 +368,9 @@ overrides the root): `status.json` (the lifecycle: running → completed |
 failed | stopped, `result.json` written before the terminal flip, the task
 text never recorded — length only), `result.json`, `runner.stdout.log` /
 `runner.stderr.log`, `system-prompt.md`, the child's `sessions/`, and
-`control/{steer-requests,stop-requests}/` (the file inbox the child
-consumes at its turn boundaries).
+`control/{steer-requests,stop-requests,supervisor-requests,
+supervisor-replies}/` (the file inboxes the child consumes at its turn
+boundaries; `supervisor-*` is the intercom channel, below).
 
 Timeouts (both recommended explicit for long children — the 30-minute run
 default kills): `timeout_ms` is the run-level deadline (default 1800000;
@@ -389,11 +390,92 @@ alternative: async detach forces a subprocess (a child must survive parent
 exit) and one harness keeps steering/stop/deadline/status identical for
 both modes.
 
-CUT this iteration (profiles/intercom/council and everything beyond the
-owner's working set are the next entry — see the iteration record's OQ-6):
-workflows/chains/parallel, worktree isolation, acceptance gates, missions,
-the fleet UI, bg_wait, MCP-direct agents, external-CLI adapters, nested
-delegation.
+### Agent profiles
+
+Custom agents are markdown files — YAML frontmatter over a system-prompt
+body — discovered per spawn (no cache; an edit lands on the next spawn)
+from two tiers over the builtin table, the higher tier winning same-name:
+user `~/.tart/agents/**/*.md`, then project `<cwd>/.tart/agents/**/*.md`
+(recursive; dotfiles and non-`.md` files ignored; a file that fails the
+contract produces a warning diagnostic and is skipped, never a crash).
+
+| field | shape | default |
+|-------|-------|---------|
+| `name` | safe token `A-Za-z0-9._-` (must not start with a separator) | the file stem |
+| `description` | string | `""` |
+| `tools` | comma string or list, each in `read edit write bash find grep ls contact_supervisor` | the builtin seven |
+| `model` | `provider/id` or `provider/id:level` (the suffix rides the spawn's thinking) | the parent's model |
+| `thinking` | off/minimal/low/medium/high/xhigh/max | — |
+| `context` | `fresh` or `fork` | `fresh` |
+
+The body is the system prompt (required, non-empty). Unknown frontmatter
+keys (pi's `systemPromptMode`, `inheritProjectContext`, `allowNestedSubagents`,
+…) are tolerated and ignored. Routing order per spawn: call `model:` > the
+profile's `model:` > the parent's current pair. Example
+(`~/.tart/agents/researcher.md`):
+
+```markdown
+---
+name: researcher
+description: Fast codebase recon
+tools: read, grep, find, ls, bash
+model: zai/glm-4.7-flash:high
+thinking: high
+---
+
+You are the researcher. Find things fast; cite file paths and line ranges.
+```
+
+`subagent({ agent: "researcher", task: "..." })` resolves it like a builtin;
+`subagent({ action: "status" })`'s unknown-agent error lists the merged
+table with a closest-match `Did you mean '<name>'?` hint.
+
+### The supervisor channel (the intercom)
+
+Every gate-on child gets `contact_supervisor` unioned into its tool list
+(last) and the `Intercom orchestration channel:` bridge instruction
+appended to its system prompt — regardless of its frontmatter `tools`. The
+child asks its parent through the run-dir channel:
+`contact_supervisor({ reason: "need_decision" | "interview_request" |
+"progress_update", message: ..., interview?: {...} })` writes
+`control/supervisor-requests/<uuid>.json` (64KB cap) and — for the two
+non-progress reasons — blocks polling `control/supervisor-replies/<id>.json`
+until the parent answers, the ask timeout
+(`<IDENTITY>_INTERCOM_ASK_TIMEOUT_MS`, default 600000ms) expires, or the
+run deadline kills it. `progress_update` returns immediately and never
+surfaces to the parent. A reply arrives as the tool result
+`**Reply from supervisor:**\n<message>`.
+
+The parent side: the channel polls the runs root (0.25s), surfaces each ask
+ONCE as a `subagent_supervisor_request` notification (displayed, with the
+wake kick for an idle interactive parent; a busy or print parent's ask rides
+the next turn boundary — the child's ask timeout bounds every miss), and
+sweeps resolved (reply present), expired, and terminal-run asks off disk.
+Answer by leaf request id — no fuzzy matching:
+`subagent({ action: "reply", reply_to: "<request-id>", message: "..." })`
+(→ `Replied to supervisor request <id>.`), and re-read the open asks with
+`subagent({ action: "pending" })` (`No pending supervisor requests.` when
+clear).
+
+### Workflow prompts
+
+Six builtin prompt templates ride the gate: `/council`,
+`/gather-context-and-clarify`, `/parallel-cleanup`, `/parallel-research`,
+`/parallel-review`, `/review-loop` — the pi-subagents council/workflow
+patterns adapted to the port's vocabulary (async `subagent` spawns + native
+completion wakes; P0/P1/P2 + `Merge verdict:` review vocabulary; the
+council roster/pass/memo protocol). They merge in LOWEST when the gate is
+on: a user/project prompt of the same name (`~/.tart/prompts/`,
+`<cwd>/.tart/prompts/`) overrides the builtin; with the gate off no
+template byte appears anywhere.
+
+CUT this entry (the OQ-9 list in the iteration record): pi's separate
+`subagent_supervisor` wire tool (reply/pending ride the `subagent` tool),
+fuzzy `to:` reply matching, external pi-intercom providers (one supervisor:
+the parent), the before-settle reminder ladder, parent-side structured-reply
+parsing, profile generation/provider catalogs, chains, package-tier agents,
+agentScanDirs/ExcludeDirs, the fleet UI, nested delegation (unchanged I48
+cut), and the TS workflow-script machinery the templates replace.
 
 ## Herdr
 

@@ -22,7 +22,8 @@ module Tart
         "bash" => "Tart::Tools::Bash",
         "find" => "Tart::Tools::Find",
         "grep" => "Tart::Tools::Grep",
-        "ls" => "Tart::Tools::Ls"
+        "ls" => "Tart::Tools::Ls",
+        "contact_supervisor" => "Tart::Tools::ContactSupervisor"
       }.freeze
 
       # Classes whose write boundary accepts the §5 toggle (registry.rb doc).
@@ -80,7 +81,8 @@ module Tart
       end
 
       # Per-class constructor kwargs: the write-boundary tools take the §5
-      # toggle; the bash tool takes the session-env exposure seams (I41) —
+      # toggle; the bash tool takes the session-env exposure seams (I41);
+      # the supervisor tool takes the face for its env namespace (I49) —
       # the other built-ins take neither.
       def build_tool(class_name, cwd:, strip_trailing_whitespace:,
                      identity: Identity::DEFAULT, session_env: {})
@@ -89,6 +91,9 @@ module Tart
         if class_name == "Tart::Tools::Bash"
           kwargs[:identity] = identity
           kwargs[:session_env] = session_env
+        end
+        if class_name == "Tart::Tools::ContactSupervisor"
+          kwargs[:identity] = identity
         end
         Object.const_get(class_name).new(**kwargs)
       end
