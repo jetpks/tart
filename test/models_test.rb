@@ -369,6 +369,45 @@ module Tart
         "an exactly-supported level passes through"
     end
 
+    # --- I52: the compat→Dialect translation (zai as data, AC5) ---
+
+    # The zai compat subset translates value-by-value onto the closed
+    # Dialect vocabulary: the I46 five keys + pi's zai store suppression.
+    def test_dialect_for_translates_the_zai_compat
+      compat = Shapes::ModelCompat.new(thinking_format: "zai", max_tokens_field: "max_tokens",
+        supports_developer_role: false, supports_reasoning_effort: true, zai_tool_stream: true)
+      dialect = Models.dialect_for(compat)
+
+      assert_equal :zai, dialect.thinking_format
+      assert_equal "max_tokens", dialect.max_tokens_field
+      assert_equal false, dialect.supports_developer_role
+      assert_equal true, dialect.supports_reasoning_effort
+      assert_equal true, dialect.zai_tool_stream
+      assert_equal false, dialect.supports_store
+    end
+
+    # The zai rename respects the compat's max_tokens_field; ANY other
+    # compat (nil, a non-zai thinkingFormat) yields the DEFAULT dialect —
+    # today's "only-zai arms" behavior verbatim.
+    def test_dialect_for_nil_and_non_zai_compat_yield_the_default_dialect
+      renamed = Models.dialect_for(Shapes::ModelCompat.new(thinking_format: "zai",
+        max_tokens_field: "max_completion_tokens", supports_developer_role: true,
+        supports_reasoning_effort: false, zai_tool_stream: false))
+      assert_equal "max_completion_tokens", renamed.max_tokens_field
+      assert_equal true, renamed.supports_developer_role
+      assert_equal false, renamed.supports_reasoning_effort
+      assert_equal false, renamed.zai_tool_stream
+      assert_equal false, renamed.supports_store
+
+      assert_equal :openai, Models.dialect_for(nil).thinking_format
+      assert_equal :openai, Models.dialect_for(Shapes::ModelCompat.new(
+        thinking_format: "deepseek", max_tokens_field: "max_tokens",
+        supports_developer_role: false, supports_reasoning_effort: true,
+        zai_tool_stream: false)).thinking_format
+      assert Models.dialect_for(nil).equal?(Models.dialect_for(nil)),
+        "the default arm is one frozen instance"
+    end
+
     # --- I43: the schema-path pins (the contract replaced the hand-rolled
     # validate* family — same strings, same order, same entry shape) ---
 

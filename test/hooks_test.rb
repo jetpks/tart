@@ -131,11 +131,11 @@ module Tart
     def test_tool_gate_cancelled_error_always_propagates
       dir = Dir.mktmpdir("tart-hooks-")
       hooks = Hooks.new
-      hooks.on_tool_call { |_event, _ctx| raise RubyLLM::CancelledError }
+      hooks.on_tool_call { |_event, _ctx| raise Fast::Completions::CancelledError }
 
       tools = Tools::Registry.build(selected: %w[read], cwd: dir, hooks: hooks)
 
-      assert_raises(RubyLLM::CancelledError) { tools["read"].call(path: "x") }
+      assert_raises(Fast::Completions::CancelledError) { tools["read"].call(path: "x") }
     ensure
       FileUtils.rm_rf(dir)
     end
@@ -148,7 +148,7 @@ module Tart
       hooks.on_tool_call { |event, _ctx| event["input"]["path"] = "b.txt"; nil }
 
       tools = Tools::Registry.build(selected: %w[read], cwd: dir, hooks: hooks)
-      tool_call = RubyLLM::ToolCall.new(id: "c1", name: "read", arguments: {"path" => "a.txt"})
+      tool_call = Agent::ToolCall.new(id: "c1", name: "read", arguments: {"path" => "a.txt"})
       result = tools["read"].call(path: "a.txt", tool_call: tool_call)
 
       assert_includes result.to_s, "B", "the handler-mutated input executes"
@@ -201,8 +201,8 @@ module Tart
       hooks.on_tool_call { |_event, _ctx| {block: true, reason: "t", terminate: true} }
       dir = Dir.mktmpdir("tart-hooks-")
       tools = Tools::Registry.build(selected: %w[read], cwd: dir, hooks: hooks)
-      tools["read"].call(path: "x", tool_call: RubyLLM::ToolCall.new(id: "x1", name: "read", arguments: {}))
-      tools["read"].call(path: "x", tool_call: RubyLLM::ToolCall.new(id: "x2", name: "read", arguments: {}))
+      tools["read"].call(path: "x", tool_call: Agent::ToolCall.new(id: "x1", name: "read", arguments: {}))
+      tools["read"].call(path: "x", tool_call: Agent::ToolCall.new(id: "x2", name: "read", arguments: {}))
 
       assert hooks.batch_terminate?(%w[x1 x2])
       refute hooks.batch_terminate?(%w[x1 y9]), "an unmarked id fails the batch"

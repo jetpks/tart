@@ -11,7 +11,7 @@ module Tart
     # Parity note: pi downloads the `fd` binary at runtime (ensureTool); the
     # port uses `fd` from PATH and pi's error message when it is missing —
     # recorded deviation (no runtime downloads).
-    class Find < RubyLLM::Tool
+    class Find < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "find"
@@ -49,7 +49,7 @@ module Tart
           failure = validate_input(pattern:, path:, limit:)
           return failure if failure
 
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
           fd_path = fd_binary
           raise ArgumentError, "fd is not available and could not be downloaded" unless fd_path
 
@@ -70,7 +70,7 @@ module Tart
           args += ["--", effective_pattern, search_path]
 
           stdout, stderr, status = run_fd(fd_path, args)
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
 
           unless status.exitstatus == 0 || status.exitstatus == 1
             error_message = stderr.strip.empty? ? "fd exited with code #{status.exitstatus}" : stderr.strip
@@ -126,7 +126,7 @@ module Tart
         out_rd.close
         err_rd.close
         [stdout, stderr, status]
-      rescue RubyLLM::CancelledError
+      rescue Fast::Completions::CancelledError
         Process.kill("TERM", pid) if pid
         raise
       end

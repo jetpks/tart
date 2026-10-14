@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "ruby_llm"
+require "fast/completions"
 
 require_relative "tools/support/truncate"
 require_relative "tools/support/path_utils"
@@ -23,7 +23,7 @@ module Tart
     # The built-in tools, verbatim-parity ports of pi's
     # packages/coding-agent/src/core/tools/ (BRIEF §3, §5-deferred).
     #
-    # Each tool is a RubyLLM::Tool subclass whose name, description, JSON
+    # Each tool is a Fast::Completions::Tool subclass whose name, description, JSON
     # schema, execute behavior, and error strings match pi's observable
     # semantics. Model-facing text is pi's text byte-for-byte; renderer-only
     # metadata (details hashes) carries the pi-shaped fields.

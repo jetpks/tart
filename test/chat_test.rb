@@ -2303,11 +2303,12 @@ module Tart
         draw(chat, session)
 
         refute chat.menu_open?, "the selection closes the menu (the editor is restored)"
-        assert_equal [{model_id: "glm-5.3", provider: "openai", context_window: 200_000,
+        assert_equal [{model_id: "glm-5.3", provider: "glm", context_window: 200_000,
                        model_reasoning: true, thinking_level_map: nil, compat: nil}], switched,
-          "the loop seam swaps the runtime chat model (the wire provider — the port's " \
-          "single chat-completions seam), re-resolves the window, and carries the " \
-          "switched entry's composed reasoning facts (known-tables-second)"
+          "the loop seam swaps the runtime chat model (the provider key rides as the " \
+          "wire model's metadata — the dialect rides the model by construction), " \
+          "re-resolves the window, and carries the switched entry's composed reasoning " \
+          "facts (known-tables-second)"
         assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("glm-5.3 • medium"),
           "the footer model segment refreshed (the entry's reasoning flag rides along)"
         assert_includes chat.transcript_lines.join, "Model: glm-5.3",
@@ -2417,7 +2418,7 @@ module Tart
       )
     end
 
-    def test_model_menu_markers_match_the_runtime_model_across_the_wire_provider
+    def test_model_menu_markers_match_the_runtime_model_across_the_model_switch
       with_chat(width: 40, screen_height: 16, models: mock_native_catalog,
         footer_data: {cwd: @dir, model: "mock-1", default_provider: "openai"}) do |chat, session|
         chat.open_model_menu
@@ -5022,10 +5023,10 @@ module Tart
     end
 
     # A streaming reasoning delta double carrying the gem's real Thinking
-    # value object (ruby_llm 2.1.0 protocols/chat_completions/streaming.rb
+    # value object (the recorded streaming shape — the field name the wire
     # :28-29 — the shape the surface reads).
     def thinking_chunk(content, text = "pondering")
-      ChunkDouble.new(content, RubyLLM::Thinking.new(text:))
+      ChunkDouble.new(content, Agent::Thinking.new(text:))
     end
 
     # Types +text+ into the input line and presses Enter (synthetic events —

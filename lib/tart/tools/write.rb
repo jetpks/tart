@@ -9,7 +9,7 @@ module Tart
     # no newline, whitespace, or encoding normalization at any write boundary
     # (BRIEF §5 verbatim-parity), except the §5 trailing-whitespace toggle
     # (default off). Creates parent directories automatically.
-    class Write < RubyLLM::Tool
+    class Write < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "write"
@@ -48,16 +48,16 @@ module Tart
 
           absolute_path = PathUtils.resolve_to_cwd(path, @cwd)
           FileMutationQueue.with(absolute_path) do
-            RubyLLM::Support::Cancellation.check
+            Fast::Completions::Cancellation.check
             dir = File.dirname(absolute_path)
             FileUtils.mkdir_p(dir)
-            RubyLLM::Support::Cancellation.check
+            Fast::Completions::Cancellation.check
 
             # Verbatim: bytes in, bytes out — no trailing-newline fixup. The
             # §5 toggle is the sole write-boundary normalization, and ships off.
             content = EditDiff.strip_trailing_whitespace(content) if @strip_trailing_whitespace
             File.binwrite(absolute_path, content)
-            RubyLLM::Support::Cancellation.check
+            Fast::Completions::Cancellation.check
 
             @details = {bytes_written: content.bytesize}
             "Successfully wrote to #{path}"

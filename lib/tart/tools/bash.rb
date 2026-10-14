@@ -10,7 +10,7 @@ module Tart
     # timed-out or aborted commands by negative-pid -TERM escalating to
     # -KILL, reaping every pid. Output is truncated to the last 2000 lines or
     # 50KB (whichever is hit first); full output spills to a temp file.
-    class Bash < RubyLLM::Tool
+    class Bash < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "bash"
@@ -121,7 +121,7 @@ module Tart
         outcome =
           begin
             spawn_and_stream(command, output, nil, on_chunk:)
-          rescue RubyLLM::CancelledError, Async::Cancel
+          rescue Fast::Completions::CancelledError, Async::Cancel
             cancelled = true
             {exit_code: nil}
           end
@@ -255,7 +255,7 @@ module Tart
           loop do
             # Cancellation checkpoint: an interrupted turn kills the whole
             # process group (pi checks signal.aborted between events).
-            RubyLLM::Support::Cancellation.check
+            Fast::Completions::Cancellation.check
             status = completed.pop(timeout: CHECKPOINT_INTERVAL)
             status ||= waitpid_no_hang(pid) unless reaper
             break if status
@@ -276,11 +276,11 @@ module Tart
             kill_process_group(pid, "KILL")
           end
           readers.each(&:join)
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
 
           exit_code = status.termsig ? 128 + status.termsig : status.exitstatus
           {exit_code:, timed_out:, cancelled: false}
-        rescue RubyLLM::CancelledError, Async::Cancel
+        rescue Fast::Completions::CancelledError, Async::Cancel
           # Interrupted mid-command: kill the whole group with a single -KILL
           # and let cancellation propagate. SOMEONE must reap the killed
           # child: the reaper task normally wins (it is parked in the
@@ -290,7 +290,7 @@ module Tart
           # poll every ~10 ms (cooperative), ECHILD-tolerant (the reaper won
           # the race), capped at TERM_GRACE_SECONDS. A zombie never outlives
           # the run. Both cancellation classes: the agent-loop cancel rides
-          # RubyLLM's checkpoint error; the user-bash escape stops the
+          # the gem checkpoint error; the user-bash escape stops the
           # reactor task itself (Task#stop — Async::Cancel at the fiber's
           # next yield), same group kill.
           kill_process_group(pid, "KILL") if pid

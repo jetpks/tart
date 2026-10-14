@@ -8,7 +8,7 @@ module Tart
     # B4 — tool inputs: one input contract per built-in tool, mirroring each
     # tool's JSON-Schema declaration shapes (the wire declarations
     # themselves stay byte-identical — the contracts validate internally,
-    # after ruby_llm's arity gate, before the runtime work). Validation is
+    # after the executor's argument hand-off, before the runtime work). Validation is
     # NO-COERCION: pi's Value.Convert string→number coercion is not ported
     # (today's port rejects wrong-typed numbers; the pi-coercion gap is
     # itemized in the iteration record).
@@ -30,7 +30,7 @@ module Tart
       PINNED_TEXTS = [PINNED_TIMEOUT_MESSAGE, PINNED_EDITS_MESSAGE].freeze
 
       # pi's edit items speak camelCase on the wire (string keys arrive
-      # untouched inside the array — ruby_llm symbolizes top-level keys
+      # untouched inside the array — the executor seam symbolizes top-level keys
       # only); direct callers may use the snake aliases
       # (Edit.normalize_edit_shapes accepts all three flavors).
       OLD_TEXT_KEYS = [:old_text, :oldText, "oldText"].freeze

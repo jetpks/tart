@@ -198,7 +198,7 @@ module Tart
 
       assert_equal %w[mcp__echo__echo mcp__echo__sleep read], tools.keys.sort
       tool = tools["mcp__echo__echo"]
-      assert_kind_of RubyLLM::Tool, tool
+      assert_kind_of Fast::Completions::Tool, tool
       assert_equal "mcp__echo__echo", tool.name
       assert_equal "Echo the message back", tool.description
       assert_equal "echo", tool.remote_name

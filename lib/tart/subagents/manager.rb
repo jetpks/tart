@@ -97,6 +97,7 @@ module Tart
         @agent = agent
         @arm_deadline_supervisor = arm_deadline_supervisor
         @supervisor_channel = nil
+        @endpoint = nil
         @mutex = Mutex.new
         @runs = []
         @supervisors = []
@@ -104,6 +105,14 @@ module Tart
         @shutdown = false
         FileUtils.mkdir_p(@home)
       end
+
+      # The parent's resolved endpoint facts ({api_key:, api_base:} — the
+      # Chat's endpoint reader) when the child env tier is unset: the
+      # launcher threads the boot's resolution onto the returned Manager
+      # (the same chain build_chat consumed; the gate stages NO env key;
+      # production boots resolve identically from the same staged HOME/cwd,
+      # so the fallback is convergence-neutral there — PHASE 0 item).
+      attr_accessor :endpoint
 
       # Spawns one child (§2.2). async:true returns the run record
       # immediately (the watcher owns it); async:false BLOCKS on the
@@ -363,9 +372,9 @@ module Tart
         env["PATH"] = @env["PATH"] if @env["PATH"]
         env["HOME"] = @env["HOME"] if @env["HOME"]
         env[key.("IDENTITY")] = @identity
-        api_key = @env[key.("API_KEY")] || global_llm_config&.openai_api_key
+        api_key = @env[key.("API_KEY")] || @endpoint&.dig(:api_key) || @endpoint&.dig("api_key")
         env[key.("API_KEY")] = api_key if api_key
-        api_base = @env[key.("API_BASE")] || global_llm_config&.openai_api_base
+        api_base = @env[key.("API_BASE")] || @endpoint&.dig(:api_base) || @endpoint&.dig("api_base")
         env[key.("API_BASE")] = api_base if api_base
         env[key.("MODEL")] = run[:model_id] if run[:model_id]
         env[key.("PROVIDER")] = run[:provider] if run[:provider]
@@ -386,17 +395,6 @@ module Tart
         env
       end
 
-      # The parent's resolved endpoint facts when the env tier is unset:
-      # the gem's global config (the gate stages NO env key; production
-      # boots resolve identically from the same staged HOME/cwd, so the
-      # fallback is convergence-neutral there — PHASE 0 item).
-      def global_llm_config
-        return nil unless defined?(RubyLLM) && RubyLLM.respond_to?(:config)
-
-        RubyLLM.config
-      rescue StandardError
-        nil
-      end
 
       def bin_tart_path
         File.expand_path("../../../bin/tart", __dir__)
@@ -439,10 +437,10 @@ module Tart
       def wait_for_exit(record)
         pipe = record[:exit_pipe]
         loop do
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
           break if pipe.nil? || pipe.wait_readable(0.05)
         end
-      rescue RubyLLM::CancelledError, Async::Cancel
+      rescue Fast::Completions::CancelledError, Async::Cancel
         # A parent-interrupt cancels the delegation: kill the child's
         # pgroup, settle the run stopped, and propagate (the bash tool's
         # cancellation discipline).

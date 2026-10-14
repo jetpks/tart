@@ -8,7 +8,7 @@ module Tart
     # whitespace, BOM, and line endings round-trip untouched. Output is
     # truncated to 2000 lines or 50KB (whichever is hit first), never
     # returning partial lines.
-    class Read < RubyLLM::Tool
+    class Read < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "read"
@@ -50,7 +50,7 @@ module Tart
           failure = validate_input(path:, offset:, limit:)
           return failure if failure
 
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
           absolute_path = PathUtils.resolve_read_path(path, @cwd)
           mime_type = Mime.detect_from_file(absolute_path)
           return execute_image(absolute_path, mime_type, path) if mime_type
@@ -63,7 +63,7 @@ module Tart
 
       def execute_image(absolute_path, mime_type, path)
         data = File.binread(absolute_path)
-        RubyLLM::Support::Cancellation.check
+        Fast::Completions::Cancellation.check
         # pi resizes here (sharp); the port sends the original bytes (recorded
         # deviation). The note text matches pi's non-failure image read.
         note = "Read image file [#{mime_type}]"

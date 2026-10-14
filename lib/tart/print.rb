@@ -27,8 +27,9 @@ module Tart
     # Runs one headless single-shot turn to completion.
     #
     # @param prompt [String]
-    # @param chat [RubyLLM::Chat] configured for the endpoint.
-    # @param tools [Hash{String => RubyLLM::Tool}] the gated loadout
+    # @param chat [Tart::Agent::Chat] the conversation object (client +
+    #   model id wired by the caller).
+    # @param tools [Hash{String => Fast::Completions::Tool}] the gated loadout
     #   ({Tools::Registry.build}).
     # @param system_prompt [String, nil]
     # @param on_event [Proc, nil] event observer; text mode prints nothing
@@ -48,7 +49,7 @@ module Tart
     #   appended to the session file in order; +nil+ = off. The launcher
     #   constructs one ALWAYS on print runs (I42: a print run records; a
     #   resumed one records into the fork).
-    # @param seed_messages [Array<Hash, RubyLLM::Message>] prior context
+    # @param seed_messages [Array<Hash, Agent::Message>] prior context
     #   messages to seed the chat with before the run (resume:
     #   Agent::Session.context_messages) — the model sees them on the wire,
     #   they are never re-recorded as new messages.

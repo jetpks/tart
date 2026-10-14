@@ -69,11 +69,9 @@ module Tart
       launcher_filter
       home = Dir.mktmpdir("tart-footer-home-")
       settings = Settings.load(cwd: home, root: home).settings
-      chat = RubyLLM.context do |config|
-        config.openai_api_key = "k"
-        config.openai_api_base = "http://localhost:1/v1"
-      end.chat(model: "accounts/fireworks/models/glm-5p3-flash", provider: "openai",
-               protocol: :chat_completions, assume_model_exists: true)
+      chat = Agent::Chat.new(
+        client: Fast::Completions::Client.new(base_url: "http://localhost:1/v1", api_key: "k"),
+        model_id: "accounts/fireworks/models/glm-5p3-flash", provider_key: "openai")
 
       data = Executable.footer_data("/somewhere", settings, chat: chat)
       assert_equal "/somewhere", data[:cwd]
@@ -109,11 +107,9 @@ module Tart
       FileUtils.mkpath(home)
       File.write(File.join(home, "settings.json"), JSON.generate("thinkingLevel" => "xhigh"))
       settings = Settings.load(cwd: home, root: home).settings.merge("modelReasoning" => true)
-      chat = RubyLLM.context do |config|
-        config.openai_api_key = "k"
-        config.openai_api_base = "http://localhost:1/v1"
-      end.chat(model: "assumed-mapless-reasoner", provider: "openai",
-               protocol: :chat_completions, assume_model_exists: true)
+      chat = Agent::Chat.new(
+        client: Fast::Completions::Client.new(base_url: "http://localhost:1/v1", api_key: "k"),
+        model_id: "assumed-mapless-reasoner", provider_key: "openai")
 
       data = Executable.footer_data("/somewhere", settings, chat: chat)
       assert_equal "high", data[:thinking_level],
