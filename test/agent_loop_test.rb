@@ -572,6 +572,98 @@ module Tart
       assert_equal "second", requests.last["messages"].select { |m| m["role"] == "user" }.last["content"]
     end
 
+    # --- I54: the queue split and the drain points (pi agent-loop.ts
+    # :295/:212-220/:302-308 — the Grounds §2 trace verification). ---
+
+    # AC1(a): a steer submitted DURING a tool round rides the NEXT request
+    # of the SAME run — no second agent_start, the steering text is the
+    # request's trailing user message AFTER the tool result.
+    def test_steering_delivered_inside_the_tool_round_rides_the_next_request
+      @server.script([
+        {type: :stream, content: "", tool_calls: [{id: "call_1", name: "sleep", arguments: {label: "a"}}]},
+        {type: :message, content: "final after steering"},
+      ])
+      agent, events = agent_on_kernel(tools: {"sleep" => SleepTool.new})
+      thread = run_in_background(agent, "start work")
+      wait_until { @server.request_count >= 1 } # request 1 served; the 0.5 s tool is running
+      agent.steer("sort by size")
+      join_run(thread)
+
+      assert_equal 1, events.count { |e| e[:type] == :agent_start },
+        "no second run: the steering rode the SAME run's next request"
+      requests = @server.captured_requests
+      assert_equal 2, requests.size
+      roles = requests.last["messages"].map { |m| m["role"] }
+      users = requests.last["messages"].select { |m| m["role"] == "user" }
+      assert_equal "sort by size", users.last["content"], "the steering text is request 2's trailing user message"
+      assert_operator roles.rindex("user"), :>, roles.rindex("tool"),
+        "the steering entered the context AFTER the tool result (inside the round)"
+    end
+
+    # AC1(b): a follow-up submitted mid-run waits for FULL completion — it
+    # rides a request only AFTER the complete tool-less answer, as a new
+    # outer turn of the SAME session flow (pi agent-loop.ts:302-308).
+    def test_follow_up_delivered_only_after_full_completion
+      @server.script([
+        {type: :stream, content: "", tool_calls: [{id: "call_1", name: "sleep", arguments: {label: "a"}}]},
+        {type: :message, content: "the complete answer"},
+        {type: :message, content: "the follow-up answer"},
+      ])
+      agent, events = agent_on_kernel(tools: {"sleep" => SleepTool.new})
+      thread = run_in_background(agent, "start work")
+      wait_until { @server.request_count >= 1 }
+      agent.follow_up("after everything")
+      join_run(thread)
+
+      assert_equal 1, events.count { |e| e[:type] == :agent_start }, "one run — the follow-up opened a new OUTER turn"
+      requests = @server.captured_requests
+      assert_equal 3, requests.size
+      users_of_complete = requests[1]["messages"].select { |m| m["role"] == "user" }
+      assert_equal "start work", users_of_complete.last["content"],
+        "the complete tool-less answer's request carried NO follow-up"
+      users = requests.last["messages"].select { |m| m["role"] == "user" }
+      assert_equal "after everything", users.last["content"], "the follow-up delivered only at full completion"
+    end
+
+    # AC1(c): the session JSONL records the steer as a user message at its
+    # DELIVERY point — between the tool result and the final assistant.
+    def test_steering_recorded_at_its_delivery_point_in_the_session_jsonl
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: File.join(@dir, "root"))
+      @server.script([
+        {type: :stream, content: "", tool_calls: [{id: "call_1", name: "sleep", arguments: {label: "a"}}]},
+        {type: :message, content: "final after steering"},
+      ])
+      agent, = agent_on_kernel(tools: {"sleep" => SleepTool.new}, recorder:)
+      thread = run_in_background(agent, "start work")
+      wait_until { @server.request_count >= 1 }
+      agent.steer("sort by size")
+      join_run(thread)
+
+      entries = Agent::Session.load_entries(recorder.path)
+      messages = entries.select { |entry| entry["message"] } # the session header carries no message
+      roles = messages.map { |entry| entry.dig("message", "role") }
+      assert_equal %w[user assistant tool user assistant], roles,
+        "the steer recorded BETWEEN the tool result and the final assistant"
+      assert_equal "sort by size", messages[3].dig("message", "content")
+    end
+
+    # AC1(d): clear_queues empties BOTH queues atomically; the snapshot
+    # readbacks enumerate; push_message is the documented steer alias.
+    def test_clear_queues_empties_both_queues_and_snapshots_read_back
+      agent, = agent_on_kernel
+      agent.push_message("via alias")
+      agent.follow_up("later")
+
+      assert_equal ["via alias"], agent.steering_texts, "push_message appends to the STEERING queue (the alias)"
+      assert_equal ["later"], agent.follow_up_texts
+      assert agent.queued_messages?, "queued_messages? covers both queues"
+
+      agent.clear_queues
+      assert_empty agent.steering_texts
+      assert_empty agent.follow_up_texts
+      refute agent.queued_messages?
+    end
+
     # The kernel-level interrupt (the trap-net sentinel — the non-raw
     # SIGINT path): the in-flight turn cancels through Task#stop and
     # surfaces through the agent_end event. (Backlog C: the EDITOR-side

@@ -112,6 +112,13 @@ class MockLLMServer
     list
   end
 
+  # The served-request count WITHOUT draining (the I54 rig knob's poll
+  # seam — Runner#run_app's mid_run_keys waits on it): a peek at the log
+  # depth; captured_request_logs semantics are untouched.
+  def request_count
+    @request_logs.size
+  end
+
   # Drains and returns all captured request entries: full wire facts
   # (method, path, notable headers, parsed body) per request.
   def captured_request_logs
