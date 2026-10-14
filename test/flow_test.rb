@@ -8,8 +8,10 @@ require "json"
 require "digest"
 
 module Tart
-  # The I45 flow contract (dry-rb-flow): the Bridge's Result terminal, the
-  # loop's step-boundary classification, the MCP client's call-surface
+  # The I45 flow contract (the step boundary): the loop's step-boundary
+  # rescue ladder (Async::Cancel, then CancelledError, then StandardError —
+  # the de-bridged I50 shape; the ladder reproduces the Bridge-era terminal
+  # classification exactly), the MCP client's call-surface
   # taxonomy, and the no-silent-swallow golden — a failure raised mid-tool
   # reaches every observable seam byte-identically (Grounds §2.3).
   class FlowTest < Test
@@ -26,45 +28,6 @@ module Tart
       (@mcp_clients || []).each(&:close)
       @server_to_stop&.stop
       FileUtils.rm_rf(@dir)
-    end
-
-    # -- the Bridge Result contract ------------------------------------------
-
-    def test_bridge_returns_success_for_clean_work_and_yields_items_in_order
-      items = []
-      result = Agent::Bridge.new.run(->(sink) {
-        sink.call({chunk: "a"})
-        sink.call({chunk: "b"})
-      }) { |item| items << item }
-
-      assert result.success?
-      assert_equal [{chunk: "a"}, {chunk: "b"}], items
-    end
-
-    def test_bridge_failure_carries_the_worker_error_instance
-      error = StandardError.new("worker boom")
-      result = Agent::Bridge.new.run(->(_) { raise error }) { }
-
-      assert result.failure?
-      assert_same error, result.failure
-    end
-
-    def test_bridge_cancelled_work_is_a_failure_typed_by_cancelled_error
-      result = Agent::Bridge.new.run(->(_) { raise RubyLLM::CancelledError, "cancelled" }) { }
-
-      assert result.failure?
-      assert_kind_of RubyLLM::CancelledError, result.failure
-    end
-
-    def test_bridge_yields_streamed_items_before_the_error_terminal
-      items = []
-      result = Agent::Bridge.new.run(lambda { |sink|
-        sink.call({chunk: "a"})
-        raise RubyLLM::BadRequestError, "mid-stream 400"
-      }) { |item| items << item }
-
-      assert_equal [{chunk: "a"}], items
-      assert_kind_of RubyLLM::BadRequestError, result.failure
     end
 
     # -- the step-boundary classification table (public surface) -------------

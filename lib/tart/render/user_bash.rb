@@ -5,18 +5,18 @@ module Tart
     # The !-prefix user-bash execution state machine extracted from the
     # chat surface (I24 wave 4 — pi handleBashCommand :6987 over the
     # BashExecutionComponent, backlog C): the single-flight gate, the
-    # escape-cancel handshake state (the worker's cancellation checkpoint
-    # flag, the reactor-side slot the worker fills), and the deferred
-    # bashExecution records (pi's _pendingBashMessages, flushed on
-    # agent_end). The Chat coordinator injects the seams at construction
-    # (the {Picker#on_select} / {Selection#line_reader} precedent): the
-    # kernel (execution + the request_draw arm), the busy reader (Chat's
-    # busy? — the record-deferral gate), and the completion sinks — the
-    # block render ({Chat#enqueue_user_bash_block}), the session record
-    # (the agent's record_bash_execution), and the warning/error
-    # scrollback lines. Unsynchronized by design: exactly the base's
-    # thread assignments survive (run/cancel arrive on the frame-loop
-    # fiber, the completion runs inside the kernel task).
+    # escape-cancel state (the tool's cancellation checkpoint flag + the
+    # task stop), and the deferred bashExecution records (pi's
+    # _pendingBashMessages, flushed on agent_end). The Chat coordinator
+    # injects the seams at construction (the {Picker#on_select} /
+    # {Selection#line_reader} precedent): the kernel (execution + the
+    # request_draw arm), the busy reader (Chat's busy? — the record-deferral
+    # gate), and the completion sinks — the block render
+    # ({Chat#enqueue_user_bash_block}), the session record (the agent's
+    # record_bash_execution), and the warning/error scrollback lines.
+    # Unsynchronized by design (de-bridged I50): run/cancel arrive on the
+    # frame-loop fiber, and the whole execution — tool run, chunk drainer,
+    # terminal render — runs on the ONE kernel task's reactor fibers.
     class UserBash
       # pi handleSubmit :3347-3356 — "!" runs whole-line bash, "!!" runs it
       # excluded from the model context; the bare prefix (no command) is
@@ -46,14 +46,15 @@ module Tart
       #   running block's birth, fired BEFORE the task spawns (pi adds the
       #   component to its container before execution starts,
       #   handleBashCommand :7000-7012).
-      # @param stream_chunk_sink [Proc, nil] +call(text)+ — each bridged
-      #   chunk, delivered on the reactor fiber (the bridge yields there;
-      #   Grounds 5 — the reader threads only push queue items).
+      # @param stream_chunk_sink [Proc, nil] +call(text)+ — each chunk,
+      #   delivered by the drainer on the kernel task's reactor fiber (the
+      #   pipe-drain reader threads only push onto the chunk Queue;
+      #   Grounds §3 probe5).
       # @param stream_end_sink [Proc, nil] +call+ — the explicit clear,
       #   fired exactly once at EVERY terminal path (the outcome arm, the
-      #   worker-error arm — both at finish's entry, so the rare
-      #   terminal-without-outcome shape clears too — and cancel). Never
-      #   implicit in a render sink.
+      #   cancelled-outcome arm, the worker-error arm — all at finish's
+      #   entry, so the rare terminal-without-outcome shape clears too).
+      #   Never implicit in a render sink.
       def initialize(kernel:, busy_reader:, block_sink:, record_sink:, line_sink:,
         stream_start_sink: nil, stream_chunk_sink: nil, stream_end_sink: nil)
         @kernel = kernel
@@ -65,8 +66,10 @@ module Tart
         @stream_chunk_sink = stream_chunk_sink
         @stream_end_sink = stream_end_sink
         # The in-flight execution: the running task (single-flight — pi's
-        # isBashRunning gate), the escape-cancel handshake state, and the
-        # deferred records while a turn runs (pi's _pendingBashMessages).
+        # isBashRunning gate), the escape-cancel checkpoint flag, and the
+        # terminal facts the task records for finish (the outcome, or a
+        # worker error) + the deferred records while a turn runs (pi's
+        # _pendingBashMessages).
         @task = nil
         @cancel_flag = false
         @slot = {}
@@ -83,15 +86,15 @@ module Tart
 
       # The user-bash execution (pi handleBashCommand :6987): one at a time
       # (pi's isBashRunning gate — the warning is pi's showWarning text).
-      # The tool run BRIDGES to a worker thread (Agent::Bridge — the tool's
-      # pop-loop blocks its thread; the reactor must keep drawing), and the
-      # block renders on completion; the RECORD defers to agent_end while
-      # a turn runs (pi's _pendingBashMessages — the entry must not
+      # The tool runs INLINE on the kernel task's reactor fiber (the
+      # de-bridged I50 shape — the tool's waits are cooperative, probe5),
+      # and the block renders on completion; the RECORD defers to agent_end
+      # while a turn runs (pi's _pendingBashMessages — the entry must not
       # interleave a tool sequence in the record). The RUNNING block lives
       # from BEFORE execution (pi :7000-7012 — the component added to the
-      # container, then requestRender) and streams its chunks over the
-      # bridge queue (pi executeBash's chunkCb :7050-7057); the sinks are
-      # Chat's seams — this class owns no render state.
+      # container, then requestRender) and streams its chunks as they land
+      # (pi executeBash's chunkCb :7050-7057); the sinks are Chat's seams —
+      # this class owns no render state.
       def run(command, excluded)
         if @task
           @line_sink.call("A bash command is already running. Press Esc to cancel it first.",
@@ -99,63 +102,68 @@ module Tart
           return
         end
         tool = Tools::Bash.new(cwd: Dir.pwd)
-        # The escape-cancel handshake: the flag flips the worker's
-        # cancellation checkpoint (the tool aborts at its next 50 ms
-        # check — the group kill + partial-output outcome are the tool's
-        # own {Tools::Bash#run_user} rescue), the task stop kills the
-        # reactor-side wait, and the handler renders from the slot the
-        # worker filled (read after the bridge's bounded join).
         @command = command
         @excluded = excluded
         # The running block's birth, before the task spawns (pi :7000-7012).
         @stream_start_sink&.call(command, excluded)
         @cancel_flag = false
         @slot = {}
+        # Chunks cross from the tool's pipe-drain reader threads via a plain
+        # ::Queue (probe5: the pops are cooperative on a reactor fiber, and
+        # the cross-thread pushes wake the drainer); the drainer — a sibling
+        # task on THIS kernel task — is the only fiber that touches render
+        # state. ONE finish path renders every terminal: the outcome arm
+        # (including the escape-cancelled partial outcome — the Cancel lands
+        # inside run_user's waits and its dual-class rescue produces the
+        # cancelled outcome), the worker-error arm (a StandardError that
+        # escapes run_user, e.g. the ENOENT cwd raise), and the rare
+        # terminal-without-outcome shape (the clear alone).
         @task = @kernel.async do
-          terminal = Agent::Bridge.new
-            .on_cancel { @cancel_flag = true }
-            .run(lambda do |sink|
-              RubyLLM::Support::Cancellation.watch(
-                -> { raise RubyLLM::CancelledError if @cancel_flag }
-              ) do
-                # The chunk seam: the tool's reader threads push onto the
-                # bridge's thread-safe queue; the queue pops HERE on the
-                # reactor and the yield block forwards (Grounds 5) — no
-                # render state crosses a thread.
-                outcome = tool.run_user(command, on_chunk: ->(text) { sink.call({chunk: text}) })
-                @slot[:outcome] = outcome
-                sink.call({})
-              end
-            end) { |item| @stream_chunk_sink&.call(item[:chunk]) if item[:chunk] }
-          finish(terminal)
+          chunks = Queue.new
+          drainer = Async::Task.current.async do
+            while (item = chunks.pop) != :done
+              @stream_chunk_sink&.call(item)
+            end
+          end
+          begin
+            RubyLLM::Support::Cancellation.watch(
+              -> { raise RubyLLM::CancelledError if @cancel_flag }
+            ) do
+              @slot[:outcome] = tool.run_user(command, on_chunk: ->(text) { chunks << text })
+            end
+          rescue StandardError => e
+            # The worker-error arm (invariant (c)): recorded here, rendered
+            # by finish as the error line. A CancelledError never lands here
+            # (run_user owns the cancelled shape — the partial outcome).
+            @slot[:error] = e unless e.is_a?(RubyLLM::CancelledError)
+          ensure
+            chunks << :done
+            begin
+              drainer.wait
+            rescue Async::Cancel
+              # The cancel landed at the drainer wait (the command finished
+              # inside the cancel's shadow, not inside run_user's waits):
+              # the stopped drainer leaves chunks queued — drain them here,
+              # still finish (no chunk or terminal render is lost), then
+              # honor the cancel.
+              chunks.pop until chunks.empty?
+              finish
+              raise
+            end
+            finish
+          end
         end
       end
 
-      # The escape-cancel (pi abortBash): flip the worker's checkpoint
-      # flag, stop the reactor-side wait (the bridge joins the worker
-      # bounded — its cancelled outcome, partial output included, lands
-      # in the slot), then render from the slot after a bounded yield
-      # loop (this handler runs in the frame-loop fiber — sleep yields).
+      # The escape-cancel (pi abortBash): flip the tool's checkpoint flag
+      # (the belt — the tool aborts at its next Cancellation.check) and stop
+      # the kernel task — the Async::Cancel lands inside run_user's waits,
+      # the tool's dual-class rescue produces the cancelled partial outcome,
+      # and the task's own finish renders it. NOTHING else: no render, no
+      # record, no wait — the unwind owns the terminal.
       def cancel
         @cancel_flag = true
         @task.stop
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
-        sleep 0.05 while @slot.empty? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        outcome = @slot[:outcome]
-        # The explicit clear before the block enqueues (the live rows and
-        # the completed block never share a frame) — cancel is this run's
-        # sole terminal path (the stopped task's finish never runs).
-        @stream_end_sink&.call
-        @task = nil
-        @block_sink.call(@command,
-          outcome ? fields(outcome) : {content: "", exit_code: nil, cancelled: true,
-                                       truncated: false, full_output_path: nil},
-          @excluded)
-        record(build_record(@command,
-          outcome || Tools::Bash::BashOutcome.new(content: "", exit_code: nil, cancelled: true,
-                                                  truncation: nil, full_output_path: nil),
-          excluded: @excluded))
-        @kernel.request_draw
       end
 
       # The agent_end flush (pi's agent-end _pendingBashMessages flush).
@@ -166,22 +174,21 @@ module Tart
 
       private
 
-      # The worker's terminal: the outcome rendered + recorded; a worker
-      # error surfaces as an error line (the ENOENT class — no block).
-      def finish(terminal)
+      # The task's single terminal: every arm renders here, on the kernel
+      # task's fiber — the outcome (including the escape-cancelled partial
+      # outcome), else the worker error line, else the clear alone (the rare
+      # terminal-without-outcome shape).
+      def finish
         @task = nil
         # The explicit clear — once per run, BEFORE the completed rows
         # enqueue (AC2: the live rows and the completed block never share
-        # a frame). Covers the outcome arm, the worker-error arm, and the
-        # terminal-without-outcome shape alike; cancel clears its own path
-        # (this method never runs there — the stopped task dies at the
-        # bridge's pop).
+        # a frame).
         @stream_end_sink&.call
         if (outcome = @slot[:outcome])
           @block_sink.call(@command, fields(outcome), @excluded)
           record(build_record(@command, outcome, excluded: @excluded))
-        elsif terminal&.failure? && !terminal.failure.is_a?(RubyLLM::CancelledError)
-          @line_sink.call("bash: #{terminal.failure.message}", fg: Theme[:error])
+        elsif (error = @slot[:error])
+          @line_sink.call("bash: #{error.message}", fg: Theme[:error])
         end
         @kernel.request_draw
       end

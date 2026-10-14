@@ -211,8 +211,9 @@ module Tart
         # double-press exit window, handleCtrlC :6840). The I38 streaming
         # sinks wire the running block's render state below (pi's
         # BashExecutionComponent lives from before execution,
-        # :7000-7062): start before the task spawns, each bridged chunk,
-        # and the explicit clear at every terminal path.
+        # :7000-7062): start before the task spawns, each chunk as the
+        # kernel task's drainer delivers it, and the explicit clear at
+        # every terminal path.
         @user_bash = UserBash.new(
           kernel: kernel,
           busy_reader: -> { busy? },
@@ -1673,9 +1674,10 @@ module Tart
       # execution, appendOutput + ui.requestRender per chunk, setComplete
       # in place) ---
 
-      # Reactor/frame-loop fibers only (the bridge yields chunks on the
-      # reactor — Grounds 5); all render-state mutation stays under the
-      # surface mutex, exactly the agent-event discipline.
+      # Reactor/frame-loop fibers only (the kernel task's drainer delivers
+      # chunks on the reactor — the pipe-drain reader threads only push its
+      # queue, Grounds §3 probe5); all render-state mutation stays under
+      # the surface mutex, exactly the agent-event discipline.
       def start_user_bash_stream(command, excluded)
         @mutex.synchronize do
           @user_bash_stream = {command:, excluded:, content: +"", spinner_started_at: @clock.call}

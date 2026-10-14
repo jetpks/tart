@@ -3043,14 +3043,17 @@ module Tart
       with_chat(width: 60) do |chat, session|
         send_message(chat, "!sleep 5")
         workers = chat.kernel.submitted.slice!(0..)
-        reactor = Thread.new do
-          Async do |root|
-            workers.each { |block| root.async { block.call } }
-          end
+        # The de-bridged terminal renders from the kernel task's fiber (I50 —
+        # finish owns every arm), so the task runs on THIS thread's reactor,
+        # where the thread-local test terminal is initialized (a side thread
+        # has none — RatatuiRuby::Error::Terminal; the old drive rendered
+        # from cancel() on the main thread, an arm the de-bridge deletes).
+        # IdleKernel#stop no-ops; the tool's checkpoint flag does the cancel.
+        Async do |root|
+          root.async { workers.each { |block| root.async { block.call } } }
+          sleep 0.3 # the command is running
+          chat.on_event(TUI.key_event("esc"))
         end
-        sleep 0.3 # the command is running
-        chat.on_event(TUI.key_event("esc"))
-        reactor.join(5)
         draw(chat, session)
 
         assert chat.transcript_lines.any? { |row| row.include?("cancelled") },
@@ -3360,13 +3363,21 @@ module Tart
     def test_escape_cancel_clears_the_live_rows_and_keeps_partial_output
       with_chat(width: 60, screen_height: 24) do |chat, session|
         send_message(chat, "!printf 'kept\\n'; sleep 5")
-        reactor = run_user_bash_task(chat)
-        sleep 0.3
-        draw(chat, session)
-        assert chat.user_bash_streaming?, "the run is mid-flight"
+        workers = chat.kernel.submitted.slice!(0..)
+        # The de-bridged terminal renders from the kernel task's fiber (I50 —
+        # finish owns every arm), so the task runs on THIS thread's reactor,
+        # where the thread-local test terminal is initialized (a side thread
+        # has none — RatatuiRuby::Error::Terminal; the old drive rendered
+        # from cancel() on the main thread, an arm the de-bridge deletes).
+        # IdleKernel#stop no-ops; the tool's checkpoint flag does the cancel.
+        Async do |root|
+          root.async { workers.each { |block| root.async { block.call } } }
+          sleep 0.3
+          draw(chat, session)
+          assert chat.user_bash_streaming?, "the run is mid-flight"
 
-        chat.on_event(TUI.key_event("esc"))
-        reactor.join(5)
+          chat.on_event(TUI.key_event("esc"))
+        end
         draw(chat, session)
 
         refute chat.user_bash_streaming?, "the cancel terminal cleared the live rows"

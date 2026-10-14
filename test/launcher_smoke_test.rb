@@ -35,10 +35,11 @@ module Tart
     end
 
     # The async-reactor IO::Buffer experimental warning never fires in print
-    # mode (no in-reactor IO — the LLM work bridges to a worker thread and
-    # print mode records no session), so its filter is unit-proven here:
-    # exactly the IO::Buffer message dies, every other warning passes
-    # through.
+    # mode (print mode records no session and its LLM turns run on the same
+    # fiber-scheduler-cooperative :net_http path as every mode — I50 de-bridge:
+    # no worker-thread hop, no in-reactor buffer IO on this surface), so its
+    # filter is unit-proven here: exactly the IO::Buffer message dies, every
+    # other warning passes through.
     def test_io_buffer_experimental_warning_is_filtered_others_pass_through
       sink = Class.new do
         attr_reader :seen

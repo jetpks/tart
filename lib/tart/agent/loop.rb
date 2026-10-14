@@ -6,12 +6,9 @@ require_relative "../herdr"
 require_relative "../memory"
 require_relative "../models"
 require_relative "../settings"
-require_relative "bridge"
 require_relative "session"
 require_relative "status"
 require_relative "system_prompt"
-
-require "dry/monads"
 
 module Tart
   module Agent
@@ -29,9 +26,11 @@ module Tart
     #
     # Kernel mapping: the loop runs as the work block (task subtree) on
     # {Core::Loop}; a kernel interrupt (Ctrl+C or the INT trap net) cancels
-    # the in-flight turn — the waiting fiber gets Async::Cancel, the chat is
-    # cancelled (tools kill their subprocess groups at the next checkpoint),
-    # and the cancel propagates.
+    # the in-flight turn — the Async::Cancel lands at the turn fiber's
+    # current wait (the streaming HTTP read, or a tool's cooperative wait —
+    # probe3: Net::HTTP over TLS is fiber-scheduler-cooperative), the chat
+    # is cancelled at the ladder (tools kill their subprocess groups at
+    # their checkpoints), and the cancel propagates.
     #
     # Events (minimal surface, pi's AgentEvent vocabulary plus the
     # compaction events): :agent_start, :turn_start, :message_start,
@@ -51,10 +50,6 @@ module Tart
     # the error). The compaction entry goes to the session recorder; the
     # chat history is replaced in place with [summary message, kept tail].
     class Loop
-      # I45: the step boundary consumes the Bridge's Result terminal (the
-      # pattern-matching vocabulary of the flow contract).
-      include Dry::Monads::Result::Mixin
-
       # @param chat [RubyLLM::Chat] configured for the endpoint (model,
       #   provider, protocol).
       # @param tools [Hash{String => RubyLLM::Tool}] the selected loadout
@@ -133,7 +128,6 @@ module Tart
         @pre_compaction_messages = {}.compare_by_identity
         @entry_ids = {}.compare_by_identity
         @new_messages = []
-        @sink = nil
         @stream_started = false
         @steering_queue = Queue.new
         @steer_inbox = steer_inbox
@@ -142,7 +136,7 @@ module Tart
         @last_error = nil
         @interrupted = false
 
-        @chat.with_tools(*tools.values) unless tools.empty?
+        @chat.with_tools(*tools.values).with_tool_options(concurrency: :fibers) unless tools.empty?
         @chat.with_instructions(system_prompt) if system_prompt
         seed_messages.each { |message| @chat.add_message(message) }
         install_chat_callbacks
@@ -277,8 +271,9 @@ module Tart
 
       # Runs the agent to completion of the prompt and every queued message.
       # Must be called on the kernel reactor fiber (as the Core::Loop work
-      # block): every model/tool step is bridged to a worker thread and this
-      # fiber waits interruptibly.
+      # block): every model/tool step runs INLINE on this fiber — the LLM
+      # HTTP I/O and tool execution are fiber-scheduler-cooperative, so the
+      # reactor keeps scheduling while the step runs.
       #
       # @return [Array<RubyLLM::Message>] the messages added by this run.
       def run(prompt = nil)
@@ -322,10 +317,11 @@ module Tart
       # Manual compaction (pi session.compact, agent-session.ts:2764 — the
       # /compact command's seam): runs the I08 machinery now, on demand.
       # Like #run, it must be called on the kernel reactor fiber (the
-      # summarization call bridges to a worker). @return [Boolean] whether
-      # a compaction happened — false when there is nothing to compact
-      # (pi raises "Nothing to compact (session too small)"); pi aborts a
-      # running turn first — the port dispatches /compact only when idle.
+      # summarization call runs inline — cooperative I/O). @return [Boolean]
+      # whether a compaction happened — false when there is nothing to
+      # compact (pi raises "Nothing to compact (session too small)"); pi
+      # aborts a running turn first — the port dispatches /compact only when
+      # idle.
       def compact
         run_compaction(reason: :manual)
       end
@@ -384,7 +380,7 @@ module Tart
       # answers without tool calls and no steering messages wait.
       def inner_loop
         loop do
-          message = step_via_bridge
+          message = step_on_reactor
           next if recover_overflow?
 
           # The error check precedes the nil-message break: a step the worker
@@ -545,29 +541,24 @@ module Tart
       # SUMMARIZATION_SYSTEM_PROMPT, one user message carrying the serialized
       # conversation; not the chat history, no tools. max_tokens =
       # min(floor(0.8 * reserve_tokens), model max) (:683-686); the gem's
-      # model.max_output_tokens is the model max (model.rb:36). Run through
-      # the Bridge like every blocking LLM call so a kernel interrupt
-      # cancels it. nil (compaction aborted) when the call fails. The full
-      # reply Message is returned — its usage is pi's CompactionResult.usage
-      # (compaction.ts:1085).
+      # model.max_output_tokens is the model max (model.rb:36). Runs INLINE
+      # on the turn fiber (cooperative I/O — a kernel interrupt cancels it
+      # natively, the Cancel arm re-raises). nil (compaction aborted) when
+      # the call fails. The full reply Message is returned — its usage is
+      # pi's CompactionResult.usage (compaction.ts:1085).
       def summarize(preparation)
         prompt = Compaction.summarization_prompt(preparation.messages_to_summarize,
           previous_summary: preparation.previous_summary)
-        result = nil
-        summary_chat = nil
-        bridge = Bridge.new
-        bridge.on_cancel { summary_chat&.cancel }
-        # Any Failure terminal (a failed call, or a cancelled one) aborts the
-        # compaction: nil, and the run continues (never stops the run).
-        case bridge.run(lambda { |_sink|
-          summary_chat = build_summary_chat
-          result = summary_chat.ask(prompt)
-        }) { |_item| }
-        in Success
-          result
-        in Failure
-          nil
-        end
+        summary_chat = build_summary_chat
+        summary_chat.ask(prompt)
+      rescue Async::Cancel
+        # Belt-and-braces (Grounds §3 probe3 ARM2): the flag stops any
+        # surviving request at its next checkpoint; the Cancel itself is
+        # re-raised — run()'s rescue owns the interrupted bookkeeping.
+        summary_chat.cancel
+        raise
+      rescue RubyLLM::CancelledError, StandardError
+        nil # compaction aborts, the run continues (today's ANY-Failure rule)
       end
 
       def build_summary_chat
@@ -612,43 +603,49 @@ module Tart
         [(reserve * 0.8).floor, cap].min
       end
 
-      # One ruby_llm #step on the worker thread. Returns the step's message
-      # (assistant message or tool result), or nil when the step produced no
-      # message (chat pause).
-      def step_via_bridge
-        bridge = Bridge.new
-        bridge.on_cancel { @chat.cancel }
+      # One ruby_llm #step INLINE on the turn fiber (the de-bridged seam —
+      # probe1/probe3: the faraday :net_http I/O is fiber-scheduler-
+      # cooperative). Returns the step's message (assistant message or tool
+      # result), or nil when the step produced no message (chat pause).
+      def step_on_reactor
         @last_message = nil
         @stream_started = false
-        terminal = bridge.run(work_callable) { |item| handle_item(item) }
-        @sink = nil
-        # The terminal Result branches by payload class (the flow contract's
-        # no-silent-swallow discipline: every arm explicit):
-        # - Failure(RubyLLM::CancelledError): today's cancelled shape — no
-        #   @last_error, no error emit; the nil message breaks the loop;
-        # - Failure(other): the worker's error lands in @last_error with the
-        #   same assistant message_end error emit as before;
-        # - Success(): the step's message (if any) already arrived as the
-        #   yielded :step item.
-        case terminal
-        in Failure(RubyLLM::CancelledError)
-          # cancelled: today's shape — no @last_error, no error emit
-        in Failure(err)
-          record_terminal_error(err)
-        in Success
-          # the step's message arrived as the yielded :step item
-        end
+        message = @chat.step { |chunk| handle_item({type: :chunk, chunk:}) }
+        handle_item({type: :step, message:}) if message
         @last_message
-      end
-
-      def work_callable
-        lambda { |sink|
-          @sink = sink
-          message = @chat.step do |chunk|
-            sink.call({type: :chunk, chunk:})
-          end
-          sink.call({type: :step, message:}) if message
-        }
+      rescue Async::Cancel
+        # Belt-and-braces (Grounds §3 probe3 ARM2): the flag stops any
+        # surviving stream at its next chunk boundary. The Cancel itself is
+        # re-raised — run()'s rescue owns the interrupted bookkeeping
+        # (loop.rb's run rescue) and Core::Loop teardown relies on the raise.
+        @chat.cancel
+        # The Bridge-era consumer of that flag — the worker thread's stream
+        # callback, raising at the next chunk boundary (probe3 ARM2) — died
+        # with the Bridge: the cancelled step's stream unwinds with THIS
+        # fiber, and the gem's only consumer is the NEXT operation's first
+        # checkpoint (raise_if_cancelled! clears the flag as it raises,
+        # chat.rb:1193-1199). Left standing, the residue would spuriously
+        # cancel the run AFTER the interrupt (esc → resubmit). So the belt
+        # sets the flag and this unwind consumes it immediately — the gem's
+        # own checkpoint, whose clear-on-raise IS the documented reuse
+        # contract ("the next cancellation checkpoint ... clears the flag so
+        # the chat can be reused").
+        begin
+          @chat.send(:raise_if_cancelled!)
+        rescue RubyLLM::CancelledError
+          nil # consumed — the flag is clear for the next run
+        end
+        raise
+      rescue RubyLLM::CancelledError
+        # cancelled: today's shape — no @last_error, no error emit; the nil
+        # message breaks the loop.
+        nil
+      rescue StandardError => e
+        # The step's error lands in @last_error with the same assistant
+        # message_end error emit as before (the flow contract's
+        # no-silent-swallow discipline).
+        record_terminal_error(e)
+        @last_message
       end
 
       # The error terminal's recording (the arm that used to sit behind the
@@ -813,24 +810,26 @@ module Tart
         @chat.before_tool_call do |tool_call|
           # ruby_llm calls after_tool_result with the result only (chat.rb:
           # run_callbacks(:after_tool_result, result)); pair the call back by
-          # fiber/thread-local — before and after run in the same execution
-          # context, per call, in both of ToolConcurrency's modes.
+          # fiber-local storage — Thread#[] is FIBER-local on CRuby (Grounds
+          # §3 probe4: sibling tool fibers isolate, no stomp), and before/after
+          # run on the SAME fiber per call, in both of ToolConcurrency's
+          # modes (under :fibers, inside the tool's own task fiber).
           Thread.current[:tart_tool_call] = tool_call
           # I17: arm the per-execution clock (monotonic — pi's
           # performance.now() delta, nested-tool-calls.ts:82).
           Thread.current[:tart_tool_started_at] = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          @sink&.call({type: :tool_execution_start, tool_call:})
+          handle_item({type: :tool_execution_start, tool_call:})
         end
         @chat.after_tool_result do |result|
           duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) -
                      Thread.current[:tart_tool_started_at]
-          @sink&.call({type: :tool_execution_end,
+          handle_item({type: :tool_execution_end,
                        tool_call: Thread.current[:tart_tool_call], result:, duration:})
         end
         @chat.after_message do |message|
           # Tool result messages appear atomically; streamed assistant
           # messages get their events from the chunk flow and step handling.
-          @sink&.call({type: :tool_message, message:}) if message.role == :tool
+          handle_item({type: :tool_message, message:}) if message.role == :tool
         end
       end
 
