@@ -28,6 +28,14 @@ module TuiSplitRig
 #                              # before the capture — the settled-screen
 #                              # instrument for post-reply key flows (s9's
 #                              # ctrl+o startup-help flip). Default: none.
+#   mid_run_keys:              # optional (I54): {after_request: N, keys:
+#     after_request: 1         # [...]} — after the prompt is sent, poll the
+#     keys: ["text", "Enter"]  # mock's NON-DRAINING request_count until it
+#                              # reaches N (HARD_CAP-bounded; a dead pane or
+#                              # a timeout fails the app's completed), then
+#                              # send the keys and let the reply settle —
+#                              # the mid-run submit instrument (s12/s13).
+#                              # Default: none (today's behavior).
 #   stage_project_resources: true  # optional: write the loaded-resource set
 #                              # into BOTH apps' run sandbox — AGENTS.md at
 #                              # the cwd, one project skill, one user skill
@@ -56,7 +64,7 @@ module TuiSplitRig
     APPS = %w[pi tart].freeze
 
     attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage,
-                :post_settle_keys, :stage_project_resources, :stage_memory
+                :post_settle_keys, :mid_run_keys, :stage_project_resources, :stage_memory
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -90,6 +98,7 @@ module TuiSplitRig
       @context_window = parse_context_window(data)
       @suppress_usage = parse_suppress_usage(data)
       @post_settle_keys = parse_post_settle_keys(data)
+      @mid_run_keys = parse_mid_run_keys(data)
       @stage_project_resources = parse_stage_project_resources(data)
       @stage_memory = parse_stage_memory(data)
     end
@@ -125,6 +134,24 @@ module TuiSplitRig
       raise Error, "#{@path}: post_settle_keys must be a list of key strings" unless raw.is_a?(Array) && raw.all?(String)
 
       raw.map { |key| String(key) }
+    end
+
+    # The optional mid-run key knob (the s12/s13 instrument, I54):
+    # {after_request: positive Integer, keys: [String]} or absent → nil.
+    # Validated at load like the existing knobs.
+    def parse_mid_run_keys(data)
+      raw = data["mid_run_keys"]
+      return nil if raw.nil?
+
+      raise Error, "#{@path}: mid_run_keys must be a mapping" unless raw.is_a?(Hash)
+      after = raw["after_request"]
+      unless after.is_a?(Integer) && after.positive?
+        raise Error, "#{@path}: mid_run_keys.after_request must be a positive integer"
+      end
+      keys = raw["keys"]
+      raise Error, "#{@path}: mid_run_keys.keys must be a list of key strings" unless keys.is_a?(Array) && keys.all?(String)
+
+      {after_request: after, keys: keys.map { |key| String(key) }}
     end
 
     # The optional loaded-resource staging knob (the s9 instrument): a

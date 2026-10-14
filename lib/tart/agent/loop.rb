@@ -132,7 +132,14 @@ module Tart
         @entry_ids = {}.compare_by_identity
         @new_messages = []
         @stream_started = false
-        @steering_queue = Queue.new
+        # The queue split (I54 — pi's two PendingMessageQueues, agent.ts
+        # :191-192): steering delivers after each tool batch / at the round
+        # boundaries; follow-up waits for FULL completion. Mutex-guarded
+        # Arrays, not ::Queue — the surface's snapshot readbacks need
+        # enumeration (Spec §1.1).
+        @steering_queue = []
+        @follow_up_queue = []
+        @queues_mutex = Mutex.new
         @steer_inbox = steer_inbox
         @wake_opening = false
         @in_run = false
@@ -155,20 +162,58 @@ module Tart
         @chat.thinking_level = @thinking_level
       end
 
-      # Queues a user message. While the agent runs, it is consumed at the
-      # next turn boundary (pi's steering queue); queued messages left after
-      # the loop would stop continue it (pi's follow-up queue) — one queue,
-      # pi's two consumption points.
-      def push_message(text)
-        @steering_queue << text
+      # Queues a STEERING message (pi Agent.steer, agent.ts:299): consumed
+      # at the next tool-batch boundary (after the batch, before the next
+      # LLM call of the SAME run — pi agent-loop.ts:295 + :212-220) or at a
+      # round boundary; queued messages left after the loop would stop
+      # continue it. The I03-era name is retained as the documented alias.
+      def steer(text)
+        @queues_mutex.synchronize { @steering_queue << text }
         self
       end
 
-      # @return [Boolean] whether steering messages are queued but not yet
-      #   consumed (thread-safe; the chat surface checks it on agent_end to
-      #   close the submit/stop race).
+      # Queues a FOLLOW-UP message (pi Agent.followUp, agent.ts:304):
+      # delivered only when the agent has no more tool calls and no pending
+      # steering — a new outer turn of the same session flow (pi
+      # agent-loop.ts:302-308).
+      def follow_up(text)
+        @queues_mutex.synchronize { @follow_up_queue << text }
+        self
+      end
+
+      # The I03-era steering alias (the compat seam — existing callers
+      # unchanged); appends to the STEERING queue.
+      def push_message(text)
+        steer(text)
+      end
+
+      # Atomically clears BOTH queues (pi clearQueue + agent.clearAllQueues,
+      # agent-session.ts:2402-2410). Returns nothing.
+      def clear_queues
+        @queues_mutex.synchronize do
+          @steering_queue.clear
+          @follow_up_queue.clear
+        end
+        nil
+      end
+
+      # Thread-safe snapshot readbacks (pi getSteeringMessages/
+      # getFollowUpMessages, agent-session.ts:2418-2424) — the surface
+      # queue mirror's render source.
+      def steering_texts
+        @queues_mutex.synchronize { @steering_queue.dup }
+      end
+
+      def follow_up_texts
+        @queues_mutex.synchronize { @follow_up_queue.dup }
+      end
+
+      # @return [Boolean] whether steering OR follow-up messages are queued
+      #   but not yet consumed (thread-safe; the chat surface checks it on
+      #   agent_end to close the submit/stop race — pi's continue on either
+      #   queue, hasQueuedMessages, agent-session.ts:1898).
       def queued_messages?
-        !@steering_queue.empty?
+        @queues_mutex.synchronize { !@steering_queue.empty? || !@follow_up_queue.empty? }
       end
 
       # @return [Boolean] whether a run is in flight (I48 — one Loop one
@@ -367,13 +412,22 @@ module Tart
         # test_queued_message_continues_the_outer_loop, two requests), a
         # recorded parity deviation.
         first = true
+        held = [] # pi's pendingMessages: the outer polls consume-and-HOLD
         loop do
           emit(type: :turn_start)
           if first && prompt
             add_user_message(prompt)
           else
             before = @new_messages.size
-            steering_messages.each { |text| add_user_message(text) }
+            steering = held + steering_messages
+            held = []
+            steering.each { |text| add_user_message(text) }
+            # pi continue()'s precedence (agent.ts:392-405): the steering
+            # arm delivers and leaves follow-ups queued; only an EMPTY
+            # steering drain opens with follow-ups — never both in one
+            # opening (the queue drains; held leftovers ride `steering` in
+            # their arrival order, pi's pendingMessages processing).
+            follow_up_messages.each { |text| add_user_message(text) } if steering.empty?
             # I48 wake: with no prompt and no steering opening the run, the
             # pending nextTurn queue IS the opening turn (each pending
             # rides the §I47 drain path). Nothing added (the queue raced
@@ -383,7 +437,14 @@ module Tart
           end
           first = false
           inner_loop
-          break if steering_messages.empty?
+          # The port's final-check race-closer now covers BOTH queues (pi's
+          # outer follow-up poll, agent-loop.ts:302-308). The check CONSUMES
+          # (the inbox + stop-file check rides the steering drain) and
+          # HANDS the texts to the next opening — pi holds its poll result
+          # in pendingMessages (:295→:212-220, :302-308); discarding here
+          # would eat a message that landed in the wind-down window.
+          held = steering_messages + follow_up_messages
+          break if held.empty?
         end
       end
 
@@ -410,6 +471,13 @@ module Tart
               @hooks.clear_terminate_ledger
               return
             end
+            # THE tool-batch arm (I54 — pi's post-turn steering poll,
+            # agent-loop.ts:295, processed before the next request at
+            # :212-220): steering submitted while the batch ran rides the
+            # NEXT step_on_reactor request of the SAME run — never a new
+            # round. Terminate comes first (pi's end-decision precedes the
+            # poll, L:288-291).
+            steering_messages.each { |text| add_user_message(text) }
             next # tool batch executed; the model responds on the next step
           elsif @chat.complete?
             # pi _handlePostAgentRun checks compaction after EVERY
@@ -629,18 +697,25 @@ module Tart
 
       # Drains queued steering messages (thread-safe consumer side). The
       # I48 file inbox (steer_inbox:) folds into the SAME seam: drained at
-      # every consumption point (the outer-loop boundary, the inner loop's
-      # complete branch, and this outer break condition) — a stop request
-      # found here interrupts the run exactly like a kernel interrupt.
+      # every consumption point (the outer-loop boundary, the tool-batch
+      # arm, the inner loop's complete branch, and this outer break
+      # condition) — a stop request found here interrupts the run exactly
+      # like a kernel interrupt.
       def steering_messages
         drain_steer_inbox
+        drain_queue(@steering_queue)
+      end
+
+      # Drains queued follow-up messages (I54 — pi getFollowUpMessages,
+      # agent-loop.ts:302-308). The file inbox steers only; no inbox read.
+      def follow_up_messages
+        drain_queue(@follow_up_queue)
+      end
+
+      def drain_queue(queue)
         messages = []
-        loop do
-          begin
-            messages << @steering_queue.pop(true)
-          rescue ThreadError
-            break
-          end
+        @queues_mutex.synchronize do
+          messages << queue.shift until queue.empty?
         end
         messages
       end
@@ -676,7 +751,7 @@ module Tart
           end
           next unless request["type"] == "steer"
 
-          @steering_queue << request["message"].to_s
+          steer(request["message"].to_s)
           append_steer_consumption(request)
           File.unlink(path) rescue nil # LAST — a crash before this re-delivers
         end

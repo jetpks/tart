@@ -216,9 +216,12 @@ module Tart
 
       # pi handleCompactCommand (interactive-mode.ts:7080): compact now.
       # pi aborts a running turn first (session.compact → this.abort(),
-      # agent-session.ts:2766) — the port dispatches builtins only when
-      # idle (recorded reduction); custom instructions are unsupported by
-      # the port's compaction seam (recorded reduction).
+      # agent-session.ts:2764-2765) — since I54 the SURFACE carries that
+      # letter: Render::Chat#busy_command_arm interrupts the in-flight run
+      # and re-dispatches /compact through the idle path at :agent_end, so
+      # this Handler still only ever compacts an IDLE agent; custom
+      # instructions are unsupported by the port's compaction seam
+      # (recorded reduction).
       def dispatch_compact
         if @agent.call.compact
           @output.call("✓ context compacted")

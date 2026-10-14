@@ -241,6 +241,18 @@ module Tart
         @reasoning = +""
         @busy = false
         @tool = nil
+        # The queued-message surface mirror (I54 — pi's _steeringMessages/
+        # _followUpMessages, agent-session.ts:2238-2263): appended by the
+        # busy submit/follow-up paths, rendered between the dock spacer and
+        # the editor (§pending_widget), removed by delivery (first-index
+        # text match at :message_start user role — pi :1122-1134) and by
+        # alt+up's dequeue.
+        @queued = {steer: [], follow_up: []}
+        # The abort-first busy command (I54 — pi session.compact/newSession
+        # abort first, agent-session.ts:2764-2765 + runtime :167-178): the
+        # surface arms kernel.interrupt_work! and re-dispatches the stored
+        # command through the idle path at :agent_end.
+        @pending_after_interrupt = nil
         # The RUNNING user-bash block's render state (I38 — pi's
         # BashExecutionComponent): the command/excluded, the accumulated
         # chunk text (the appendOutput join IS this string buffer), and
@@ -446,6 +458,14 @@ module Tart
               # (pi renders the block ONCE).
               @transcript_state.enqueue_custom_block(message.custom_type, message.content) if message.display
             else
+              # The queued-message delivery arm (I54 — pi agent-session.ts
+              # :1122-1134 + interactive-mode.ts:3503-3507): a user-role
+              # message_start whose text matches a mirror's FIRST-index
+              # entry removes it and renders the user echo AT DELIVERY (the
+              # idle submit's opening message never matches — it already
+              # echoed at submit). Runs under the surface mutex (the sink
+              # holds it) — no re-synchronize.
+              deliver_queued_message(message) if message.respond_to?(:role) && message.role == :user
               @live = +""
               @reasoning = +""
             end
@@ -546,8 +566,17 @@ module Tart
             # A message submitted in the wind-down window (after the agent's
             # final steering check, before agent_end) sits queued with no run
             # in flight — continue the run (pi's queued-message semantics:
-            # pi polls the queue at loop start, agent-loop.ts:175).
-            if handled.nil? && @agent&.queued_messages?
+            # pi polls the queue at loop start, agent-loop.ts:175). The
+            # deferred abort-first command (§busy_command_arm) takes THIS
+            # agent_end instead: re-dispatch through the EXACT idle paths
+            # (kernel.async schedules outside the mutex) and SKIP the
+            # wind-down — manual compaction never continues the interrupted
+            # turn (pi agent-session.ts:2762-2763).
+            if @pending_after_interrupt
+              deferred = @pending_after_interrupt
+              @pending_after_interrupt = nil
+              @kernel.async { @commands&.dispatch(deferred) }
+            elsif handled.nil? && @agent&.queued_messages?
               @kernel.async { @agent.run }
             end
           end
@@ -783,13 +812,19 @@ module Tart
         when "enter"
           # pi editor.ts:889-919 — the newline keys route to addNewLine
           # BEFORE the submit path (tui.input.newLine = shift+enter/
-          # ctrl+j, keybindings.ts:143; alt+enter is pi's terminal
+          # ctrl+j, keybindings.ts:143; alt+enter WAS pi's terminal
           # fallback arm), and plain enter submits — with the
           # no-shift+enter terminal workaround: a "\\" before the cursor
           # is deleted and a newline inserted instead (:906-917). The
           # list keeps pi's select.confirm fall-through: a "/"-prefix
-          # completion applies then submits (editor.ts:790-816).
-          if event.modifiers.include?("shift") || alt
+          # completion applies then submits (editor.ts:790-816). I54:
+          # alt+enter is app.message.followUp (keybindings.ts:67-70,
+          # registered interactive-mode.ts:3116) — checked BEFORE the
+          # shift arm (its submit_follow_up carries the cancel);
+          # newline keys remain shift+enter/ctrl+j.
+          if alt
+            submit_follow_up
+          elsif event.modifiers.include?("shift")
             @autocomplete.cancel # pi addNewLine editor.ts:1329
             @editor.add_new_line
           elsif @autocomplete.suggestions
@@ -857,7 +892,14 @@ module Tart
         # yields — pi custom-editor.ts:127-131 → editor.ts:766-771);
         # otherwise pi's cursorUp/cursorDown dispatch runs (history at
         # the visual extremes per its gating, else one visual row).
-        when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.cursor_up
+        when "up"
+          # I54: alt+up is app.message.dequeue (keybindings.ts:71-74) —
+          # restore the queued messages to the editor (pi handleDequeue
+          # :4507-4514); the plain/list arms are untouched below it.
+          if alt then dequeue_queued_messages
+          elsif @autocomplete.suggestions then @autocomplete.navigate(-1)
+          else @editor.cursor_up
+          end
         when "down" then @autocomplete.suggestions ? @autocomplete.navigate(1) : @editor.cursor_down
         when "tab"
           # app.thinking.cycle (pi keybindings.ts:33-35, default
@@ -941,11 +983,13 @@ module Tart
       # pi's submit path (interactive-mode.ts:3200-3442): a leading "/"
       # routes through the commands module before any agent call —
       # /skill:<name> expands (unknown skill passes through as plain text),
-      # builtins dispatch when idle, and text matching nothing falls through
-      # to the agent as a plain message. Deviation (itemized): pi's builtin
-      # if-chain precedes its streaming branch, so pi dispatches builtins
-      # mid-turn (/compact aborts the turn first) — the port routes ALL
-      # slash text through the steer path while a turn runs.
+      # builtins dispatch busy-or-not, and text matching nothing falls
+      # through to the agent as a plain message. I54: the I13-era !busy?
+      # gates DROP (pi's builtin if-chain precedes its streaming branch,
+      # :3200-3365 — builtins dispatch mid-turn; /compact and /new take
+      # the abort-first arm below). The idle submit echoes at submit and
+      # runs; a busy submit steers with NO echo — the user message renders
+      # AT DELIVERY (pi :3503-3507, the message_start event).
       def submit
         text = @editor.input.dup.strip # pi onSubmit trims (interactive-mode.ts:3201)
         @autocomplete.cancel
@@ -957,9 +1001,10 @@ module Tart
         @editor.exit_history_browsing
         @footer.invalidate_branch # per-turn branch invalidation
         if @commands && text.start_with?("/")
-          text = @commands.expand_skill(text)
-          return if !busy? && gate_thinking_level(text)
-          return if !busy? && @commands.dispatch(text)
+          text = @commands.expand_skill(text) # expansion BEFORE queue (agent-session.ts:2005-2010)
+          return if gate_thinking_level(text) # busy-or-not (pi handleThinkingCommand, :5145-5163)
+          return if busy_command_arm(text) # §busy_command_arm — false = fall through
+          return if @commands.dispatch(text) # busy-or-not
         end
         # The !-prefix bash intercepts BEFORE the user echo (pi handleSubmit
         # :3347-3360 — the BashExecutionComponent is the display, no user
@@ -967,12 +1012,122 @@ module Tart
         parsed = UserBash.parse(text)
         return @user_bash.run(*parsed) if parsed
 
-        @transcript_state.enqueue_user_submission(text)
         if busy?
-          @agent.push_message(text) # steering: consumed at the next turn boundary
+          steer_submitted_text(text) # no echo: the delivery arm echoes (pi :3503-3507)
         else
+          @transcript_state.enqueue_user_submission(text)
           @kernel.async { @agent.run(text) }
         end
+      end
+
+      # The abort-first arm for /compact + /new while a turn runs (I54 —
+      # pi session.compact aborts first, agent-session.ts:2764-2765; the
+      # runtime's newSession aborts first, agent-session-runtime.ts
+      # :167-178). Everything else dispatches immediately (pi's builtin
+      # if-chain runs before its streaming branch). The port's realization:
+      # interrupt the in-flight run, store the command text, and re-dispatch
+      # it through the EXACT idle paths at :agent_end (§on_agent_event).
+      # False here = not busy or not one of the two commands — the caller
+      # falls through to the immediate dispatch.
+      def busy_command_arm(text)
+        return false unless busy?
+        return false unless text == "/new" || text == "/compact" || text.start_with?("/compact ")
+
+        @pending_after_interrupt = text
+        @kernel.interrupt_work!
+        @kernel.request_draw
+        true
+      end
+
+      # app.message.followUp's submit (I54 — pi handleFollowUp,
+      # interactive-mode.ts:4475-4505): while streaming the text queues as
+      # a FOLLOW-UP (delivered only at full completion); idle alt+enter
+      # behaves exactly like plain Enter (:4497-4504). Like pi's prompt()
+      # queue branch, skill/prompt-template expansion applies before
+      # queueing (agent-session.ts:2005-2010); the builtin dispatch and
+      # the thinking gate do NOT run here (pi's handleFollowUp skips the
+      # if-chain) and neither does the !-bash intercept — the text queues
+      # verbatim (post-expansion). NO submit echo: the delivery arm echoes.
+      def submit_follow_up
+        text = @editor.input.dup.strip
+        return if text.empty?
+
+        return submit unless busy? # pi :4497-4504 — idle alt+enter = Enter
+
+        text = @commands.expand_skill(text) if @commands
+        @autocomplete.cancel
+        @editor.add_to_history(text)
+        @editor.clear
+        @editor.clear_undo_stack # the submit surface's discipline, mirrored
+        @editor.exit_history_browsing
+        @footer.invalidate_branch
+        follow_up_submitted_text(text)
+      end
+
+      # The shared busy-queue append (the surface mirror + the loop's
+      # queue). Compaction-time submits steer too (pi queueCompactionMessage
+      # routes non-extension text to a queue with showStatus —
+      # interactive-mode.ts:4763-4772; the port's inline compaction makes
+      # the separate surface compaction queue unnecessary — the
+      # post-compaction drain IS the loop's complete? arm), with pi's
+      # flash text.
+      def steer_submitted_text(text)
+        @mutex.synchronize { @queued[:steer] << text }
+        flash("Queued message for after compaction") if @compaction_reason
+        @agent.steer(text)
+        @kernel.request_draw
+      end
+
+      def follow_up_submitted_text(text)
+        @mutex.synchronize { @queued[:follow_up] << text }
+        flash("Queued message for after compaction") if @compaction_reason
+        @agent.follow_up(text)
+        @kernel.request_draw
+      end
+
+      # The queued-message delivery (I54 — pi agent-session.ts:1122-1134
+      # + interactive-mode.ts:3503-3507): the FIRST-index text match across
+      # the mirror (steer first, else follow_up) is removed and echoed AT
+      # DELIVERY. CALLER HOLDS @mutex (the on_agent_event sink).
+      def deliver_queued_message(message)
+        text = message.content
+        return unless text.is_a?(String)
+
+        %i[steer follow_up].each do |queue|
+          index = @queued[queue].index(text)
+          next unless index
+
+          @queued[queue].delete_at(index)
+          @transcript_state.enqueue_user_submission(text)
+          @kernel.request_draw
+          return
+        end
+      end
+
+      # app.message.dequeue (I54 — pi handleDequeue :4507-4514 +
+      # restoreQueuedMessagesToEditor :4743-4761): BOTH the surface mirror
+      # and the loop's queues clear (pi clearAllQueues); queued-then-current
+      # join with blank lines into the editor via {Editor#set_text}; NO
+      # abort (the abort-restore arm is pi's extension abortHandler — no
+      # extension seam, cut). pi's status texts.
+      def dequeue_queued_messages
+        steer_texts, follow_texts = @mutex.synchronize { [@queued[:steer], @queued[:follow_up]].map(&:dup) }
+        @agent.clear_queues
+        all = [*steer_texts, *follow_texts]
+        if all.empty?
+          flash("No queued messages to restore")
+          return
+        end
+
+        combined = [all.join("\n\n"), @editor.input].reject { |text| text.strip.empty? }.join("\n\n")
+        @editor.set_text(combined)
+        n = all.size
+        flash("Restored #{n} queued message#{n > 1 ? "s" : ""} to editor")
+        @mutex.synchronize do
+          @queued[:steer].clear
+          @queued[:follow_up].clear
+        end
+        @kernel.request_draw
       end
 
       # --- app.message.copy (pi handleCopyCommand :6637-6669) + its flash ---
@@ -1085,11 +1240,12 @@ module Tart
 
       # The transcript area's row budget — the page size and the mouse
       # mapping's viewport bound (pi chat-viewport geometry, shared with
-      # {build_widget}): the viewport minus the dock — spacer 1 + editor +
-      # footer (pi chat-viewport.ts:22-45, the widgets-above default
-      # Spacer(1); AC2).
+      # {build_widget}): the viewport minus the dock — spacer 1 + pending
+      # rows + editor + footer (pi chat-viewport.ts:22-45; I54 adds the
+      # pending block — pi's document-area shrink: the TRANSCRIPT yields,
+      # the editor/footer never move).
       def transcript_area_rows(height = screen_height)
-        [height - editor_area_rows(height) - FOOTER_ROWS - dock_spacer_rows(height), 1].max
+        [height - editor_area_rows(height) - FOOTER_ROWS - dock_spacer_rows(height) - pending_rows, 1].max
       end
 
       # --- mouse: wheel scroll + transcript selection (items 6/10, pi
@@ -1277,23 +1433,29 @@ module Tart
       # a transcript area on top (Min 1 — takes the rest), the bordered
       # editor area and the footer docked at the bottom (Length — pi's
       # shrink:1 fixed-height dock). All heights derive from the session's
-      # viewport every frame, so a resize recomposes cleanly.
+      # viewport every frame, so a resize recomposes cleanly. I54: the
+      # pending block (pi pendingMessagesContainer) sits between the dock
+      # spacer and the editor (createChatViewport :969-976 — document →
+      # pendingMessages → status → widgetsAbove → editor).
       def build_widget
         area = @session.viewport_area
         height = area ? area.height : 24
         editor_rows = editor_area_rows(height)
         transcript_rows = transcript_area_rows(height)
         spacer_rows = dock_spacer_rows(height)
+        pending = pending_rows
         TUI.layout(
           children: [
             transcript_widget(transcript_rows),
             dock_spacer_widget,
+            pending_widget(pending),
             picker_or_menu_widget || editor_widget,
             footer_widget,
           ],
           constraints: [
             TUI.constraint_min(transcript_rows),
             TUI.constraint_length(spacer_rows),
+            TUI.constraint_length(pending),
             TUI.constraint_length(editor_rows),
             TUI.constraint_length(FOOTER_ROWS),
           ]
@@ -1325,6 +1487,45 @@ module Tart
       # the editor (AC2).
       def dock_spacer_widget
         TUI.paragraph(text: [Panel.blank_line], wrap: false)
+      end
+
+      # The pending block's row count (pi updatePendingMessagesDisplay
+      # :4724-4740): 0 when both mirror arrays are empty (the widget drops
+      # out of the layout entirely); else the blank spacer row + one row
+      # per queued message + the dequeue hint row. Lock-free: the render
+      # frame holds @mutex, and the unlocked readbacks (the wheel/scroll
+      # math) tolerate a one-frame-stale count. Array size/each under MRI's
+      # GVL do not interleave with the mutators' single C-level ops.
+      def pending_rows
+        count = @queued[:steer].size + @queued[:follow_up].size
+        count.zero? ? 0 : 2 + count
+      end
+
+      # The pending rows (pi updatePendingMessagesDisplay + TruncatedText
+      # truncated-text.ts:7-40 — TruncatedText(text, 1, 0): ONE line,
+      # clipped, paddingX 1 each side): a blank row (pi Spacer(1)), one
+      # dim "Steering: <text>" row per steering message, one dim
+      # "Follow-up: <text>" row per follow-up, then the dim dequeue hint
+      # (pi's keyDisplayText("app.message.dequeue") = "Alt+Up" — the port
+      # has no keybinding registry, the string is the rendered constant).
+      def pending_widget(rows)
+        return TUI.paragraph(text: [], wrap: false) if rows.zero?
+
+        width = viewport_width
+        lines = [Panel.blank_line]
+        @queued[:steer].each { |text| lines << pending_row("Steering: ", text, width) }
+        @queued[:follow_up].each { |text| lines << pending_row("Follow-up: ", text, width) }
+        lines << pending_row("", "↳ Alt+Up to edit all queued messages", width)
+        TUI.paragraph(text: lines, wrap: false)
+      end
+
+      # One dim pending row: the text's FIRST line only, clipped to the
+      # viewport width minus 2, one leading space, right-padded to the
+      # width (pi TruncatedText's paddingX 1 discipline).
+      def pending_row(label, text, width)
+        body = Text.clip_text(text.to_s.lines(chomp: true).first.to_s, [width - 2, 0].max)
+        line = " #{label}#{body}"
+        TUI.line(line + " " * ([width - TUI.text_width(line), 0].max), fg: Theme[:dim])
       end
 
       # The transcript area: the scroll buffer's viewport — pi ScrollView

@@ -505,6 +505,26 @@ module Tart
         @undo_stack.clear
       end
 
+      # pi setText (editor.ts:1115-1126 + setTextInternal :494-496, default
+      # cursorPlacement "end") — the dequeue-restore's write surface (I54):
+      # exit history browsing, normalize newlines, push an undo snapshot
+      # WHEN the normalized content differs from the current, replace the
+      # content, cursor at the END. The autocomplete context is surface-
+      # side ({Autocomplete}); the editor seam clears the kill/yank window
+      # state per the port's discipline ({last_action} — the same reset
+      # every write op makes). No paste-registry interaction (the port has
+      # none). The render window re-clamps at the next render.
+      def set_text(text)
+        exit_history_browsing
+        @last_action = nil
+        normalized = self.class.normalize_text(text)
+        push_undo_snapshot unless normalized == input
+        @lines = normalized.empty? ? [""] : normalized.split("\n", -1)
+        @cursor_line = @lines.length - 1
+        set_cursor_col(@lines.last.length)
+        @scroll_offset = 0
+      end
+
       # --- history ---
 
       # pi's editor history (components/editor.ts addToHistory): trimmed,

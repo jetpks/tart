@@ -122,6 +122,14 @@ module TuiSplitRig
       boot = settle(session, "boot")
       alive = session_exists?(session)
       tmux("send-keys", "-t", session, @scenario.prompt, "Enter") if alive
+      # The scenario's mid-run keys (the s12/s13 instrument, I54): after
+      # the prompt, poll the mock's NON-DRAINING request_count until the
+      # after_request-th request has been SERVED (HARD_CAP-bounded — a dead
+      # pane or a timeout fails the app's completed), then send the tokens
+      # verbatim. The existing reply settle continues (default: today's
+      # behavior, byte-identical — the knob is nil for every pre-I54
+      # scenario).
+      alive &&= send_mid_run_keys(session, mock) if alive && @scenario.mid_run_keys
       reply = alive ? settle(session, "reply") : {ms: nil, timed_out: true}
       # The scenario's post-settle keys (the s9 instrument): each token
       # sent after the reply settles, then a re-settle, so the capture
@@ -446,6 +454,25 @@ module TuiSplitRig
     end
 
     # -- settle --
+
+    # The mid_run_keys knob's arm (I54): poll mock.request_count every
+    # POLL_INTERVAL until >= after_request (HARD_CAP-bounded; captured_
+    # request_logs semantics untouched — the drain stays at capture time),
+    # then send each key token. Returns false when the pane died or the
+    # wait timed out (the caller fails the app's completed); true when the
+    # keys were sent.
+    def send_mid_run_keys(session, mock)
+      cfg = @scenario.mid_run_keys
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      until mock.request_count >= cfg[:after_request]
+        return false unless session_exists?(session)
+        return false if Process.clock_gettime(Process::CLOCK_MONOTONIC) - started >= HARD_CAP
+
+        sleep POLL_INTERVAL
+      end
+      cfg[:keys].each { |key| tmux("send-keys", "-t", session, key) }
+      true
+    end
 
     def capture(session)
       # A dead pane/session is a legitimate mid-run state (we surface it in

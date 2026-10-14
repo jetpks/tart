@@ -1335,6 +1335,193 @@ module Tart
         "a message typed mid-run must steer the running agent"
     end
 
+    # --- I54: the busy-or-not submit cure, the queue display, and the
+    # followUp/dequeue keybinds (pi's letter). ---
+
+    # AC2: /thinking off while busy EXECUTES (the level changes on the
+    # surface AND the loop) and NOTHING queues — the command text is never
+    # handed to the steer queue and never reaches the model.
+    def test_thinking_command_while_busy_dispatches_and_queues_nothing
+      with_chat(width: 40) do |chat, session|
+        steered = []
+        chat.commands = Commands::Handler.new(
+          skills: [], settings: {}, output: ->(_text) {}, spawn: ->(&block) { block.call },
+          agent: -> { chat.agent }, reset: -> {}, quit: -> {},
+          thinking: ->(arg) { chat.set_thinking_level(arg) }
+        )
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:steer) { |text| steered << text }
+          a.define_singleton_method(:run) { |*| flunk "busy submit never runs" }
+          a.define_singleton_method(:set_thinking_level) { |level| @level = level }
+          a.define_singleton_method(:level) { @level }
+        end
+        chat.on_agent_event({type: :agent_start})
+        send_message(chat, "/thinking off")
+
+        assert_empty steered, "the command text is NEVER handed to the steer queue (the finding-4 cure)"
+        assert_empty kernel_runs(chat), "no run starts"
+        assert_equal "off", chat.agent.level, "the loop's session level changed"
+        assert_equal "off", chat.send(:thinking_level), "the surface's runtime level changed"
+        draw(chat, session)
+        assert chat.transcript_lines.join.include?("Thinking level: off"), "the dispatch's status rendered"
+        refute session.buffer_content.join.include?("Steering: "), "nothing queued"
+      end
+    end
+
+    # AC3: the queued rows render between the dock spacer and the editor —
+    # the blank row, the dim Steering row, the dim hint — and the
+    # transcript area yields the rows (the editor/footer never move); NO
+    # submit-time echo (the delivery echoes).
+    def test_queued_messages_render_rows_and_shrink_the_transcript_budget
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:steer) { |*| }
+          a.define_singleton_method(:run) { |*| }
+        end
+        chat.on_agent_event({type: :agent_start})
+        draw(chat, session)
+        editor_border_before = session.buffer_content.index { |row| row.include?("─" * 40) }
+
+        send_message(chat, "sort them by size")
+        draw(chat, session)
+
+        rows = session.buffer_content
+        refute chat.transcript_lines.any? { |row| row.include?("sort them by size") },
+          "NO submit-time echo for a busy submit (the delivery echoes, pi :3503-3507)"
+        steer_row = rows.index { |row| row.include?("Steering: sort them by size") }
+        refute_nil steer_row, "the dim Steering row renders"
+        assert rows[steer_row - 1].strip.empty?, "the blank spacer row precedes (pi Spacer(1))"
+        assert rows[steer_row + 1].include?("↳ Alt+Up to edit all queued messages"), "the dim dequeue hint follows"
+        # The geometry at 12 rows with ONE queued message (pending_rows =
+        # 3: blank + steering + hint): transcript 3 + dock spacer 1 +
+        # pending 3 → the pending block starts at row 4 and the editor's
+        # top border sits directly below the hint — THE EDITOR NEVER MOVES
+        # (the transcript yielded the 3 pending rows). The bottom border
+        # (always plain 40 dashes — the busy top border is status-titled)
+        # anchors the before/after comparison.
+        assert_equal 5, steer_row, "the pending block sits between the dock spacer and the editor"
+        assert rows[steer_row + 2].start_with?("─"), "the editor's top border sits directly below the hint"
+        assert_equal editor_border_before, steer_row + 4,
+          "the transcript budget shrank by exactly the pending rows — the editor/footer never move"
+      end
+    end
+
+    # AC3: alt+enter while busy queues a FOLLOW-UP (not a steer, never a
+    # newline); idle alt+enter submits exactly like plain Enter (pi
+    # :4497-4504).
+    def test_alt_enter_queues_follow_up_while_busy_and_submits_while_idle
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        follow_ups = []
+        runs = []
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:follow_up) { |text| follow_ups << text }
+          a.define_singleton_method(:steer) { |*| flunk "alt+enter queues a FOLLOW-UP, not a steer" }
+          a.define_singleton_method(:run) { |*args| runs << args.first }
+          a.define_singleton_method(:queued_messages?) { true }
+        end
+        chat.on_agent_event({type: :agent_start})
+        "one more".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter", modifiers: ["alt"]))
+
+        assert_equal ["one more"], follow_ups, "busy alt+enter queues via follow_up"
+        assert_equal "", chat.input, "the editor cleared"
+        draw(chat, session)
+        assert session.buffer_content.any? { |row| row.include?("Follow-up: one more") }, "the dim Follow-up row renders"
+
+        chat.on_agent_event({type: :agent_end, interrupted: false, messages: []})
+        drain_runs(chat) # the wind-down continuation (the mirror still holds "one more")
+        "again".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter", modifiers: ["alt"]))
+        assert_equal "", chat.input, "idle alt+enter submitted"
+        drain_runs(chat) # the idle submit's own run block
+        assert_equal "again", runs.last, "idle alt+enter submits through the idle run path (pi :4497-4504)"
+      end
+    end
+
+    # AC3: alt+up restores queued-then-current joined with blank lines via
+    # Editor#set_text, clears BOTH the mirror and the loop queues, NEVER
+    # aborts, and flashes pi's status texts (handleDequeue :4507-4514).
+    def test_alt_up_restores_queued_messages_to_the_editor
+      with_chat(width: 40, screen_height: 16) do |chat, session|
+        cleared = 0
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:clear_queues) { cleared += 1 }
+          a.define_singleton_method(:steer) { |*| }
+          a.define_singleton_method(:follow_up) { |*| }
+          a.define_singleton_method(:run) { |*| }
+          a.define_singleton_method(:queued_messages?) { true }
+        end
+        chat.on_agent_event({type: :agent_start})
+        finish_message(chat, "progress") # transcript content: the flash composites at its row 0
+        send_message(chat, "first wish")
+        "second wish".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter", modifiers: ["alt"]))
+        draw(chat, session)
+        assert session.buffer_content.any? { |row| row.include?("Follow-up: second wish") }
+        chat.on_agent_event({type: :agent_end, interrupted: false, messages: []})
+        drain_runs(chat) # the wind-down
+
+        chat.on_event(TUI.key_event("up", modifiers: ["alt"]))
+        assert_equal "first wish\n\nsecond wish", chat.input,
+          "queued-then-current joined with blank lines into the editor (set_text)"
+        assert_equal 1, cleared, "the loop queues cleared too (pi clearAllQueues)"
+        # NO abort: the IdleKernel has no interrupt_work! — an abort attempt
+        # would have raised NoMethodError; dequeue just restores (pi
+        # handleDequeue passes no abort).
+        draw(chat, session)
+        assert session.buffer_content.join.include?("Restored 2 queued messages to editor"), "pi's restore status text"
+
+        chat.on_event(TUI.key_event("up", modifiers: ["alt"]))
+        draw(chat, session)
+        assert session.buffer_content.join.include?("No queued messages to restore"), "the empty case's status text"
+      end
+    end
+
+    # AC3: the delivery — a user-role :message_start whose text is queued
+    # removes the row and echoes AT DELIVERY (pi agent-session.ts
+    # :1122-1134 + interactive-mode.ts:3503-3507).
+    def test_queued_message_delivery_removes_the_row_and_echoes_at_delivery
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:steer) { |*| }
+          a.define_singleton_method(:run) { |*| }
+        end
+        chat.on_agent_event({type: :agent_start})
+        send_message(chat, "mid-flight wish")
+        draw(chat, session)
+        assert session.buffer_content.any? { |row| row.include?("Steering: mid-flight wish") }
+        refute chat.transcript_lines.any? { |row| row.include?("mid-flight wish") }, "no echo at submit"
+
+        chat.on_agent_event({type: :message_start, message: MessageDouble.new(:user, "mid-flight wish")})
+        draw(chat, session)
+        refute session.buffer_content.any? { |row| row.include?("Steering: mid-flight wish") }, "the mirror row removed at delivery"
+        assert chat.transcript_lines.any? { |row| row.include?("mid-flight wish") }, "the user echo renders AT DELIVERY"
+      end
+    end
+
+    # AC2: a submit during compaction steers (delivered after compaction at
+    # the next drain point) with pi's "Queued message for after compaction"
+    # feedback (queueCompactionMessage's showStatus).
+    def test_compaction_submit_steers_with_the_after_compaction_flash
+      with_chat(width: 40, screen_height: 12) do |chat, session|
+        steered = []
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:steer) { |text| steered << text }
+          a.define_singleton_method(:run) { |*| }
+        end
+        chat.on_agent_event({type: :agent_start})
+        finish_message(chat, "progress") # transcript content: the flash composites at its row 0
+        draw(chat, session)
+        chat.on_agent_event({type: :compaction_start, reason: :threshold})
+        send_message(chat, "hold on")
+
+        assert_equal ["hold on"], steered, "the compaction-time submit routes to the steer queue"
+        draw(chat, session)
+        assert session.buffer_content.join.include?("Queued message for after compaction"),
+          "pi queueCompactionMessage's showStatus text flashes"
+      end
+    end
+
     def test_kernel_interrupt_during_streaming_cancels_and_leaves_render_coherent
       @server = MockLLMServer.new.start
       @server.script([{type: :slow_stream, content: "x" * 40}])
@@ -1396,12 +1583,15 @@ module Tart
     end
 
     # Records agent.run calls (the idle branch wraps the run in a kernel
-    # task — IdleKernel captures the block; the test runs it).
+    # task — IdleKernel captures the block; the test runs it). I54 re-pin:
+    # the surface's busy-submit collaborator is {Agent::Loop#steer} (the
+    # push_message alias remains on the loop for callers, but the SURFACE
+    # calls the pi-named seam).
     def with_recording_agent(chat)
       runs = []
       agent = Object.new.tap do |a|
         a.define_singleton_method(:run) { |text| runs << text }
-        a.define_singleton_method(:push_message) { |text| runs << [:steer, text] }
+        a.define_singleton_method(:steer) { |text| runs << [:steer, text] }
       end
       chat.agent = agent
       runs
@@ -1883,28 +2073,61 @@ module Tart
       end
     end
 
-    def test_slash_text_while_running_steers_like_any_message
-      @server = MockLLMServer.new.start
-      @server.script([
-        {type: :slow_stream, content: "first answer"},
-        {type: :message, content: "second answer"},
-      ])
-      kernel, chat, session = chat_with_server
-      with_commands_handler(chat)
+    # I54: the I13-era deviation pin ("slash text mid-turn steers instead
+    # of dispatching") is REPLACED by the pi letter — builtins dispatch
+    # busy-or-not, and /compact + /new take the abort-first arm. The two
+    # defers pins below carry the behavior; the generic dispatch-while-busy
+    # cure is test_thinking_command_while_busy_dispatches_and_queues_nothing.
+    # (The InterruptKernel double lives next to RecordingKernel, below —
+    # IdleKernel must be defined first.)
 
-      scenario = Thread.new do
-        type(session, "first")
-        wait_until { chat.busy? }
-        type(session, "/compact")
-        wait_until { captured.size >= 2 }
-        kernel.stop!
+    def test_compact_while_busy_defers_the_dispatch_to_agent_end
+      with_chat(width: 40, kernel: InterruptKernel.new) do |chat, session, kernel|
+        outputs = with_commands_handler(chat)
+        runs = []
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:run) { |*| runs << :run }
+          a.define_singleton_method(:steer) { |*| flunk "the command must never queue" }
+          a.define_singleton_method(:compact) { true }
+          a.define_singleton_method(:queued_messages?) { false }
+        end
+        chat.on_agent_event({type: :agent_start})
+        send_message(chat, "/compact")
+
+        assert_equal 1, kernel.interrupted, "the abort-first arm interrupts the in-flight run (pi session.compact aborts first)"
+        assert_empty outputs, "nothing dispatches while busy"
+        assert_empty kernel_runs(chat), "no run started"
+
+        chat.on_agent_event({type: :agent_end, interrupted: true, messages: []})
+        drain_runs(chat)
+        assert outputs.last.to_s.include?("context compacted"),
+          "the deferred dispatch ran the EXACT idle compact path at :agent_end"
+        assert_empty runs, "the wind-down continuation is SKIPPED for the deferred agent_end (pi :2762-2763)"
       end
-      kernel.run
-      scenario.join
+    end
 
-      request = captured.last
-      assert_equal "/compact", request["messages"].select { |m| m["role"] == "user" }.last["content"],
-        "the reduced deviation: slash text mid-turn steers instead of dispatching"
+    def test_new_while_busy_defers_the_reset_to_agent_end
+      with_chat(width: 40, kernel: InterruptKernel.new) do |chat, session, kernel|
+        resets = 0
+        chat.commands = Commands::Handler.new(
+          skills: [], settings: {}, output: ->(_text) {}, spawn: ->(&block) { block.call },
+          agent: -> { chat.agent }, reset: -> { resets += 1 }, quit: -> {}
+        )
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:run) { |*| flunk "no run" }
+          a.define_singleton_method(:steer) { |*| flunk "the command must never queue" }
+          a.define_singleton_method(:queued_messages?) { false }
+        end
+        chat.on_agent_event({type: :agent_start})
+        send_message(chat, "/new")
+
+        assert_equal 1, kernel.interrupted, "the abort-first arm interrupts the in-flight run (the runtime's newSession aborts first)"
+        assert_equal 0, resets, "nothing dispatches while busy"
+
+        chat.on_agent_event({type: :agent_end, interrupted: true, messages: []})
+        drain_runs(chat)
+        assert_equal 1, resets, "the deferred dispatch ran the idle reset lambda"
+      end
     end
 
     # --- markdown seam (I06/AC5): assistant completions render through the
@@ -2973,7 +3196,7 @@ module Tart
       with_chat(width: 60) do |chat, session|
         chat.agent = Object.new.tap do |a|
           a.define_singleton_method(:record_bash_execution) { |m| recorder.append_bash_execution(m) }
-          a.define_singleton_method(:push_message) { |*| raise "not reached" }
+          a.define_singleton_method(:steer) { |*| raise "not reached" }
         end
         send_message(chat, "! echo hi")
         drain_runs(chat)
@@ -4108,19 +4331,26 @@ module Tart
         "  a".each_char { |char| chat.on_event(TUI.key_event(char)) }
         chat.on_event(TUI.key_event("enter", modifiers: ["shift"]))
         assert_equal "  a\n", chat.input, "shift+enter inserts a newline (tui.input.newLine)"
-        chat.on_event(TUI.key_event("enter", modifiers: ["alt"]))
-        assert_equal "  a\n\n", chat.input, "alt+enter is pi's terminal fallback"
         chat.on_event(TUI.key_event("j", modifiers: ["ctrl"]))
-        assert_equal "  a\n\n\n", chat.input, "ctrl+j inserts a newline (keybindings.ts:143)"
+        assert_equal "  a\n\n", chat.input, "ctrl+j inserts a newline (keybindings.ts:143)"
         "b  ".each_char { |char| chat.on_event(TUI.key_event(char)) }
         chat.on_event(TUI.key_event("enter"))
         assert_equal "", chat.input, "plain enter submits"
+        # I54 RE-PIN: alt+enter is no longer the terminal-fallback newline —
+        # it is app.message.followUp, and IDLE alt+enter submits exactly
+        # like plain Enter (pi interactive-mode.ts:4497-4504).
+        "c".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter", modifiers: ["alt"]))
+        assert_equal "", chat.input, "idle alt+enter submits (pi :4497-4504 — no newline, no queue)"
         draw(chat, session)
         lines = chat.transcript_lines
         assert_includes lines, " a", "the echo carried the joined text (leading-trimmed)"
         assert_includes lines, " b", "...and the trailing spaces are gone (pi submitValue trims)"
+        assert_includes lines, " c", "the idle alt+enter submit echoed like any submit"
         chat.on_event(TUI.key_event("up")) # empty editor: straight into history
-        assert_equal "a\n\n\nb", chat.input,
+        assert_equal "c", chat.input, "the most recent entry recalls first"
+        chat.on_event(TUI.key_event("up"))
+        assert_equal "a\n\nb", chat.input,
           "submit sent the JOINED TRIMMED text — the interior blanks survive the trim (pi submitValue)"
       end
     end
@@ -5300,6 +5530,22 @@ module Tart
       def animate(duration:)
         @animate_calls << duration
         nil
+      end
+    end
+
+    # The busy-command pins' kernel double (I54): IdleKernel plus the
+    # interrupt seam the escape path uses — the abort-first arm records
+    # through it.
+    class InterruptKernel < IdleKernel
+      attr_reader :interrupted
+
+      def initialize
+        super
+        @interrupted = 0
+      end
+
+      def interrupt_work!
+        @interrupted += 1
       end
     end
   end

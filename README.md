@@ -294,7 +294,9 @@ compaction, autocomplete unchanged):
 | Alt+D or Alt+Delete | delete one word forward (the newline at a line end) |
 | Ctrl+U / Ctrl+K | kill to the logical line's start / end (the newline at a boundary merges the lines) |
 | Ctrl+Y / Alt+Y | yank / yank-pop (multi-line ring text splices across lines) |
-| Shift+Enter or Alt+Enter, Ctrl+J | insert a newline |
+| Shift+Enter, Ctrl+J | insert a newline |
+| Alt+Enter | queue a follow-up message (submits when idle) |
+| Alt+Up | restore queued messages to the editor |
 | Enter | send (a `\\` before the cursor becomes a newline instead; steers a running agent) |
 | PageUp / PageDown | page the editor's visual rows (sticky column, clamped) |
 
