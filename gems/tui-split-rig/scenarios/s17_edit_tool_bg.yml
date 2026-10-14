@@ -1,0 +1,44 @@
+# S17 — edit tool bg (I57): the mock scripts write → edit (the single-line
+# bravo→charlie replacement) → edit-ERROR (the no-match arm) → a fixed final
+# reply. Four mock requests per app. `replay: true` re-boots each app on its
+# recorded session after the live turn — the replay captures render the edit
+# family from the recorded details side channel.
+#
+# The edit block (header + diff + intra-line inverse + the result bg) is the
+# I57 surface; the write stage uses the existing mock vocabulary — no staging
+# knob. The calib-1 8-line content is the frozen Grounds §1 file.
+name: s17_edit_tool_bg
+prompt: "write then edit the file"
+expected_requests: 4
+replay: true
+responses:
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_s17_1
+        name: write
+        arguments:
+          path: "edit-bg.txt"
+          content: "alpha line one\nline two bravo\nline three\nline four\nline five\nline six\nline seven\nline eight"
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_s17_2
+        name: edit
+        arguments:
+          path: "edit-bg.txt"
+          edits:
+            - oldText: "line two bravo"
+              newText: "line two charlie (edited)"
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_s17_3
+        name: edit
+        arguments:
+          path: "edit-bg.txt"
+          edits:
+            - oldText: "NO SUCH LINE ANYWHERE"
+              newText: "irrelevant"
+  - type: stream
+    content: "Done; fixed final reply for the edit-bg scenario."

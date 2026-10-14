@@ -6,7 +6,10 @@ module Tart
     # ToolCall-shape preserved): the hooks, the ToolGate, the batch
     # executor, and the tests all construct it. +arguments+ keeps the
     # parsed Hash the provider sent (insertion order — the replay bytes).
-    ToolCall = Struct.new(:id, :name, :arguments, keyword_init: true)
+    # +details+ (I57, nil default) is the per-call display side channel the
+    # edit tool fills at execution (pi's EditToolDetails riding the result
+    # object) — never on the wire, never recorded on non-edit calls.
+    ToolCall = Struct.new(:id, :name, :arguments, :details, keyword_init: true)
 
     # The recorded token counts duck (the replaced client's Tokens reader
     # surface the footer/compaction math consumes). Unreported counts are
@@ -40,7 +43,7 @@ module Tart
       FINISH_REASONS = {stop: "stop", length: "length", tool_use: "tool_calls"}.freeze
 
       attr_reader :role, :content, :tool_calls, :tool_call_id, :thinking, :tokens,
-                  :finish_reason, :provider, :model
+                  :finish_reason, :provider, :model, :details
 
       # @param role [Symbol] one of {ROLES}.
       # @param content [String, nil] the text (assistant nil = tool-calls-only).
@@ -53,9 +56,14 @@ module Tart
       #   usage (assistant turns; nil = unreported).
       # @param finish_reason [String, Symbol, nil] the stop reason — a
       #   recorded String spelling or a gem symbol (normalized on read).
+      # @param details [Hash, nil] the tool result's display side channel
+      #   (I57 — pi session-manager records it on the toolResult message;
+      #   NEVER sent to the LLM — the context projection drops the key and
+      #   the wire conversion reads content only). Nil on every non-edit
+      #   result: the recorded byte-shape gains no key.
       def initialize(role:, content: nil, tool_calls: {}, tool_call_id: nil,
                      thinking: nil, thinking_signature: nil, tokens: nil,
-                     finish_reason: nil, provider: nil, model: nil)
+                     finish_reason: nil, provider: nil, model: nil, details: nil)
         unless ROLES.include?(role)
           raise ArgumentError, "role must be one of #{ROLES.inspect}, got #{role.inspect}"
         end
@@ -69,6 +77,7 @@ module Tart
         @finish_reason = normalize_finish_reason(finish_reason)
         @provider = provider
         @model = model
+        @details = details
         freeze
       end
 
@@ -78,7 +87,9 @@ module Tart
 
       def self.system(content) = new(role: :system, content: content)
 
-      def self.tool(tool_call_id:, content:) = new(role: :tool, tool_call_id: tool_call_id, content: content)
+      def self.tool(tool_call_id:, content:, details: nil)
+        new(role: :tool, tool_call_id: tool_call_id, content: content, details: details)
+      end
 
       # The recorded-hash projection — the recorder's bytes (the empirical
       # shape, Grounds D5). Key order is the recorded serializer's own
@@ -86,7 +97,7 @@ module Tart
       def to_h
         case role
         when :assistant then assistant_to_h
-        when :tool then {role: "tool", content:, tool_call_id:}
+        when :tool then tool_to_h
         else {role: role.to_s, content:}
         end
       end
@@ -133,6 +144,15 @@ module Tart
       def tool_call? = role == :assistant && !tool_calls.empty?
 
       private
+
+      # The tool entry: the frozen three-key shape {role, content,
+      # tool_call_id}; +details+ appends ONLY when present (I57 — the edit
+      # tool's display diff; every existing recorded byte is unchanged).
+      def tool_to_h
+        out = {role: "tool", content:, tool_call_id:}
+        out[:details] = details if details
+        out
+      end
 
       # The assistant entry: the frozen no-tool-calls pin is
       # {"role","content","tool_calls"=>{},"finish_reason","input_tokens",

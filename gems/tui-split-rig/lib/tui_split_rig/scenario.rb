@@ -71,6 +71,18 @@ module TuiSplitRig
 #                              # resize-window — resize-PANE does not move a
 #                              # manual-size session). The SIGWINCH instrument
 #                              # (s16). Default: none (today's behavior).
+#   replay: true               # optional (I57): AFTER the completed turn and
+#                              # the primary teardown, re-boot the app on its
+#                              # RECORDED session (pi `--continue`; tart the
+#                              # `-r` flag APPENDED AFTER the workdir
+#                              # positional — OptionParser's optional [ID]
+#                              # placeholder greedily eats a following token)
+#                              # under the same staged home/sandbox, settle,
+#                              # and capture <app>.replay.capture{,.styled}.
+#                              # NO prompt is sent and no requests are
+#                              # expected; `completed` is computed BEFORE the
+#                              # replay leg and untouched by it. Default:
+#                              # false (the no-knob path byte-frozen).
 #   env:                       # optional per-app env overrides (the
   #     tart:                    # runner layers them over its staged
   #       TART_IDENTITY: tart    # env — the branding/staging seam)
@@ -83,7 +95,7 @@ module TuiSplitRig
 
     attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage,
                 :post_settle_keys, :mid_run_keys, :stage_project_resources, :stage_memory, :paste, :submit,
-                :resize
+                :resize, :replay
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -118,6 +130,7 @@ module TuiSplitRig
       @paste = parse_paste(data)
       @submit = parse_submit(data)
       @resize = parse_resize(data)
+      @replay = parse_replay(data)
       @env = parse_env(data)
       @context_window = parse_context_window(data)
       @suppress_usage = parse_suppress_usage(data)
@@ -170,6 +183,17 @@ module TuiSplitRig
       unless raw.is_a?(Array) && raw.length == 2 && raw.all? { |value| value.is_a?(Integer) && value.positive? }
         raise Error, "#{@path}: resize must be a [width, height] pair of positive integers"
       end
+
+      raw
+    end
+
+    # The replay knob (the s17 instrument, I57): a boolean or absent →
+    # false. Validated at load like the other knobs — the I55 discipline.
+    def parse_replay(data)
+      raw = data["replay"]
+      return false if raw.nil?
+
+      raise Error, "#{@path}: replay must be a boolean" unless raw == true || raw == false
 
       raw
     end

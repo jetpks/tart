@@ -201,7 +201,14 @@ module Tart
 
         return bash_execution_context_message(envelope) if envelope.role == "bashExecution"
 
-        Shapes::ContextMessage.new(envelope.message)
+        message = envelope.message
+        # pi session-manager.ts:153 — the toolResult `details` are
+        # display-only and "not sent to LLM": the context projection drops
+        # the key for tool messages (defense in depth on top of
+        # from_seed_hash's declared-fields read — a `details` key is inert
+        # there; here it is GONE). I57 P3.
+        message = message.except("details") if envelope.role == "tool" && message.key?("details")
+        Shapes::ContextMessage.new(message)
       end
 
       # pi convertToLlm's bashExecution case (messages.ts:149-160): the

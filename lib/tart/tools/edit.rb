@@ -61,8 +61,20 @@ module Tart
       # The agent loop normalizes arguments before execution (pi: agent-loop
       # prepareToolCallArguments); the port does it in #call, which the
       # executor invokes for every model-issued call.
+      #
+      # pi's renderCall carries the call's EditToolDetails on the tool
+      # result object (edit.ts:210); the port rides the per-call ToolCall
+      # side channel (I57 P3 — never the wire String, which is
+      # byte-unchanged). camelCase values, pi's EditToolDetails names
+      # (edit.ts:70-76), from the values execute already computed — and
+      # only on success (an error result carries no details).
       def call(tool_call: nil, **arguments)
-        super(tool_call:, **self.class.normalize_arguments(arguments))
+        result = super(tool_call:, **self.class.normalize_arguments(arguments))
+        if tool_call && @details
+          tool_call.details = {diff: @details[:diff], patch: @details[:patch],
+                               firstChangedLine: @details[:first_changed_line]}
+        end
+        result
       end
 
       # Port of pi's prepareEditArguments.
@@ -101,6 +113,10 @@ module Tart
 
       # @return [String] pi's success text, or {error:} on failure.
       def execute(path:, edits:)
+        # The per-call reset: +@details+ carries the LAST success otherwise
+        # (the tool instance is shared across calls), and an error result
+        # must ride no details (pi's error toolResults carry none).
+        @details = nil
         safe_execute do
           failure = validate_input(path:, edits:)
           return failure if failure

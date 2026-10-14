@@ -212,6 +212,47 @@ module TuiSplitRig
       assert_raises(Error) { Scenario.load("/nonexistent/scenario.yml") }
     end
 
+    # The replay knob (I57, s17): absent → false (the no-knob path
+    # byte-frozen), true parses; anything non-boolean is a rig error.
+    def test_replay_knob_defaults_to_false_and_parses_true
+      plain = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(plain, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert_equal false, Scenario.load(plain).replay, "absent by default — the no-knob path is byte-frozen"
+
+      enabled = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(enabled, "name: s\nprompt: p\nexpected_requests: 1\nreplay: true\nresponses:\n  - type: stream\n    content: x\n")
+      assert_equal true, Scenario.load(enabled).replay
+    end
+
+    def test_replay_knob_rejects_non_boolean
+      bad_shapes = [
+        "replay: 1\n",
+        "replay: \"true\"\n",
+        "replay: nil\n",
+        "replay: [true]\n",
+      ]
+      bad_shapes.each do |replay_line|
+        path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+        File.write(path, "name: s\nprompt: p\nexpected_requests: 1\n#{replay_line}responses:\n  - type: stream\n    content: x\n")
+        error = assert_raises(Error) { Scenario.load(path) }
+        assert_match(/replay must be a boolean/, error.message)
+      end
+    end
+
+    # The shipped s17 instrument: write → edit → edit-error → reply with
+    # the replay leg armed — the edit-family bg surface's parity scenario.
+    def test_replay_knob_loads_the_shipped_s17_edit_tool_bg_scenario
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s17_edit_tool_bg.yml"))
+      assert_equal "s17_edit_tool_bg", scenario.name
+      assert_equal true, scenario.replay
+      assert_equal 4, scenario.expected_requests
+      assert_equal 4, scenario.responses.size
+      assert_equal "write", scenario.responses[0][:tool_calls][0][:name]
+      assert_equal "edit", scenario.responses[1][:tool_calls][0][:name]
+      assert_equal "edit", scenario.responses[2][:tool_calls][0][:name]
+      assert_equal "line two bravo", scenario.responses[1][:tool_calls][0][:arguments][:edits][0][:oldText]
+    end
+
     # The context-window lever shrinks BOTH apps consistently: pi's staged
     # models.json + zeroed compaction knobs, tart's TART_CONTEXT_WINDOW env
     # + the same zeroed knobs in the staged HOME's settings.json (I26).
