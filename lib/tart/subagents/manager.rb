@@ -60,7 +60,12 @@ module Tart
       FLEET_EMPTY_LINE = "No active subagent fleet. Background runs that already finished are available " \
                          "through completion notifications or subagent({ action: \"status\", id: \"...\" }).".freeze
 
-      attr_reader :cwd, :home, :identity
+      attr_reader :cwd, :home, :identity, :root
+      # The parent-side supervisor channel (I49): register() constructs and
+      # arms it; #shutdown stops it; the `subagent` tool's reply/pending
+      # actions read it (a bare Manager — tests — carries nil, and the
+      # tool answers the empty-state texts).
+      attr_accessor :supervisor_channel
 
       # @param cwd [String] the children's working directory (the parent's).
       # @param home [String] the runs root ({Subagents.home}).
@@ -77,15 +82,21 @@ module Tart
       #   backstop thread (default true). Tests disarm it to prove the
       #   child self-deadline alone enforces (T2 both-sides; PHASE 0: an
       #   additive defaulted kwarg beside the frozen §2.7 surface).
-      def initialize(cwd:, home:, env:, identity:, hooks:, kernel: nil, agent: nil, arm_deadline_supervisor: true)
+      # @param root [String] the agent root for the I49 profile tier's
+      #   user scan (`<root>/agents/**/*.md`; Profiles). Additive defaulted
+      #   kwarg — default {Agent::Session.default_root}.
+      def initialize(cwd:, home:, env:, identity:, hooks:, kernel: nil, agent: nil, arm_deadline_supervisor: true,
+                     root: Agent::Session.default_root)
         @cwd = File.expand_path(cwd)
         @home = home
         @env = env
         @identity = identity
+        @root = root
         @hooks = hooks
         @kernel = kernel
         @agent = agent
         @arm_deadline_supervisor = arm_deadline_supervisor
+        @supervisor_channel = nil
         @mutex = Mutex.new
         @runs = []
         @supervisors = []
@@ -101,11 +112,23 @@ module Tart
       # settled state.
       def spawn_run(agent:, task:, async:, model: nil, timeout_ms: nil, tool_timeout_ms: nil,
                     tool_call_id: nil, parent_session: nil)
-        spec = BUILTIN_AGENTS[agent.to_s]
-        raise ArgumentError, unknown_agent_message(agent) unless spec
+        # I49: the merged table (builtins < user < project profiles),
+        # resolved fresh from disk EVERY spawn (no cache); raises the
+        # unknown-agent ArgumentError (the retired unknown_agent_message's
+        # shape lives in Profiles.resolve now).
+        spec = Profiles.resolve(agent.to_s, cwd: @cwd, root: @root, env: @env)
 
+        # The model tier (I49 Spec §3b): call `model:` > the profile's
+        # `model:` > the parent's current pair — the profile rides the
+        # SAME resolve_model path (`provider/id[:level]`).
+        source = model || spec[:model]
         provider, model_id, level =
-          model ? Subagents.resolve_model(model, catalog: nil, fallback: parent_model_pair) : parent_model_pair
+          source ? Subagents.resolve_model(source, catalog: nil, fallback: parent_model_pair) : parent_model_pair
+        # I49 D5: every gate-on child gets the intercom bridge —
+        # contact_supervisor appended to its tools and the instruction
+        # appended to its prompt (pi applyIntercomBridgeToAgent, mode
+        # "always"; never mutates the resolved spec).
+        spec = Supervisor.apply_bridge(spec)
         # pi's implicit-fork fallback (tool-reference.md "Fork context
         # details"): a :fork agent with no parent session available runs
         # fresh — no preamble, no --resume.
@@ -119,6 +142,8 @@ module Tart
         FileUtils.mkdir_p([dir,
                            File.join(dir, "control", "steer-requests"),
                            File.join(dir, "control", "stop-requests"),
+                           File.join(dir, "control", "supervisor-requests"),
+                           File.join(dir, "control", "supervisor-replies"),
                            File.join(dir, "sessions")])
         File.write(File.join(dir, "system-prompt.md"), spec[:system_prompt])
 
@@ -277,7 +302,8 @@ module Tart
       end
 
       # Test teardown: stop every running run (the full graceful ladder),
-      # then join the watcher + supervisor threads.
+      # then join the watcher + supervisor threads; the I49 supervisor
+      # channel stops LAST (its terminal sweep sees the settled runs).
       def shutdown
         @mutex.synchronize { @shutdown = true }
         ids = @mutex.synchronize { @runs.select { |record| record[:state] == :running }.map { |record| record[:id] } }
@@ -292,6 +318,11 @@ module Tart
         watcher&.join(POLL_INTERVAL * 8)
         threads = @mutex.synchronize { supervisors = @supervisors; @supervisors = []; supervisors }
         threads.each { |thread| thread.join(1) rescue nil }
+        begin
+          @supervisor_channel&.stop
+        rescue StandardError
+          nil
+        end
         nil
       end
 
@@ -346,6 +377,12 @@ module Tart
         # Print.run arms sleep(remaining) → TERM on its own pgroup.
         env[key.("RUN_DEADLINE_MS")] = (run[:started_at] + run[:timeout_ms]).to_s if run[:timeout_ms]
         env[key.("SUBAGENTS_HOME")] = @home
+        # I49 — the intercom channel (Spec §3d): the run-dir control dir +
+        # the agent label for the surfaced ask. UNCONDITIONAL: the run-dir
+        # mkdir always creates the channel dirs, so the child's tool is
+        # never inert in a real child.
+        env[key.("SUPERVISOR_CHANNEL")] = File.join(run[:dir], "control")
+        env[key.("SUBAGENTS_AGENT")] = run[:agent]
         env
       end
 
@@ -368,10 +405,6 @@ module Tart
       def parent_model_pair
         key = ->(suffix) { Identity.env_key(@identity, suffix) }
         [@env[key.("PROVIDER")], @env[key.("MODEL")], @env[key.("THINKING_LEVEL")]]
-      end
-
-      def unknown_agent_message(agent)
-        "unknown agent #{agent.inspect}. Built-in agents: #{BUILTIN_AGENTS.keys.sort.join(", ")}."
       end
 
       def normalize_deadline(value)

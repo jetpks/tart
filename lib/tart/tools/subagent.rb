@@ -25,10 +25,14 @@ module Tart
       pi_name "subagent"
 
       DESCRIPTION = "Delegate work to a subagent. Built-in agents: worker (implementation), oracle " \
-        "(high-context decision consistency, runs from a fork of this conversation), reviewer (read-only review). " \
+        "(high-context decision consistency, runs from a fork of this conversation), reviewer (read-only review); " \
+        "custom agents load from ~/.tart/agents/**/*.md and <cwd>/.tart/agents/**/*.md (YAML frontmatter over a " \
+        "system-prompt body). " \
         "Pass agent + task to delegate — by default the run detaches and returns immediately; completion arrives " \
         "as a native notification (async: false blocks until the child finishes and returns its output). " \
         "Manage runs with action: \"status\" (+ optional id), action: \"steer\" (id + message), action: \"stop\" (id). " \
+        "Supervisor intercom: action: \"pending\" re-reads the children's open supervisor asks; action: \"reply\" " \
+        "(reply_to + message) answers one by its request id. " \
         "Set timeout_ms (run deadline, default 30 min, 0 = unbounded) and tool_timeout_ms (per-tool-call deadline) " \
         "explicitly for long-running children."
 
@@ -45,10 +49,12 @@ module Tart
                                                            "(default 1800000; 0 = unbounded)"},
           "tool_timeout_ms" => {type: "integer", description: "Per-tool-call hard deadline in milliseconds " \
                                                                 "(default: unset)"},
-          "action" => {type: "string", description: "Management action: status, steer, or stop",
-                        "enum" => %w[status steer stop]},
+          "action" => {type: "string", description: "Management action: status, steer, stop, or the " \
+                                                     "supervisor intercom's reply/pending",
+                        "enum" => %w[status steer stop reply pending]},
           "id" => {type: "string", description: "Run id (status/steer/stop)"},
-          "message" => {type: "string", description: "Steering text (steer)"},
+          "reply_to" => {type: "string", description: "The pending supervisor request id being answered (reply)"},
+          "message" => {type: "string", description: "Steering text (steer) or the supervisor reply text (reply)"},
           "mode" => {type: "string", description: "Steer mode: steer (deliver into the running turn), " \
                                                     "follow_up (queue for later), auto (default)", "enum" => %w[steer follow_up auto]}
         }
@@ -66,10 +72,11 @@ module Tart
 
       # The dispatch (Specification §3): agent+task (no action) → spawn
       # with `async` defaulting TRUE (pi's default-on); action status /
-      # steer / stop; every other combination → the safe-next-steps
-      # error naming the status action.
+      # steer / stop; the supervisor intercom's reply / pending (I49);
+      # every other combination → the safe-next-steps error naming the
+      # actions.
       def execute(agent: nil, task: nil, async: nil, model: nil, timeout_ms: nil, tool_timeout_ms: nil,
-                  action: nil, id: nil, message: nil, mode: nil)
+                  action: nil, id: nil, reply_to: nil, message: nil, mode: nil)
         safe_execute do
           case action
           when nil, ""
@@ -95,6 +102,16 @@ module Tart
             return safe_next_steps if present(id).nil?
 
             next @manager.stop(id: id.to_s)
+          when "reply"
+            return safe_next_steps if present(reply_to).nil? || present(message).nil?
+
+            # No channel (a Manager built without register — tests) means
+            # provably nothing is pending: the state error IS the T1 text.
+            channel = @manager.supervisor_channel
+            next channel&.reply(reply_to: reply_to.to_s, message: message.to_s) ||
+                 {error: "No pending supervisor request found for reply_to '#{reply_to}'."}
+          when "pending"
+            next @manager.supervisor_channel&.pending_text || "No pending supervisor requests."
           else
             safe_next_steps
           end
@@ -131,11 +148,13 @@ module Tart
       end
 
       # The safe-next-steps error (pi's shape names the management
-      # actions; the port names status — Specification §3).
+      # actions; the port names status + the intercom actions).
       def safe_next_steps
         {error: "Unknown subagent call. Delegate with agent + task (async defaults to true), or manage runs: " \
                 'subagent({ action: "status" }) for the fleet, subagent({ action: "status", id: "..." }) ' \
-                'for one run, action "steer" with id + message, action "stop" with id.'}
+                'for one run, action "steer" with id + message, action "stop" with id, ' \
+                'action "pending" for the children\'s open supervisor asks, or action "reply" with reply_to + message ' \
+                'to answer one.'}
       end
 
       def present(value)

@@ -7,13 +7,15 @@ require_relative "schemas/settings"
 require_relative "schemas/models"
 require_relative "schemas/mcp"
 require_relative "schemas/tools"
+require_relative "schemas/subagents"
 
 module Tart
   # The I43 parsing-boundary schema family (program ENTRY 1, the
   # pattern-setter): one member module per boundary — {Schemas::Settings}
   # (resolution contracts + the carried-key typed view), {Schemas::Models}
   # (models.json), {Schemas::Mcp} (mcp.json), {Schemas::Tools} (the seven
-  # built-in tools' input contracts).
+  # built-in tools' input contracts), {Schemas::Subagents} (the I49 agent
+  # profile frontmatter contract).
   #
   # The error discipline every later dry-rb iteration copies: contracts
   # validate SHAPE (semantic floors and precedence arithmetic stay in the
