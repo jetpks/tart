@@ -4375,6 +4375,93 @@ module Tart
       end
     end
 
+    # --- the paste registry through the surface (I55). Name filter
+    # /paste_marker/ is the AC gate contract (D8): submit expands — the
+    # marker is display-only; the raw readers stay raw (pi :4753). ---
+
+    # A 12-line block (> 10 lines — the line-form marker); the exact
+    # calibrated bytes are the rig's pin (s14/s15), any 12 lines pin here.
+    def paste_block
+      (1..12).map { |i| "line #{i}" }.join("\n")
+    end
+
+    def test_paste_marker_idle_submit_delivers_the_expanded_text_everywhere
+      with_chat(width: 40) do |chat, session|
+        runs = []
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:run) { |*args| runs << args.first }
+        end
+        chat.on_event(TUI.paste_event(paste_block))
+        editor = chat.instance_variable_get(:@editor)
+        assert_equal "[paste #1 +12 lines]", chat.input, "ONLY the marker in the editor"
+
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal "", chat.input, "the editor cleared"
+        drain_runs(chat)
+        assert_equal [paste_block], runs, "the agent run received the EXPANDED text"
+        assert_equal [paste_block], editor.instance_variable_get(:@history), "history holds the expanded text"
+
+        draw(chat, session)
+        lines = chat.transcript_lines
+        assert lines.any? { |row| row.include?("line 1") }, "the echo opens with the expanded text…"
+        assert lines.any? { |row| row.include?("line 12") }, "…and carries it all"
+        refute lines.join.include?("[paste #"), "the marker string never echoes"
+      end
+    end
+
+    def test_paste_marker_busy_enter_steers_the_expanded_text
+      with_chat(width: 40) do |chat|
+        steered = []
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:steer) { |text| steered << text }
+          a.define_singleton_method(:run) { |*| flunk "busy submit never runs" }
+        end
+        chat.on_agent_event({type: :agent_start})
+        chat.on_event(TUI.paste_event(paste_block))
+        chat.on_event(TUI.key_event("enter"))
+        assert_equal [paste_block], steered, "the steer queue gets the EXPANDED text (pi submitValue expands first)"
+        assert_equal "", chat.input
+      end
+    end
+
+    def test_paste_marker_busy_alt_enter_queues_the_expanded_follow_up
+      with_chat(width: 40) do |chat|
+        follow_ups = []
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:follow_up) { |text| follow_ups << text }
+          a.define_singleton_method(:steer) { |*| flunk "alt+enter queues a FOLLOW-UP, not a steer" }
+          a.define_singleton_method(:run) { |*| }
+        end
+        chat.on_agent_event({type: :agent_start})
+        chat.on_event(TUI.paste_event(paste_block))
+        chat.on_event(TUI.key_event("enter", modifiers: ["alt"]))
+        assert_equal [paste_block], follow_ups, "the follow-up queue gets the EXPANDED text (pi :4476)"
+        assert_equal "", chat.input
+      end
+    end
+
+    def test_paste_marker_dequeue_restore_joins_the_raw_marker_text_with_the_registry_cleared
+      with_chat(width: 40, screen_height: 16) do |chat|
+        chat.agent = Object.new.tap do |a|
+          a.define_singleton_method(:clear_queues) { }
+          a.define_singleton_method(:steer) { |*| }
+          a.define_singleton_method(:follow_up) { |*| }
+          a.define_singleton_method(:run) { |*| }
+          a.define_singleton_method(:queued_messages?) { true }
+        end
+        chat.on_agent_event({type: :agent_start})
+        send_message(chat, "first wish") # steers: the queue holds one text
+        chat.on_event(TUI.paste_event(paste_block)) # a LIVE marker in the editor
+        chat.on_event(TUI.key_event("up", modifiers: ["alt"]))
+        assert_equal "first wish\n\n[paste #1 +12 lines]", chat.input,
+          "the RAW editor text joins (pi restoreQueuedMessagesToEditor :4753 reads getText — no expansion)"
+        editor = chat.instance_variable_get(:@editor)
+        assert_empty editor.pastes, "set_text cleared the registry: the marker is dead literal text"
+        assert_equal 0, editor.paste_counter
+        assert_equal chat.input, editor.expanded_text, "nothing left to expand"
+      end
+    end
+
     def test_multi_line_history_recall_edits_and_submits_as_text
       TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 12) do |session|
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: false)

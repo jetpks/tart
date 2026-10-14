@@ -36,6 +36,18 @@ module TuiSplitRig
 #                              # send the keys and let the reply settle —
 #                              # the mid-run submit instrument (s12/s13).
 #                              # Default: none (today's behavior).
+#   paste: |-                  # optional (I55): the text sent as a bracketed
+#     line one                 # paste BEFORE the prompt (tmux load-buffer +
+#                              # paste-buffer -p — the app sees ONE Paste
+#                              # event, exactly like a terminal paste).
+#   submit: false              # optional (I55, default TRUE): gates the
+#                              # Enter after the prompt — false is the
+#                              # paste-only display flows (s14). With paste
+#                              # unset and submit true (every pre-existing
+#                              # scenario) the runner sends EXACTLY today's
+#                              # single `tmux send-keys <prompt> Enter` call;
+#                              # expected_requests accepts 0 for the
+#                              # paste-only flows (negative still rejected).
 #   stage_project_resources: true  # optional: write the loaded-resource set
 #                              # into BOTH apps' run sandbox — AGENTS.md at
 #                              # the cwd, one project skill, one user skill
@@ -64,7 +76,7 @@ module TuiSplitRig
     APPS = %w[pi tart].freeze
 
     attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage,
-                :post_settle_keys, :mid_run_keys, :stage_project_resources, :stage_memory
+                :post_settle_keys, :mid_run_keys, :stage_project_resources, :stage_memory, :paste, :submit
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -82,8 +94,10 @@ module TuiSplitRig
       @name = require_field(data, "name")
       @prompt = require_field(data, "prompt")
       @expected_requests = require_field(data, "expected_requests")
-      unless @expected_requests.is_a?(Integer) && @expected_requests.positive?
-        raise Error, "#{path}: expected_requests must be a positive integer"
+      # Non-negative (I55): a paste-only display flow makes ZERO requests
+      # (s14). Negative stays a rig error.
+      unless @expected_requests.is_a?(Integer) && @expected_requests >= 0
+        raise Error, "#{path}: expected_requests must be a non-negative integer"
       end
 
       responses = require_field(data, "responses")
@@ -94,6 +108,8 @@ module TuiSplitRig
         symbolized[:type] = symbolized[:type].to_s.to_sym if symbolized.is_a?(Hash) && symbolized[:type]
         symbolized
       end
+      @paste = parse_paste(data)
+      @submit = parse_submit(data)
       @env = parse_env(data)
       @context_window = parse_context_window(data)
       @suppress_usage = parse_suppress_usage(data)
@@ -110,6 +126,28 @@ module TuiSplitRig
       return nil if raw.nil?
 
       raise Error, "#{@path}: context_window must be a positive integer" unless raw.is_a?(Integer) && raw.positive?
+
+      raw
+    end
+
+    # The paste knob (the s14/s15 instrument, I55): a String or absent →
+    # nil. Validated at load like the existing knobs.
+    def parse_paste(data)
+      raw = data["paste"]
+      return nil if raw.nil?
+
+      raise Error, "#{@path}: paste must be a string" unless raw.is_a?(String)
+
+      raw
+    end
+
+    # The submit knob (I55): gates the Enter after the prompt — false is
+    # the paste-only display flows (s14). Default TRUE: today's behavior.
+    def parse_submit(data)
+      raw = data["submit"]
+      return true if raw.nil?
+
+      raise Error, "#{@path}: submit must be a boolean" unless raw == true || raw == false
 
       raw
     end

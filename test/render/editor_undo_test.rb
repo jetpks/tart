@@ -306,6 +306,60 @@ module Tart
       assert_equal "", editor.input, "pi submitValue :1373 — after submit, undo is a no-op"
     end
 
+    # --- the registry rides the snapshot (I55, pi :2116-2134). Name
+    # filter /marker/ is the AC gate contract (D8). ---
+
+    def test_marker_delete_then_undo_restores_text_and_registry
+      editor = Render::Editor.new
+      content = (1..11).map { |i| "a#{i}" }.join("\n")
+      editor.insert_paste(content) # [paste #1 +11 lines], cursor at its end
+      editor.delete_backward # the marker arm: whole span + registry drop
+      assert_equal "", editor.input
+      assert_empty editor.pastes
+      editor.undo
+      assert_equal "[paste #1 +11 lines]", editor.input, "the marker text restores"
+      assert_equal content, editor.pastes[1], "the registry restores with the state triple (pi :2130-2131)"
+      assert_equal 1, editor.paste_counter
+      assert_equal content, editor.expanded_text, "the round-trip is byte-exact"
+    end
+
+    def test_paste_over_marker_is_one_undo_unit
+      editor = Render::Editor.new
+      content = (1..11).map { |i| "a#{i}" }.join("\n")
+      editor.insert_paste(content)
+      editor.insert_paste(content) # the paste-over arm + the new marker
+      editor.undo
+      assert_equal "[paste #1 +11 lines]", editor.input, "ONE undo restores the marker"
+      assert_equal content, editor.pastes[1], "the registry restores — the owner arm is part of the ONE paste unit"
+      assert_equal 1, editor.paste_counter
+    end
+
+    def test_set_text_clears_the_marker_registry_and_undo_restores_it
+      editor = Render::Editor.new
+      content = (1..11).map { |i| "a#{i}" }.join("\n")
+      editor.insert_paste(content)
+      editor.set_text("fresh")
+      assert_equal "fresh", editor.input
+      assert_empty editor.pastes, "pi setText :1124-1125 — the registry clears"
+      assert_equal 0, editor.paste_counter
+      assert_equal "fresh", editor.expanded_text
+      editor.undo
+      assert_equal "[paste #1 +11 lines]", editor.input, "the clear was ONE undo away"
+      assert_equal content, editor.pastes[1], "the snapshot carried the OLD registry (the push precedes the clear)"
+    end
+
+    def test_paste_marker_clear_also_clears_the_registry_and_undo_restores
+      editor = Render::Editor.new
+      content = (1..11).map { |i| "a#{i}" }.join("\n")
+      editor.insert_paste(content)
+      editor.clear # the clearEditor → setText("") realization
+      assert_empty editor.pastes
+      assert_equal 0, editor.paste_counter
+      editor.undo
+      assert_equal "[paste #1 +11 lines]", editor.input
+      assert_equal content, editor.pastes[1], "the clear is undoable WITH the registry"
+    end
+
     private
 
     def editor_with(text)

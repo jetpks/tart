@@ -121,7 +121,26 @@ module TuiSplitRig
 
       boot = settle(session, "boot")
       alive = session_exists?(session)
-      tmux("send-keys", "-t", session, @scenario.prompt, "Enter") if alive
+      if alive && @scenario.paste
+        # The paste knob (I55, s14/s15): the text rides a token-scoped tmux
+        # buffer; paste-buffer -p wraps it in the bracketed-paste pair the
+        # apps enable (live-calibrated — Grounds §4.1), so the app sees ONE
+        # Paste event, exactly like a terminal paste. Then the prompt only
+        # when non-empty; Enter only when submit (paste-only display flows
+        # never submit).
+        paste_path = File.join(stage, "#{app}-paste.txt")
+        File.write(paste_path, @scenario.paste)
+        buffer = "tui-split-rig-#{@token}-paste"
+        tmux("load-buffer", "-b", buffer, paste_path)
+        tmux("paste-buffer", "-b", buffer, "-p", "-t", session)
+        tmux("delete-buffer", "-b", buffer)
+        tmux("send-keys", "-t", session, @scenario.prompt) unless @scenario.prompt.empty?
+        tmux("send-keys", "-t", session, "Enter") if @scenario.submit
+      elsif alive
+        # The no-knob path is byte-frozen (I55 Spec D6): today's ONE call,
+        # unsplit and unreordered — the s1–s10 battery is its regression net.
+        tmux("send-keys", "-t", session, @scenario.prompt, "Enter")
+      end
       # The scenario's mid-run keys (the s12/s13 instrument, I54): after
       # the prompt, poll the mock's NON-DRAINING request_count until the
       # after_request-th request has been SERVED (HARD_CAP-bounded — a dead
