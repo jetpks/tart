@@ -39,7 +39,9 @@ module Tart
       assert_kind_of Fast::Completions::BadRequestError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
       assert_kind_of Fast::Completions::BadRequestError, end_event[:error]
-      assert_equal %i[user], agent.new_messages.map(&:role)
+      # I60 D6 (the declared re-pin): the failure now leaves pi's trace —
+      # the synthesized failure assistant rides new_messages beside the user.
+      assert_equal %i[user assistant], agent.new_messages.map(&:role)
     end
 
     def test_context_length_error_classifies_with_compaction_disabled

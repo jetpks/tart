@@ -258,6 +258,11 @@ module Tart
         @live_region_cache = nil
         @busy = false
         @tool = nil
+        # The failure row's double-render guard (I60 D3): set by the
+        # :message_end error-row arm, cleared at :agent_start — the
+        # agent_end error arm skips its scrollback line when the failure's
+        # own row already rendered.
+        @error_row_rendered = false
         # The queued-message surface mirror (I54 — pi's _steeringMessages/
         # _followUpMessages, agent-session.ts:2238-2263): appended by the
         # busy submit/follow-up paths, rendered between the dock spacer and
@@ -496,6 +501,10 @@ module Tart
           case event[:type]
           when :agent_start
             @busy = true
+            # The failure row's double-render guard resets per run (D3 —
+            # set by the :message_end error-row arm; the agent_end error
+            # arm reads it).
+            @error_row_rendered = false
             # pi turn_start creates the working indicator (interactive-mode.ts
             # :3427-3433) — the Loader's frame-0 reset.
             restart_spinner!
@@ -541,6 +550,21 @@ module Tart
               # base — same row order, buffer reset with the completion).
               @transcript_state.enqueue_message(handled, reasoning: @reasoning)
               @reasoning = +""
+              if message.respond_to?(:finish_reason) && message.finish_reason == "error"
+                # pi assistant-message.ts:184-198 — the failure component's
+                # row: Spacer(1), then "Error: <errorMessage>" in error fg
+                # (after any partial content), outputPad-led and wrapped.
+                # The flag arms the agent_end error arm's skip (pi's
+                # agent_end renders no error text — the component owns the
+                # row; without the guard the failure would double-render).
+                # The respond_to? guard is the footer's usage-read idiom:
+                # every real loop event carries the Message reader; reader-
+                # less display doubles (render_perf's Msg) stay inert.
+                @error_row_rendered = true
+                @transcript_state.enqueue_region([Panel.blank_line,
+                  *Panel.padded_fg_rows("Error: #{message.error_message}", viewport_width,
+                    fg: Theme[:error])])
+              end
             end
           when :tool_execution_start
             @tool = event[:tool_call].name
@@ -620,10 +644,18 @@ module Tart
               handled = "interrupted"
               @transcript_state.enqueue_scrollback(handled, fg: Theme[:warning])
             elsif event[:error]
-              # pi's error arm: the same loop with the error's message.
+              # pi's error arm: the same loop with the error's message. The
+              # flag-set case (the failure message's own message_end already
+              # rendered the pad-led error row — D3) SKIPS the scrollback
+              # line: pi's agent_end renders no error text (the component
+              # owns the row). The flag-UNSET case (a failure with no
+              # synthesized message_end) renders today's line byte-
+              # identically. The finalize stays in BOTH (defense).
               @transcript_state.finalize_pending_as_error(event[:error].message.to_s)
-              handled = "error: #{event[:error].message}"
-              @transcript_state.enqueue_scrollback(handled, fg: Theme[:error])
+              unless @error_row_rendered
+                handled = "error: #{event[:error].message}"
+                @transcript_state.enqueue_scrollback(handled, fg: Theme[:error])
+              end
             end
             # A message submitted in the wind-down window (after the agent's
             # final steering check, before agent_end) sits queued with no run

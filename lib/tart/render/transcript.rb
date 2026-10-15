@@ -714,7 +714,15 @@ module Tart
         reasoning = message["thinking"]
         has_reasoning = reasoning.is_a?(String) && !reasoning.empty?
         tool_calls = message["tool_calls"].is_a?(Hash) ? message["tool_calls"] : {}
-        return unless has_content || has_reasoning || tool_calls.any?
+        # The failure row's readback (I60 D4 — pi assistant-message.ts
+        # :184-198's guard): a recorded finish_reason "error" with a
+        # non-empty error_message String. Pre-I60 files (no error_message
+        # key — and no "error" finish_reason) read has_error false: the
+        # old guard, byte-identical renders.
+        error_message = message["error_message"]
+        has_error = message["finish_reason"] == "error" && error_message.is_a?(String) &&
+                    !error_message.empty?
+        return unless has_content || has_reasoning || tool_calls.any? || has_error
 
         @reseed_sink.call(message) if update_footer
         # pi assistant-message.ts:103-105 — the spacer rides VISIBLE
@@ -726,6 +734,15 @@ module Tart
           @scrollback << [Panel.blank_line] if has_content # pi :172-174
         end
         enqueue_markdown(content) if has_content
+        if has_error
+          # pi :184-198 — the same component serves live AND replay (the
+          # resume renders through renderSessionEntries): Spacer(1), then
+          # the pad-led wrapped error-fg row AFTER any partial content —
+          # the same region shape the live :message_end arm enqueues (D3).
+          @scrollback << [Panel.blank_line,
+                          *Panel.padded_fg_rows("Error: #{error_message}", viewport_width,
+                            fg: Theme[:error])]
+        end
         tool_calls.each_value do |call|
           next unless call.is_a?(Hash) && call["name"].is_a?(String)
 

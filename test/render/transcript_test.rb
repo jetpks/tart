@@ -260,6 +260,71 @@ module Tart
         refute_includes bgs, Theme[:tool_pending_bg], "zero pending-bg spans on the replay path"
       end
 
+      # --- I60 error_transcript: the failure row on replay (D4) --------------
+
+      # AC2: a recorded failure entry renders the pad-led error-fg row AFTER
+      # its content — the same region shape the live arm enqueues (pi :184-198,
+      # the one component serving live AND replay).
+      def test_error_transcript_replays_a_failure_row_after_its_content
+        entries = [
+          {"type" => "message", "message" => {"role" => "user", "content" => "hello"}},
+          {"type" => "message", "message" => {"role" => "assistant", "content" => "partial words",
+                                              "tool_calls" => {}, "finish_reason" => "error",
+                                              "error_message" => "400: boom detail"}},
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        texts_after_user = texts.drop_while { |row| !row.include?("hello") }
+        assert_includes texts_after_user.join, "partial words", "the content row renders first"
+        content_index = texts_after_user.index { |row| row.include?("partial words") }
+        error_index = texts_after_user.index { |row| row.include?("Error: 400: boom detail") }
+        refute_nil content_index
+        assert_operator error_index, :>, content_index, "the error row renders AFTER its content"
+        error_rows = texts_after_user.grep(/Error: 400: boom detail/)
+        assert_equal 1, error_rows.size, "exactly ONE error row"
+        assert error_rows[0].start_with?(" "), "pad-led"
+        error_line = @transcript.lines.find { |line| line.spans.map(&:content).join.include?("Error: 400: boom detail") }
+        assert_equal Theme[:error], error_line.spans.map { |span| span.style&.fg }.compact.first,
+          "the row rides the error fg"
+      end
+
+      # AC2: the s18 shape — an EMPTY-content failure entry (the pre-stream
+      # synthesis) renders the row alone; the leading spacer gate stays shut
+      # (no visible content preceded, pi :103-105).
+      def test_error_transcript_replays_the_empty_content_failure_row_alone
+        entries = [
+          {"type" => "message", "message" => {"role" => "user", "content" => "hello"}},
+          {"type" => "message", "message" => {"role" => "assistant", "content" => "",
+                                              "tool_calls" => {}, "finish_reason" => "error",
+                                              "error_message" => "400: boom"}},
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        texts_after_user = texts.drop_while { |row| !row.include?("hello") }
+        error_rows = texts_after_user.grep(/Error: 400: boom/)
+        assert_equal 1, error_rows.size, "the row renders with no content above it"
+      end
+
+      # AC2: pre-I60 files — a finish_reason "error" WITHOUT the
+      # error_message key (and every keyless plain assistant) reads
+      # has_error false: the old guard, byte-identical renders.
+      def test_error_transcript_pre_i60_files_render_byte_identically
+        entries = [
+          {"type" => "message", "message" => {"role" => "user", "content" => "hello"}},
+          {"type" => "message", "message" => {"role" => "assistant", "content" => "done",
+                                              "tool_calls" => {}, "finish_reason" => "stop"}},
+          {"type" => "message", "message" => {"role" => "assistant", "content" => "",
+                                              "tool_calls" => {}, "finish_reason" => "error"}},
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        refute texts.join.include?("Error: "), "no error row without the error_message key"
+        assert_includes texts.join, "done", "the plain assistant unchanged"
+      end
+
       # --- I56: the resize-live rebuild ---
 
       # rebuild_live_expandables re-invokes ONLY the resize_live-flagged

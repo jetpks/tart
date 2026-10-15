@@ -511,19 +511,40 @@ module Tart
       # a context-overflow step failure compacts and retries the turn once;
       # the second consecutive overflow surfaces as the error
       # (_overflowRecoveryAttempted, :3040). The latch resets on a clean
-      # assistant response (:1168-1171). The chat never appends a failed
-      # response to its history (the request raises before any append), so
-      # the overflowing attempt is already omitted. False here lets
+      # assistant response (:1168-1171). False here lets
       # stopped_on_error? surface it.
       def recover_overflow?
         return false unless @last_error.is_a?(Fast::Completions::ContextLengthExceededError)
         return false if @overflow_recovery_attempted
 
         @overflow_recovery_attempted = true
+        # pi _omitRecoveryAttempt (:3039-3043, :1237): the failed attempt is
+        # PERSISTENTLY OMITTED from the context before the recovery
+        # compaction — the synthesized failure message rides no retry
+        # request (the in-session context mirrors pi's POST-OMISSION shape;
+        # pi holds it as _failedResponse and surfaces it if the recovery
+        # fails — here agent_end[:error]). The message itself stays recorded
+        # and in new_messages: the omission is the context projection, not
+        # the trace.
+        omit_recovery_attempt
         return false unless run_compaction(reason: :overflow)
 
         @last_error = nil
         true
+      end
+
+      # The overflow-retry context projection (pi _omitRecoveryAttempt,
+      # agent-session.ts:1237): the just-synthesized failure message leaves
+      # the CHAT history (the wire context) before the recovery compaction.
+      # Without it the empty failure assistant would trail the history —
+      # the Chat's complete? gate reads a trailing tool-call-less assistant
+      # as a finished turn and the retry would silently no-op. The public
+      # messages= setter, the same seam run_compaction's rebuild uses.
+      def omit_recovery_attempt
+        message = @last_message
+        return unless message&.role == :assistant && message.finish_reason == "error"
+
+        @chat.messages = @chat.messages.reject { |candidate| candidate.equal?(message) }
       end
 
       # pi _checkCompaction Case 3 (agent-session.ts:3050-3090): after a
@@ -665,7 +686,22 @@ module Tart
       def step_on_reactor
         @last_message = nil
         @stream_started = false
-        message = @chat.step { |chunk| handle_item({type: :chunk, chunk:}) }
+        # The step's streamed chunks accumulate here (the SAME chunks the
+        # block hands handle_item): a terminal failure synthesizes them into
+        # the failure message (pi's stream encodes failures in the final
+        # assistant, content = whatever blocks streamed, none pre-stream).
+        # Reset per step — step-local in effect; the frozen one-arg
+        # record_terminal_error/synthesize_failure_message seam reads them
+        # from the loop object (the stream runs inline on THIS reactor
+        # fiber — no cross-fiber writes).
+        @step_streamed_text = +""
+        @step_streamed_thinking = +""
+        message = @chat.step do |chunk|
+          @step_streamed_text << chunk.content if chunk.content.is_a?(String) && !chunk.content.empty?
+          thinking = chunk.thinking&.text
+          @step_streamed_thinking << thinking if thinking.is_a?(String) && !thinking.empty?
+          handle_item({type: :chunk, chunk:})
+        end
         handle_item({type: :step, message:}) if message
         @last_message
       rescue Async::Cancel
@@ -690,11 +726,43 @@ module Tart
       # The error terminal's recording (the arm that used to sit behind the
       # terminal-Hash check): the payload becomes @last_error — the loop's
       # existing error branches (stopped_on_error?, recover_overflow?)
-      # classify it by class.
+      # classify it by class. The with-assistant-message arm (a batch
+      # executor raised after the assistant recorded) is frozen byte-identical;
+      # the no-message arm (pre-stream or mid-stream API failure — the step
+      # never completed) synthesizes pi's failure message (D2).
       def record_terminal_error(error)
         @last_error = error
         message = @last_message
-        emit(type: :message_end, message:, error: true) if message&.role == :assistant
+        if message&.role == :assistant
+          emit(type: :message_end, message:, error: true) # frozen arm, byte-identical
+        else
+          synthesize_failure_message(error) # D2's new arm
+        end
+      end
+
+      # The pi-shaped failure trace (pi agent.ts:532-548 handleRunFailure +
+      # agent-loop.ts:443-468): an API failure that killed the step still
+      # leaves pi's trace — the failure assistant message rides the NORMAL
+      # machinery: message_start ONLY when no stream ever started (a
+      # mid-stream failure already had its message_start from the first
+      # chunk), then handle_item's :step-arm bookkeeping — @last_message,
+      # @new_messages, message_end, record, and @chat.add_message (pi
+      # pushes the failure message into agent state AND the loop context at
+      # message_end — the in-session retry's context mirrors pi; the
+      # gem's empty-assistant wire-skip keeps the seed wire-neutral).
+      # Deliberately NOT handle_item itself: the :step arm resets the
+      # overflow-recovery latch on assistant messages, and pi's reset is
+      # clean-response-only (agent-session.ts:1168-1171) — a synthesis
+      # during the overflow arm must not defeat the latch.
+      def synthesize_failure_message(error)
+        message = Message.error_failure(error_message: error.message,
+          content: @step_streamed_text, thinking: @step_streamed_thinking)
+        emit(type: :message_start, message:) unless @stream_started
+        @last_message = message
+        @new_messages << message
+        emit(type: :message_end, message:)
+        record(message)
+        @chat.add_message(message)
       end
 
       def stopped_on_error?

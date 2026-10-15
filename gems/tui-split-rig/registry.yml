@@ -67,3 +67,17 @@ classes:
   # divergence on those rows still surfaces.
   - name: staged-path-wrap-fragment
     pattern: '^\s*\S+\.md$'
+  # The error row's message TAIL (I60 s18): each app's frozen provider-error
+  # formatting on the SAME row shape (pad-led, error fg, "Error: <status>:
+  # …"). pi keeps the raw JSON body via the OpenAI SDK message ("400: {json}");
+  # the port's frozen gem formats "400: <error.message>" (fast-completions
+  # Specification §8, api_message). The gem's §8 formatting is the ORACLE
+  # boundary — reproduce, never modify — so the tails stay sanctioned.
+  - name: error-transcript-row-tail
+    pattern: 'Error: \d{3}: '
+  # pi's /bug hint row (I60 s18): "If this looks like a pi bug, /bug sends a
+  # report to the developers." (interactive-mode.ts suggestBugReport, fired
+  # once per session for non-retryable errors). The port cuts the /bug
+  # machinery — rendering a hint for a nonexistent command would lie (OQ-1).
+  - name: pi-bug-report-hint
+    pattern: 'If this looks like a pi bug'
