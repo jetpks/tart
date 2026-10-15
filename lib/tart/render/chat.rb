@@ -51,13 +51,12 @@ module Tart
 
       # pi loader.ts:17 DEFAULT_INTERVAL_MS — the spinner's frame dwell: the
       # glyph advances on TIME, never on renders ({spinner_glyph} derives
-      # the frame from the monotonic clock at each already-animated frame).
+      # the frame from the monotonic clock at each rendered frame). Since
+      # I58 this interval also PACES the renders: the busy spinner tick
+      # ({arm_spinner_tick}) requests one draw every dwell — pi's own
+      # cadence (the Loader interval advances the frame, then
+      # updateDisplay calls requestRender, loader.ts:82-99).
       SPINNER_INTERVAL_SECONDS = 0.08
-
-      # How long one draw re-arms the animation window while the agent works
-      # (frame pacing: deadline-paced at the frame rate while busy, purely
-      # event-driven when idle — the I02 static-loop property).
-      BUSY_FRAME_SECONDS = 0.25
 
       # Rows the footer always occupies (pi renders a pwd line + a stats
       # line — footer.ts:169-171).
@@ -246,6 +245,17 @@ module Tart
         # normalization happens at the request seam — Agent::Loop's
         # before_request hook; the message itself keeps its thinking).
         @reasoning = +""
+        # The streaming region's conversion cache (I58 D2):
+        # {[width, live bytes, reasoning bytes] => rows} from
+        # {assistant_live_lines} — the per-frame whole-text markdown/
+        # reasoning re-conversion was 95-97% of heavy-frame render CPU
+        # (Grounds §2). Cleared at every @live/@reasoning RESET site:
+        # within one message generation deltas only append (the bytesize
+        # key is monotone), so the reset clearing is what makes size-keyed
+        # invalidation exact — without it, a later message colliding on a
+        # cached size at the same width would serve the previous message's
+        # rows (AC2's reset-cycle exactness pins this).
+        @live_region_cache = nil
         @busy = false
         @tool = nil
         # The queued-message surface mirror (I54 — pi's _steeringMessages/
@@ -328,7 +338,7 @@ module Tart
       end
 
       # @return [Boolean] whether a user-bash run's live rows are on
-      #   screen (the animate gate's second arm — @busy stays false: a
+      #   screen (the spinner tick's second arm — @busy stays false: a
       #   bash run never lights the border's Working status).
       def user_bash_streaming?
         @mutex.synchronize { !@user_bash_stream.nil? }
@@ -428,12 +438,15 @@ module Tart
           # from the session area again.
           @resize_dims = nil
         end
-        # Keep frames deadline-paced while the agent works (spinner, live
-        # region) OR a user-bash run streams (the bash loader's glyph must
-        # advance between chunks — pi's Loader ticks requestRender on its
-        # own 80 ms interval, loader.ts:79-84); idle goes event-driven
-        # again on agent_end / stream end.
-        @kernel.animate(duration: BUSY_FRAME_SECONDS) if busy? || user_bash_streaming?
+        # I58 — pi's render discipline (tui.ts requestRender/scheduleRender):
+        # nothing renders at a fixed rate here anymore. State changes —
+        # agent events (the sink's tail request_draw), user-bash chunks
+        # (the I38 sinks), user input (the kernel's per-event dirty mark),
+        # the ~80 ms spinner tick ({arm_spinner_tick}) — each request
+        # exactly one paint; with nothing pending the loop blocks on the
+        # event queue (the I02 static-loop property). The retired
+        # re-arm rendered 60 frames/s where pi renders on request ≈ 22/s
+        # on the identical stream (Grounds §2 — the burn).
         widget
       end
 
@@ -486,6 +499,7 @@ module Tart
             # pi turn_start creates the working indicator (interactive-mode.ts
             # :3427-3433) — the Loader's frame-0 reset.
             restart_spinner!
+            arm_spinner_tick
             @footer.invalidate_branch # per-turn branch invalidation (pi's provider cache, reduced)
           when :message_start
             message = event[:message]
@@ -507,6 +521,7 @@ module Tart
               deliver_queued_message(message) if message.respond_to?(:role) && message.role == :user
               @live = +""
               @reasoning = +""
+              @live_region_cache = nil # the reset invalidates (I58, §live_region_cache)
             end
           when :message_update
             chunk = event[:chunk]
@@ -589,6 +604,10 @@ module Tart
           when :agent_end
             @busy = false
             @compaction_reason = nil
+            # The tick cancels with the run (I58) — unless a user-bash
+            # stream keeps it alive. Direct ivar read: this arm HOLDS the
+            # surface mutex (user_bash_streaming? would re-synchronize).
+            cancel_spinner_tick unless @user_bash_stream
             # The deferred bashExecution records flush at agent end (pi's
             # _pendingBashMessages flush) — never mid-tool-sequence.
             @user_bash.flush_pending
@@ -624,7 +643,13 @@ module Tart
             end
           end
         end
-        @kernel.animate(duration: BUSY_FRAME_SECONDS)
+        # I58 — the tick discipline: this sink's tail requests ONE paint
+        # per event (the delta arm paints on arrival; the retired tail
+        # re-opened a 0.25 s animation window here on EVERY event — half
+        # the burn). request_draw is the user-bash chunk sink's in-tree
+        # precedent (reactor-context legal; this sink runs on the agent
+        # fiber of the reactor).
+        @kernel.request_draw
       end
 
       # The /new surface (bin/tart's reset seam): pi handleClearCommand →
@@ -710,6 +735,7 @@ module Tart
       # (nil when nothing to show).
       def complete(text)
         @live = +""
+        @live_region_cache = nil # the reset invalidates (I58, §live_region_cache)
         return nil if !text.is_a?(String) || text.empty?
 
         text
@@ -807,6 +833,7 @@ module Tart
         @selection_state.reset
         @live = +""
         @reasoning = +""
+        @live_region_cache = nil # the reset invalidates (I58, §live_region_cache)
       end
 
       def viewport_width
@@ -1752,9 +1779,10 @@ module Tart
         # frames[floor((t − anchor)/interval) mod n] whatever the render
         # cadence: pi's setInterval advances the frame on TIME (+
         # requestRender); the port derives the same frame from the
-        # monotonic clock at each already-animated frame (the
-        # BUSY_FRAME_SECONDS cadence is unchanged) — no timer task. nil
-        # anchor → frame 0 (pi setIndicator resets currentFrame).
+        # monotonic clock at each rendered frame (since I58 the renders
+        # themselves ride the spinner tick — {arm_spinner_tick} — the
+        # cadence is pi's 12.5 Hz). nil anchor → frame 0 (pi setIndicator
+        # resets currentFrame).
         return SPINNER.first unless anchor
 
         elapsed = @clock.call - anchor
@@ -1776,6 +1804,31 @@ module Tart
       # the next working indicator restarts).
       def restart_spinner!
         @spinner_started_at = @clock.call
+      end
+
+      # The busy spinner tick (I58 — pi's Loader owns its cadence,
+      # loader.ts:82-99): one repeating ~80 ms reactor task requesting a
+      # draw for as long as a run is in flight or a user-bash stream
+      # renders — the retired burn (a 60 Hz animation window re-armed per
+      # frame/event) is pi's 12.5 Hz here. The glyph stays time-derived
+      # ({spinner_frame}); the tick only paces the paints. Idempotent (a
+      # live tick is kept — :compaction_start re-anchors the glyph, not
+      # the pacer). Reactor context only (the sinks that arm run on the
+      # reactor; Loop#tick spawns a reactor task). Loop teardown stops the
+      # task with the rest of the reactor subtree (Loop#run's ensure).
+      def arm_spinner_tick
+        return if @spinner_tick
+
+        @spinner_tick = @kernel.tick(SPINNER_INTERVAL_SECONDS)
+      end
+
+      # Cancels the spinner tick (the returned task's +stop+ — the same
+      # Task#stop mechanism Ctrl+C uses). Idempotent; a dead task's stop
+      # is a no-op.
+      def cancel_spinner_tick
+        task = @spinner_tick
+        @spinner_tick = nil
+        task&.stop
       end
 
       # The embedded status's per-segment colors (pi's embedded colorFns):
@@ -1899,14 +1952,28 @@ module Tart
       # reasoning rows, a blank when content follows the reasoning, the
       # content. The blank appearing only at completion was the 2nd-pass
       # shift (the row insert moved streaming content down a line).
+      #
+      # Since I58 the conversion is cached on
+      # [viewport_width, @live.bytesize, @reasoning.bytesize] (D2): a
+      # cached-window frame (the spinner tick) re-serves the rows, a delta
+      # frame (a key change) recomputes. The rows are a pure function of
+      # the key's inputs; the reset sites clear the cache so a same-size
+      # different-content message can never hit a stale entry (AC2's
+      # reset-cycle exactness). Returns a COPY of the cached rows — the
+      # caller ({live_lines}) concats into the result.
       def assistant_live_lines(width)
         return [] if @live.empty? && @reasoning.empty?
+
+        key = [width, @live.bytesize, @reasoning.bytesize]
+        cached = @live_region_cache
+        return cached[1].dup if cached && cached[0] == key
 
         lines = [Panel.blank_line]
         lines.concat(Transcript.reasoning_lines(@reasoning, width)) unless @reasoning.empty?
         lines << Panel.blank_line if !@reasoning.empty? && !@live.empty?
         lines.concat(Transcript.markdown_lines(@live, width)) unless @live.empty?
-        lines
+        @live_region_cache = [key, lines]
+        lines.dup
       end
 
       # The RUNNING user-bash block's rows (I38 — pi's chat/pending
@@ -1940,7 +2007,11 @@ module Tart
           @user_bash_stream = {command:, excluded:, content: +"", spinner_started_at: @clock.call}
         end
         # pi adds the component then requestRender (:7033-7034) — the
-        # header + loader row paint before the first chunk.
+        # header + loader row paint before the first chunk. The bash
+        # loader's glyph must advance between chunks (pi's Loader ticks
+        # requestRender on its own 80 ms interval, loader.ts:79-84) — the
+        # spinner tick arms with the stream (I58).
+        arm_spinner_tick
         @kernel.request_draw
       end
 
@@ -1962,9 +2033,11 @@ module Tart
       # The explicit terminal clear (every path — completion, worker
       # error, cancel — notifies exactly once; idempotent). No draw: the
       # caller's own request_draw paints the settled block in the same
-      # frame the live rows vanish (AC2).
+      # frame the live rows vanish (AC2). The spinner tick cancels with
+      # the stream unless an agent run keeps it (I58).
       def end_user_bash_stream
         @mutex.synchronize { @user_bash_stream = nil }
+        cancel_spinner_tick unless busy?
       end
 
       # /thinking's seam (pi selectThinkingLevel :5165-5177): the session
