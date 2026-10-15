@@ -305,6 +305,12 @@ module Tart
       # --tools (I48 §5.2): the exact allowlist rides selected_tools: —
       # Print.run builds the loadout from exactly that list.
       selected_tools = parse_tools_flag(options[:tools])
+      # The catalog entry resolves ONCE (the interactive boot's shape —
+      # I59 D4): the print boot threads the same FACTS pair below the
+      # env/settings tiers (resolve checks the env tier FIRST, so a set
+      # <IDENTITY>_CONTEXT_WINDOW still wins); the loop's fetch arm
+      # catches the no-entry case.
+      entry = resolve_boot_entry(models, boot)
       code = Print.run(
         prompt: options[:print],
         chat:,
@@ -315,9 +321,14 @@ module Tart
         system_prompt: prompt,
         recorder:,
         seed_messages:,
+        context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:) ||
+          Models.entry_context_window(entry),
+        max_tokens: Models.entry_max_tokens(entry),
         # The compaction knobs MUST reach the loop (the interactive path
-        # threads them too); context_window: stays nil so the loop's env
-        # tier resolves <IDENTITY>_CONTEXT_WINDOW itself.
+        # threads them too). The window is boot-resolved (I59): the env
+        # tier folds in FIRST — a set <IDENTITY>_CONTEXT_WINDOW still
+        # wins — then the catalog entry's; the loop's fetch arm catches
+        # the no-entry case.
         compaction: Settings.compaction_kwargs(settings),
         identity:,
         hooks:,
@@ -445,6 +456,11 @@ module Tart
           chat = build_chat(models, boot, identity:, resolved:)
           facts = footer_data(workdir, settings, boot:, chat:, identity:, models:, resolved:)
           surface.footer_data = facts
+          # The catalog entry resolves ONCE (the same helper the compat:
+          # arm rode — I59 D3): the boot threads the entry's FACTS pair
+          # below the env/settings tiers (Grounds §4-a) — the placeholder
+          # chat.model's nil window is what keeps the || chain correct.
+          entry = resolve_boot_entry(models, boot)
           surface.agent = Agent::Loop.new(
             chat:,
             tools:,
@@ -455,13 +471,15 @@ module Tart
             hooks_context: -> { {cwd: workdir, mode: "tui", session: session_ref(current_recorder), identity:} },
             recorder:,
             seed_messages:,
-            context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
+            context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:) ||
+              Models.entry_context_window(entry),
+            max_tokens: Models.entry_max_tokens(entry),
             compaction: Settings.compaction_kwargs(settings),
             identity:,
             thinking_level: facts.fetch(:thinking_level),
             model_reasoning: facts.fetch(:reasoning),
             thinking_level_map: facts.fetch(:thinking_level_map),
-            compat: resolve_boot_entry(models, boot)&.compat
+            compat: entry&.compat
           )
           # The session_start emission (pi extensions/types.ts:744 —
           # reasons startup|new|resume; fork/reload have no port surface):

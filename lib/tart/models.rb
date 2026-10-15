@@ -111,6 +111,34 @@ module Tart
       Config.new(providers: {}, default: nil, error: "Failed to load models.json: #{e.message} (#{path})")
     end
 
+    # pi's modelFromJson definition defaults (provider-composer.ts:242-243):
+    # `contextWindow: definition.contextWindow ?? 128000`, `maxTokens:
+    # definition.maxTokens ?? 16384` — applied at model-DEFINITION time,
+    # i.e. ONLY where a models.json entry exists. They ride the
+    # facts-threading seam below (never catalog load — Shapes::Model#to_h
+    # stays DECLARED == the parsed entry — and never Settings
+    # .resolve_context_window); a NO-entry boot has no definition and the
+    # no-entry chain owns the window (Grounds §4-b: env → settings →
+    # known-tables → 0, the cap nil → wire_model's window fallback).
+    DEFAULT_ENTRY_CONTEXT_WINDOW = 128_000
+    DEFAULT_ENTRY_MAX_TOKENS = 16_384
+
+    # The entry's declared window, else pi's 128_000 definition default
+    # when an entry EXISTS; nil without an entry (the no-entry chain's
+    # signal — no default may leak into an entry-less boot).
+    def entry_context_window(entry)
+      return nil unless entry
+      entry.context_window || DEFAULT_ENTRY_CONTEXT_WINDOW
+    end
+
+    # The entry's declared cap, else pi's 16_384 definition default when
+    # an entry EXISTS (never the window fallback — the big-declared-window
+    # fallback is the Face-1 400); nil without an entry.
+    def entry_max_tokens(entry)
+      return nil unless entry
+      entry.max_tokens || DEFAULT_ENTRY_MAX_TOKENS
+    end
+
     # The wire model (Grounds D7): the catalog facts + the resolved
     # window into the gem's Model. +context_window+ MUST arrive as an
     # Integer — the caller runs the existing resolution chain (catalog →

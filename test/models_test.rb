@@ -444,5 +444,48 @@ module Tart
         config.model_entries.first.thinking_level_map,
         "the owner's override map round-trips symbolized through the contract path"
     end
+
+    # --- I59 zai_max_tokens: the D1 entry-facts helpers (pi's definition
+    # defaults ride the facts-THREADING seam, never catalog load) ---
+
+    # The truth table (Grounds §4-c): a declared value passes through
+    # verbatim; an entry that omits the field carries pi's modelFromJson
+    # default (provider-composer.ts:242-243); NO entry means NO default —
+    # the no-entry chain owns the window and wire_model's window fallback
+    # owns the cap. The typed entries come off a real catalog load so the
+    # shapes stay exactly what the boot threads.
+    def test_zai_max_tokens_entry_context_window_truth_table
+      write_models(CATALOG)
+      declared, windowless = load_models.model_entries
+
+      assert_equal 200_000, Models.entry_context_window(declared),
+        "the declared contextWindow passes through verbatim"
+      assert_equal 128_000, Models.entry_context_window(windowless),
+        "a windowless ENTRY carries pi's definition default (provider-composer.ts:242)"
+      assert_equal Models::DEFAULT_ENTRY_CONTEXT_WINDOW,
+        Models.entry_context_window(windowless), "the default is the frozen constant"
+      assert_nil Models.entry_context_window(nil),
+        "NO entry means NO default — the no-entry chain owns the window"
+    end
+
+    def test_zai_max_tokens_entry_max_tokens_truth_table
+      write_models(CATALOG)
+      declared, windowless = load_models.model_entries
+
+      assert_equal 8_192, Models.entry_max_tokens(declared),
+        "the declared maxTokens passes through verbatim"
+      assert_equal 16_384, Models.entry_max_tokens(windowless),
+        "a capless ENTRY carries pi's definition default (provider-composer.ts:243) — " \
+        "never the window fallback (the Face-1 400 shape)"
+      assert_equal Models::DEFAULT_ENTRY_MAX_TOKENS, Models.entry_max_tokens(windowless),
+        "the default is the frozen constant"
+      assert_nil Models.entry_max_tokens(nil),
+        "NO entry means NO default — wire_model's window fallback owns the cap"
+
+      # The DECLARED pin (shapes_test's neighbor): the helpers read the
+      # typed entry — catalog load itself stays defaulted-free, so the
+      # loaded entry still carries the raw nil.
+      assert_nil windowless.max_tokens, "no catalog-load defaulting (Shapes::Model#to_h stays DECLARED)"
+    end
   end
 end
