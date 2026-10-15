@@ -999,6 +999,116 @@ module Tart
       assert_equal "switched", result.last.content
     end
 
+    # --- I59 zai_max_tokens: the catalog facts reach the wire on every
+    # construction path (AC1; the plan's pin (1) and the Face-1/Face-2
+    # discrimination) ---
+
+    # P1 — the boot-shaped ctor threading: the placeholder Chat + the
+    # ctor's threaded pair (the interactive boot's construction with a
+    # catalog entry behind it) land BOTH facts on the wire model, and the
+    # request sends the gem's OWN clamp of that model on the same inputs —
+    # min(cap, window − est − 4096) — which is > 1 (the one-token Face-2
+    # shape is gone from the entry path).
+    def test_zai_max_tokens_ctor_threads_the_entry_pair_onto_the_wire
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      @server.script([{type: :message, content: "ok"}])
+      agent = Agent::Loop.new(chat:, tools: empty_tools,
+        context_window: 131_072, max_tokens: 131_072)
+
+      wire = chat.instance_variable_get(:@model)
+      assert_equal 131_072, wire.context_window, "the threaded window rides the wire model"
+      assert_equal 131_072, wire.max_tokens, "the threaded cap rides the wire model"
+
+      run_agent(agent, "hello")
+      body = @server.captured_requests.first
+      max = body["max_completion_tokens"]
+      # The gem's own arithmetic on the REQUEST's inputs (the instructions
+      # ride the body's system message): exact, path-independent.
+      expected = Fast::Completions::Protocol.clamp_max_tokens(
+        chat.instance_variable_get(:@model), body["messages"].first["content"],
+        body["messages"][1..].map { |m| Struct.new(:content).new(m["content"]) }, nil)
+      assert_equal expected, max,
+        "the sent max IS the gem's own clamp on the same inputs (exact, path-independent)"
+      assert_operator max, :>, 1, "the plan's pin (1): min(cap, available) > 1"
+    end
+
+    # P2(i) — the no-entry precedence pin (Grounds §4-a/§4-b; the
+    # workaround's verified shape, tmp/repro6_workaround.rb): a set
+    # PI_CONTEXT_WINDOW still wins over everything — the wire carries
+    # 120_000/120_000 (no cap threaded → wire_model's window fallback)
+    # and the clamp sends ≤ 120_000 − 4096 (the safety margin holds).
+    def test_zai_max_tokens_env_tier_still_wins_no_entry_window_fallback
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      @server.script([{type: :message, content: "ok"}])
+      saved = ENV["PI_CONTEXT_WINDOW"]
+      ENV["PI_CONTEXT_WINDOW"] = "120000"
+      begin
+        agent = Agent::Loop.new(chat:, tools: empty_tools)
+
+        wire = chat.instance_variable_get(:@model)
+        assert_equal 120_000, wire.context_window, "the env tier wins over the catalog tier"
+        assert_equal 120_000, wire.max_tokens, "no cap threaded — the window fallback"
+
+        run_agent(agent, "hello")
+        max = @server.captured_requests.first["max_completion_tokens"]
+        assert_kind_of Integer, max
+        assert_operator max, :<=, 120_000 - 4_096, "the clamp subtracts the safety margin"
+        assert_operator max, :>=, 1
+      ensure
+        saved ? ENV["PI_CONTEXT_WINDOW"] = saved : ENV.delete("PI_CONTEXT_WINDOW")
+      end
+    end
+
+    # P2(ii) — the DECLARED no-entry fallback (Grounds §4-b, the Face-2
+    # shape confined to entry-less boots): no entry, no env, no table row
+    # — the wire carries 0/0 and the request sends max_tokens 1.
+    def test_zai_max_tokens_no_entry_fallback_sends_one
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      @server.script([{type: :message, content: "ok"}])
+      saved = %w[PI_CONTEXT_WINDOW TART_CONTEXT_WINDOW].to_h { |key| [key, ENV[key]] }
+      saved.each_key { |key| ENV.delete(key) }
+      begin
+        agent = Agent::Loop.new(chat:, tools: empty_tools)
+
+        wire = chat.instance_variable_get(:@model)
+        assert_equal 0, wire.context_window, "the no-entry chain lands the 0 placeholder"
+        assert_equal 0, wire.max_tokens, "the cap rides the window fallback into 0"
+
+        run_agent(agent, "hello")
+        assert_equal 1, @server.captured_requests.first["max_completion_tokens"],
+          "the declared no-entry fallback (the Face-2 shape, pinned at the unit seam)"
+      ensure
+        saved.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
+      end
+    end
+
+    # P4 — the Face-1 bar: the switch seam threads the cap (D5/D6), so
+    # the clamped send is bounded by it — the ~985K window-fallback 400
+    # can never recur.
+    def test_zai_max_tokens_switch_model_threads_the_cap_never_the_window_fallback
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      agent = Agent::Loop.new(chat:, tools: empty_tools)
+      agent.switch_model("glm-5.3", provider: "zai", context_window: 131_072,
+        max_tokens: 131_072, compat: zai_compat)
+
+      wire = chat.instance_variable_get(:@model)
+      assert_equal 131_072, wire.context_window, "the raw switch window rides (today's shape)"
+      assert_equal 131_072, wire.max_tokens, "the switched cap rides — NOT the window fallback"
+
+      @server.script([{type: :message, content: "ok"}])
+      run_agent(agent, "hello")
+      body = @server.captured_requests.first
+      # The zai dialect renames the max key (pin 6): read whichever the
+      # wire carries.
+      max = body["max_tokens"] || body["max_completion_tokens"]
+      assert_operator max, :<=, 131_072, "the 985K face can never recur"
+      assert_operator max, :>, 1
+      expected = Fast::Completions::Protocol.clamp_max_tokens(
+        chat.instance_variable_get(:@model), body["messages"].first["content"],
+        body["messages"][1..].map { |m| Struct.new(:content).new(m["content"]) }, nil)
+      assert_equal expected, max, "the gem's own clamp on the same inputs"
+    end
+
     # I41 (AC4, the tier readback): the loop's env tier speaks the
     # identity's namespace — the resolved face decides which CONTEXT_WINDOW
     # var the compaction denominator reads (tart → TART_, default pi →

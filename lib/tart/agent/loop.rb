@@ -71,6 +71,11 @@ module Tart
       #   overriding the resolution order <IDENTITY>_CONTEXT_WINDOW →
       #   chat.model.context_window → nil (nil/<= 0 disables the threshold
       #   trigger only; the overflow trigger always fires).
+      # @param max_tokens [Integer, nil] the model's output cap (the
+      #   catalog entry's maxTokens — D2): threaded beside the resolved
+      #   window into the wire model, whose request seam clamps the sent
+      #   max key through it (pi clampMaxTokensToContext); nil = the
+      #   no-entry shape (wire_model's window fallback).
       # @param identity [String] the resolved face (Tart::Identity) whose
       #   env namespace the context-window env tier reads (AC4).
       # @param compaction [Hash, Compaction::Settings, nil] compaction
@@ -110,7 +115,7 @@ module Tart
       #   that fails to parse is unlinked and skipped (poison-pill
       #   safety). nil (interactive parents, tests) = today's behavior.
       def initialize(chat:, tools:, system_prompt: nil, on_event: nil,
-        recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
+        recorder: nil, seed_messages: [], context_window: nil, max_tokens: nil, compaction: nil,
         identity: Identity::DEFAULT, thinking_level: "medium",
         model_reasoning: false, thinking_level_map: nil, compat: nil,
         hooks: nil, hooks_context: nil, steer_inbox: nil)
@@ -122,6 +127,7 @@ module Tart
         @recorder = recorder
         @identity = identity
         @context_window = context_window
+        @max_tokens = max_tokens
         @compaction_settings = Compaction::Settings.resolve(compaction)
         @thinking_level = thinking_level
         @model_reasoning = model_reasoning == true
@@ -158,7 +164,8 @@ module Tart
         @chat.apply_facts(model_reasoning: @model_reasoning,
           thinking_level_map: @thinking_level_map, compat: @compat,
           context_window: resolved_context_window ||
-            Settings::MODEL_CONTEXT_WINDOWS.fetch(@chat.model_id, 0))
+            Settings::MODEL_CONTEXT_WINDOWS.fetch(@chat.model_id, 0),
+          max_tokens: @max_tokens)
         @chat.thinking_level = @thinking_level
       end
 
@@ -296,9 +303,11 @@ module Tart
       # — the surface passes them; nil = the entry declares none, the
       # map-less rule). I46: +compat:+ rides the same wholesale re-resolve
       # (nil IS "the switched model declares none" — the default dialect —
-      # not "keep the previous").
-      def switch_model(model_id, provider:, context_window: nil, model_reasoning: nil, thinking_level_map: nil,
-        compat: nil)
+      # not "keep the previous"). I59: +max_tokens:+ rides it too (the
+      # switched entry's maxTokens — D5; nil = the window fallback, the
+      # no-entry shape).
+      def switch_model(model_id, provider:, context_window: nil, max_tokens: nil, model_reasoning: nil,
+        thinking_level_map: nil, compat: nil)
         # pi has no cached window to go stale: setModel swaps the Model
         # object (agent-session.ts:2484) and every check reads
         # model.contextWindow live (:2965). The port's cache re-resolves
@@ -312,15 +321,16 @@ module Tart
         @model_reasoning = model_reasoning == true
         @thinking_level_map = thinking_level_map
         @compat = compat
+        @max_tokens = max_tokens
         @chat.apply_facts(model_id: model_id, provider_key: provider,
           model_reasoning: @model_reasoning, thinking_level_map: @thinking_level_map,
-          compat: @compat, context_window: context_window)
+          compat: @compat, context_window: context_window, max_tokens: @max_tokens)
         @context_window = Settings.resolve_context_window(explicit: context_window, model: @chat.model)
         # The wire model re-builds once more with the RESOLVED window (its
         # max-tokens fallback reads it); apply_facts is idempotent.
         @chat.apply_facts(model_id: model_id, provider_key: provider,
           model_reasoning: @model_reasoning, thinking_level_map: @thinking_level_map,
-          compat: @compat,
+          compat: @compat, max_tokens: @max_tokens,
           context_window: @context_window || Settings::MODEL_CONTEXT_WINDOWS.fetch(model_id, 0))
         self
       end

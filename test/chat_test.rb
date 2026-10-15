@@ -2665,9 +2665,10 @@ module Tart
         switched = []
         chat.agent = Object.new.tap do |agent|
           agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil,
-                                                           model_reasoning: nil, thinking_level_map: nil,
-                                                           compat: nil|
-            switched << {model_id:, provider:, context_window:, model_reasoning:, thinking_level_map:, compat:}
+                                                           max_tokens: nil, model_reasoning: nil,
+                                                           thinking_level_map: nil, compat: nil|
+            switched << {model_id:, provider:, context_window:, max_tokens:,
+                         model_reasoning:, thinking_level_map:, compat:}
           end
           # The I40 switch seam also re-clamps the stored level onto the
           # loop (pi setModel → setThinkingLevel); inert for this pin,
@@ -2681,11 +2682,13 @@ module Tart
 
         refute chat.menu_open?, "the selection closes the menu (the editor is restored)"
         assert_equal [{model_id: "glm-5.3", provider: "glm", context_window: 200_000,
+                       max_tokens: Models.entry_max_tokens(model_catalog.model_entries.first),
                        model_reasoning: true, thinking_level_map: nil, compat: nil}], switched,
           "the loop seam swaps the runtime chat model (the provider key rides as the " \
           "wire model's metadata — the dialect rides the model by construction), " \
-          "re-resolves the window, and carries the switched entry's composed reasoning " \
-          "facts (known-tables-second)"
+          "re-resolves the window, carries the switched entry's composed reasoning " \
+          "facts (known-tables-second), and the entry's cap (I59 D8 re-pin: the " \
+          "capless entry rides pi's 16_384 definition default)"
         assert session.buffer_content[footer_stats_row(session)].rstrip.end_with?("glm-5.3 • medium"),
           "the footer model segment refreshed (the entry's reasoning flag rides along)"
         assert_includes chat.transcript_lines.join, "Model: glm-5.3",

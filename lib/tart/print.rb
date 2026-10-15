@@ -56,8 +56,13 @@ module Tart
     # @param context_window [Integer, nil] the model's context window,
     #   overriding the resolution order <IDENTITY>_CONTEXT_WINDOW →
     #   chat.model.context_window → nil (nil/<= 0 disables the threshold
-    #   trigger only; the overflow trigger always fires). The launcher keeps
-    #   nil so the loop's env tier resolves <IDENTITY>_CONTEXT_WINDOW itself.
+    #   trigger only; the overflow trigger always fires). The launcher
+    #   threads the boot-resolved value (I59): the env tier folds in FIRST
+    #   (a set <IDENTITY>_CONTEXT_WINDOW still wins — resolve checks it
+    #   before the catalog), then the catalog entry's window.
+    # @param max_tokens [Integer, nil] the model's output cap (the catalog
+    #   entry's maxTokens — I59 D4), forwarded to the loop beside the
+    #   window; nil = the no-entry shape (wire_model's window fallback).
     # @param compaction [Hash, Compaction::Settings, nil] compaction
     #   settings ({enabled:, reserve_tokens:, keep_recent_tokens:});
     #   nil = pi's defaults (enabled, reserve 16384, keep-recent 20000).
@@ -77,14 +82,14 @@ module Tart
     #   the wire order). nil = the caller-built +tools+ (today).
     # @return [Integer] the exit code (pi's runPrintMode return).
     def run(prompt:, chat:, tools:, system_prompt: nil, on_event: nil,
-            recorder: nil, seed_messages: [], context_window: nil, compaction: nil,
+            recorder: nil, seed_messages: [], context_window: nil, max_tokens: nil, compaction: nil,
             stdout: $stdout, stderr: $stderr, thinking_level: Settings::DEFAULT_THINKING_LEVEL,
             model_reasoning: false, thinking_level_map: nil, compat: nil, identity: Identity::DEFAULT,
             hooks: nil, steer_inbox: nil, selected_tools: nil)
       stdout.sync = true
       tools = Tools::Registry.build(selected: selected_tools, cwd: Dir.pwd, identity:, hooks:) if selected_tools
       agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,
-        recorder:, seed_messages:, context_window:, compaction:, hooks:, steer_inbox:,
+        recorder:, seed_messages:, context_window:, max_tokens:, compaction:, hooks:, steer_inbox:,
         thinking_level:, model_reasoning:, thinking_level_map:, compat:, identity:)
       deadline = arm_run_deadline(identity)
       begin

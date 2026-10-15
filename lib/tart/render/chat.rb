@@ -2232,6 +2232,7 @@ module Tart
         end
         @agent&.switch_model(entry.id, provider: entry.provider,
           context_window: entry.context_window,
+          max_tokens: Models.entry_max_tokens(entry),
           model_reasoning: facts.reasoning,
           thinking_level_map: facts.thinking_level_map,
           compat: entry.compat)

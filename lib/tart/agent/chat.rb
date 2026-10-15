@@ -189,7 +189,7 @@ module Tart
         chat = Chat.new(client: @client, model_id: @model_id, provider_key: @provider_key,
                         endpoint: @endpoint)
         chat.apply_facts(model_reasoning: @model_reasoning, thinking_level_map: @thinking_level_map,
-          compat: @compat, context_window: @facts.context_window)
+          compat: @compat, context_window: @facts.context_window, max_tokens: @facts.max_tokens)
         chat.with_instructions(instructions)
         chat.with_max_output_tokens(max_output_tokens)
         chat.thinking_level = @thinking_level

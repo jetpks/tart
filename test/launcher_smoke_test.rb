@@ -267,5 +267,74 @@ module Tart
         "TART_MCP_CONFIG" => File.join(home, "absent-mcp.json")
       }
     end
+
+    # --- I59 zai_max_tokens: the Face-2 regression bar at the REAL boot
+    # (P3 — real `bin/tart -p` subprocess, staged HOME, MockLLMServer) ---
+
+    # The scrubbed boot env: the model-shaping env tiers are UNSET so the
+    # leg decides the boot model (Process.spawn merges the parent env — a
+    # CI/agent parent carrying PI_MODEL/PI_PROVIDER must not leak in).
+    def wire_env(home, server)
+      smoke_env(home, server).merge(
+        "PI_MODEL" => nil, "PI_PROVIDER" => nil,
+        "TART_MODEL" => nil, "TART_PROVIDER" => nil,
+        "PI_CONTEXT_WINDOW" => nil, "TART_CONTEXT_WINDOW" => nil)
+    end
+
+    # P3(i) — the catalog leg: a staged ~/.tart/models.json (provider mock
+    # pointing at the mock server, glm-5.3 window 131_072 cap 131_072,
+    # declared default) and NO context-window env — the boot threads the
+    # entry's pair and the request sends min(cap, window − est − 4096):
+    # an Integer in (120_000, 131_072] — never 1. The harness prompt's
+    # estimate is checkout-depth-sensitive, so the RANGE is the
+    # path-robust exact bar (Face 2 sends exactly 1 — five orders of
+    # magnitude of discrimination).
+    def test_zai_max_tokens_staged_catalog_boot_sends_the_capped_max
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "capped"}])
+      home = Dir.mktmpdir("tart-maxtok-home-")
+      FileUtils.mkdir_p(File.join(home, ".tart"))
+      File.write(File.join(home, ".tart", "models.json"), JSON.generate(
+        "default" => "mock/glm-5.3",
+        "providers" => {
+          "mock" => {"name" => "Mock", "baseUrl" => server.url, "apiKey" => "k",
+                     "models" => [{"id" => "glm-5.3", "contextWindow" => 131_072,
+                                   "maxTokens" => 131_072}]}
+        }))
+      stdout, stderr, status = Open3.capture3(wire_env(home, server),
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "hello",
+        chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "the staged-catalog boot runs (stderr: #{stderr})"
+      max = server.captured_request_logs.first.fetch(:body).fetch("max_completion_tokens")
+      assert_kind_of Integer, max
+      assert_operator max, :>, 120_000, "the clamp's safety margin is the only deduction"
+      assert_operator max, :<=, 131_072, "the catalog cap bounds the send"
+      refute_equal 1, max, "Face 2 (the one-token boot) is cured on the real boot"
+    ensure
+      server&.stop
+      FileUtils.rm_rf(home)
+    end
+
+    # P3(ii) — the no-entry leg: no models.json, an env-tier boot model in
+    # no known table, no context-window env — today's chain lands wire 0/0
+    # and the request sends max_tokens 1 (the DECLARED fallback, pinned at
+    # the real boot; Grounds §4-b).
+    def test_zai_max_tokens_no_entry_boot_still_sends_one
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "fallback"}])
+      home = Dir.mktmpdir("tart-maxtok-none-")
+      stdout, stderr, status = Open3.capture3(
+        wire_env(home, server).merge("PI_MODEL" => "custom-x", "PI_PROVIDER" => "openai"),
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "hello",
+        chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "the entry-less boot runs (stderr: #{stderr})"
+      assert_equal 1, server.captured_request_logs.first.fetch(:body).fetch("max_completion_tokens"),
+        "the no-entry chain keeps today's exact fallback shape"
+    ensure
+      server&.stop
+      FileUtils.rm_rf(home)
+    end
   end
 end
