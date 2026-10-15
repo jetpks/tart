@@ -173,6 +173,29 @@ module Tart
         end
       end
 
+      # Repeating redraw request on an absolute schedule (I58 — pi's Loader
+      # interval, loader.ts:12/:82-99): fires {request_draw} every +interval+
+      # seconds until the returned task is cancelled (+stop+, the same
+      # Task#stop mechanism every reactor task answers to). The unbounded
+      # form of {#every}: the busy duration is unknown up front, so a finite
+      # tick count cannot express the busy window. Reactor context only.
+      # The first fire lands one interval after the arm (setInterval
+      # semantics — pi's Loader advances its frame on TIME and then
+      # updateDisplay calls requestRender); arming state paints frame 0
+      # itself ({request_draw} from the arming sink).
+      def tick(interval)
+        async do
+          t0 = now
+          n = 0
+          loop do
+            n += 1
+            d = t0 + n * interval - now
+            sleep d if d > 0
+            request_draw
+          end
+        end
+      end
+
       # Requests shutdown from any thread: sets the stop flag (mutex-guarded)
       # and wakes the idle loop.
       def stop!

@@ -1,0 +1,562 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# render-perf-probe — the I58 render-perf GATE (the entry's instrument,
+# committed: rig bin + the default-off tart-side instrument at
+# test/support/render_perf_probe.rb). Drives the frozen calibration shape
+# ("gate": 1×12,000-line marker-carrying seed (MK-### every 9 rows,
+# deterministic filler), the 80-row marker-free tail seed, then the final
+# reply as ~800 markdown-flavored ~50-char deltas paced 100 ms apart,
+# mid-stream ALT+wheel-up burst) through the rig's public primitives under
+# real tmux, computes the AC3 metrics over the streaming window, and
+# asserts the frozen budgets:
+#
+#   BP1  median frame_ms (render+draw per frame)   <= 3.0    (base 10.34)
+#   BP2  total render-ms per streaming second      <= 250    (base 606)
+#   BP3  markdown/reasoning conversions per second <= 25     (base 58.4)
+#   BP4  pane paints per streaming second          <= 35     (base 58.8)
+#   BP5  scroll burst-start -> first top-row-change <= 40 ms (base 18.4)
+#
+# with the anti-vacuity preconditions (window >= 120 s; frames >= 1500;
+# max live bytes >= 30,000; max transcript rows >= 11,000; the scroll
+# marker observed; requests == expected). The budgets were MEASURED at
+# base 41f0a5f with this exact shape (Grounds §2 — the spec-time
+# calibration runs); they are the deliverable's numbers, not aspirations.
+#
+# Internal metrics (BP1-BP3) ride the instrument, which only tart loads
+# (the RUBYOPT/TART_PERF_OUT scenario env); a pi-only run asserts the
+# preconditions it can see (window, marker, requests) and prints its
+# external distributions as the anchor record — pi is the reference, its
+# numbers are not budgeted.
+#
+#   render-perf-probe [--app tart|pi|both] [--shape gate] [--out DIR]
+#
+# --app both (the default) runs pi first, then tart, against the same
+# byte-identical script (the anchor leg). THE GATE runs `--app tart`.
+# Exits 0 with RENDER_PERF_OK only when every asserted budget and
+# precondition holds; otherwise prints the failing lines and exits 1.
+# Stdlib only — runs without Bundler. `env -u HERDR_*` is the caller's
+# discipline (the frozen gate command carries it).
+
+require "base64"
+require "fileutils"
+require "json"
+require "open3"
+require "optparse"
+require "shellwords"
+
+require_relative "../lib/tui_split_rig"
+
+options = {app: "both", shape: "gate", out: "tmp/render-perf-probe-#{Time.now.to_i}"}
+parser = OptionParser.new do |p|
+  p.on("--app APP", %w[tart pi both], "which app(s) to drive (default both; the GATE runs tart)") { |a| options[:app] = a }
+  p.on("--shape SHAPE", %w[gate], "the frozen calibration shape (only gate)") { |s| options[:shape] = s }
+  p.on("--out DIR", "artifact directory (default tmp/render-perf-probe-<ts>)") { |d| options[:out] = d }
+end
+parser.parse!(ARGV)
+
+# The streaming turn runs ~80 s of mock-paced deltas plus settle overhead —
+# raise the settle cap (probe-side, in-process only; the rig constant and
+# lib/ stay untouched — the scratch calibration's proven move).
+TuiSplitRig::Runner.send(:remove_const, :HARD_CAP)
+TuiSplitRig::Runner.const_set(:HARD_CAP, 150.0)
+
+REPO_ROOT = File.expand_path("../../..", __dir__) # gems/tui-split-rig/bin → the tart repo root
+INSTRUMENT = File.join(REPO_ROOT, "test", "support", "render_perf_probe.rb")
+STAGE = File.expand_path(options[:out])
+FileUtils.mkdir_p(STAGE)
+
+# ---- the frozen gate shape ----
+SEEDS = 1
+SEED_LINES = 12_000
+TAIL_LINES = 80
+DELTAS = 800
+BURST_EVENTS = 120
+
+# ---- the frozen budgets (AC3; measured at base 41f0a5f, Grounds §2) ----
+BUDGETS = {
+  bp1_median_frame_ms: 3.0,
+  bp2_render_ms_per_s: 250.0,
+  bp3_md_conversions_per_s: 25.0,
+  bp4_paints_per_s: 35.0,
+  bp5_scroll_top_change_ms: 40.0
+}.freeze
+
+# ---- deterministic content (the scratch calibration's generators,
+# byte-identical: the budgets were measured on THESE bytes) ----
+FILLER_WORDS = %w[stream fiber frame render scroll latency budget marker
+  terminal viewport markdown transcript delta window paint cadence buffer
+  queue reactor poll settle capture parity rig probe measure].freeze
+
+def sentence(seed, n = 12)
+  rnd = Random.new(seed)
+  n.times.map { FILLER_WORDS[rnd.rand(FILLER_WORDS.size)] }.join(" ").capitalize << "."
+end
+
+# One seed reply: marker lines every 9 rows (marker counter runs across
+# seeds), filler markdown rows otherwise.
+def seed_body(marker, lines:)
+  body = []
+  (1..lines).each do |n|
+    if n % 9 == 4
+      marker[0] += 1
+      body << format("MK-%03d", marker[0])
+    else
+      kind = n % 7
+      case kind
+      when 0 then body << "## Section heading #{n}"
+      when 1 then body << "- list item #{n}: #{sentence(n * 31)}"
+      when 2 then body << "    indented code row #{n}"
+      else body << sentence(n * 17)
+      end
+    end
+  end
+  body.join("\n")
+end
+
+# The final marker-free seed (the marker-free tail zone).
+def tail_seed_body
+  (1..TAIL_LINES).map { |n| "tail filler row #{n} #{sentence(n * 13)}" }.join("\n")
+end
+
+# The streaming reply: ~50-char markdown-flavored deltas.
+def stream_deltas
+  parts = []
+  DELTAS.times do |i|
+    parts <<
+      if i.zero? then "# The long streaming reply\n\n"
+      elsif i % 10 == 5 then "\n- point #{i}: #{sentence(i * 7)}\n"
+      elsif i == 20 then "\n```ruby\n"
+      elsif i == 60 then "\n```\n\n"
+      else "#{sentence(i * 11, 7)} "
+      end
+  end
+  parts << "\nDone streaming.\n"
+  parts
+end
+
+# The mock script (built in RUBY — `:pause` cannot ride YAML, safe_load
+# rejects symbols): seed + tail as whole streams, the final reply as
+# sliced deltas each followed by a pause.
+def build_responses
+  marker = [0]
+  responses = []
+  SEEDS.times do
+    responses << {type: :stream, content: seed_body(marker, lines: SEED_LINES)}
+  end
+  responses << {type: :stream, content: tail_seed_body}
+  chunks = []
+  stream_deltas.each do |part|
+    part.chars.each_slice(50) do |slice|
+      chunks << {choices: [{delta: {content: slice.join}}]}
+      chunks << :pause
+    end
+  end
+  responses << {type: :stream, chunks: chunks}
+  responses
+end
+
+# The scenario carrier: staging + the instrument env (tart only). The
+# mock's REAL script is the Ruby-built one above; the YAML-facing
+# responses field carries a valid seed for the load validation only.
+# Built as a Hash and handed to Scenario.new directly — no YAML file, so
+# no safe_load symbol rejection (the :pause sentinels never ride it).
+def build_scenario(app, stage)
+  data = {
+    "name" => "render-perf-gate",
+    "prompt" => "give the long answer",
+    "expected_requests" => SEEDS + 2,
+    "responses" => [{"type" => "stream", "content" => seed_body([0], lines: SEED_LINES)}]
+  }
+  if app == "tart"
+    data["env"] = {
+      "tart" => {
+        "RUBYOPT" => "-r#{INSTRUMENT}",
+        "TART_PERF_OUT" => File.join(stage, "frames.jsonl")
+      }
+    }
+  end
+  TuiSplitRig::Scenario.new("render-perf-gate", data)
+end
+
+# ---- helpers (the scratch orchestrator's shape) ----
+
+def log(msg)
+  puts "[render-perf-probe #{Time.now.strftime('%H:%M:%S')}] #{msg}"
+  $stdout.flush
+end
+
+def mono = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+def tmux(*args)
+  out, st = Open3.capture2("tmux", *args)
+  raise "tmux #{args.join(' ')} failed: #{st.exitstatus}" unless st.success?
+
+  out
+end
+
+def send_enter(session, text)
+  system("tmux", "send-keys", "-t", session, "-l", text) or raise "send-keys -l failed"
+  system("tmux", "send-keys", "-t", session, "Enter") or raise "send-keys Enter failed"
+end
+
+# ALT+wheel-up SGR bytes (bit-3 alt = 5 lines/event in BOTH apps: pi
+# tui-alt-screen.ts:709-711, tart viewport.rb:29-30/67-70).
+WHEEL_ALT_UP = %w[1b 5b 3c 37 32 3b 32 30 3b 32 30 4d].freeze
+
+def send_wheel(session)
+  system("tmux", "send-keys", "-t", session, "-H", *WHEEL_ALT_UP) or raise "wheel send failed"
+end
+
+def capture_text(session)
+  out, st = Open3.capture2("tmux", "capture-pane", "-p", "-t", session)
+  st.success? ? out : nil
+end
+
+# The pipe-pane timestamping wrapper: every pane-output chunk gets a
+# CLOCK_MONOTONIC-ms stamp + base64 body (CLOCK_MONOTONIC is system-wide,
+# comparable with this orchestrator's clock). Written into the stage dir
+# at run time — no extra repo file.
+STAMP_SOURCE = <<~'RUBY'
+  out_path = ARGV.fetch(0)
+  out = File.open(out_path, "a")
+  out.sync = true
+
+  loop do
+    begin
+      chunk = STDIN.readpartial(65_536)
+      ts = (Process.clock_gettime(Process::CLOCK_MONOTONIC) * 1000).round(3)
+      out.puts format("%s\t%s", ts, [chunk].pack("m0"))
+    rescue EOFError, Errno::EPIPE
+      break
+    end
+  end
+RUBY
+
+class EventLog
+  def initialize(path)
+    @io = File.open(path, "a")
+    @io.sync = true
+  end
+
+  def emit(type, **extra)
+    @io.puts(JSON.generate({type: type, t: mono}.merge(extra)))
+  end
+end
+
+# ---- one app run (the scratch orchestrator, gate shape) ----
+
+def run_app(app, stage)
+  FileUtils.rm_rf(stage)
+  FileUtils.mkdir_p(stage)
+  File.write(File.join(stage, "stamp.rb"), STAMP_SOURCE)
+
+  events = EventLog.new(File.join(stage, "events.jsonl"))
+  scenario = build_scenario(app, stage)
+  runner = TuiSplitRig::Runner.new(scenario: scenario, runs: 1, app: "both", out: File.join(stage, "unused"))
+
+  responses = build_responses
+  mock = MockLLMServer.new.script(responses)
+  mock.start
+  mock.rearm!
+
+  begin
+    boot = runner.boot_session(app, mock, 1, stage)
+    session = boot.fetch(:session)
+    log "#{app}: booted #{session}"
+    runner.settle(session, "boot")
+
+    # paint stream ON
+    paint_tsv = File.join(stage, "paint.tsv")
+    tmux("pipe-pane", "-o", "-t", session,
+         "ruby #{Shellwords.escape(File.join(stage, 'stamp.rb'))} #{Shellwords.escape(paint_tsv)}")
+
+    # seed turns: the marker-carrying seed + the marker-free tail seed
+    (SEEDS + 1).times do |i|
+      send_enter(session, "seed turn #{i + 1} please")
+      events.emit(:seed_sent, n: i + 1)
+      rr = runner.settle(session, "seed#{i + 1}")
+      log "#{app}: seed #{i + 1}/#{SEEDS + 1} settle #{rr[:ms]}ms"
+    end
+
+    # the final streaming turn
+    send_enter(session, scenario.prompt)
+    events.emit(:final_sent)
+    log "#{app}: final prompt sent; streaming"
+
+    # let the stream build ~2 s of live content
+    sleep 2.0
+
+    # the scroll burst: each ALT+wheel event followed by a capture-pane
+    # poll — first poll whose top row changed = scroll took effect; first
+    # poll matching a marker = scrolled into the marker zone.
+    base = capture_text(session)
+    base_top = base&.lines&.first
+    events.emit(:baseline, top: base_top&.strip)
+
+    t_marker = t_top_change = nil
+    burst_start = mono
+    events.emit(:burst_start)
+    BURST_EVENTS.times do |i|
+      send_wheel(session)
+      txt = capture_text(session)
+      if txt
+        if t_top_change.nil? && base_top && txt.lines.first && txt.lines.first != base_top
+          t_top_change = mono
+          events.emit(:top_change, at_event: i + 1)
+        end
+        if t_marker.nil? && txt.match?(/MK-\d{3}/)
+          t_marker = mono
+          events.emit(:marker_seen, at_event: i + 1)
+        end
+      end
+      break if t_marker
+    end
+    events.emit(:burst_end) unless t_marker
+    if t_marker.nil?
+      deadline = mono + 3.0
+      while mono < deadline
+        txt = capture_text(session)
+        if txt&.match?(/MK-\d{3}/)
+          t_marker = mono
+          events.emit(:marker_seen, at_event: "post_burst")
+          break
+        end
+      end
+    end
+    events.emit(:scroll_result,
+                key_to_marker_ms: t_marker ? ((t_marker - burst_start) * 1000).round(1) : nil,
+                key_to_top_change_ms: t_top_change ? ((t_top_change - burst_start) * 1000).round(1) : nil)
+    log "#{app}: scroll top_change=#{t_top_change ? ((t_top_change - burst_start) * 1000).round : 'NEVER'}ms " \
+        "marker=#{t_marker ? ((t_marker - burst_start) * 1000).round : 'NEVER'}ms"
+
+    # let the stream finish
+    rr = runner.settle(session, "final")
+    events.emit(:final_settled, ms: rr[:ms])
+    log "#{app}: final settle #{rr[:ms]}ms timed_out=#{rr[:timed_out]}"
+
+    File.write(File.join(stage, "requests.jsonl"),
+               mock.captured_request_logs.map { |r| JSON.generate(r) }.join("\n") << "\n")
+
+    tmux("pipe-pane", "-t", session)
+    runner.teardown(session)
+  ensure
+    mock.stop
+  end
+  log "#{app}: artifacts in #{stage}"
+end
+
+# ---- the analyzer (the scratch analyze.rb, gate metrics) ----
+
+def read_paints(path)
+  return [] unless File.file?(path)
+
+  File.readlines(path).filter_map do |line|
+    ts, b64 = line.split("\t", 2)
+    next unless b64
+
+    {t: ts.to_f / 1000.0, bytes: Base64.decode64(b64.strip)}
+  end
+end
+
+def read_events(path)
+  File.readlines(path).map { |l| JSON.parse(l) }
+end
+
+def read_frames(path)
+  return [] unless File.file?(path)
+
+  File.readlines(path).filter_map do |l|
+    JSON.parse(l)
+  rescue StandardError
+    nil
+  end
+end
+
+def percentile(sorted, q)
+  sorted[(sorted.size * q).clamp(0, sorted.size - 1).floor]
+end
+
+# Pair each render record with the nearest following draw record => one
+# frame (the scratch analyzer's pairing).
+def pair_frames(records, t_from, t_to)
+  frames = []
+  pending = nil
+  records.each do |rec|
+    case rec["type"]
+    when "render"
+      pending = rec unless rec["t0"] < t_from
+    when "draw"
+      next unless pending
+
+      if rec["t0"] <= t_to
+        frames << {
+          "frame_ms" => pending["ms"] + rec["ms"],
+          "md_ms" => pending["md_ms"],
+          "md_calls" => pending["md_calls"],
+          "transcript_lines" => pending["transcript_lines"],
+          "live_bytes" => pending["live_bytes"]
+        }
+      end
+      pending = nil
+    end
+  end
+  frames
+end
+
+def analyze(app, stage)
+  events = read_events(File.join(stage, "events.jsonl"))
+  evt = ->(type) { events.find { |e| e["type"] == type } }
+  final_sent = evt.call("final_sent")["t"]
+  final_settled = evt.call("final_settled")["t"]
+  window = final_settled - final_sent
+
+  paints = read_paints(File.join(stage, "paint.tsv"))
+  in_window = paints.select { |p| p[:t] >= final_sent && p[:t] <= final_settled }
+  gaps = in_window.each_cons(2).map { |a, b| b[:t] - a[:t] }
+
+  burst = evt.call("burst_start")["t"]
+  top_change = evt.call("top_change")
+  marker = evt.call("marker_seen")
+
+  requests = File.file?(File.join(stage, "requests.jsonl")) ? File.readlines(File.join(stage, "requests.jsonl")).reject { |l| l.strip.empty? } : []
+
+  out = {
+    app: app,
+    window: window,
+    paints: in_window.size,
+    paints_per_s: in_window.size / window,
+    inter_paint_median_ms: gaps.any? ? percentile(gaps.sort, 0.5) * 1000 : nil,
+    inter_paint_p95_ms: gaps.any? ? percentile(gaps.sort, 0.95) * 1000 : nil,
+    top_change_ms: top_change ? (top_change["t"] - burst) * 1000 : nil,
+    marker_seen: !marker.nil?,
+    requests: requests.size,
+    expected_requests: SEEDS + 2
+  }
+
+  records = read_frames(File.join(stage, "frames.jsonl"))
+  if records.any?
+    frames = pair_frames(records, final_sent, final_settled)
+    frame_ms = frames.map { |f| f["frame_ms"] }.sort
+    out[:frames] = frames.size
+    out[:median_frame_ms] = frame_ms.any? ? percentile(frame_ms, 0.5) : nil
+    out[:p95_frame_ms] = frame_ms.any? ? percentile(frame_ms, 0.95) : nil
+    out[:render_ms_per_s] = frames.sum { |f| f["frame_ms"] } / window
+    out[:md_conversions_per_s] = frames.sum { |f| f["md_calls"] } / window
+    out[:max_live_bytes] = frames.map { |f| f["live_bytes"] }.max
+    out[:max_transcript_rows] = frames.map { |f| f["transcript_lines"] }.max
+  end
+  out
+end
+
+# ---- the gate verdict ----
+
+failures = []
+results = {}
+
+def fail(failures, line)
+  failures << line
+  puts line
+end
+
+apps = options[:app] == "both" ? %w[pi tart] : [options[:app]]
+apps.each do |app|
+  stage = File.join(STAGE, app)
+  run_app(app, stage)
+  results[app] = analyze(app, stage)
+end
+
+puts "== render-perf gate (shape #{options[:shape]}) =="
+internal_app = results.key?("tart") ? "tart" : apps.first
+r = results[internal_app]
+budgeted = results.key?("tart") # BP1-BP5 are asserted for the tart run; a pi-only run is the anchor record
+
+# The anti-vacuity preconditions (AC3) — the window must be the real
+# stream and the scroll must have worked. The rendering-shape and
+# request-count preconditions bind to the budgeted (tart) run: pi answers
+# the identical script but pi's own retry behavior on the huge seed is
+# its own (the calibration logged 4 requests for 3 prompts) and pi is
+# the reference, not the deliverable.
+av = {
+  "window" => [r[:window] >= 120, format("%.1fs (want >= 120)", r[:window])],
+  "marker" => [r[:marker_seen], r[:marker_seen] ? "observed" : "never observed"]
+}
+if budgeted
+  av["requests"] = [r[:requests] == r[:expected_requests], "#{r[:requests]} (want == #{r[:expected_requests]})"]
+  if r[:frames]
+    av["frames"] = [r[:frames] >= 1500, format("%d (want >= 1500)", r[:frames])]
+    av["live-bytes"] = [r[:max_live_bytes] >= 30_000, format("%d (want >= 30,000)", r[:max_live_bytes])]
+    av["transcript-rows"] = [r[:max_transcript_rows] >= 11_000, format("%d (want >= 11,000)", r[:max_transcript_rows])]
+  end
+end
+av.each do |name, (ok, measured)|
+  if ok
+    puts "AV #{name}: PASS #{measured}"
+  else
+    failures << "AV #{name}: FAIL #{measured}"
+    puts "AV #{name}: FAIL #{measured}"
+  end
+end
+
+# The budgets (AC3). BP1-BP3 are the instrument's (tart only); BP4/BP5
+# are external (both apps carry them, but the budgets are the TART
+# cure's — a pi-only run prints them as the anchor record).
+if r[:median_frame_ms]
+  measured = r[:median_frame_ms]
+  line = format("BP1: %s %.2f (median frame_ms <= %.1f)", measured <= BUDGETS[:bp1_median_frame_ms] ? "PASS" : "FAIL", measured, BUDGETS[:bp1_median_frame_ms])
+  failures << line if measured > BUDGETS[:bp1_median_frame_ms]
+  puts line
+
+  measured = r[:render_ms_per_s]
+  line = format("BP2: %s %.1f (render-ms/s <= %.0f)", measured <= BUDGETS[:bp2_render_ms_per_s] ? "PASS" : "FAIL", measured, BUDGETS[:bp2_render_ms_per_s])
+  failures << line if measured > BUDGETS[:bp2_render_ms_per_s]
+  puts line
+
+  measured = r[:md_conversions_per_s]
+  line = format("BP3: %s %.1f (md conversions/s <= %.0f)", measured <= BUDGETS[:bp3_md_conversions_per_s] ? "PASS" : "FAIL", measured, BUDGETS[:bp3_md_conversions_per_s])
+  failures << line if measured > BUDGETS[:bp3_md_conversions_per_s]
+  puts line
+end
+
+if r[:paints_per_s]
+  measured = r[:paints_per_s]
+  if budgeted
+    line = format("BP4: %s %.1f (paints/s <= %.0f)", measured <= BUDGETS[:bp4_paints_per_s] ? "PASS" : "FAIL", measured, BUDGETS[:bp4_paints_per_s])
+    failures << line if measured > BUDGETS[:bp4_paints_per_s]
+    puts line
+  else
+    puts format("BP4: ANCHOR #{internal_app} %.1f paints/s (pi is the reference, not budgeted)", measured)
+  end
+end
+
+if r[:top_change_ms]
+  measured = r[:top_change_ms]
+  if budgeted
+    line = format("BP5: %s %.1f (burst->top-row-change ms <= %.0f)", measured <= BUDGETS[:bp5_scroll_top_change_ms] ? "PASS" : "FAIL", measured, BUDGETS[:bp5_scroll_top_change_ms])
+    failures << line if measured > BUDGETS[:bp5_scroll_top_change_ms]
+    puts line
+  else
+    puts format("BP5: ANCHOR #{internal_app} %.1f ms to top-row-change (pi is the reference, not budgeted)", measured)
+  end
+else
+  line = "BP5: FAIL the burst never moved the top row"
+  failures << line
+  puts line
+end
+
+# The anchor record (both/pi runs): pi's external distributions.
+results.each do |app, res|
+  next unless app == "pi"
+
+  puts format("pi anchor: paints/s %.1f  inter-paint median/p95 %.1f/%.1f ms  top-change %s ms",
+              res[:paints_per_s], res[:inter_paint_median_ms] || -1, res[:inter_paint_p95_ms] || -1,
+              res[:top_change_ms] ? format("%.1f", res[:top_change_ms]) : "NEVER")
+end
+
+if failures.empty?
+  puts "artifacts at #{STAGE}"
+  puts "RENDER_PERF_OK"
+else
+  puts "#{failures.size} gate line(s) failed"
+  exit 1
+end

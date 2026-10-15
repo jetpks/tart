@@ -1305,7 +1305,12 @@ module Tart
 
       request = captured.first
       assert_equal "hi", request["messages"].select { |m| m["role"] == "user" }.last["content"]
-      assert_equal ["", " hi", ""], chat.transcript_lines,
+      # I58 re-pin: the read races the reply's enqueue, and the retired
+      # burn (a 60 Hz re-arm holding the surface mutex per frame) no
+      # longer delays the agent fiber — the fast mock's reply now reliably
+      # lands before the stop. The pin's intent (the echo bytes + padding)
+      # is the transcript's LEADING rows; the reply rows may follow.
+      assert_equal ["", " hi", ""], chat.transcript_lines.first(3),
         "the submitted prompt is echoed into the transcript (paddingY wrap, outputPad)"
     end
 
@@ -3763,9 +3768,14 @@ module Tart
       end
     end
 
-    # AC4: the glyph advances across draws with NO chunk between (the
-    # animation window is open for the run) while @busy stays false — no
-    # border Working status renders from a bash run.
+    # AC4 (re-pinned I58 — the tick discipline replaces the retired
+    # animation-window burn): the glyph advances across draws with NO
+    # chunk between — the spinner tick paces the frames for the run —
+    # while @busy stays false — no border Working status renders from a
+    # bash run. The glyph-advances-on-TIME assertions are verbatim from
+    # the I38 pin; the window assertions became tick arms (the tick arms
+    # at the stream start and cancels at its end — the fire cadence is
+    # pinned against the real kernel in loop_test).
     def test_bash_loader_glyph_advances_across_draws_without_busy
       t = 0.0
       clock = -> { t }
@@ -3778,8 +3788,11 @@ module Tart
         refute chat.busy?, "@busy stays false — a bash run is no agent turn"
         draw(chat, session)
         assert_equal "⠋", loader_row_spans(chat)[1].content, "frame 0 at the run-start anchor"
-        animate_after_first_draw = kernel.animate_calls.length
-        assert_operator animate_after_first_draw, :>=, 1, "the animation window is open for the run"
+        armed_after_first_draw = kernel.ticks.length
+        assert_operator armed_after_first_draw, :>=, 1,
+          "the spinner tick is armed for the run (pi's 80 ms Loader interval)"
+        assert_equal Render::Chat::SPINNER_INTERVAL_SECONDS, kernel.ticks.last,
+          "the tick paces at the spinner dwell"
 
         t += Render::Chat::SPINNER_INTERVAL_SECONDS
         draw(chat, session) # no chunk between the draws — the glyph advances on TIME
@@ -3789,13 +3802,15 @@ module Tart
         draw(chat, session)
         assert_equal "⠹", loader_row_spans(chat)[1].content
 
-        assert_operator kernel.animate_calls.length, :>, animate_after_first_draw,
-          "frames keep pacing while the run is in flight"
+        assert kernel.tick_handles.none?(&:stopped?),
+          "frames keep pacing while the run is in flight (the tick is live)"
         refute chat.busy?, "still no agent turn"
         draw(chat, session)
         refute session.buffer_content.any? { |row| row.include?("Working") },
           "no border Working status renders from a bash run (mid-flight)"
         reactor.join(5)
+        assert kernel.tick_handles.all?(&:stopped?),
+          "the tick cancels at the stream's end"
       end
     end
 
@@ -5717,19 +5732,32 @@ module Tart
     end
     TokensDouble = Struct.new(:input, :output, :cache_read, :cache_write)
 
-    # A kernel double for render-only tests (chat opens animation windows and
-    # submits runs through the real one in kernel-driven tests).
+    # A kernel double for render-only tests (the surface submits runs and
+    # arms the spinner tick through the real one in kernel-driven tests).
     class IdleKernel
-      attr_reader :submitted
+      attr_reader :submitted, :ticks, :tick_handles
 
       def initialize
         @submitted = []
         @timers = []
+        @ticks = []
+        @tick_handles = []
       end
 
       def animate(duration:) = nil
 
       def request_draw = nil
+
+      # The I58 spinner tick's double (Loop#tick's shape): records the
+      # armed interval and returns a cancellable handle (the arm/cancel
+      # pins read tick_handles). The body is deliberately never run
+      # synchronously — drain_runs drives submitted blocks to completion,
+      # and the real tick loops until cancelled — the arm/fire/cadence
+      # pins drive the REAL kernel in loop_test.
+      def tick(interval)
+        @ticks << interval
+        TickHandle.new.tap { |handle| @tick_handles << handle }
+      end
 
       # Reactor-task stand-in: records the submitted blocks (the submit
       # seam's agent runs AND the one-shot timers — drain_runs runs them
@@ -5759,20 +5787,44 @@ module Tart
       def stop = nil
     end
 
-    # The idle kernel plus an animation-window recording (the I38
-    # frame-pacing pins: the bash loader's window opens without busy?).
+    # The idle kernel plus render-seam recordings: the I38-era
+    # animation-window recording (dead since I58 — no lib/ caller remains;
+    # kept so the double still mirrors the real kernel's full seam) and
+    # the tick-discipline recordings (the requested draws) the re-pinned
+    # loader pins read. Tick arms/cancels ride IdleKernel (ticks/TickHandle).
     class RecordingKernel < IdleKernel
-      attr_reader :animate_calls
+      attr_reader :animate_calls, :draws
 
       def initialize
         super
         @animate_calls = []
+        @draws = 0
       end
 
       def animate(duration:)
         @animate_calls << duration
         nil
       end
+
+      def request_draw
+        @draws += 1
+        nil
+      end
+    end
+
+    # The tick task's double role (I58): the surface cancels via #stop —
+    # the same task role the real Loop#tick returns — and the arm/cancel
+    # pins read stopped?.
+    class TickHandle
+      def initialize
+        @stopped = false
+      end
+
+      def stop
+        @stopped = true
+      end
+
+      def stopped? = @stopped
     end
 
     # The busy-command pins' kernel double (I54): IdleKernel plus the

@@ -219,6 +219,72 @@ module Tart
       assert_equal 10, ticks.size
     end
 
+    # The spinner tick (I58 — Loop#tick, the unbounded #every): fires
+    # request_draw on an absolute ~interval schedule until the returned
+    # task is cancelled (Task#stop — the reactor's own cancel mechanism).
+    # The first fire lands one interval after the arm (setInterval
+    # semantics — pi's Loader advances its frame on TIME, loader.ts:82-99;
+    # the arming sink paints frame 0 itself via its own request_draw).
+    def test_tick_fires_request_draws_until_cancelled
+      session = ScriptedSession.new
+      event_loop = Core::Loop.new(session:, renderer: -> { "frame" })
+      observed = {}
+
+      event_loop.run do
+        wait_until { !session.drawn.empty? } # the boot frame
+        boot_draws = event_loop.stats[:draws]
+        task = event_loop.tick(0.02)
+        wait_until { event_loop.stats[:draws] >= boot_draws + 3 } # ≥3 fires at 20 ms
+        task.stop
+        sleep 0.1 # five intervals' worth: a live tick would fire ~5 more
+        observed[:after_cancel] = event_loop.stats[:draws]
+        sleep 0.1
+        observed[:quiet] = event_loop.stats[:draws]
+      end
+
+      assert_operator observed[:after_cancel], :>=, 4, "the tick fired request_draw per interval"
+      assert_equal observed[:after_cancel], observed[:quiet],
+        "the cancelled tick fires no more (Task#stop)"
+    end
+
+    # The tick's cadence is the interval, not a fixed-rate burn: successive
+    # fires land ~interval apart on the absolute schedule (no cumulative
+    # drift — #every's shape). Pinned at a fast interval; the armed
+    # spinner interval itself (SPINNER_INTERVAL_SECONDS) is the chat pins'
+    # (render_perf_test).
+    def test_tick_fires_at_the_interval_not_a_fixed_rate_burn
+      session = ScriptedSession.new
+      fire_times = Queue.new
+      render_clock = -> { fire_times << Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+      event_loop = Core::Loop.new(session:, renderer: -> { render_clock.call; "frame" })
+
+      event_loop.run do
+        wait_until { !session.drawn.empty? } # the boot frame's render
+        times = []
+        begin
+          loop { times << fire_times.pop(true) } # drain the boot renders
+        rescue ThreadError
+          nil
+        end
+        task = event_loop.tick(0.02)
+        wait_until { fire_times.size >= 4 } # the boot + ≥3 tick fires
+        task.stop
+      end
+
+      times = []
+      begin
+        loop { times << fire_times.pop(true) }
+      rescue ThreadError
+        nil
+      end
+      gaps = times.each_cons(2).map { |a, b| b - a }
+      assert_operator gaps.length, :>=, 2, "enough fires to judge the cadence"
+      gaps.each do |gap|
+        assert_operator gap, :>=, 0.012, "fires no faster than the interval (got #{gap.round(4)}s)"
+        assert_operator gap, :<=, 0.09, "fires at ~the interval, not once and never (got #{gap.round(4)}s)"
+      end
+    end
+
     def test_stop_from_another_thread_ends_run
       session = ScriptedSession.new
       event_loop = Core::Loop.new(session:)
