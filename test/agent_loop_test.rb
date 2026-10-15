@@ -119,7 +119,9 @@ module Tart
       assert error_event[:error], "the worker's error must surface on agent_end"
       assert_kind_of Fast::Completions::BadRequestError, agent.last_error
       assert_includes agent.last_error.message, "Extra inputs"
-      assert_equal %i[user], agent.new_messages.map(&:role)
+      # I60 D6 (the declared re-pin): the failure now leaves pi's trace —
+      # the synthesized failure assistant rides new_messages beside the user.
+      assert_equal %i[user assistant], agent.new_messages.map(&:role)
     end
 
     # I36 (the replay protocol — pi :1340-1352, the delta-carried field):
@@ -1224,14 +1226,22 @@ module Tart
       assert_equal :overflow, compaction[:reason]
       assert_includes compaction[:summary], "a summary of the first turn"
 
-      # The kept tail [first answer, second question] — chronological,
-      # no summarized-away turn, no summary message, the recorded
-      # (as-loaded) entry hashes exactly.
+      # The kept tail [first answer, second question, the I60 failure
+      # entry] — chronological, no summarized-away turn, no summary
+      # message, the recorded (as-loaded) entry hashes exactly. The
+      # trailing failure entry is the judge-sanctioned E-1 residue: the
+      # overflow arm's synthesized failure message leaves the WIRE chat
+      # (loop.rb omit_recovery_attempt — pi _omitRecoveryAttempt,
+      # agent-session.ts:3039-3043) but the recorder's context projection
+      # keeps it: the port has no pi context_edit projection layer, so
+      # the kept payload (and the post-compaction rebuild) carry it where
+      # pi's projection excludes it (backlog: the projection port).
       entries = compaction[:entries]
-      assert_equal %w[assistant user], entries.map { |e| e["message"]["role"] }
-      assert_equal ["first answer", "second question"], entries.map { |e| e["message"]["content"] }
+      assert_equal %w[assistant user assistant], entries.map { |e| e["message"]["role"] }
+      assert_equal ["first answer", "second question", ""], entries.map { |e| e["message"]["content"] }
+      assert_equal "error", entries[2]["message"]["finish_reason"]
       recorded = Agent::Session.load_entries(recorder.path)
-      assert_equal recorded[2, 2], entries, "the payload IS the recorded kept slice"
+      assert_equal recorded[2, 3], entries, "the payload IS the recorded kept slice"
 
       persisted = recorded.find { |e| e["type"] == "compaction" }
       # The gem's chat_completions mapping reports an unexplained cache
@@ -1478,6 +1488,182 @@ module Tart
       assert_kind_of Fast::Completions::ConnectionError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
       assert_kind_of Fast::Completions::ConnectionError, end_event[:error]
+    end
+
+    # --- I60 error_transcript (the synthesized failure trace, D2) ---------
+
+    # AC1: a pre-stream 400 synthesizes the pi-shaped failure assistant and
+    # runs it through the NORMAL machinery — message_start with the FINAL
+    # failure message (no stream ever started), message_end, the recorder,
+    # the chat history, new_messages; turn_end/agent_end carry it. The
+    # recorded bytes are the D1 family, no token keys.
+    def test_error_transcript_pre_stream_failure_synthesizes_the_pi_shaped_message
+      @server.script([{type: :error, status: 400, message: "The max_tokens parameter is illegal."}])
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: File.join(@dir, "root"))
+      agent, events = agent_on_kernel(recorder:)
+      run_agent(agent, "hello")
+
+      failure = agent.new_messages.last
+      assert_equal :assistant, failure.role
+      assert_equal "", failure.content, "pre-stream: no partial ever streamed"
+      assert_empty failure.tool_calls
+      assert_equal "error", failure.finish_reason
+      assert_equal "400: The max_tokens parameter is illegal.", failure.error_message,
+        "error_message carries the exception's message"
+      assert_nil failure.tokens, "the unreported-usage convention drops every token key"
+
+      assistant_starts = events.select { |e| e[:type] == :message_start &&
+                                        e[:message].respond_to?(:role) && e[:message].role == :assistant }
+      assert_equal [failure], assistant_starts.map { |e| e[:message] },
+        "the pre-stream message_start carries the FINAL failure message (pi :443-448)"
+      synthesized_end = events.find { |e| e[:type] == :message_end && e[:message].equal?(failure) }
+      refute synthesized_end[:error], "the synthesized message_end rides the normal arm"
+      assert_equal failure, events.find { |e| e[:type] == :turn_end }[:message]
+      agent_end = events.find { |e| e[:type] == :agent_end }
+      assert_includes agent_end[:messages], failure
+      assert agent_end[:error]
+
+      # The recorded bytes: the D1 family, exactly, no token keys.
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      assert_equal({"role" => "assistant", "content" => "", "tool_calls" => {},
+                    "finish_reason" => "error",
+                    "error_message" => "400: The max_tokens parameter is illegal."},
+        entries.last.dig("message"), "the session file's failure entry is the frozen byte family")
+
+      # The chat history mirrors pi (the in-session retry's context) and the
+      # seed is WIRE-NEUTRAL (the gem's empty-assistant skip, Grounds §4):
+      # the next turn's request carries no assistant message.
+      @server.script([{type: :message, content: "recovered"}])
+      run_agent(agent, "again")
+      wire = @server.captured_requests.last["messages"].reject { |m| %w[system developer].include?(m["role"]) }
+      assert_equal %w[user user], wire.map { |m| m["role"] }
+    end
+
+    # AC1: a mid-stream failure accumulates the step's streamed chunks (the
+    # same chunks the block receives) into the synthesis, and keeps its
+    # existing message_start — never a second one (pi :459-468).
+    def test_error_transcript_mid_stream_partial_accumulates_into_the_synthesis
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      chat.extend(Module.new do
+        define_method(:step) do |&step_block|
+          step_block.call(Agent::Chat::Chunk.new(nil, Agent::Thinking.new(text: "pondering")))
+          step_block.call(Agent::Chat::Chunk.new("partial answer ", nil))
+          raise StandardError, "mid-stream explosion"
+        end
+      end)
+      agent, events = agent_on_kernel_with_chat(chat)
+      run_agent(agent, "hello")
+
+      failure = agent.new_messages.last
+      assert_equal "partial answer ", failure.content, "the streamed partial accumulated"
+      assert_equal "pondering", failure.thinking.text, "the thinking delta accumulated"
+      assert_equal "reasoning_content", failure.thinking.signature
+      assert_equal "mid-stream explosion", failure.error_message
+      assert_equal 1, events.count { |e| e[:type] == :message_start &&
+                                       !(e[:message].respond_to?(:role) && e[:message].role == :user) },
+        "the mid-stream failure keeps its existing message_start — NO second one"
+      synthesized = events.find { |e| e[:type] == :message_end && e[:message].equal?(failure) }
+      refute_nil synthesized
+      refute synthesized[:error]
+    end
+
+    # AC1: the cancel ladder synthesizes NOTHING — Async::Cancel re-raises
+    # (the interrupt arm, OQ-2's declared divergence records nothing) and
+    # CancelledError returns nil (no @last_error, no message events).
+    def test_error_transcript_cancel_ladder_synthesizes_nothing
+      cancelled = TestChat.build(@server, system_prompt: "test prompt")
+      cancelled.extend(Module.new do
+        define_method(:step) do |&step_block|
+          raise Fast::Completions::CancelledError, "cancelled"
+        end
+      end)
+      agent, events = agent_on_kernel_with_chat(cancelled)
+      result = run_agent(agent, "hello")
+
+      assert_equal %i[user], agent.new_messages.map(&:role), "no failure message on the cancelled shape"
+      assert_nil agent.last_error
+      assert_equal %i[user], result.map(&:role), "the nil message breaks the loop (the user turn rides)"
+      refute events.any? { |e| %i[message_start message_end].include?(e[:type]) &&
+                                e[:message].respond_to?(:role) && e[:message].role == :assistant }
+
+      # The Async::Cancel arm: the interrupt's trace stays empty (the D3
+      # conversion re-raises; run()'s rescue owns the bookkeeping).
+      @server.script([{type: :slow_stream, content: "x" * 40}])
+      interruptee, interrupt_events = agent_on_kernel
+      Async do |root|
+        turn = root.async do
+          begin
+            interruptee.run("long stream")
+          rescue Async::Cancel
+            nil # run() re-raises after the interrupted bookkeeping
+          end
+        end
+        root.async do
+          sleep 0.3 # mid-stream
+          turn.stop
+        end
+        begin
+          turn.wait
+        rescue Async::Cancel
+          nil
+        end
+      end
+      assert interruptee.interrupted?
+      assert_equal %i[user], interruptee.new_messages.map(&:role), "the interrupt synthesizes nothing"
+      refute interrupt_events.any? { |e| e[:type] == :message_end &&
+                                         e[:message].respond_to?(:role) && e[:message].role == :assistant }
+    end
+
+    # AC1: a synthesis during the overflow arm does NOT reset the recovery
+    # latch (pi's reset is clean-response-only, agent-session.ts:1168-1171):
+    # both overflows synthesize, the second still surfaces, and the retry
+    # wire stays neutral (the empty-assistant skip — the seeded failure
+    # message rides no request).
+    def test_error_transcript_overflow_synthesis_does_not_reset_the_recovery_latch
+      @server.script([
+        {type: :error, status: 400, message: "This model's maximum context length is 8 tokens"},
+        {type: :message, content: "a summary of the prior turns"},
+        {type: :error, status: 400, message: "This model's maximum context length is 8 tokens"},
+      ])
+      agent, _events = agent_on_kernel_with_seeds
+      run_agent(agent, "new question")
+
+      requests = @server.captured_requests
+      assert_equal 3, requests.size, "no third LLM call — the latch survived BOTH syntheses"
+      retry_payload = requests[2]["messages"].reject { |m| %w[system developer].include?(m["role"]) }
+      assert_equal %w[user user], retry_payload.map { |m| m["role"] },
+        "the synthesized failure message is wire-neutral on the retry (Grounds §4)"
+      assert_equal %i[user assistant assistant], agent.new_messages.map(&:role),
+        "each overflow failure synthesized its trace; the latch still surfaced the second"
+      assert_kind_of Fast::Completions::ContextLengthExceededError, agent.last_error
+    end
+
+    # AC1: the with-assistant-message arm (a batch executor raised AFTER the
+    # assistant recorded) is byte-identical: message_end error: true on the
+    # existing message, NO synthesis, no double record.
+    def test_error_transcript_with_message_arm_emits_error_true_byte_identically
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      chat.extend(Module.new do
+        define_method(:step) do
+          assistant = Agent::Message.new(role: :assistant, content: nil,
+            tool_calls: {"call_1" => Agent::ToolCall.new(id: "call_1", name: "sleep", arguments: {})},
+            finish_reason: :tool_use)
+          @messages << assistant
+          @after_message_hooks.each { |hook| hook.call(assistant) }
+          raise StandardError, "the batch executor exploded"
+        end
+      end)
+      agent, events = agent_on_kernel_with_chat(chat)
+      run_agent(agent, "go")
+
+      assert_equal %i[user assistant], agent.new_messages.map(&:role),
+        "the batch assistant recorded once through the normal :step arm — no synthesized duplicate"
+      ends = events.select { |e| e[:type] == :message_end && e[:message].role == :assistant }
+      assert_equal 2, ends.size
+      refute ends[0][:error], "the normal :step arm's message_end"
+      assert ends[1][:error], "the frozen with-message arm emits error: true"
+      refute events.any? { |e| e[:type] == :message_start && e[:message].respond_to?(:role) &&
+                                e[:message].role == :assistant }, "no synthesized message_start"
     end
 
     # --- I47 seam pins (the hooks-semantics gate drives the same surface) ---

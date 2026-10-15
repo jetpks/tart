@@ -43,7 +43,7 @@ module Tart
       FINISH_REASONS = {stop: "stop", length: "length", tool_use: "tool_calls"}.freeze
 
       attr_reader :role, :content, :tool_calls, :tool_call_id, :thinking, :tokens,
-                  :finish_reason, :provider, :model, :details
+                  :finish_reason, :error_message, :provider, :model, :details
 
       # @param role [Symbol] one of {ROLES}.
       # @param content [String, nil] the text (assistant nil = tool-calls-only).
@@ -56,6 +56,10 @@ module Tart
       #   usage (assistant turns; nil = unreported).
       # @param finish_reason [String, Symbol, nil] the stop reason — a
       #   recorded String spelling or a gem symbol (normalized on read).
+      # @param error_message [String, nil] the failure's message (I60 — the
+      #   synthesized assistant's exception message, pi's errorMessage);
+      #   display-side: it rides the recorded bytes when present and
+      #   from_seed_hash never reads it (replay renders from the RAW entry).
       # @param details [Hash, nil] the tool result's display side channel
       #   (I57 — pi session-manager records it on the toolResult message;
       #   NEVER sent to the LLM — the context projection drops the key and
@@ -63,7 +67,8 @@ module Tart
       #   result: the recorded byte-shape gains no key.
       def initialize(role:, content: nil, tool_calls: {}, tool_call_id: nil,
                      thinking: nil, thinking_signature: nil, tokens: nil,
-                     finish_reason: nil, provider: nil, model: nil, details: nil)
+                     finish_reason: nil, error_message: nil, provider: nil,
+                     model: nil, details: nil)
         unless ROLES.include?(role)
           raise ArgumentError, "role must be one of #{ROLES.inspect}, got #{role.inspect}"
         end
@@ -75,10 +80,30 @@ module Tart
         @thinking = normalize_thinking(thinking, thinking_signature)
         @tokens = tokens
         @finish_reason = normalize_finish_reason(finish_reason)
+        @error_message = error_message
         @provider = provider
         @model = model
         @details = details
         freeze
+      end
+
+      # The pi-shaped failure assistant (pi agent.ts:532-548 handleRunFailure):
+      # the failure message the loop synthesizes when an API error kills a
+      # step with no assistant message — role :assistant, +content+ the
+      # step's accumulated partial ("" pre-stream), no tool calls,
+      # finish_reason "error", +error_message+ the exception's message, and
+      # NO token keys (+tokens: nil+ — the port's unreported-usage convention
+      # drops every token key; pi's EMPTY_USAGE zeros are pi's own file
+      # format, the recorded byte family governs). +thinking+ takes the
+      # accumulated thinking text: it rides as
+      # +Thinking.new(text:, signature: "reasoning_content")+ only when a
+      # thinking delta preceded the failure, else nil (an empty buffer is
+      # no delta — never a recorded empty thinking key).
+      def self.error_failure(error_message:, content: "", thinking: nil)
+        thinking = nil if thinking.is_a?(String) && thinking.empty?
+        thinking = Thinking.new(text: thinking, signature: "reasoning_content") if thinking.is_a?(String)
+        new(role: :assistant, content: content, tool_calls: {}, finish_reason: "error",
+            error_message: error_message, thinking: thinking)
       end
 
       # The gem-style constructors the test factories and the Chat's
@@ -165,6 +190,11 @@ module Tart
         out[:thinking] = thinking.text if thinking&.text
         out[:thinking_signature] = thinking.signature if thinking&.signature
         out[:finish_reason] = finish_reason if finish_reason
+        # pi's errorMessage adjacency to stopReason (openai-completions.ts
+        # output serialization) — the key rides ONLY when present: every
+        # message without an error keeps the frozen no-tool-calls pin
+        # byte-identical (I60 adds no key to any existing recorded byte).
+        out[:error_message] = error_message if error_message
         merge_usage(out)
         out
       end

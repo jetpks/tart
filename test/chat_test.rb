@@ -1094,6 +1094,84 @@ module Tart
       end
     end
 
+    # --- I60 error_transcript: the failure row, live (D3) --------------------
+
+    # AC2: the failure message_end renders ONE pad-led, error-fg, wrapped
+    # "Error: <msg>" row after any streamed partial (pi assistant-message.ts
+    # :184-198 — Spacer(1) + the error row, outputPad-led).
+    def test_error_transcript_live_error_row_renders_padded_after_a_partial
+      with_chat(width: 40) do |chat, session|
+        stream(chat, "partial answer ")
+        draw(chat, session)
+        chat.on_agent_event({type: :message_end, message: Agent::Message.error_failure(
+          error_message: "400: The max_tokens parameter is illegal.", content: "partial answer ")})
+        draw(chat, session)
+
+        rows = chat.transcript_lines
+        assert_includes rows.join, "partial answer", "the mid-stream partial survives above the row"
+        error_rows = rows.grep(/Error: 400: The max_tokens/)
+        assert_equal 1, error_rows.size, "exactly ONE error row"
+        assert error_rows[0].start_with?(" "), "the row is pad-led (padded_fg_rows)"
+        assert_includes rows.join, "parameter is illegal.",
+          "the long message wrapped to the viewport (the tail row below)"
+        assert fg_cell?(session, ->(symbol, _x, _y) { symbol == "E" }, Theme[:error]),
+          "the row renders the error fg"
+      end
+    end
+
+    # AC2: the agent_end guard — with the flag set (the row rendered at
+    # :message_end), the agent_end error arm SKIPS its "error: <msg>"
+    # scrollback line (no double render) but KEEPS finalize_pending_as_error
+    # (the orphaned pending still settles, defense).
+    def test_error_transcript_agent_end_guard_skips_the_double_render
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        chat.on_agent_event({type: :message_end,
+                             message: Agent::Message.error_failure(error_message: "400: boom")})
+        chat.on_agent_event({type: :agent_end, error: StandardError.new("400: boom")})
+        draw(chat, session)
+
+        rows = chat.transcript_lines
+        assert_equal 1, rows.grep(/Error: 400: boom/).size, "the pad-led row renders ONCE"
+        refute_includes rows, "error: 400: boom", "the agent_end scrollback line skipped (the guard)"
+        assert_includes rows.join, "$ sleep 6", "the pending block still settled (the kept finalize)"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg]), "no pending bg survives"
+      end
+    end
+
+    # AC2: the flag-UNSET agent_end error case (no failure message_end ever
+    # rendered) keeps today's line byte-identically — the frozen chat pin's
+    # shape, under this filter.
+    def test_error_transcript_flag_unset_agent_end_error_stays_byte_identical
+      with_chat(width: 40) do |chat, session|
+        tool_start(chat, "bash", arguments: {"command" => "sleep 6"})
+        draw(chat, session)
+        chat.on_agent_event({type: :agent_end, error: StandardError.new("boom")})
+        draw(chat, session)
+
+        assert_includes chat.transcript_lines, "error: boom", "today's error scrollback line"
+        refute chat.transcript_lines.join.include?("Error: "), "no pad-led row on the flag-unset path"
+        refute buffer_bg_hit?(session, Theme[:tool_pending_bg])
+      end
+    end
+
+    # AC2: the interrupted arm is untouched — it reads no flag, and an
+    # interrupt after a rendered failure row still carries the interrupt
+    # scrollback line (pi's agent_end renders no error text on either arm;
+    # the abort row is the interrupt arm's own additive line).
+    def test_error_transcript_interrupted_arm_stays_untouched
+      with_chat(width: 40) do |chat, session|
+        chat.on_agent_event({type: :message_end,
+                             message: Agent::Message.error_failure(error_message: "400: boom")})
+        chat.on_agent_event({type: :agent_end, interrupted: true})
+        draw(chat, session)
+
+        assert_includes chat.transcript_lines, "interrupted", "the interrupt scrollback line stays"
+        assert_equal 1, chat.transcript_lines.grep(/Error: 400: boom/).size, "the row rendered once"
+      end
+    end
+
     # AC3: the replay (resume) renders final blocks only — zero
     # pending-bg spans (the pending machinery never engages).
     def test_resume_replays_render_no_pending_bg

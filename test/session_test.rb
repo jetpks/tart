@@ -391,6 +391,54 @@ module Tart
         "no recorder, no files anywhere under the root"
     end
 
+    # --- I60 error_transcript: the failure entry (D1/D2) --------------------
+
+    # AC1: the synthesized failure message round-trips through the recorder
+    # — the file gains the entry on the leaf chain with the D1 byte family
+    # (no token keys), and the context projection reads it back as a plain
+    # assistant ContextMessage.
+    def test_error_transcript_failure_entry_round_trips_through_the_recorder
+      @server.script([{type: :error, status: 400, message: "The max_tokens parameter is illegal."}])
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      agent = agent_on_kernel(recorder:)
+      run_agent(agent, "hello")
+
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      assert_equal 3, entries.size, "header + user + the failure entry — the two-line defect is dead"
+      assert_equal({"role" => "assistant", "content" => "", "tool_calls" => {},
+                    "finish_reason" => "error",
+                    "error_message" => "400: The max_tokens parameter is illegal."},
+        entries.last["message"], "the D1 byte family — error_message rides, no token keys")
+      assert_equal entries[1]["id"], entries.last["parentId"], "the entry chains from the user turn"
+
+      # The context readback: a plain assistant context message (the wire
+      # conversion's empty-assistant skip keeps it off every request).
+      context = Agent::Session.context_messages(recorder.path)
+      assert_equal({role: :assistant, content: "", tool_calls: {}, finish_reason: "error",
+                    error_message: "400: The max_tokens parameter is illegal."},
+        context.last)
+    end
+
+    # AC1: the seed side — from_seed_hash reads declared fields only: a
+    # resumed failure message seeds content ""/finish_reason "error" while
+    # error_message stays display-side (replay renders from the RAW entry
+    # hash); pre-I60 files (no error_message key) seed byte-identically.
+    def test_error_transcript_seed_keeps_error_message_display_side
+      recorded = Agent::Message.error_failure(error_message: "400: boom")
+      seeded = Agent::Message.from_seed_hash(recorded.to_h.transform_keys(&:to_s))
+
+      assert_equal "", seeded.content
+      assert_equal "error", seeded.finish_reason
+      assert_nil seeded.error_message, "error_message is display-side — the seed never reads it"
+      assert_nil seeded.tokens&.input, "the seed's token duck carries no counts (no token keys recorded)"
+
+      pre_i60 = Agent::Message.new(role: :assistant, content: "done", tokens: nil, finish_reason: "stop")
+      reseeded = Agent::Message.from_seed_hash(pre_i60.to_h.transform_keys(&:to_s))
+      assert_equal "done", reseeded.content
+      assert_equal "stop", reseeded.finish_reason
+      assert_nil reseeded.error_message, "pre-I60 files: no error_message key, nothing changes"
+    end
+
     # Session.list (item 2/AC2, pi SessionManager.list's discovery shape):
     # the cwd's valid-header sessions, mtime descending, fixture-rooted.
     def test_lists_the_cwd_s_sessions_newest_first

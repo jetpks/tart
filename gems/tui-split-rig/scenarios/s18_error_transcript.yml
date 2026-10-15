@@ -1,0 +1,20 @@
+# S18 — error transcript (I60): the mock scripts ONE HTTP 400 on the first
+# request — the owner's live z.ai outage shape (Grounds §1's measurement:
+# at base tart's session file stayed TWO lines, the dangling user turn, and
+# its resume showed no error anywhere; pi's file carried the failure entry
+# and its resume re-rendered the row). replay: true re-boots each app on
+# its recorded session: both apps must render the padded error-fg row live
+# AND again on the replay leg, and tart's session file must carry the
+# failure entry as its THIRD line (the D1 byte family). The message tail
+# diverges by frozen formatting (pi keeps the raw JSON body via the SDK
+# message; the gem extracts error.message — registry
+# error-transcript-row-tail), and pi's /bug hint row is the machinery cut
+# (registry pi-bug-report-hint, OQ-1).
+name: s18_error_transcript
+prompt: "hello"
+expected_requests: 1
+replay: true
+responses:
+  - type: error
+    status: 400
+    message: "The max_tokens parameter is illegal."

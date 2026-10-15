@@ -188,12 +188,16 @@ module Tart
     end
 
     # pi getAssistantUsage (compaction.ts:144-158): skips messages without
-    # valid (non-nil, non-all-zero) usage. pi's aborted/error stop-reason
-    # skip is unobservable here and itemized as cut: the chat raises
-    # instead of appending failed/aborted responses (the step's request
-    # raises before any append — a cancelled stream unwinds with the
-    # Async::Cancel conversion), and a recorded finish_reason never
-    # carries aborted/error — a skip on those values would guard nothing.
+    # valid (non-nil, non-all-zero) usage. Since I60 a recorded
+    # finish_reason CAN carry "error" — the loop's synthesized failure
+    # message rides the normal machinery (error_message in tow, tokens:
+    # nil) — so the error stop-reason skip pi does is net-equivalent HERE
+    # through the nil-tokens guard below: the failure message reports no
+    # usage and is skipped by the same check that skips every unreported
+    # turn. The aborted premise stands as itemized: the chat raises
+    # instead of appending aborted responses (a cancelled stream unwinds
+    # with the Async::Cancel conversion — OQ-2's declared divergence
+    # records nothing).
     def assistant_usage(message)
       return nil unless message.respond_to?(:role) && message.role == :assistant
 
