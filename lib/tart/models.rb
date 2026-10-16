@@ -162,13 +162,17 @@ module Tart
       )
     end
 
-    # The compat→Dialect translation (D6 — zai as data): the I46 five-key
+    # The compat→Dialect translation (D6 — zai as data): the I46/I64 six-key
     # compat subset maps onto the closed Dialect vocabulary — a zai
     # thinkingFormat builds the zai-shaped declaration (the gem's shipped
     # :zai values: max_tokens rename, no developer role, effort enabled,
-    # tool_stream, pi's zai store suppression); ANY other compat (nil, a
-    # non-zai thinkingFormat) rides the DEFAULT dialect — today's
-    # "only-zai arms" behavior verbatim.
+    # tool_stream, pi's zai store suppression, and I64's strict-sampling
+    # gate — supports_strict_mode threads the compat's
+    # supportsStrictMode; nil/false/absent stay false, pi detectCompat's
+    # "OpenAI compatibility alone does not imply it"); ANY other compat
+    # (nil, a non-zai thinkingFormat) rides the DEFAULT dialect — today's
+    # "only-zai arms" behavior verbatim (a non-zai compat declaring
+    # supportsStrictMode is tolerated-and-DROPPED: the frozen boundary).
     #
     # BOTH arms declare supports_finish_reason: false — pi's
     # finish-inference arm (the gem infers the stop reason from the
@@ -188,6 +192,7 @@ module Tart
         supports_developer_role: compat.supports_developer_role == true,
         supports_reasoning_effort: compat.supports_reasoning_effort == true,
         zai_tool_stream: compat.zai_tool_stream == true,
+        supports_strict_mode: compat.supports_strict_mode == true,
         supports_store: false,
         supports_finish_reason: false
       )
@@ -263,7 +268,7 @@ module Tart
       )
     end
 
-    # The pi compat subset (I46): the five carried keys picked off the
+    # The pi compat subset (I46, I64): the six carried keys picked off the
     # parsed object (symbolized into the struct), UNKNOWN keys dropped —
     # the schema tolerates them (pi additionalProperties:true) and the
     # struct carries only the dialect the request seam reads. nil when the
@@ -278,7 +283,8 @@ module Tart
         max_tokens_field: raw["maxTokensField"],
         supports_developer_role: raw["supportsDeveloperRole"],
         supports_reasoning_effort: raw["supportsReasoningEffort"],
-        zai_tool_stream: raw["zaiToolStream"]
+        zai_tool_stream: raw["zaiToolStream"],
+        supports_strict_mode: raw["supportsStrictMode"]
       )
     end
 

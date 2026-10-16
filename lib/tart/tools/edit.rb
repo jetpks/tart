@@ -19,27 +19,32 @@ module Tart
         "merge them into one edit instead of emitting overlapping edits. Do not include large unchanged " \
         "regions just to connect distant changes."
 
+      # STRING-KEYED THROUGHOUT (I64): the gem's strict engine reads string
+      # keys (pi's JS node["type"] shape) — a symbol-keyed root makes the
+      # "prefer" declaration SILENTLY INERT (the resolver falls back loose
+      # with zero errors). Serialization-neutral: JSON.generate emits
+      # identical bytes for either key form, so the non-strict wire holds.
       PARAMETERS_SCHEMA = {
-        type: "object",
-        properties: {
-          "path" => {type: "string", description: "Path to the file to edit (relative or absolute)"},
+        "type" => "object",
+        "properties" => {
+          "path" => {"type" => "string", "description" => "Path to the file to edit (relative or absolute)"},
           "edits" => {
-            type: "array",
-            description: "One or more targeted replacements. Each edit is matched against the original file, " \
+            "type" => "array",
+            "description" => "One or more targeted replacements. Each edit is matched against the original file, " \
               "not incrementally. Do not include overlapping or nested edits. If two changes touch the same " \
               "block or nearby lines, merge them into one edit instead.",
-            items: {
-              type: "object",
-              properties: {
-                "oldText" => {type: "string", description: "Exact text for one targeted replacement. It must " \
+            "items" => {
+              "type" => "object",
+              "properties" => {
+                "oldText" => {"type" => "string", "description" => "Exact text for one targeted replacement. It must " \
                   "be unique in the original file and must not overlap with any other edits[].oldText in the same call."},
-                "newText" => {type: "string", description: "Replacement text for this targeted edit."}
+                "newText" => {"type" => "string", "description" => "Replacement text for this targeted edit."}
               },
-              required: ["oldText", "newText"]
+              "required" => ["oldText", "newText"]
             }
           }
         },
-        required: ["path", "edits"]
+        "required" => ["path", "edits"]
       }.freeze
 
       attr_reader :cwd, :details
@@ -55,6 +60,11 @@ module Tart
       description DESCRIPTION
 
       parameters PARAMETERS_SCHEMA.dup
+
+      # pi edit.ts :156 — one of EXACTLY four core tools pi tags with
+      # constrainedSampling; the strict engine rewrites `parameters` and
+      # ships `strict: true` on a strict-capable dialect (I64).
+      constrained_sampling({"type" => "json_schema", "strict" => "prefer"})
 
       # pi's prepareEditArguments hook: some models send edits as a JSON
       # string, a single edit object, or legacy top-level oldText/newText.

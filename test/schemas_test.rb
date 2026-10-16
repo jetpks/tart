@@ -77,8 +77,9 @@ module Tart
     # --- I46: the per-model compat subset --------------------------------------
 
     # The owner's live zai catalog object (Grounds §3, verbatim compat —
-    # supportsStore/supportsStrictMode are UNKNOWN keys: tolerated, no
-    # error — pi additionalProperties:true).
+    # supportsStore is an UNKNOWN key: tolerated, no error — pi
+    # additionalProperties:true. supportsStrictMode is CARRIED since I64
+    # (a strict boolean trio became a quartet).
     OWNER_COMPAT = {"supportsStore" => false, "supportsDeveloperRole" => false,
                     "supportsReasoningEffort" => true, "maxTokensField" => "max_tokens",
                     "thinkingFormat" => "zai", "supportsStrictMode" => true,
@@ -103,7 +104,9 @@ module Tart
           "  - providers.a.models[0].compat.supportsReasoningEffort: expected a boolean",
         compat_model_json({"zaiToolStream" => "true"}) =>
           "  - providers.a.models[0].compat.zaiToolStream: expected a boolean",
-        # Several bad keys in one object: the five-key rule order
+        compat_model_json({"supportsStrictMode" => "prefer"}) =>
+          "  - providers.a.models[0].compat.supportsStrictMode: expected a boolean",
+        # Several bad keys in one object: the six-key rule order
         # (thinkingFormat, maxTokensField, then the booleans).
         compat_model_json({"thinkingFormat" => "nope", "zaiToolStream" => "yes"}) =>
           "  - providers.a.models[0].compat.thinkingFormat: expected a thinking format\n" \
@@ -124,6 +127,9 @@ module Tart
         {"supportsDeveloperRole" => true},
         {"supportsReasoningEffort" => false},
         {"zaiToolStream" => true},
+        {"supportsStrictMode" => true},
+        {"supportsStrictMode" => false},
+        {"supportsStrictMode" => nil},
         {"thinkingFormat" => "zai", "maxTokensField" => "max_tokens", "supportsDeveloperRole" => false,
          "supportsReasoningEffort" => true, "zaiToolStream" => true},
         OWNER_COMPAT

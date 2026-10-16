@@ -1,7 +1,7 @@
 PATH
   remote: ../fast-llm/gems/completions
   specs:
-    fast-completions (0.2.0)
+    fast-completions (0.3.0)
       async-http (~> 0.95)
 
 PATH
@@ -156,7 +156,7 @@ PLATFORMS
   x86_64-linux
 
 DEPENDENCIES
-  fast-completions (= 0.2.0)!
+  fast-completions (= 0.3.0)!
   irb
   minitest (~> 5.20)
   rake (~> 13.0)
@@ -181,7 +181,7 @@ CHECKSUMS
   dry-types (1.9.1) sha256=baebeecdb9f8395d6c9d227b62011279440943e3ef2468fe8ccc1ba11467f178
   dry-validation (1.11.1) sha256=70900bb5a2d911c8aab566d3e360c6bff389b8bf92ea8e04885ce51c41ff8085
   erb (6.0.7) sha256=c5ca6dc25b0ef974a44dc8f59fe847577122483b1968a38dec305c60bf91ee92
-  fast-completions (0.2.0)
+  fast-completions (0.3.0)
   fast-uuid (0.1.0) sha256=91745f0af982e03bcad709d9037c6229fa25325df559276f3c743ab86ed09c2c
   fiber-annotation (0.2.0) sha256=7abfadf1d119f508867d4103bf231c0354d019cc39a5738945dec2edadaf6c03
   fiber-local (1.1.0) sha256=c885f94f210fb9b05737de65d511136ea602e00c5105953748aa0f8793489f06

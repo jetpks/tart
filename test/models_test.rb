@@ -133,7 +133,7 @@ module Tart
       JSON
       config = load_models
 
-      assert_nil config.error, "the owner's live object (unknown supportsStore/supportsStrictMode) loads clean"
+      assert_nil config.error, "the owner's live object (unknown supportsStore; supportsStrictMode now CARRIED) loads clean"
       compat = config.model_entries.first.compat
       assert_instance_of Shapes::ModelCompat, compat
       assert_equal "zai", compat.thinking_format
@@ -141,9 +141,10 @@ module Tart
       assert_equal false, compat.supports_developer_role
       assert_equal true, compat.supports_reasoning_effort
       assert_equal true, compat.zai_tool_stream
+      assert_equal true, compat.supports_strict_mode
     end
 
-    def test_compat_absent_parses_nil_and_partial_compat_picks_the_five
+    def test_compat_absent_parses_nil_and_partial_compat_picks_the_six
       write_models('{"providers": {"a": {"models": [{"id": "m"}, {"id": "n", "compat": {"thinkingFormat": "zai", "madeUp": 1}}]}}}')
       config = load_models
 
@@ -155,6 +156,7 @@ module Tart
       assert_nil second.compat.supports_developer_role
       assert_nil second.compat.supports_reasoning_effort
       assert_nil second.compat.zai_tool_stream
+      assert_nil second.compat.supports_strict_mode
     end
 
     def test_entry_compat_bridges_typed_and_legacy_raw_hash_entries
@@ -372,10 +374,12 @@ module Tart
     # --- I52: the compat→Dialect translation (zai as data, AC5) ---
 
     # The zai compat subset translates value-by-value onto the closed
-    # Dialect vocabulary: the I46 five keys + pi's zai store suppression.
+    # Dialect vocabulary: the I46/I64 six keys + pi's zai store suppression
+    # — with I64's supportsStrictMode threading (zai arm true).
     def test_dialect_for_translates_the_zai_compat
       compat = Shapes::ModelCompat.new(thinking_format: "zai", max_tokens_field: "max_tokens",
-        supports_developer_role: false, supports_reasoning_effort: true, zai_tool_stream: true)
+        supports_developer_role: false, supports_reasoning_effort: true, zai_tool_stream: true,
+        supports_strict_mode: true)
       dialect = Models.dialect_for(compat)
 
       assert_equal :zai, dialect.thinking_format
@@ -383,6 +387,7 @@ module Tart
       assert_equal false, dialect.supports_developer_role
       assert_equal true, dialect.supports_reasoning_effort
       assert_equal true, dialect.zai_tool_stream
+      assert_equal true, dialect.supports_strict_mode
       assert_equal false, dialect.supports_store
     end
 
@@ -406,6 +411,64 @@ module Tart
         zai_tool_stream: false)).thinking_format
       assert Models.dialect_for(nil).equal?(Models.dialect_for(nil)),
         "the default arm is one frozen instance"
+      # I64: the 14th key — non-strict everywhere off the zai arm (nil,
+      # false, and the DEFAULT singleton itself).
+      assert_equal false, Models.dialect_for(nil).supports_strict_mode
+      assert_equal false, Models.dialect_for(Shapes::ModelCompat.new(
+        thinking_format: "zai", supports_strict_mode: false)).supports_strict_mode
+      assert_equal false, Models::DEFAULT_DIALECT.supports_strict_mode
+    end
+
+    # --- I64: the supportsStrictMode carry (the strict-compat gate) ------
+
+    # The owner-catalog-shaped compat carries through the FULL chain:
+    # models.json → parsed compat → Dialect → wire model. wire_model is
+    # the single seam every construction path threads (boot, /model
+    # switch, compaction one-shot, subagent children), so the flag rides
+    # everywhere by construction — no per-path edits.
+    def test_strict_compat_carries_through_load_dialect_and_wire_model
+      write_models(<<~JSON)
+        {"providers": {"zai": {"name": "Z.AI", "baseUrl": "https://api.z.ai/api/coding/paas/v4",
+          "models": [{"id": "glm-5.3", "reasoning": true, "contextWindow": 200000,
+            "compat": {"supportsStore": false, "supportsDeveloperRole": false,
+                       "supportsReasoningEffort": true, "maxTokensField": "max_tokens",
+                       "thinkingFormat": "zai", "supportsStrictMode": true, "zaiToolStream": true}}]}}}
+      JSON
+      config = load_models
+      assert_nil config.error
+      entry = config.model_entries.first
+
+      assert_equal true, entry.compat.supports_strict_mode
+      dialect = Models.dialect_for(entry.compat)
+      assert_equal true, dialect.supports_strict_mode
+      wire = Models.wire_model(model_id: entry.id, provider_key: "zai", reasoning: entry.reasoning,
+        context_window: 200_000, compat: entry.compat)
+      assert_equal true, wire.dialect.supports_strict_mode,
+        "the strict flag rides the mounted wire model"
+    end
+
+    def test_strict_compat_absent_nil_or_false_yields_a_non_strict_zai_dialect
+      absent = Models.dialect_for(Shapes::ModelCompat.new(thinking_format: "zai"))
+      explicit_nil = Models.dialect_for(Shapes::ModelCompat.new(thinking_format: "zai", supports_strict_mode: nil))
+      explicit_false = Models.dialect_for(Shapes::ModelCompat.new(thinking_format: "zai", supports_strict_mode: false))
+
+      assert_equal false, absent.supports_strict_mode
+      assert_equal false, explicit_nil.supports_strict_mode
+      assert_equal false, explicit_false.supports_strict_mode
+    end
+
+    # The frozen boundary (I46's only-zai-arms shape): a NON-zai compat
+    # declaring supportsStrictMode is tolerated-and-DROPPED — it rides
+    # DEFAULT_DIALECT itself (pi's getCompat would thread it; recorded
+    # divergence + known unknown, no such catalog entry exists here).
+    def test_strict_compat_on_a_non_zai_arm_stays_the_default_dialect
+      boundary = Models.dialect_for(Shapes::ModelCompat.new(supports_strict_mode: true))
+      deepseek = Models.dialect_for(Shapes::ModelCompat.new(thinking_format: "deepseek", supports_strict_mode: true))
+
+      assert Models::DEFAULT_DIALECT.equal?(boundary),
+        "a compat-less/zai-less strict declaration rides the frozen DEFAULT singleton"
+      assert Models::DEFAULT_DIALECT.equal?(deepseek)
+      assert_equal false, boundary.supports_strict_mode
     end
 
     # --- I43: the schema-path pins (the contract replaced the hand-rolled
