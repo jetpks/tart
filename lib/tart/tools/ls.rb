@@ -7,7 +7,7 @@ module Tart
     # The ls tool (port of pi's ls.ts): directory listing sorted
     # case-insensitively, '/' suffix for directories, dotfiles included,
     # truncated to 500 entries or 50KB.
-    class Ls < RubyLLM::Tool
+    class Ls < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "ls"
@@ -42,7 +42,7 @@ module Tart
           failure = validate_input(path:, limit:)
           return failure if failure
 
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
           dir_path = PathUtils.resolve_to_cwd(path || ".", @cwd)
           raise ArgumentError, "Path not found: #{dir_path}" unless File.exist?(dir_path)
           raise ArgumentError, "Not a directory: #{dir_path}" unless File.directory?(dir_path)

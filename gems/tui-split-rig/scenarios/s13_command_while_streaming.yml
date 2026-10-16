@@ -1,0 +1,20 @@
+# S13 — slash commands dispatch busy-or-not (I54, finding 4): `/thinking
+# off` typed mid-stream must EXECUTE in both apps (the rig's mock-1 is
+# reasoning:false, so both gates offer only `off` — pi models.ts:1224-1226,
+# the port's available_thinking_levels) and queue NOTHING: the command text
+# never reaches the model (the s13 gate asserts request 2 carries no
+# "/thinking"). :slow_stream paces 0.1 s/char (mock spec_pause) — the keys
+# land mid-stream deterministically. OLD-port discrimination (D11): the
+# command queued as a steer and reached the model as a user message, which
+# the request-log assertion fails.
+name: s13_command_while_streaming
+prompt: "hello"
+expected_requests: 2
+mid_run_keys:
+  after_request: 1
+  keys: ["/thinking off", "Enter"]
+responses:
+  - type: slow_stream
+    content: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  - type: stream
+    content: "Reply after the command."

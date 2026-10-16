@@ -55,7 +55,7 @@ module Tart
       #   registered) wraps in a {ToolGate}; registered tools merge after
       #   built-ins + MCP (same name overrides — pi's registry merge,
       #   agent-session.ts _refreshToolRegistry).
-      # @return [Hash{String => RubyLLM::Tool}] instances for the selected
+      # @return [Hash{String => Fast::Completions::Tool}] instances for the selected
       #   tools only, keyed by wire name IN SELECTED ORDER.
       def build(selected:, cwd:, strip_trailing_whitespace: false, mcp_servers: nil,
                 identity: Identity::DEFAULT, session_env: {}, hooks: nil)
@@ -140,7 +140,7 @@ module Tart
       #    (OQ-7); terminate: true records the tool_call_id for the loop's
       #    batch consult. NO isolation: a handler StandardError blocks
       #    fail-safe with the error's message (agent-session.ts:685-687);
-      #    RubyLLM::CancelledError ALWAYS propagates (never blocked-on).
+      #    Fast::Completions::CancelledError ALWAYS propagates (never blocked-on).
       # 4. unblocked → the inner tool's call with the possibly
       #    handler-mutated input (Tool#call re-symbolizes the keys).
       def call(tool_call: nil, **args)
@@ -154,7 +154,7 @@ module Tart
         event = {"type" => "tool_call", "tool_name" => name, "tool_call_id" => tool_call&.id, "input" => input}
         begin
           result = @hooks.dispatch_tool_call(event)
-        rescue RubyLLM::CancelledError
+        rescue Fast::Completions::CancelledError
           raise
         rescue StandardError => e
           return e.message

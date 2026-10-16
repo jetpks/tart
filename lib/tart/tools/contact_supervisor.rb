@@ -26,7 +26,7 @@ module Tart
     # answers the no-channel error and never touches disk. It is in NO
     # default loadout — Settings::DEFAULT_TOOL_NAMES is untouched, so the
     # default wire never changes.
-    class ContactSupervisor < RubyLLM::Tool
+    class ContactSupervisor < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "contact_supervisor"

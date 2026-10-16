@@ -68,9 +68,99 @@ module Tart
       # The hint rows carry the keyHint styles (keybinding-hints.ts:42-44):
       # the key dim, the description muted.
       def test_pi_expanded_hint_rows_render_the_keyhint_styles
-        row = Motd.pi_header_lines(expanded: true)[2]
+        row = Motd.pi_header_lines(expanded: true, width: 120)[2]
         assert_equal Theme[:dim], row.spans[1].style.fg, "the key renders dim"
         assert_equal Theme[:muted], row.spans[2].style.fg, "the description renders muted"
+      end
+
+      # I56 AC2: the wrapped header rows reproduce the live-pi artifact
+      # bytes EXACTLY at the pinned widths — 50 (the whitespace-break
+      # class: the separator's leading space rides the continuation), 52
+      # (the separator-carrying class: `…clear/exit ·` / `␣/ commands…`)
+      # and 80 (the word-break class: `…! bash ·` / `␣ctrl+o more`).
+      # Plain bytes from tmp/resize-calib/stage3/pi-w{50,52,80}.txt (the
+      # oracle table, cross-checked against a deno run of pi's own
+      # wrapTextWithAnsi); rows below the header (the reply/footer area)
+      # are not part of the pin.
+      def test_pi_header_rows_wrap_to_the_live_oracle_bytes_at_pinned_widths
+        assert_equal [
+          " ▀▀█  v#{Identity::ORACLE_VERSION}",
+          " █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit",
+          "  · / commands · ! bash · ctrl+o more",
+          " Press ctrl+o to show full startup help and",
+          " loaded resources.",
+          "",
+          " Pi can explain its own features and look up its",
+          " docs. Ask it how to use or extend Pi."
+        ], pi_header_rows(expanded: false, width: 50), "w50: the whitespace-break class"
+
+        assert_equal [
+          " ▀▀█  v#{Identity::ORACLE_VERSION}",
+          " █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit ·",
+          " / commands · ! bash · ctrl+o more",
+          " Press ctrl+o to show full startup help and loaded",
+          " resources.",
+          "",
+          " Pi can explain its own features and look up its",
+          " docs. Ask it how to use or extend Pi."
+        ], pi_header_rows(expanded: false, width: 52), "w52: the separator-carrying class"
+
+        assert_equal [
+          " ▀▀█  v#{Identity::ORACLE_VERSION}",
+          " █▀ █ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash ·",
+          " ctrl+o more",
+          " Press ctrl+o to show full startup help and loaded resources.",
+          "",
+          " Pi can explain its own features and look up its docs. Ask it how to use or",
+          " extend Pi."
+        ], pi_header_rows(expanded: false, width: 80), "w80: the word-break class"
+      end
+
+      # The wrapped continuation's EFFECTIVE runs match the -e artifact
+      # (pi-w50.styled row 3): the pad renders unstyled, the separator's
+      # leading space rides the muted ` · ` run (pi's re-issued SGR —
+      # utils.ts:941), the keys re-open dim. At a fitting width the row is
+      # ONE span run per source segment, byte-identical to the frozen
+      # 120-col shape.
+      def test_pi_header_rows_wrap_keeps_the_continuation_style_runs
+        row = Motd.pi_header_lines(expanded: false, width: 50)[2].spans
+        assert_equal " ", row[0].content
+        assert_nil row[0].style, "the pad renders unstyled"
+        assert_equal " · ", row[1].content, "the separator's leading space rides the continuation"
+        assert_equal Theme[:muted], row[1].style.fg, "the muted run re-opens at the separator"
+        assert_equal ["/", " commands", " · ", "!"], row.values_at(2, 3, 4, 5).map(&:content)
+        assert_equal Theme[:dim], row[2].style.fg, "the key re-opens dim"
+
+        row80 = Motd.pi_header_lines(expanded: false, width: 80)[2].spans
+        assert_equal [" ", "ctrl+o", " more"], row80.map(&:content), "the word-led continuation"
+        assert_equal Theme[:dim], row80[1].style.fg
+
+        onboard = Motd.pi_header_lines(expanded: false, width: 80)[6].spans
+        assert_equal [" ", "extend Pi."], onboard.map(&:content), "the wrapped onboarding pair"
+      end
+
+      # I56 AC3: the ladder — the WIDEST piece by max-row CELL width whose
+      # pad + widest row fits the width; the 40-cell tie breaks name-asc
+      # (mono-12 over rebel). From the MEASURED table (ladder.txt,
+      # regenerated with TUI.text_width): 120 → slant-relief (66),
+      # 43 → twisted (42, fits its width exactly), 42 → mono-12 (40; the
+      # measured tie over rebel), 35 → soft (32).
+      def test_ladder_picks_the_widest_fitting_piece_per_width
+        assert_equal logo("slant-relief"), Motd.motd_logo_lines(120, wordmark: "tart")
+        assert_equal logo("twisted"), Motd.motd_logo_lines(43, wordmark: "tart"),
+          "twisted fits 43 exactly (42 + one pad)"
+        assert_equal logo("mono-12"), Motd.motd_logo_lines(42, wordmark: "tart"),
+          "the 40-cell tie breaks name-ascending: mono-12 over rebel"
+        assert_equal logo("soft"), Motd.motd_logo_lines(35, wordmark: "tart")
+      end
+
+      # Below the smallest piece (tmplr, 6 cells + pad = 7) the ladder
+      # floors at the WORDMARK row — the identity name, one row.
+      def test_ladder_wordmark_floor_below_the_smallest_piece
+        assert_equal ["tart"], Motd.motd_logo_lines(6, wordmark: "tart")
+        assert_equal ["tart"], Motd.motd_logo_lines(1, wordmark: "tart")
+        assert_equal ["mike"], Motd.motd_logo_lines(6, wordmark: "mike"), "the wordmark is the caller's identity name"
+        assert_equal logo("tmplr"), Motd.motd_logo_lines(7, wordmark: "tart"), "the smallest piece fits 7"
       end
 
       # The tart family's expanded header: one row per REAL bound key
@@ -184,8 +274,13 @@ module Tart
 
       private
 
-      def pi_header_rows(expanded:)
-        Motd.pi_header_lines(expanded:).map { |row| row.spans.map(&:content).join }
+      def pi_header_rows(expanded:, width: 120)
+        Motd.pi_header_lines(expanded:, width:).map { |row| row.spans.map(&:content).join }
+      end
+
+      # One logo piece's raw lines (the ladder's return shape).
+      def logo(name)
+        File.readlines(File.join(Motd::LOGOS_DIR, "#{name}.txt"), chomp: true)
       end
     end
   end

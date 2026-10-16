@@ -8,6 +8,7 @@ require_relative "panel"
 require_relative "bash_block"
 require_relative "file_blocks"
 require_relative "tool_block"
+require_relative "edit_block"
 require_relative "editor"
 require_relative "kill_ring"
 require_relative "autocomplete"
@@ -50,13 +51,12 @@ module Tart
 
       # pi loader.ts:17 DEFAULT_INTERVAL_MS — the spinner's frame dwell: the
       # glyph advances on TIME, never on renders ({spinner_glyph} derives
-      # the frame from the monotonic clock at each already-animated frame).
+      # the frame from the monotonic clock at each rendered frame). Since
+      # I58 this interval also PACES the renders: the busy spinner tick
+      # ({arm_spinner_tick}) requests one draw every dwell — pi's own
+      # cadence (the Loader interval advances the frame, then
+      # updateDisplay calls requestRender, loader.ts:82-99).
       SPINNER_INTERVAL_SECONDS = 0.08
-
-      # How long one draw re-arms the animation window while the agent works
-      # (frame pacing: deadline-paced at the frame rate while busy, purely
-      # event-driven when idle — the I02 static-loop property).
-      BUSY_FRAME_SECONDS = 0.25
 
       # Rows the footer always occupies (pi renders a pwd line + a stats
       # line — footer.ts:169-171).
@@ -178,6 +178,12 @@ module Tart
         # screen (motd: false, or the /resume screen) — the rebuild
         # restores none.
         @header_enqueued = false
+        # The tart art pick (I56 — the ladder at enqueue/re-pick time; nil
+        # until the first header enqueue) and the resize latch (the event
+        # dims driving the ONE post-SIGWINCH compose; {render_frame}
+        # clears it after {build_widget}).
+        @logo_lines = nil
+        @resize_dims = nil
         # The /resume session picker (item 2, pi SessionSelectorComponent
         # reduced): nil = closed; open it holds the {Picker} over the
         # launcher-built [{path:, label:}] list (newest first).
@@ -211,8 +217,9 @@ module Tart
         # double-press exit window, handleCtrlC :6840). The I38 streaming
         # sinks wire the running block's render state below (pi's
         # BashExecutionComponent lives from before execution,
-        # :7000-7062): start before the task spawns, each bridged chunk,
-        # and the explicit clear at every terminal path.
+        # :7000-7062): start before the task spawns, each chunk as the
+        # kernel task's drainer delivers it, and the explicit clear at
+        # every terminal path.
         @user_bash = UserBash.new(
           kernel: kernel,
           busy_reader: -> { busy? },
@@ -238,8 +245,36 @@ module Tart
         # normalization happens at the request seam — Agent::Loop's
         # before_request hook; the message itself keeps its thinking).
         @reasoning = +""
+        # The streaming region's conversion cache (I58 D2):
+        # {[width, live bytes, reasoning bytes] => rows} from
+        # {assistant_live_lines} — the per-frame whole-text markdown/
+        # reasoning re-conversion was 95-97% of heavy-frame render CPU
+        # (Grounds §2). Cleared at every @live/@reasoning RESET site:
+        # within one message generation deltas only append (the bytesize
+        # key is monotone), so the reset clearing is what makes size-keyed
+        # invalidation exact — without it, a later message colliding on a
+        # cached size at the same width would serve the previous message's
+        # rows (AC2's reset-cycle exactness pins this).
+        @live_region_cache = nil
         @busy = false
         @tool = nil
+        # The failure row's double-render guard (I60 D3): set by the
+        # :message_end error-row arm, cleared at :agent_start — the
+        # agent_end error arm skips its scrollback line when the failure's
+        # own row already rendered.
+        @error_row_rendered = false
+        # The queued-message surface mirror (I54 — pi's _steeringMessages/
+        # _followUpMessages, agent-session.ts:2238-2263): appended by the
+        # busy submit/follow-up paths, rendered between the dock spacer and
+        # the editor (§pending_widget), removed by delivery (first-index
+        # text match at :message_start user role — pi :1122-1134) and by
+        # alt+up's dequeue.
+        @queued = {steer: [], follow_up: []}
+        # The abort-first busy command (I54 — pi session.compact/newSession
+        # abort first, agent-session.ts:2764-2765 + runtime :167-178): the
+        # surface arms kernel.interrupt_work! and re-dispatches the stored
+        # command through the idle path at :agent_end.
+        @pending_after_interrupt = nil
         # The RUNNING user-bash block's render state (I38 — pi's
         # BashExecutionComponent): the command/excluded, the accumulated
         # chunk text (the appendOutput join IS this string buffer), and
@@ -308,7 +343,7 @@ module Tart
       end
 
       # @return [Boolean] whether a user-bash run's live rows are on
-      #   screen (the animate gate's second arm — @busy stays false: a
+      #   screen (the spinner tick's second arm — @busy stays false: a
       #   bash run never lights the border's Working status).
       def user_bash_streaming?
         @mutex.synchronize { !@user_bash_stream.nil? }
@@ -402,26 +437,61 @@ module Tart
           @motd_pending = false
           @transcript_state.flush_scrollback
           widget = build_widget
+          # One-frame latch semantics (I56): the resize event's dims drove
+          # THIS compose; the draw's autoresize has refreshed the gem area
+          # by the next frame (Grounds §2) — subsequent frames compose
+          # from the session area again.
+          @resize_dims = nil
         end
-        # Keep frames deadline-paced while the agent works (spinner, live
-        # region) OR a user-bash run streams (the bash loader's glyph must
-        # advance between chunks — pi's Loader ticks requestRender on its
-        # own 80 ms interval, loader.ts:79-84); idle goes event-driven
-        # again on agent_end / stream end.
-        @kernel.animate(duration: BUSY_FRAME_SECONDS) if busy? || user_bash_streaming?
+        # I58 — pi's render discipline (tui.ts requestRender/scheduleRender):
+        # nothing renders at a fixed rate here anymore. State changes —
+        # agent events (the sink's tail request_draw), user-bash chunks
+        # (the I38 sinks), user input (the kernel's per-event dirty mark),
+        # the ~80 ms spinner tick ({arm_spinner_tick}) — each request
+        # exactly one paint; with nothing pending the loop blocks on the
+        # event queue (the I02 static-loop property). The retired
+        # re-arm rendered 60 frames/s where pi renders on request ≈ 22/s
+        # on the identical stream (Grounds §2 — the burn).
         widget
       end
 
       # Kernel event sink (every dispatched event, native or synthetic).
       # Ctrl+C never reaches here — the kernel owns it (interrupt). Mouse
-      # events route to the surface's wheel-scroll/selection machinery;
-      # resize is ignored (the kernel marks the frame dirty either way and
-      # the next frame recomposes from the session's fresh viewport).
+      # events route to the surface's wheel-scroll/selection machinery.
+      # I56: resize events latch the event's dims and re-compose — the gem's
+      # viewport_area answers the LAST DRAWN frame's area outside draw (ext
+      # terminal/query.rs:118-124; Grounds §2), so the first post-SIGWINCH
+      # frame must compose from the EVENT's own width/height; the kernel's
+      # dirty-mark alone would draw at the stale area with no follow-up.
       def on_event(event, _source = nil)
         return handle_mouse(event) if event.respond_to?(:mouse?) && event.mouse?
+        return handle_resize(event) if event.respond_to?(:resize?) && event.resize?
+
         return unless event.key? || event.paste?
 
         edit_input(event)
+      end
+
+      # The SIGWINCH arm (I56): latch the event dims as the compose-time
+      # geometry (one frame — {render_frame} clears the latch after
+      # {build_widget}; on a real terminal the draw's autoresize refreshes
+      # the gem area by then), re-pick the header art at the new width and
+      # rebuild the resize-live header block in place, then request the
+      # draw. No header enqueued (motd: false — the /resume screens) → no
+      # art re-pick, no rebuild; the latch still sets (the editor reflow
+      # works headless too). The predicate form mirrors the mouse arm (the
+      # base Event answers every ? predicate via method_missing — the
+      # respond_to? guard is what separates the classes).
+      def handle_resize(event)
+        rebuilt = false
+        @mutex.synchronize do
+          @resize_dims = [event.width, event.height]
+          if @header_enqueued
+            @logo_lines = Motd.motd_logo_lines(event.width, wordmark: @identity)
+            rebuilt = @transcript_state.rebuild_live_expandables
+          end
+        end
+        @kernel.request_draw if rebuilt
       end
 
       # Agent event sink (I03 event surface). Runs on the agent fiber.
@@ -431,9 +501,14 @@ module Tart
           case event[:type]
           when :agent_start
             @busy = true
+            # The failure row's double-render guard resets per run (D3 —
+            # set by the :message_end error-row arm; the agent_end error
+            # arm reads it).
+            @error_row_rendered = false
             # pi turn_start creates the working indicator (interactive-mode.ts
             # :3427-3433) — the Loader's frame-0 reset.
             restart_spinner!
+            arm_spinner_tick
             @footer.invalidate_branch # per-turn branch invalidation (pi's provider cache, reduced)
           when :message_start
             message = event[:message]
@@ -445,8 +520,17 @@ module Tart
               # (pi renders the block ONCE).
               @transcript_state.enqueue_custom_block(message.custom_type, message.content) if message.display
             else
+              # The queued-message delivery arm (I54 — pi agent-session.ts
+              # :1122-1134 + interactive-mode.ts:3503-3507): a user-role
+              # message_start whose text matches a mirror's FIRST-index
+              # entry removes it and renders the user echo AT DELIVERY (the
+              # idle submit's opening message never matches — it already
+              # echoed at submit). Runs under the surface mutex (the sink
+              # holds it) — no re-synchronize.
+              deliver_queued_message(message) if message.respond_to?(:role) && message.role == :user
               @live = +""
               @reasoning = +""
+              @live_region_cache = nil # the reset invalidates (I58, §live_region_cache)
             end
           when :message_update
             chunk = event[:chunk]
@@ -466,6 +550,21 @@ module Tart
               # base — same row order, buffer reset with the completion).
               @transcript_state.enqueue_message(handled, reasoning: @reasoning)
               @reasoning = +""
+              if message.respond_to?(:finish_reason) && message.finish_reason == "error"
+                # pi assistant-message.ts:184-198 — the failure component's
+                # row: Spacer(1), then "Error: <errorMessage>" in error fg
+                # (after any partial content), outputPad-led and wrapped.
+                # The flag arms the agent_end error arm's skip (pi's
+                # agent_end renders no error text — the component owns the
+                # row; without the guard the failure would double-render).
+                # The respond_to? guard is the footer's usage-read idiom:
+                # every real loop event carries the Message reader; reader-
+                # less display doubles (render_perf's Msg) stay inert.
+                @error_row_rendered = true
+                @transcript_state.enqueue_region([Panel.blank_line,
+                  *Panel.padded_fg_rows("Error: #{message.error_message}", viewport_width,
+                    fg: Theme[:error])])
+              end
             end
           when :tool_execution_start
             @tool = event[:tool_call].name
@@ -483,9 +582,13 @@ module Tart
             # the per-tool block dispatch's rows (pi's per-tool renderers
             # — bash owns the shell shapes, I17 — the frozen
             # :tool_execution_end contract carries `duration:`; write/read
-            # their file-tool shapes, I18; the rest the generic ⎿ line).
+            # their file-tool shapes, I18; edit the diff-display family
+            # fed the call's details side channel, I57 — the respond_to?
+            # guard keeps the recorded ToolCall-shape doubles without the
+            # member inert; the rest the generic ⎿ line).
             # No live pending (the replay path) falls back to the append.
-            @transcript_state.finalize_tool_block(call.name, call.arguments, event[:result], event[:duration])
+            @transcript_state.finalize_tool_block(call.name, call.arguments, event[:result], event[:duration],
+                                                  details: call.respond_to?(:details) ? call.details : nil)
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after
             # prepare succeeds): the border shows pi's per-reason label
@@ -525,6 +628,10 @@ module Tart
           when :agent_end
             @busy = false
             @compaction_reason = nil
+            # The tick cancels with the run (I58) — unless a user-bash
+            # stream keeps it alive. Direct ivar read: this arm HOLDS the
+            # surface mutex (user_bash_streaming? would re-synchronize).
+            cancel_spinner_tick unless @user_bash_stream
             # The deferred bashExecution records flush at agent end (pi's
             # _pendingBashMessages flush) — never mid-tool-sequence.
             @user_bash.flush_pending
@@ -537,21 +644,44 @@ module Tart
               handled = "interrupted"
               @transcript_state.enqueue_scrollback(handled, fg: Theme[:warning])
             elsif event[:error]
-              # pi's error arm: the same loop with the error's message.
+              # pi's error arm: the same loop with the error's message. The
+              # flag-set case (the failure message's own message_end already
+              # rendered the pad-led error row — D3) SKIPS the scrollback
+              # line: pi's agent_end renders no error text (the component
+              # owns the row). The flag-UNSET case (a failure with no
+              # synthesized message_end) renders today's line byte-
+              # identically. The finalize stays in BOTH (defense).
               @transcript_state.finalize_pending_as_error(event[:error].message.to_s)
-              handled = "error: #{event[:error].message}"
-              @transcript_state.enqueue_scrollback(handled, fg: Theme[:error])
+              unless @error_row_rendered
+                handled = "error: #{event[:error].message}"
+                @transcript_state.enqueue_scrollback(handled, fg: Theme[:error])
+              end
             end
             # A message submitted in the wind-down window (after the agent's
             # final steering check, before agent_end) sits queued with no run
             # in flight — continue the run (pi's queued-message semantics:
-            # pi polls the queue at loop start, agent-loop.ts:175).
-            if handled.nil? && @agent&.queued_messages?
+            # pi polls the queue at loop start, agent-loop.ts:175). The
+            # deferred abort-first command (§busy_command_arm) takes THIS
+            # agent_end instead: re-dispatch through the EXACT idle paths
+            # (kernel.async schedules outside the mutex) and SKIP the
+            # wind-down — manual compaction never continues the interrupted
+            # turn (pi agent-session.ts:2762-2763).
+            if @pending_after_interrupt
+              deferred = @pending_after_interrupt
+              @pending_after_interrupt = nil
+              @kernel.async { @commands&.dispatch(deferred) }
+            elsif handled.nil? && @agent&.queued_messages?
               @kernel.async { @agent.run }
             end
           end
         end
-        @kernel.animate(duration: BUSY_FRAME_SECONDS)
+        # I58 — the tick discipline: this sink's tail requests ONE paint
+        # per event (the delta arm paints on arrival; the retired tail
+        # re-opened a 0.25 s animation window here on EVERY event — half
+        # the burn). request_draw is the user-bash chunk sink's in-tree
+        # precedent (reactor-context legal; this sink runs on the agent
+        # fiber of the reactor).
+        @kernel.request_draw
       end
 
       # The /new surface (bin/tart's reset seam): pi handleClearCommand →
@@ -637,6 +767,7 @@ module Tart
       # (nil when nothing to show).
       def complete(text)
         @live = +""
+        @live_region_cache = nil # the reset invalidates (I58, §live_region_cache)
         return nil if !text.is_a?(String) || text.empty?
 
         text
@@ -660,18 +791,23 @@ module Tart
       # The header-container block: the identity's header content between
       # its Spacers, built at the CURRENT global toggle state (pi
       # getStartupExpansionState = verbose || toolOutputExpanded; the port
-      # has no --verbose, cut, itemized). Registered so the flip and the
-      # compaction rebuild re-invoke the builder. The tart art samples
-      # ONCE per block (the flip must restore the collapsed bytes exactly;
-      # a /new re-enqueue samples fresh art — the sanctioned presentation).
+      # has no --verbose, cut, itemized). Registered RESIZE-LIVE (I56 —
+      # the SIGWINCH rebuild sweeps only this block). The tart art comes
+      # from the LADDER at the current width (I56 — deterministic per
+      # width; the random sample is retired): the pick re-runs at boot,
+      # /new, and the compaction re-enqueue (all through here, at the
+      # then-current {viewport_width} — the latch during a resize), and
+      # is re-set ONLY by {handle_resize}; the ctrl+o flip path never
+      # re-picks (the I33 byte-restore property — the builder closes over
+      # the ivar, not the ladder).
       def enqueue_motd_header
         @header_enqueued = true
-        logo_lines = Motd.motd_logo_lines
-        @transcript_state.push_expandable(->(expanded) { motd_header_rows(expanded, logo_lines) })
+        @logo_lines = Motd.motd_logo_lines(viewport_width, wordmark: @identity)
+        @transcript_state.push_expandable(->(expanded) { motd_header_rows(expanded) }, resize_live: true)
       end
 
-      def motd_header_rows(expanded, logo_lines)
-        header = @identity == Identity::PI ? Motd.pi_header_lines(expanded:) : Motd.tart_header_lines(viewport_width, @identity, expanded:, logo_lines:)
+      def motd_header_rows(expanded)
+        header = @identity == Identity::PI ? Motd.pi_header_lines(expanded:, width: viewport_width) : Motd.tart_header_lines(viewport_width, @identity, expanded:, logo_lines: @logo_lines)
         [Panel.blank_line, *header, Panel.blank_line]
       end
 
@@ -729,9 +865,12 @@ module Tart
         @selection_state.reset
         @live = +""
         @reasoning = +""
+        @live_region_cache = nil # the reset invalidates (I58, §live_region_cache)
       end
 
       def viewport_width
+        return @resize_dims[0] if @resize_dims
+
         area = @session.viewport_area
         area ? area.width : 80
       end
@@ -782,13 +921,19 @@ module Tart
         when "enter"
           # pi editor.ts:889-919 — the newline keys route to addNewLine
           # BEFORE the submit path (tui.input.newLine = shift+enter/
-          # ctrl+j, keybindings.ts:143; alt+enter is pi's terminal
+          # ctrl+j, keybindings.ts:143; alt+enter WAS pi's terminal
           # fallback arm), and plain enter submits — with the
           # no-shift+enter terminal workaround: a "\\" before the cursor
           # is deleted and a newline inserted instead (:906-917). The
           # list keeps pi's select.confirm fall-through: a "/"-prefix
-          # completion applies then submits (editor.ts:790-816).
-          if event.modifiers.include?("shift") || alt
+          # completion applies then submits (editor.ts:790-816). I54:
+          # alt+enter is app.message.followUp (keybindings.ts:67-70,
+          # registered interactive-mode.ts:3116) — checked BEFORE the
+          # shift arm (its submit_follow_up carries the cancel);
+          # newline keys remain shift+enter/ctrl+j.
+          if alt
+            submit_follow_up
+          elsif event.modifiers.include?("shift")
             @autocomplete.cancel # pi addNewLine editor.ts:1329
             @editor.add_new_line
           elsif @autocomplete.suggestions
@@ -856,7 +1001,14 @@ module Tart
         # yields — pi custom-editor.ts:127-131 → editor.ts:766-771);
         # otherwise pi's cursorUp/cursorDown dispatch runs (history at
         # the visual extremes per its gating, else one visual row).
-        when "up" then @autocomplete.suggestions ? @autocomplete.navigate(-1) : @editor.cursor_up
+        when "up"
+          # I54: alt+up is app.message.dequeue (keybindings.ts:71-74) —
+          # restore the queued messages to the editor (pi handleDequeue
+          # :4507-4514); the plain/list arms are untouched below it.
+          if alt then dequeue_queued_messages
+          elsif @autocomplete.suggestions then @autocomplete.navigate(-1)
+          else @editor.cursor_up
+          end
         when "down" then @autocomplete.suggestions ? @autocomplete.navigate(1) : @editor.cursor_down
         when "tab"
           # app.thinking.cycle (pi keybindings.ts:33-35, default
@@ -940,13 +1092,19 @@ module Tart
       # pi's submit path (interactive-mode.ts:3200-3442): a leading "/"
       # routes through the commands module before any agent call —
       # /skill:<name> expands (unknown skill passes through as plain text),
-      # builtins dispatch when idle, and text matching nothing falls through
-      # to the agent as a plain message. Deviation (itemized): pi's builtin
-      # if-chain precedes its streaming branch, so pi dispatches builtins
-      # mid-turn (/compact aborts the turn first) — the port routes ALL
-      # slash text through the steer path while a turn runs.
+      # builtins dispatch busy-or-not, and text matching nothing falls
+      # through to the agent as a plain message. The text is the editor's
+      # EXPANDED read (pi submitValue expands markers before onSubmit,
+      # editor.ts:1364-1377 — the marker is display-only; the wire, the
+      # session, the history, and the queues all get the full content).
+      # I54: the I13-era !busy?
+      # gates DROP (pi's builtin if-chain precedes its streaming branch,
+      # :3200-3365 — builtins dispatch mid-turn; /compact and /new take
+      # the abort-first arm below). The idle submit echoes at submit and
+      # runs; a busy submit steers with NO echo — the user message renders
+      # AT DELIVERY (pi :3503-3507, the message_start event).
       def submit
-        text = @editor.input.dup.strip # pi onSubmit trims (interactive-mode.ts:3201)
+        text = @editor.expanded_text.dup.strip # pi submitValue expands BEFORE the trim (editor.ts:1364-1377)
         @autocomplete.cancel
         return if text.empty?
 
@@ -956,9 +1114,10 @@ module Tart
         @editor.exit_history_browsing
         @footer.invalidate_branch # per-turn branch invalidation
         if @commands && text.start_with?("/")
-          text = @commands.expand_skill(text)
-          return if !busy? && gate_thinking_level(text)
-          return if !busy? && @commands.dispatch(text)
+          text = @commands.expand_skill(text) # expansion BEFORE queue (agent-session.ts:2005-2010)
+          return if gate_thinking_level(text) # busy-or-not (pi handleThinkingCommand, :5145-5163)
+          return if busy_command_arm(text) # §busy_command_arm — false = fall through
+          return if @commands.dispatch(text) # busy-or-not
         end
         # The !-prefix bash intercepts BEFORE the user echo (pi handleSubmit
         # :3347-3360 — the BashExecutionComponent is the display, no user
@@ -966,12 +1125,122 @@ module Tart
         parsed = UserBash.parse(text)
         return @user_bash.run(*parsed) if parsed
 
-        @transcript_state.enqueue_user_submission(text)
         if busy?
-          @agent.push_message(text) # steering: consumed at the next turn boundary
+          steer_submitted_text(text) # no echo: the delivery arm echoes (pi :3503-3507)
         else
+          @transcript_state.enqueue_user_submission(text)
           @kernel.async { @agent.run(text) }
         end
+      end
+
+      # The abort-first arm for /compact + /new while a turn runs (I54 —
+      # pi session.compact aborts first, agent-session.ts:2764-2765; the
+      # runtime's newSession aborts first, agent-session-runtime.ts
+      # :167-178). Everything else dispatches immediately (pi's builtin
+      # if-chain runs before its streaming branch). The port's realization:
+      # interrupt the in-flight run, store the command text, and re-dispatch
+      # it through the EXACT idle paths at :agent_end (§on_agent_event).
+      # False here = not busy or not one of the two commands — the caller
+      # falls through to the immediate dispatch.
+      def busy_command_arm(text)
+        return false unless busy?
+        return false unless text == "/new" || text == "/compact" || text.start_with?("/compact ")
+
+        @pending_after_interrupt = text
+        @kernel.interrupt_work!
+        @kernel.request_draw
+        true
+      end
+
+      # app.message.followUp's submit (I54 — pi handleFollowUp,
+      # interactive-mode.ts:4475-4505): while streaming the text queues as
+      # a FOLLOW-UP (delivered only at full completion); idle alt+enter
+      # behaves exactly like plain Enter (:4497-4504). Like pi's prompt()
+      # queue branch, skill/prompt-template expansion applies before
+      # queueing (agent-session.ts:2005-2010); the builtin dispatch and
+      # the thinking gate do NOT run here (pi's handleFollowUp skips the
+      # if-chain) and neither does the !-bash intercept — the text queues
+      # verbatim (post-expansion). NO submit echo: the delivery arm echoes.
+      def submit_follow_up
+        text = @editor.expanded_text.dup.strip # pi handleFollowUp reads getExpandedText (interactive-mode.ts:4476)
+        return if text.empty?
+
+        return submit unless busy? # pi :4497-4504 — idle alt+enter = Enter
+
+        text = @commands.expand_skill(text) if @commands
+        @autocomplete.cancel
+        @editor.add_to_history(text)
+        @editor.clear
+        @editor.clear_undo_stack # the submit surface's discipline, mirrored
+        @editor.exit_history_browsing
+        @footer.invalidate_branch
+        follow_up_submitted_text(text)
+      end
+
+      # The shared busy-queue append (the surface mirror + the loop's
+      # queue). Compaction-time submits steer too (pi queueCompactionMessage
+      # routes non-extension text to a queue with showStatus —
+      # interactive-mode.ts:4763-4772; the port's inline compaction makes
+      # the separate surface compaction queue unnecessary — the
+      # post-compaction drain IS the loop's complete? arm), with pi's
+      # flash text.
+      def steer_submitted_text(text)
+        @mutex.synchronize { @queued[:steer] << text }
+        flash("Queued message for after compaction") if @compaction_reason
+        @agent.steer(text)
+        @kernel.request_draw
+      end
+
+      def follow_up_submitted_text(text)
+        @mutex.synchronize { @queued[:follow_up] << text }
+        flash("Queued message for after compaction") if @compaction_reason
+        @agent.follow_up(text)
+        @kernel.request_draw
+      end
+
+      # The queued-message delivery (I54 — pi agent-session.ts:1122-1134
+      # + interactive-mode.ts:3503-3507): the FIRST-index text match across
+      # the mirror (steer first, else follow_up) is removed and echoed AT
+      # DELIVERY. CALLER HOLDS @mutex (the on_agent_event sink).
+      def deliver_queued_message(message)
+        text = message.content
+        return unless text.is_a?(String)
+
+        %i[steer follow_up].each do |queue|
+          index = @queued[queue].index(text)
+          next unless index
+
+          @queued[queue].delete_at(index)
+          @transcript_state.enqueue_user_submission(text)
+          @kernel.request_draw
+          return
+        end
+      end
+
+      # app.message.dequeue (I54 — pi handleDequeue :4507-4514 +
+      # restoreQueuedMessagesToEditor :4743-4761): BOTH the surface mirror
+      # and the loop's queues clear (pi clearAllQueues); queued-then-current
+      # join with blank lines into the editor via {Editor#set_text}; NO
+      # abort (the abort-restore arm is pi's extension abortHandler — no
+      # extension seam, cut). pi's status texts.
+      def dequeue_queued_messages
+        steer_texts, follow_texts = @mutex.synchronize { [@queued[:steer], @queued[:follow_up]].map(&:dup) }
+        @agent.clear_queues
+        all = [*steer_texts, *follow_texts]
+        if all.empty?
+          flash("No queued messages to restore")
+          return
+        end
+
+        combined = [all.join("\n\n"), @editor.input].reject { |text| text.strip.empty? }.join("\n\n")
+        @editor.set_text(combined)
+        n = all.size
+        flash("Restored #{n} queued message#{n > 1 ? "s" : ""} to editor")
+        @mutex.synchronize do
+          @queued[:steer].clear
+          @queued[:follow_up].clear
+        end
+        @kernel.request_draw
       end
 
       # --- app.message.copy (pi handleCopyCommand :6637-6669) + its flash ---
@@ -1076,19 +1345,23 @@ module Tart
       end
 
       # The session viewport's height (the 24 fallback matches
-      # {viewport_width}'s 80 — the headless defaults' shape).
+      # {viewport_width}'s 80 — the headless defaults' shape). The resize
+      # latch prefers the event's height for the one latched frame (I56).
       def screen_height
+        return @resize_dims[1] if @resize_dims
+
         area = @session.viewport_area
         area ? area.height : 24
       end
 
       # The transcript area's row budget — the page size and the mouse
       # mapping's viewport bound (pi chat-viewport geometry, shared with
-      # {build_widget}): the viewport minus the dock — spacer 1 + editor +
-      # footer (pi chat-viewport.ts:22-45, the widgets-above default
-      # Spacer(1); AC2).
+      # {build_widget}): the viewport minus the dock — spacer 1 + pending
+      # rows + editor + footer (pi chat-viewport.ts:22-45; I54 adds the
+      # pending block — pi's document-area shrink: the TRANSCRIPT yields,
+      # the editor/footer never move).
       def transcript_area_rows(height = screen_height)
-        [height - editor_area_rows(height) - FOOTER_ROWS - dock_spacer_rows(height), 1].max
+        [height - editor_area_rows(height) - FOOTER_ROWS - dock_spacer_rows(height) - pending_rows, 1].max
       end
 
       # --- mouse: wheel scroll + transcript selection (items 6/10, pi
@@ -1276,23 +1549,28 @@ module Tart
       # a transcript area on top (Min 1 — takes the rest), the bordered
       # editor area and the footer docked at the bottom (Length — pi's
       # shrink:1 fixed-height dock). All heights derive from the session's
-      # viewport every frame, so a resize recomposes cleanly.
+      # viewport every frame, so a resize recomposes cleanly. I54: the
+      # pending block (pi pendingMessagesContainer) sits between the dock
+      # spacer and the editor (createChatViewport :969-976 — document →
+      # pendingMessages → status → widgetsAbove → editor).
       def build_widget
-        area = @session.viewport_area
-        height = area ? area.height : 24
+        height = screen_height
         editor_rows = editor_area_rows(height)
         transcript_rows = transcript_area_rows(height)
         spacer_rows = dock_spacer_rows(height)
+        pending = pending_rows
         TUI.layout(
           children: [
             transcript_widget(transcript_rows),
             dock_spacer_widget,
+            pending_widget(pending),
             picker_or_menu_widget || editor_widget,
             footer_widget,
           ],
           constraints: [
             TUI.constraint_min(transcript_rows),
             TUI.constraint_length(spacer_rows),
+            TUI.constraint_length(pending),
             TUI.constraint_length(editor_rows),
             TUI.constraint_length(FOOTER_ROWS),
           ]
@@ -1324,6 +1602,45 @@ module Tart
       # the editor (AC2).
       def dock_spacer_widget
         TUI.paragraph(text: [Panel.blank_line], wrap: false)
+      end
+
+      # The pending block's row count (pi updatePendingMessagesDisplay
+      # :4724-4740): 0 when both mirror arrays are empty (the widget drops
+      # out of the layout entirely); else the blank spacer row + one row
+      # per queued message + the dequeue hint row. Lock-free: the render
+      # frame holds @mutex, and the unlocked readbacks (the wheel/scroll
+      # math) tolerate a one-frame-stale count. Array size/each under MRI's
+      # GVL do not interleave with the mutators' single C-level ops.
+      def pending_rows
+        count = @queued[:steer].size + @queued[:follow_up].size
+        count.zero? ? 0 : 2 + count
+      end
+
+      # The pending rows (pi updatePendingMessagesDisplay + TruncatedText
+      # truncated-text.ts:7-40 — TruncatedText(text, 1, 0): ONE line,
+      # clipped, paddingX 1 each side): a blank row (pi Spacer(1)), one
+      # dim "Steering: <text>" row per steering message, one dim
+      # "Follow-up: <text>" row per follow-up, then the dim dequeue hint
+      # (pi's keyDisplayText("app.message.dequeue") = "Alt+Up" — the port
+      # has no keybinding registry, the string is the rendered constant).
+      def pending_widget(rows)
+        return TUI.paragraph(text: [], wrap: false) if rows.zero?
+
+        width = viewport_width
+        lines = [Panel.blank_line]
+        @queued[:steer].each { |text| lines << pending_row("Steering: ", text, width) }
+        @queued[:follow_up].each { |text| lines << pending_row("Follow-up: ", text, width) }
+        lines << pending_row("", "↳ Alt+Up to edit all queued messages", width)
+        TUI.paragraph(text: lines, wrap: false)
+      end
+
+      # One dim pending row: the text's FIRST line only, clipped to the
+      # viewport width minus 2, one leading space, right-padded to the
+      # width (pi TruncatedText's paddingX 1 discipline).
+      def pending_row(label, text, width)
+        body = Text.clip_text(text.to_s.lines(chomp: true).first.to_s, [width - 2, 0].max)
+        line = " #{label}#{body}"
+        TUI.line(line + " " * ([width - TUI.text_width(line), 0].max), fg: Theme[:dim])
       end
 
       # The transcript area: the scroll buffer's viewport — pi ScrollView
@@ -1494,9 +1811,10 @@ module Tart
         # frames[floor((t − anchor)/interval) mod n] whatever the render
         # cadence: pi's setInterval advances the frame on TIME (+
         # requestRender); the port derives the same frame from the
-        # monotonic clock at each already-animated frame (the
-        # BUSY_FRAME_SECONDS cadence is unchanged) — no timer task. nil
-        # anchor → frame 0 (pi setIndicator resets currentFrame).
+        # monotonic clock at each rendered frame (since I58 the renders
+        # themselves ride the spinner tick — {arm_spinner_tick} — the
+        # cadence is pi's 12.5 Hz). nil anchor → frame 0 (pi setIndicator
+        # resets currentFrame).
         return SPINNER.first unless anchor
 
         elapsed = @clock.call - anchor
@@ -1518,6 +1836,31 @@ module Tart
       # the next working indicator restarts).
       def restart_spinner!
         @spinner_started_at = @clock.call
+      end
+
+      # The busy spinner tick (I58 — pi's Loader owns its cadence,
+      # loader.ts:82-99): one repeating ~80 ms reactor task requesting a
+      # draw for as long as a run is in flight or a user-bash stream
+      # renders — the retired burn (a 60 Hz animation window re-armed per
+      # frame/event) is pi's 12.5 Hz here. The glyph stays time-derived
+      # ({spinner_frame}); the tick only paces the paints. Idempotent (a
+      # live tick is kept — :compaction_start re-anchors the glyph, not
+      # the pacer). Reactor context only (the sinks that arm run on the
+      # reactor; Loop#tick spawns a reactor task). Loop teardown stops the
+      # task with the rest of the reactor subtree (Loop#run's ensure).
+      def arm_spinner_tick
+        return if @spinner_tick
+
+        @spinner_tick = @kernel.tick(SPINNER_INTERVAL_SECONDS)
+      end
+
+      # Cancels the spinner tick (the returned task's +stop+ — the same
+      # Task#stop mechanism Ctrl+C uses). Idempotent; a dead task's stop
+      # is a no-op.
+      def cancel_spinner_tick
+        task = @spinner_tick
+        @spinner_tick = nil
+        task&.stop
       end
 
       # The embedded status's per-segment colors (pi's embedded colorFns):
@@ -1641,14 +1984,28 @@ module Tart
       # reasoning rows, a blank when content follows the reasoning, the
       # content. The blank appearing only at completion was the 2nd-pass
       # shift (the row insert moved streaming content down a line).
+      #
+      # Since I58 the conversion is cached on
+      # [viewport_width, @live.bytesize, @reasoning.bytesize] (D2): a
+      # cached-window frame (the spinner tick) re-serves the rows, a delta
+      # frame (a key change) recomputes. The rows are a pure function of
+      # the key's inputs; the reset sites clear the cache so a same-size
+      # different-content message can never hit a stale entry (AC2's
+      # reset-cycle exactness). Returns a COPY of the cached rows — the
+      # caller ({live_lines}) concats into the result.
       def assistant_live_lines(width)
         return [] if @live.empty? && @reasoning.empty?
+
+        key = [width, @live.bytesize, @reasoning.bytesize]
+        cached = @live_region_cache
+        return cached[1].dup if cached && cached[0] == key
 
         lines = [Panel.blank_line]
         lines.concat(Transcript.reasoning_lines(@reasoning, width)) unless @reasoning.empty?
         lines << Panel.blank_line if !@reasoning.empty? && !@live.empty?
         lines.concat(Transcript.markdown_lines(@live, width)) unless @live.empty?
-        lines
+        @live_region_cache = [key, lines]
+        lines.dup
       end
 
       # The RUNNING user-bash block's rows (I38 — pi's chat/pending
@@ -1673,15 +2030,20 @@ module Tart
       # execution, appendOutput + ui.requestRender per chunk, setComplete
       # in place) ---
 
-      # Reactor/frame-loop fibers only (the bridge yields chunks on the
-      # reactor — Grounds 5); all render-state mutation stays under the
-      # surface mutex, exactly the agent-event discipline.
+      # Reactor/frame-loop fibers only (the kernel task's drainer delivers
+      # chunks on the reactor — the pipe-drain reader threads only push its
+      # queue, Grounds §3 probe5); all render-state mutation stays under
+      # the surface mutex, exactly the agent-event discipline.
       def start_user_bash_stream(command, excluded)
         @mutex.synchronize do
           @user_bash_stream = {command:, excluded:, content: +"", spinner_started_at: @clock.call}
         end
         # pi adds the component then requestRender (:7033-7034) — the
-        # header + loader row paint before the first chunk.
+        # header + loader row paint before the first chunk. The bash
+        # loader's glyph must advance between chunks (pi's Loader ticks
+        # requestRender on its own 80 ms interval, loader.ts:79-84) — the
+        # spinner tick arms with the stream (I58).
+        arm_spinner_tick
         @kernel.request_draw
       end
 
@@ -1703,9 +2065,11 @@ module Tart
       # The explicit terminal clear (every path — completion, worker
       # error, cancel — notifies exactly once; idempotent). No draw: the
       # caller's own request_draw paints the settled block in the same
-      # frame the live rows vanish (AC2).
+      # frame the live rows vanish (AC2). The spinner tick cancels with
+      # the stream unless an agent run keeps it (I58).
       def end_user_bash_stream
         @mutex.synchronize { @user_bash_stream = nil }
+        cancel_spinner_tick unless busy?
       end
 
       # /thinking's seam (pi selectThinkingLevel :5165-5177): the session
@@ -1880,9 +2244,9 @@ module Tart
           thinking_level_map: entry.fetch(:thinking_level_map, nil),
           compat: entry.fetch(:compat, nil)) unless entry.is_a?(Shapes::Model)
         status = persist ? "Default model: #{entry.provider}/#{entry.id}" : "Model: #{entry.id}"
-        # The wire provider is the models.json key mapped onto the port's
-        # carried seam (Models.wire_provider — the loop's with_model
-        # needs a native slug); the window + the composed reasoning facts
+        # The provider key rides the switch as METADATA (the wire model's
+        # provider attribute — the dialect rides the model by
+        # construction); the window + the composed reasoning facts
         # re-resolve in the loop seam (the entry's flag/map, the known
         # tables when the entry declares none — Settings.thinking_facts).
         facts = Settings.thinking_facts(entry, model_id: entry.id)
@@ -1898,8 +2262,9 @@ module Tart
           @thinking_level = effective
           @transcript_state.enqueue_status(status)
         end
-        @agent&.switch_model(entry.id, provider: Models.wire_provider(entry.provider),
+        @agent&.switch_model(entry.id, provider: entry.provider,
           context_window: entry.context_window,
+          max_tokens: Models.entry_max_tokens(entry),
           model_reasoning: facts.reasoning,
           thinking_level_map: facts.thinking_level_map,
           compat: entry.compat)

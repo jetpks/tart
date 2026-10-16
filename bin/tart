@@ -16,6 +16,20 @@
 #
 # Run from a REAL terminal (raw mode / alt-screen need a tty).
 
+# The bundled boot: the runtime deps ride the Gemfile (the path-pinned
+# fast-completions among them — Grounds D8), so a bare `ruby bin/tart`
+# activates the bundle beside this file first. Outside a checkout (an
+# installed `tart` gem — no Gemfile beside the executable) the bare load
+# path stands and the released gem resolves from the gem home.
+require "rubygems"
+require "bundler"
+begin
+  ENV["BUNDLE_GEMFILE"] ||= File.expand_path("../Gemfile", __dir__)
+  Bundler.setup
+rescue Bundler::BundlerError
+  nil # no Gemfile beside the executable — the bare load path resolves
+end
+
 require "optparse"
 require_relative "../lib/tart"
 
@@ -280,6 +294,7 @@ module Tart
       # returned Manager owns the agent-end drain below (pi's auto-drain).
       manager = subagents_enabled?(settings, identity) ?
         Subagents.register(hooks:, cwd: workdir, env: ENV, identity:) : nil
+      manager&.endpoint = chat.endpoint
       hooks.emit({"type" => "session_start", "reason" => "startup"},
         context: {cwd: workdir, mode: "print", session: session_ref(recorder), identity:})
       # --system-prompt-file (I48 §5.2): the file bytes REPLACE the
@@ -290,6 +305,12 @@ module Tart
       # --tools (I48 §5.2): the exact allowlist rides selected_tools: —
       # Print.run builds the loadout from exactly that list.
       selected_tools = parse_tools_flag(options[:tools])
+      # The catalog entry resolves ONCE (the interactive boot's shape —
+      # I59 D4): the print boot threads the same FACTS pair below the
+      # env/settings tiers (resolve checks the env tier FIRST, so a set
+      # <IDENTITY>_CONTEXT_WINDOW still wins); the loop's fetch arm
+      # catches the no-entry case.
+      entry = resolve_boot_entry(models, boot)
       code = Print.run(
         prompt: options[:print],
         chat:,
@@ -300,9 +321,14 @@ module Tart
         system_prompt: prompt,
         recorder:,
         seed_messages:,
+        context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:) ||
+          Models.entry_context_window(entry),
+        max_tokens: Models.entry_max_tokens(entry),
         # The compaction knobs MUST reach the loop (the interactive path
-        # threads them too); context_window: stays nil so the loop's env
-        # tier resolves <IDENTITY>_CONTEXT_WINDOW itself.
+        # threads them too). The window is boot-resolved (I59): the env
+        # tier folds in FIRST — a set <IDENTITY>_CONTEXT_WINDOW still
+        # wins — then the catalog entry's; the loop's fetch arm catches
+        # the no-entry case.
         compaction: Settings.compaction_kwargs(settings),
         identity:,
         hooks:,
@@ -403,9 +429,12 @@ module Tart
         # tool, not an extension-module row (pi-subagents' config lives
         # outside the [Extensions] list).
         if subagents_enabled?(settings, identity)
-          Subagents.register(hooks:,
+          subagents_manager = Subagents.register(hooks:,
             kernel: Subagents::KernelBridge.new(->(block) { TUI.push_event(block) }),
             agent: -> { surface.agent }, cwd: workdir, env: ENV, identity:)
+          subagents_manager.endpoint =
+            endpoint_facts(models, Models.resolve_boot_model(models, settings, identity:),
+              identity:, resolved:)
         end
         tools = build_tools(workdir, settings, mcp_servers:,
           identity:, session_env: session_env_readers(surface), hooks:)
@@ -427,6 +456,11 @@ module Tart
           chat = build_chat(models, boot, identity:, resolved:)
           facts = footer_data(workdir, settings, boot:, chat:, identity:, models:, resolved:)
           surface.footer_data = facts
+          # The catalog entry resolves ONCE (the same helper the compat:
+          # arm rode — I59 D3): the boot threads the entry's FACTS pair
+          # below the env/settings tiers (Grounds §4-a) — the placeholder
+          # chat.model's nil window is what keeps the || chain correct.
+          entry = resolve_boot_entry(models, boot)
           surface.agent = Agent::Loop.new(
             chat:,
             tools:,
@@ -437,13 +471,15 @@ module Tart
             hooks_context: -> { {cwd: workdir, mode: "tui", session: session_ref(current_recorder), identity:} },
             recorder:,
             seed_messages:,
-            context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
+            context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:) ||
+              Models.entry_context_window(entry),
+            max_tokens: Models.entry_max_tokens(entry),
             compaction: Settings.compaction_kwargs(settings),
             identity:,
             thinking_level: facts.fetch(:thinking_level),
             model_reasoning: facts.fetch(:reasoning),
             thinking_level_map: facts.fetch(:thinking_level_map),
-            compat: resolve_boot_entry(models, boot)&.compat
+            compat: entry&.compat
           )
           # The session_start emission (pi extensions/types.ts:744 —
           # reasons startup|new|resume; fork/reload have no port surface):
@@ -731,18 +767,26 @@ module Tart
     # the resolved provider's models.json config (endpoint block) slots
     # between the env overrides and the resolved-settings view's keys —
     # the identity-namespaced API_KEY/API_BASE keep working against it.
+    # The gem's Client carries the endpoint (timeout 120; NO retries —
+    # Grounds D9: a transient 5xx/429 surfaces immediately); the Chat
+    # carries the wire model + the endpoint facts (the subagents Manager
+    # threads them to its children).
     def build_chat(models, boot, identity:, resolved:)
+      endpoint = endpoint_facts(models, boot, identity:, resolved:)
+      client = Fast::Completions::Client.new(base_url: endpoint.fetch(:api_base),
+        api_key: endpoint.fetch(:api_key), timeout: 120)
+      Agent::Chat.new(client:, model_id: boot.id, provider_key: boot.provider, endpoint:)
+    end
+
+    # The endpoint facts (the boot's key/base resolution — the SAME chain
+    # build_chat always spoke): identity-namespaced env > the models.json
+    # provider config > the resolved-settings view's keys.
+    def endpoint_facts(models, boot, identity:, resolved:)
       provider = models.provider(boot.provider)
-      context = RubyLLM.context do |config|
-        config.openai_api_key = ENV[Identity.env_key(identity, "API_KEY")] || provider&.api_key || resolved.api_key
-        config.openai_api_base = ENV[Identity.env_key(identity, "API_BASE")] || provider&.base_url || resolved.api_base
-        config.request_timeout = 120
-        config.max_retries = 1
-      end
-      context.chat(
-        model: boot.id, provider: Models.wire_provider(boot.provider),
-        protocol: :chat_completions, assume_model_exists: true
-      )
+      {
+        api_key: ENV[Identity.env_key(identity, "API_KEY")] || provider&.api_key || resolved.api_key,
+        api_base: ENV[Identity.env_key(identity, "API_BASE")] || provider&.base_url || resolved.api_base
+      }
     end
 
     # The bash tool's session-env readers over the interactive surface (I41

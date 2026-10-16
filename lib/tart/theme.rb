@@ -98,6 +98,19 @@ module Tart
       logoYellow: "#eab65d",      # rgb(234,182,93) (pi-logo.ts:7)
     }.freeze
 
+    # The edit diff-render tokens (I57 P4 — pi renderDiff, components/
+    # diff.ts over dark.json's green/red/muted vars; all three confirmed
+    # against the live-pi styled capture — Grounds §3). A SIBLING table,
+    # deliberately NOT TOKENS members: the frozen theme-test pin is the
+    # full-table equality (assert_equal EXPECTED, TOKENS) and that test
+    # file is outside this lane's touch set — the lookup falls through so
+    # {Theme[]} resolves the diff tokens exactly like the rest.
+    DIFF_TOKENS = {
+      tool_diff_added: "#68b78d",   # dark.json green var (= md_code_block)
+      tool_diff_removed: "#ea7f81", # dark.json red var (= error)
+      tool_diff_context: "#9da5a9", # dark.json muted var (= tool_output)
+    }.freeze
+
     # The markdown converter (Render::Markdown::FG, read-only) emits raw
     # color symbols; the surface routes every markdown span's fg through
     # {md_fg} so the token table stays the single source of color truth.
@@ -125,7 +138,7 @@ module Tart
       # @return the color for a pi token name (Symbol): the hex on a
       #   truecolor terminal, the Xterm index (Integer) on 256-color.
       def [](token)
-        color = TOKENS.fetch(token)
+        color = TOKENS.fetch(token) { DIFF_TOKENS.fetch(token) }
         truecolor? ? color : indexed[token]
       end
 
@@ -151,9 +164,10 @@ module Tart
 
       private
 
-      # The 256-color table, resolved once per token (memoized).
+      # The 256-color table, resolved once per token (memoized) — both
+      # tables (the diff tokens downgrade through the same math).
       def indexed
-        @indexed ||= TOKENS.transform_values { |hex| hex_to_ansi256(hex) }
+        @indexed ||= TOKENS.merge(DIFF_TOKENS).transform_values { |hex| hex_to_ansi256(hex) }
       end
 
       # pi colors.ts:279-297 rgbToAnsi256: snap each channel to the cube,

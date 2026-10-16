@@ -81,6 +81,13 @@ module Tart
       assert_equal false, compat.supports_developer_role
       assert_equal true, compat.supports_reasoning_effort
       assert_equal true, compat.zai_tool_stream
+      # I64: the sixth attribute (nil default, omittable like the five).
+      assert_nil zai_compat.supports_strict_mode
+      assert_equal true, zai_compat(supports_strict_mode: true).supports_strict_mode
+      assert_equal false, zai_compat(supports_strict_mode: false).supports_strict_mode
+      # to_h still emits the key (the nil-defaulted docstring contract).
+      assert_equal true, zai_compat(supports_strict_mode: true).to_h[:supports_strict_mode]
+      assert_nil zai_compat.to_h[:supports_strict_mode]
 
       # Every attribute is omittable at construction and nil-defaulted
       # (pi's Optional keys — absent = the detection stand-in).
@@ -90,6 +97,7 @@ module Tart
       assert_nil bare.supports_developer_role
       assert_nil bare.supports_reasoning_effort
       assert_nil bare.zai_tool_stream
+      assert_nil bare.supports_strict_mode
     end
 
     def test_model_compat_enum_and_bool_constraints_raise

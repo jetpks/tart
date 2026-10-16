@@ -8,7 +8,7 @@ module Tart
     # whitespace, BOM, and line endings round-trip untouched. Output is
     # truncated to 2000 lines or 50KB (whichever is hit first), never
     # returning partial lines.
-    class Read < RubyLLM::Tool
+    class Read < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "read"
@@ -18,14 +18,19 @@ module Tart
         "(whichever is hit first). Use offset/limit for large files. When you need the full file, " \
         "continue with offset until complete."
 
+      # STRING-KEYED THROUGHOUT (I64): the gem's strict engine reads string
+      # keys (pi's JS node["type"] shape) — a symbol-keyed root makes the
+      # "prefer" declaration SILENTLY INERT (the resolver falls back loose
+      # with zero errors). Serialization-neutral: JSON.generate emits
+      # identical bytes for either key form, so the non-strict wire holds.
       PARAMETERS_SCHEMA = {
-        type: "object",
-        properties: {
-          "path" => {type: "string", description: "Path to the file to read (relative or absolute)"},
-          "offset" => {type: "number", description: "Line number to start reading from (1-indexed)"},
-          "limit" => {type: "number", description: "Maximum number of lines to read"}
+        "type" => "object",
+        "properties" => {
+          "path" => {"type" => "string", "description" => "Path to the file to read (relative or absolute)"},
+          "offset" => {"type" => "number", "description" => "Line number to start reading from (1-indexed)"},
+          "limit" => {"type" => "number", "description" => "Maximum number of lines to read"}
         },
-        required: ["path"]
+        "required" => ["path"]
       }.freeze
 
       attr_reader :cwd, :details
@@ -44,13 +49,18 @@ module Tart
 
       parameters PARAMETERS_SCHEMA.dup
 
+      # pi read.ts :101 — one of EXACTLY four core tools pi tags with
+      # constrainedSampling; the strict engine rewrites `parameters` and
+      # ships `strict: true` on a strict-capable dialect (I64).
+      constrained_sampling({"type" => "json_schema", "strict" => "prefer"})
+
       # @return [String] the model-facing text, or {error:} on failure.
       def execute(path:, offset: nil, limit: nil)
         safe_execute do
           failure = validate_input(path:, offset:, limit:)
           return failure if failure
 
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
           absolute_path = PathUtils.resolve_read_path(path, @cwd)
           mime_type = Mime.detect_from_file(absolute_path)
           return execute_image(absolute_path, mime_type, path) if mime_type
@@ -63,7 +73,7 @@ module Tart
 
       def execute_image(absolute_path, mime_type, path)
         data = File.binread(absolute_path)
-        RubyLLM::Support::Cancellation.check
+        Fast::Completions::Cancellation.check
         # pi resizes here (sharp); the port sends the original bytes (recorded
         # deviation). The note text matches pi's non-failure image read.
         note = "Read image file [#{mime_type}]"

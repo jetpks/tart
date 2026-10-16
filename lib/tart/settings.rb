@@ -29,11 +29,10 @@ module Tart
     # replaces the user's list; a list of only modifiers appends
     # (mergeDefaultTools :119-125).
     #
-    # The model context-window registry-default table (I08 carry-in): the
-    # pinned ruby_llm registry misses the default fireworks model
-    # (RubyLLM.models.find raises ModelNotFoundError, live-verified), so
-    # the port's resolution order ends in this table — pi's catalog value
-    # for the model (models.dev registry, pi generate-models.ts source).
+    # The model context-window known-tables tier (I08 carry-in): the
+    # carried models have no pi-catalog row of their own, so the port's
+    # resolution order ends in this table — pi's catalog value for the
+    # model (models.dev registry, pi generate-models.ts source).
     ROOT_KEY = "settings.json"
     CONFIG_DIR = ".tart"
 
@@ -107,7 +106,7 @@ module Tart
     )["accounts/fireworks/models/glm-5p3-flash" => 1_048_573].freeze
 
     # The known reasoning-capable models (same assumed-model class as
-    # {MODEL_CONTEXT_WINDOWS}: ids RubyLLM's registry has no entry for,
+    # {MODEL_CONTEXT_WINDOWS}: ids the wire catalog has no entry for,
     # but the owner's daily-driver catalog declares reasoning — pi's
     # footer shows the level for them, so the port must too).
     MODEL_REASONING = Shapes::Types::Strict::Hash.map(
@@ -223,8 +222,8 @@ module Tart
     end
 
     # The footer's model-metadata fact (pi footer.ts:233-244 reads
-    # state.model?.reasoning off the registry's model entry; the port's
-    # registry is RubyLLM's — a found entry answers .supports?(:reasoning)).
+    # state.model?.reasoning off the model entry): the wire model's own
+    # reasoning flag is the fallback (the gem Model carries it natively).
     # The provider LABEL is never rendered: pi prefixes the model only
     # when its available-model snapshot spans >1 provider (footer.ts:246
     # -258) — the port's static snapshot is one provider, so the prefix
@@ -233,18 +232,16 @@ module Tart
     # truthiness rides the modelReasoning contract
     # ({Schemas::Settings.model_reasoning} — nil = unstaged, the staged
     # vocabulary passes, anything else answers false: today's
-    # `staged == true || staged == "true"` table); an assumed model
-    # (no registry entry) falls back to the known-models table — the
-    # owner's daily-driver glm declares reasoning in pi's book, and the
-    # footer/border parity dies without it.
+    # `staged == true || staged == "true"` table); a model with no entry
+    # and no flag falls to false — the owner's daily-driver glm declares
+    # reasoning in the known-models table, and the footer/border parity
+    # dies without it.
     def model_reasoning_capable(settings, model, identity: Identity::DEFAULT)
       staged = resolve_setting("modelReasoning", settings, identity:)
       outcome = Schemas::Settings.model_reasoning(staged)
       return outcome unless outcome.nil?
 
-      MODEL_REASONING.fetch(model&.id) do
-        model.respond_to?(:supports?) ? model.supports?(:reasoning) : false
-      end
+      MODEL_REASONING.fetch(model&.id) { model&.reasoning == true }
     end
 
     # The compaction settings as Agent::Loop kwargs (camelCase JSON keys →

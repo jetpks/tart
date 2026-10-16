@@ -10,7 +10,7 @@ module Tart
     #
     # Parity note: pi downloads `rg` at runtime (ensureTool); the port uses
     # `rg` from PATH and pi's error message when missing — recorded deviation.
-    class Grep < RubyLLM::Tool
+    class Grep < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "grep"
@@ -52,7 +52,7 @@ module Tart
           failure = validate_input(pattern:, path:, glob:, ignore_case:, literal:, context:, limit:)
           return failure if failure
 
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
           rg_path = rg_binary
           raise ArgumentError, "ripgrep (rg) is not available and could not be downloaded" unless rg_path
 
@@ -64,7 +64,7 @@ module Tart
           matches, match_limit_reached, exit_ok = run_rg(
             rg_path, pattern, search_path, glob, ignore_case, literal, effective_limit
           )
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
           raise ArgumentError, "ripgrep exited with code #{exit_ok}" unless exit_ok
 
           return "No matches found" if matches.empty?

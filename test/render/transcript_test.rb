@@ -210,7 +210,7 @@ module Tart
 
       # A second enqueue while one is live appends sanely and SUPERSEDES
       # the registration (unreachable under sequential execution —
-      # ruby_llm tool_concurrency defaults false; the documented caveat):
+      # the executor's batch is the only concurrency; the documented caveat):
       # the superseded block renders on under the pending bg (its end
       # falls back to the append below it), the live one replaces.
       def test_second_pending_supersedes_and_the_stale_end_appends
@@ -259,7 +259,217 @@ module Tart
           "the replay dispatches through the append path — final blocks only"
         refute_includes bgs, Theme[:tool_pending_bg], "zero pending-bg spans on the replay path"
       end
-    end
+
+      # --- I60 error_transcript: the failure row on replay (D4) --------------
+
+      # AC2: a recorded failure entry renders the pad-led error-fg row AFTER
+      # its content — the same region shape the live arm enqueues (pi :184-198,
+      # the one component serving live AND replay).
+      def test_error_transcript_replays_a_failure_row_after_its_content
+        entries = [
+          {"type" => "message", "message" => {"role" => "user", "content" => "hello"}},
+          {"type" => "message", "message" => {"role" => "assistant", "content" => "partial words",
+                                              "tool_calls" => {}, "finish_reason" => "error",
+                                              "error_message" => "400: boom detail"}},
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        texts_after_user = texts.drop_while { |row| !row.include?("hello") }
+        assert_includes texts_after_user.join, "partial words", "the content row renders first"
+        content_index = texts_after_user.index { |row| row.include?("partial words") }
+        error_index = texts_after_user.index { |row| row.include?("Error: 400: boom detail") }
+        refute_nil content_index
+        assert_operator error_index, :>, content_index, "the error row renders AFTER its content"
+        error_rows = texts_after_user.grep(/Error: 400: boom detail/)
+        assert_equal 1, error_rows.size, "exactly ONE error row"
+        assert error_rows[0].start_with?(" "), "pad-led"
+        error_line = @transcript.lines.find { |line| line.spans.map(&:content).join.include?("Error: 400: boom detail") }
+        assert_equal Theme[:error], error_line.spans.map { |span| span.style&.fg }.compact.first,
+          "the row rides the error fg"
+      end
+
+      # AC2: the s18 shape — an EMPTY-content failure entry (the pre-stream
+      # synthesis) renders the row alone; the leading spacer gate stays shut
+      # (no visible content preceded, pi :103-105).
+      def test_error_transcript_replays_the_empty_content_failure_row_alone
+        entries = [
+          {"type" => "message", "message" => {"role" => "user", "content" => "hello"}},
+          {"type" => "message", "message" => {"role" => "assistant", "content" => "",
+                                              "tool_calls" => {}, "finish_reason" => "error",
+                                              "error_message" => "400: boom"}},
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        texts_after_user = texts.drop_while { |row| !row.include?("hello") }
+        error_rows = texts_after_user.grep(/Error: 400: boom/)
+        assert_equal 1, error_rows.size, "the row renders with no content above it"
+      end
+
+      # AC2: pre-I60 files — a finish_reason "error" WITHOUT the
+      # error_message key (and every keyless plain assistant) reads
+      # has_error false: the old guard, byte-identical renders.
+      def test_error_transcript_pre_i60_files_render_byte_identically
+        entries = [
+          {"type" => "message", "message" => {"role" => "user", "content" => "hello"}},
+          {"type" => "message", "message" => {"role" => "assistant", "content" => "done",
+                                              "tool_calls" => {}, "finish_reason" => "stop"}},
+          {"type" => "message", "message" => {"role" => "assistant", "content" => "",
+                                              "tool_calls" => {}, "finish_reason" => "error"}},
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        refute texts.join.include?("Error: "), "no error row without the error_message key"
+        assert_includes texts.join, "done", "the plain assistant unchanged"
+      end
+
+      # --- I56: the resize-live rebuild ---
+
+      # rebuild_live_expandables re-invokes ONLY the resize_live-flagged
+      # builders at the CURRENT toggle state and splices in place with the
+      # flip's start/delta arithmetic: the live block's rows replace in
+      # place, content BELOW shifts by the height delta, and non-live
+      # registrations (a tool block) keep their rows byte-identical.
+      def test_rebuild_live_expandables_replaces_the_live_block_and_shifts_later_rows
+        live_rows = 1 # the live block's row count (the rebuild's height delta lever)
+        @transcript.push_expandable(->(expanded) { live_rows.times.map { |i| TUI.line("header r#{i} expanded=#{expanded}") } },
+          resize_live: true)
+        @transcript.push_expandable(->(expanded) { [TUI.line("tool expanded=#{expanded}")] })
+        @transcript.enqueue_scrollback("below the fold", fg: Theme[:dim])
+        flush
+
+        assert_equal ["header r0 expanded=false", "tool expanded=false", "below the fold"], texts
+
+        live_rows = 2 # the rebuilt block is one row TALLER
+        assert @transcript.rebuild_live_expandables, "the rebuild reports a live block rebuilt"
+
+        assert_equal ["header r0 expanded=false", "header r1 expanded=false", "tool expanded=false", "below the fold"],
+          texts, "the live block replaced in place at the current expand state; later content intact"
+        assert_equal 4, @transcript.lines.size, "the height delta shifted the rows below"
+
+        @transcript.set_tool_output_expanded(true)
+        @transcript.rebuild_live_expandables
+        assert_equal ["header r0 expanded=true", "header r1 expanded=true", "tool expanded=true", "below the fold"],
+          texts, "the rebuild reads the CURRENT toggle state (no flip of its own)"
+      end
+
+      # resize_live defaults FALSE — every pre-I56 push_expandable caller
+      # byte-identical — and rebuild_live_expandables no-ops (returns
+      # false, rows untouched) when only non-live blocks are registered.
+      def test_rebuild_live_expandables_defaults_false_and_no_ops_without_live_blocks
+        @transcript.push_expandable(->(_expanded) { [TUI.line("tool block")] })
+        flush
+
+        refute @transcript.rebuild_live_expandables, "no live blocks → nothing rebuilt"
+        assert_equal ["tool block"], texts, "the rows are untouched"
+        assert_equal 1, @transcript.lines.size
+      end
+
+      # --- I57: the generic-family live-settle bg cure + the edit family ---
+
+      # AC1 (the root-cause cure): the LIVE settle of a generic tool used
+      # to compose bg-less rows (the nil-key forwarding suppressed
+      # generic_panel_rows' default); now the finalize arm paints exactly
+      # like the replay arm — success #254131, pads included.
+      def test_generic_bg_live_settle_paints_the_success_bg
+        @transcript.finalize_tool_block("grep", {}, "hit", nil)
+        flush
+
+        assert_equal ["", "", "  ⎿ grep: hit", ""], texts, "the generic shape is unchanged (pads are blank text)"
+        assert_equal [Theme[:tool_success_bg]], bgs, "the pad + content rows ride the result bg"
+      end
+
+      # The error arm: a failed generic settle paints toolErrorBg.
+      def test_generic_bg_live_settle_paints_the_error_bg
+        @transcript.finalize_tool_block("grep", {}, { error: "boom" }, nil)
+        flush
+
+        assert_equal Theme[:tool_error_bg], bgs.first, "the error bg"
+        assert_includes texts[2], "⎿ grep: boom"
+      end
+
+      # The pending arm's bytes are UNCHANGED by the cure (explicit bg).
+      def test_generic_bg_pending_arm_stays_byte_frozen
+        @transcript.enqueue_pending_tool_block("grep", {})
+        flush
+
+        assert_equal ["", "  ⎿ grep", ""], texts.drop(1), "the pending shape"
+        assert_equal [Theme[:tool_pending_bg]], bgs, "the pending bg only"
+      end
+
+      # AC2/AC4: the edit dispatch settles from the call's details — the
+      # pending block replaced IN PLACE with the EditBlock family (no ⎿
+      # row, the diff from the details, the success bg).
+      def test_edit_block_dispatch_settles_from_the_call_details
+        args = { "path" => "f.txt" }
+        @transcript.enqueue_pending_tool_block("edit", args)
+        flush
+        pending_size = @transcript.lines.size
+
+        details = { diff: "-1 line two bravo\n+1 line two charlie", patch: "", firstChangedLine: 1 }
+        @transcript.finalize_tool_block("edit", args, "Successfully replaced 1 block(s) in f.txt.", nil,
+                                        details: details)
+        flush
+
+        assert_operator @transcript.lines.size, :>, pending_size, "the diff rows landed"
+        joined = texts.join("\n")
+        assert_includes joined, " edit f.txt", "the header"
+        assert_includes joined, "-1 line two bravo", "the removed row"
+        assert_includes joined, "+1 line two charlie", "the added row"
+        refute_includes joined, "⎿ edit:", "the generic defect row is gone"
+        assert_includes bgs, Theme[:tool_success_bg], "the success bg"
+      end
+
+      # The replay arm: the recorded details string-key hash renders the
+      # same family from the recorded session.
+      def test_edit_block_replay_renders_from_the_recorded_details
+        entries = [
+          { "type" => "message", "message" => { "role" => "user", "content" => "write then edit" } },
+          { "type" => "message", "message" => { "role" => "assistant", "content" => nil,
+                                                "tool_calls" => { "c1" => { "id" => "c1", "name" => "edit",
+                                                                            "arguments" => { "path" => "f.txt" } } } } },
+          { "type" => "message", "message" => { "role" => "tool", "content" => "ok", "tool_call_id" => "c1",
+                                                "details" => { "diff" => "-1 a bravo", "patch" => "",
+                                                               "firstChangedLine" => 1 } } },
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        joined = texts.join("\n")
+        assert_includes joined, " edit f.txt"
+        assert_includes joined, "-1 a bravo"
+        assert_includes bgs, Theme[:tool_success_bg]
+      end
+
+      # Sessions recorded pre-I57 (no details) replay HEADER-ONLY.
+      def test_edit_block_replay_without_recorded_details_renders_header_only
+        entries = [
+          { "type" => "message", "message" => { "role" => "assistant", "content" => nil,
+                                                "tool_calls" => { "c1" => { "id" => "c1", "name" => "edit",
+                                                                            "arguments" => { "path" => "f.txt" } } } } },
+          { "type" => "message", "message" => { "role" => "tool", "content" => "ok", "tool_call_id" => "c1" } },
+        ]
+        @transcript.replay_entries(entries, update_footer: false, populate_history: false)
+        flush
+
+        joined = texts.join("\n")
+        assert_includes joined, " edit f.txt"
+        refute_includes joined, "⎿ edit:", "still the edit family, not the generic row"
+        assert_equal 4, @transcript.lines.size, "spacer + pad + header + pad"
+      end
+
+      # AC3: the pending edit block — the header alone under the pending
+      # bg (the preview cut, Grounds §6).
+      def test_edit_block_pending_renders_the_header_under_the_pending_bg
+        @transcript.enqueue_pending_tool_block("edit", { "path" => "f.txt" })
+        flush
+
+        assert_equal ["", "", " edit f.txt", ""], texts, "the 4-row pending frame"
+        assert_equal [Theme[:tool_pending_bg]], bgs, "the pending bg only"
+      end
+      end
     # --- I47: the custom-message block (pi CustomMessageComponent's
     # default rendering — the Grounds section-6 staged-pi capture is the
     # row-shape oracle) ---
@@ -306,6 +516,49 @@ module Tart
       flush
 
       assert_empty @transcript.lines, "display false renders nothing (pi's display gate)"
+    end
+
+    # --- I56: the resize-live rebuild ---
+
+    # rebuild_live_expandables re-invokes ONLY the resize_live-flagged
+    # builders at the CURRENT toggle state and splices in place with the
+    # flip's start/delta arithmetic: the live block's rows replace in
+    # place, content BELOW shifts by the height delta, and non-live
+    # registrations (a tool block) keep their rows byte-identical.
+    def test_rebuild_live_expandables_replaces_the_live_block_and_shifts_later_rows
+      generation = "a"
+      @transcript.push_expandable(->(expanded) { [TUI.line("header #{generation} expanded=#{expanded}")] },
+        resize_live: true)
+      @transcript.push_expandable(->(expanded) { [TUI.line("tool expanded=#{expanded}")] })
+      @transcript.enqueue_scrollback("below the fold", fg: Theme[:dim])
+      flush
+
+      assert_equal ["header a expanded=false", "tool expanded=false", "below the fold"], texts
+
+      generation = "bb" # the rebuilt header is one row TALLER
+      assert @transcript.rebuild_live_expandables, "the rebuild reports a live block rebuilt"
+
+      assert_equal ["header bb expanded=false", "tool expanded=false", "below the fold"], texts,
+        "the live block replaced in place at the current expand state; later content intact"
+      assert_equal 4, @transcript.lines.size, "the height delta shifted the rows below"
+
+      @transcript.set_tool_output_expanded(true)
+      generation = "cc"
+      @transcript.rebuild_live_expandables
+      assert_equal ["header cc expanded=true", "tool expanded=true", "below the fold"], texts,
+        "the rebuild reads the CURRENT toggle state (no flip of its own)"
+    end
+
+    # resize_live defaults FALSE — every pre-I56 push_expandable caller
+    # byte-identical — and rebuild_live_expandables no-ops (returns
+    # false, rows untouched) when only non-live blocks are registered.
+    def test_rebuild_live_expandables_defaults_false_and_no_ops_without_live_blocks
+      @transcript.push_expandable(->(_expanded) { [TUI.line("tool block")] })
+      flush
+
+      refute @transcript.rebuild_live_expandables, "no live blocks → nothing rebuilt"
+      assert_equal ["tool block"], texts, "the rows are untouched"
+      assert_equal 1, @transcript.lines.size
     end
   end
 end

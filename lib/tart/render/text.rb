@@ -60,6 +60,124 @@ module Tart
         end
       end
 
+      # pi wrapSingleLine (tui utils.ts:925-1010) over the TUI span
+      # vocabulary — the HEADER-family wrap (I56): one row of duck-typed
+      # spans (content + style) in, wrapped span rows out, regrouped by
+      # contiguous source span. Rows that fit pass through UNCHANGED (the
+      # frozen s1/s9 shapes ride the identity arm). The port reproduces
+      # pi's token mechanics exactly (verified against the live-oracle
+      # artifact table + a deno run of pi's own tokenizer):
+      #   · tokens are whitespace/word runs built ACROSS span boundaries
+      #     (utils.ts:799-880 splitIntoTokensWithAnsi);
+      #   · an SGR code rides every segment boundary (each theme.fg emits
+      #     its own), so pi's whitespace test — `token.trim() === ""`
+      #     (:941) — sees the code and a token that OPENS a span is never
+      #     whitespace, even when its visible text is spaces. That is the
+      #     whole continuation game: at content width 48 the ` · `
+      #     separator's leading space (its own muted segment,
+      #     interactive-mode.ts:1049-1056) survives the break and LEADS
+      #     the next row (`␣␣· / commands…`, pi-w50.txt row 3); a plain
+      #     whitespace token never starts a row (:968-970);
+      #   · breaks trimEnd the row (:965), over-long word tokens
+      #     hard-break at exactly +width+ cells (breakLongWord). The ANSI
+      #     tracker's line-end resets have no cell-vocabulary equivalent
+      #     — styles ride the cells themselves.
+      def wrap_spans(row, width)
+        return [row] if row.empty? || TUI.text_width(row.map(&:content).join) <= width
+
+        lines = []
+        current = []
+        span_tokens(row).each do |token|
+          token_width = TUI.text_width(token[:cells].map(&:first).join)
+          if token_width > width && !token[:ws]
+            lines << current unless current.empty?
+            broken = break_span_cells(token[:cells], width)
+            lines.concat(broken[0..-2])
+            current = broken.last
+            next
+          end
+
+          if TUI.text_width(current.map(&:first).join) + token_width > width && !current.empty?
+            lines << current
+            current = token[:ws] ? [] : token[:cells].dup
+          else
+            current.concat(token[:cells])
+          end
+        end
+        lines << current unless current.empty?
+        lines.map { |cells| span_row(cells, row) }
+      end
+
+      # pi splitIntoTokensWithAnsi over cells: maximal same-kind runs
+      # (" " is the only space kind — utils.ts:839). +ws+ is pi's
+      # isWhitespace — `token.trim() === ""` (:941): the trim strips
+      # whitespace but leaves ANSI codes, so a token is whitespace only
+      # when its visible text is all spaces AND it carries no code —
+      # codes ride segment joins (each theme.fg emits one), inside the
+      # token just as at its head. That is the continuation mechanic: the
+      # ` · ` separator's leading space re-opens the muted run, survives
+      # trim, and leads the next row (pi-w50.txt row 3).
+      def span_tokens(row)
+        cells = row.each_with_index.flat_map { |span, index| span.content.chars.product([index]) }
+        tokens = []
+        current = nil
+        current_kind = nil
+        previous_index = nil
+        cells.each do |(char, index)|
+          kind = char == " " ? :space : :word
+          if current_kind && current_kind != kind
+            tokens << finish_span_token(current)
+            current = nil
+          end
+          current ||= {cells: [], ws: true}
+          current_kind = kind
+          current[:cells] << [char, index]
+          current[:ws] &&= !previous_index.nil? && index == previous_index
+          previous_index = index
+        end
+        tokens << finish_span_token(current) if current
+        tokens
+      end
+
+      # pi's trim check over one token: whitespace only when no cell
+      # opened (or crossed) a source span and every visible char is a
+      # space. Empty tokens (never produced) would read whitespace.
+      def finish_span_token(token)
+        token[:ws] &&= token[:cells].all? { |(char, _)| char == " " }
+        token
+      end
+
+      # pi breakLongWord (:1022-1062) over cells: width-cell rows,
+      # split only where the next grapheme would overflow.
+      def break_span_cells(cells, width)
+        rows = []
+        current = []
+        current_width = 0
+        cells.each do |cell|
+          char_width = TUI.text_width(cell.first)
+          if current_width + char_width > width
+            rows << current
+            current = []
+            current_width = 0
+          end
+          current << cell
+          current_width += char_width
+        end
+        rows << current unless current.empty?
+        rows
+      end
+
+      # One wrapped row's cells regrouped into spans (contiguous source
+      # spans coalesce; trailing whitespace trimmed — pi's final
+      # `wrapped.map(line => line.trimEnd())`, :1006-1008).
+      def span_row(cells, row)
+        cells.pop while !cells.empty? && cells.last.first =~ /\s/
+        cells.chunk_while { |(_, a), (_, b)| a == b }.map do |group|
+          source = row[group.first[1]]
+          RatatuiRuby::Text::Span.new(content: group.map(&:first).join, style: source.style)
+        end
+      end
+
       # Hard cell-wise clip (pi truncateToWidth with an empty tail).
       def clip_text(text, width)
         out = []

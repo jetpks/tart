@@ -343,6 +343,239 @@ module Tart
       assert_nil editor2.instance_variable_get(:@last_action), "paste is not a type-word (pi: lastAction nil)"
     end
 
+    # --- the paste registry (I55): pi's large-paste marker compaction
+    # (editor.ts:1300-1317) + the owner's paste-over arm (Grounds §3).
+    # Name filters paste_marker|expanded_text|paste_over|path_prefix are
+    # the AC gate contract (D8). ---
+
+    def eleven_lines(prefix)
+      (1..11).map { |i| "#{prefix}#{i}" }.join("\n")
+    end
+
+    def type_text(editor, text)
+      text.each_char { |char| editor.insert(char) }
+    end
+
+    def test_paste_marker_line_form_stores_the_registry_and_inserts_only_the_marker
+      editor = Render::Editor.new
+      content = eleven_lines("a")
+      editor.insert_paste(content)
+      assert_equal "[paste #1 +11 lines]", editor.input, "ONLY the marker inserts (line form over 10 lines)"
+      assert_equal 20, editor.cursor_col, "the cursor sits right after the marker"
+      assert_equal 1, editor.paste_counter
+      assert_equal content, editor.pastes[1], "the FULL text is in the registry"
+      assert_equal content, editor.expanded_text, "expansion round-trips the stored content"
+    end
+
+    def test_paste_marker_char_form_over_thousand_chars_on_one_line
+      editor = Render::Editor.new
+      editor.insert_paste("x" * 1001)
+      assert_equal "[paste #1 1001 chars]", editor.input, "the char form (line count at or under 10)"
+      assert_equal 1001, editor.pastes[1].length
+    end
+
+    def test_paste_marker_char_form_when_only_the_char_bar_crosses
+      editor = Render::Editor.new
+      content = "x" * 1001 + "\ny"
+      editor.insert_paste(content) # 2 lines (no line form), 1003 chars
+      assert_equal "[paste #1 1003 chars]", editor.input
+    end
+
+    def test_paste_marker_boundaries_stay_inline_at_ten_lines_and_thousand_chars
+      editor = Render::Editor.new
+      editor.insert_paste((1..10).map { |i| "l#{i}" }.join("\n"))
+      assert_equal 10, editor.lines.size, "10 lines splice inline (strictly greater crosses)"
+      assert_empty editor.pastes
+
+      editor2 = Render::Editor.new
+      editor2.insert_paste("y" * 1000)
+      assert_equal 1, editor2.lines.size, "1000 chars splice inline"
+      assert_empty editor2.pastes
+    end
+
+    def test_paste_marker_counts_the_filtered_text_after_normalize_and_printable_filter
+      editor = Render::Editor.new
+      content = (1..11).map { |i| "r#{i}\t\x01" }.join("\r\n")
+      editor.insert_paste(content)
+      filtered = (1..11).map { |i| "r#{i}    " }.join("\n")
+      assert_equal "[paste #1 +11 lines]", editor.input, "\r\n normalizes before the line count"
+      assert_equal filtered, editor.pastes[1], "the registry stores the FILTERED text (tabs expanded, control bytes dropped)"
+    end
+
+    def test_path_prefix_space_prepends_one_space_after_an_ascii_word_char
+      editor = Render::Editor.new
+      type_text(editor, "cat")
+      editor.insert_paste("/tmp/notes.txt")
+      assert_equal "cat /tmp/notes.txt", editor.input, "one space separates the word from the path (pi :1290-1299)"
+      assert_equal "/tmp/notes.txt", editor.input[1..].split(" ", 2).last
+
+      editor2 = Render::Editor.new
+      type_text(editor2, "run")
+      editor2.insert_paste("~/bin/tool")
+      assert_equal "run ~/bin/tool", editor2.input, "~ leads too"
+
+      editor3 = Render::Editor.new
+      type_text(editor3, "see")
+      editor3.insert_paste("./script")
+      assert_equal "see ./script", editor3.input, ". leads too"
+    end
+
+    def test_path_prefix_no_space_at_line_start_after_a_space_or_after_unicode
+      editor = Render::Editor.new
+      editor.insert_paste("/tmp/x") # line start: col 0, no char before
+      assert_equal "/tmp/x", editor.input
+
+      editor2 = Render::Editor.new
+      type_text(editor2, "cat ")
+      editor2.insert_paste("/tmp/x")
+      assert_equal "cat /tmp/x", editor2.input, "the char before the cursor is a space — no extra space"
+
+      editor3 = Render::Editor.new
+      type_text(editor3, "café")
+      editor3.insert_paste("/tmp/x")
+      assert_equal "café/tmp/x", editor3.input,
+        "é is not ASCII \\w (pi's JS \\w — NOT the port's unicode-wide WORD_CHAR)"
+    end
+
+    def test_expanded_text_expands_every_marker_id_driven
+      editor = Render::Editor.new
+      editor.insert_paste(eleven_lines("a"))
+      editor.add_new_line
+      editor.insert_paste("x" * 1001 + "y") # char form, id 2
+      assert_equal 2, editor.paste_counter
+      expanded = editor.expanded_text
+      assert expanded.start_with?(eleven_lines("a")), "id 1's content expands"
+      assert expanded.end_with?("x" * 1001 + "y"), "id 2's content expands"
+      refute expanded.include?("[paste #"), "no marker bytes survive expansion"
+    end
+
+    def test_expanded_text_keeps_regex_danger_bytes_verbatim
+      editor = Render::Editor.new
+      danger = (1..11).map { |i| "r#{i} \\1 \\\\ \\0 z" }.join("\n")
+      editor.insert_paste(danger)
+      assert_equal danger, editor.expanded_text,
+        "block-form replacement only: \\1/\\\\-shaped paste bytes expand verbatim (pi's replacer function)"
+    end
+
+    def test_expanded_text_expands_a_hand_typed_marker_with_a_valid_id_and_any_suffix
+      editor = Render::Editor.new
+      content = eleven_lines("a")
+      editor.insert_paste(content)
+      editor.move_start
+      type_text(editor, "[paste #1]") # hand-typed, no suffix
+      assert editor.expanded_text.end_with?(content), "a hand-typed marker whose id is in the registry expands (pi quirk)"
+
+      editor2 = Render::Editor.new
+      editor2.insert_paste(content)
+      editor2.move_start
+      type_text(editor2, "[paste #1 +99 lines]") # hand-typed, WRONG suffix
+      refute editor2.expanded_text.include?("[paste #1 +99 lines]"), "the typed bytes expand away too (suffix-agnostic)…"
+      assert editor2.expanded_text.end_with?(content), "…and still expand (pi :1090-1097)"
+    end
+
+    def test_paste_over_marker_large_then_large_expands_inline_and_renumbers
+      editor = Render::Editor.new
+      first = eleven_lines("a")
+      second = eleven_lines("b")
+      editor.insert_paste(first)
+      editor.insert_paste(second) # lands with the marker ending exactly at the cursor
+      assert_equal second, editor.pastes[1], "the old entry dropped, the new paste took id 1 (contiguity 1..1)"
+      assert_equal 1, editor.paste_counter
+      assert editor.lines.first.start_with?("a1"), "the old content expanded inline at the span start"
+      assert_equal "a11[paste #1 +11 lines]", editor.lines.last,
+        "the new marker inserts at the cursor (the OLD content's expanded tail)"
+      assert_equal first + second, editor.expanded_text, "the marker is display-only"
+    end
+
+    def test_paste_over_marker_large_then_small_splices_expanded_plus_inline
+      editor = Render::Editor.new
+      content = eleven_lines("a")
+      editor.insert_paste(content)
+      editor.insert_paste("hello")
+      assert_empty editor.pastes, "the small paste ran the normal path: no marker"
+      assert_equal 0, editor.paste_counter
+      assert_equal "a11hello", editor.lines.last, "the expanded content + the inline splice"
+      assert_equal content + "hello", editor.expanded_text
+    end
+
+    def test_paste_over_marker_needs_a_valid_marker_ending_at_the_cursor
+      editor = Render::Editor.new
+      editor.insert_paste(eleven_lines("a"))
+      type_text(editor, "xx") # the cursor no longer sits at the marker's end
+      editor.insert_paste(eleven_lines("b"))
+      assert_equal 2, editor.paste_counter, "the normal path: a SECOND marker"
+      assert_equal %w[a b].map { |p| eleven_lines(p) }, [editor.pastes[1], editor.pastes[2]]
+    end
+
+    def test_paste_over_marker_is_one_undo_round_trip
+      editor = Render::Editor.new
+      content = eleven_lines("a")
+      editor.insert_paste(content)
+      editor.insert_paste(content) # the paste-over + the new marker, ONE undo unit
+      editor.undo
+      assert_equal "[paste #1 +11 lines]", editor.input, "ONE undo restores the pre-paste text"
+      assert_equal content, editor.pastes[1], "…and the pre-paste registry"
+      assert_equal 1, editor.paste_counter
+    end
+
+    def test_paste_marker_backspace_renumbers_the_registry_and_every_text_marker
+      editor = Render::Editor.new
+      editor.insert_paste(eleven_lines("a")) # [paste #1 +11 lines]
+      editor.add_new_line
+      editor.insert_paste("x" * 1002) # [paste #2 1002 chars] — a DIFFERENT suffix form
+      editor.cursor_up # onto marker #1's line (one visual row each)
+      editor.move_end
+      editor.delete_backward # the #1 arm: drop, shift, renumber
+      assert_equal ["", "[paste #1 1002 chars]"], editor.lines,
+        "the survivor renumbers to id 1 with its suffix preserved VERBATIM (char form intact)"
+      assert_equal [1], editor.pastes.keys
+      assert_equal 1, editor.paste_counter
+      assert_equal "x" * 1002, editor.pastes[1], "the registry shifted down with the text"
+    end
+
+    def test_paste_marker_backspace_over_a_hand_typed_id_deletes_char_wise
+      editor = Render::Editor.new
+      type_text(editor, "[paste #9]") # id 9 is NOT in the (empty) registry — an unmerged segment
+      editor.delete_backward
+      assert_equal "[paste #9", editor.input, "char-wise: only the ] goes (pi's unmerged segment)"
+    end
+
+    def test_paste_marker_backspace_renumbers_markers_on_the_same_line_too
+      editor = Render::Editor.new
+      editor.insert_paste("x" * 1001) # [paste #1 1001 chars]
+      type_text(editor, " ")
+      editor.insert_paste("y" * 1001) # [paste #2 1001 chars] — SAME line, cursor at its end
+      editor.delete_backward # the #2 arm: drop 2, renumber #1 → #1 (no-op), delete the #2 span
+      assert_equal "[paste #1 1001 chars] ", editor.input,
+        "the survivor keeps its renumbered id on the shared line; the deleted span is gone"
+      assert_equal [1], editor.pastes.keys
+      assert_equal 22, editor.cursor_col, "the cursor lands at the deleted span's start"
+
+      editor2 = Render::Editor.new
+      editor2.insert_paste("x" * 1001) # id 1
+      type_text(editor2, " ")
+      editor2.insert_paste("y" * 1001) # id 2 — same line
+      editor2.move_start
+      editor2.move_end # (0, 43) — the line is 21 + 1 + 21 chars
+      22.times { editor2.move_left } # (0, 21) — marker #1's end
+      editor2.delete_backward # the #1 arm: drop 1, shift #2 → #1 IN THE TEXT on this line, delete the #1 span
+      assert_equal " [paste #1 1001 chars]", editor2.input,
+        "the same-line higher marker renumbered (pi re-reads the line post-renumber, :1419)"
+      assert_equal "y" * 1001, editor2.pastes[1], "the registry shifted down with the text"
+    end
+
+    def test_paste_marker_forward_delete_removes_the_span_without_registry_cleanup
+      editor = Render::Editor.new
+      content = eleven_lines("a")
+      editor.insert_paste(content)
+      editor.move_start
+      editor.delete_forward
+      assert_equal "", editor.input, "the whole span goes in one op"
+      assert_equal 1, editor.paste_counter, "the registry is UNTOUCHED (pi :1792-1800 — the exact quirk)"
+      assert_equal content, editor.pastes[1]
+      assert_equal "", editor.expanded_text, "the stale entry is inert: expansion is marker-driven (Grounds OQ-2)"
+    end
+
     # --- test list (5, editor half): the render window. ---
 
     def test_max_visible_lines_comes_from_the_rows_reader

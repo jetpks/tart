@@ -1,0 +1,24 @@
+# S12 — steering delivered INSIDE the tool round (I54, finding 7): the
+# steer typed while request 1's bash tool sleeps (1.5 s — the determinism
+# window, D11) must ride the NEXT request of the SAME run, not open a new
+# round. Request-count discrimination (D11): the OLD round-boundary drain
+# makes THREE requests (request 2 = the plain continuation; the steer then
+# opens request 3) and fails `completed`; the cured shape makes exactly 2,
+# with the steering text the LAST user message of request 2 (the s12 gate
+# asserts those bytes).
+name: s12_steering_mid_round
+prompt: "list the files"
+expected_requests: 2
+mid_run_keys:
+  after_request: 1
+  keys: ["wait, sort them by size", "Enter"]
+responses:
+  - type: stream
+    content: ""
+    tool_calls:
+      - id: call_s12_1
+        name: bash
+        arguments:
+          command: "sleep 1.5 && echo steering-window"
+  - type: stream
+    content: "Done after steering."

@@ -1,0 +1,29 @@
+# S14 — the large-paste marker, DISPLAY (I55): a 12-line bracketed paste
+# (> 10 lines, over the filtered text) stores the full text in the editor
+# registry and inserts ONLY the "[paste #1 +12 lines]" marker — the byte
+# form is live-calibrated (Grounds §4.2). Paste-only: submit: false sends
+# NO Enter and expected_requests: 0 (the never-served response satisfies
+# the non-empty responses rule). RED-at-base by design: base tart spliced
+# the raw 12 lines into the editor (the I20/I35 RED-at-base control
+# class); the gate asserts the marker row in BOTH apps' settled screens
+# and NO pasted-content row.
+name: s14_paste_marker_display
+prompt: ""
+paste: |-
+  line alpha one
+  line bravo two
+  line charlie three
+  line delta four
+  line echo five
+  line foxtrot six
+  line golf seven
+  line hotel eight
+  line india nine
+  line juliet ten
+  line kilo eleven
+  line lima twelve
+submit: false
+expected_requests: 0
+responses:
+  - type: stream
+    content: "never served — paste-only display flow"

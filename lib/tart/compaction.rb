@@ -34,7 +34,7 @@ module Tart
 
     # pi's CompactionEntry summary wrapper (messages.ts:11-19), projected
     # onto a user message (convertToLlm's compactionSummary branch,
-    # messages.ts:176-184 — ruby_llm has no compactionSummary role).
+    # messages.ts:176-184 — the wire has no compactionSummary role).
     COMPACTION_SUMMARY_PREFIX = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n"
     COMPACTION_SUMMARY_SUFFIX = "\n</summary>"
 
@@ -163,16 +163,19 @@ module Tart
 
     # pi calculateContextTokens (compaction.ts:138-140):
     # totalTokens || input + output + cacheRead + cacheWrite. The gem's
-    # Tokens carries no total accessor (tokens.rb READERS :35-37), so the
-    # component sum is the whole formula; unreported counts are nil.
+    # Usage carries total_tokens NATIVE (OQ-9) — used directly; the
+    # {Agent::Tokens} duck (the recorded reseed's shape) falls back to
+    # the component sum; unreported counts are nil.
     def calculate_context_tokens(tokens)
+      return tokens.total_tokens if tokens.respond_to?(:total_tokens) && tokens.total_tokens
+
       [tokens.input, tokens.output, tokens.cache_read, tokens.cache_write].compact.sum
     end
 
     # pi estimateContextTokens (compaction.ts:196-225): provider-usage-backed
     # through the last valid assistant usage, chars/4 estimates for the
     # messages after it; all-estimate when no usage is in the history.
-    # +tools+ (the chat's registered tools, ruby_llm Chat#tools) feeds the
+    # +tools+ (the chat's registered tools, the Chat's tools reader) feeds the
     # all-estimate arm only: on the usage-backed path the provider's report
     # covers the standing context, pi's system arm included.
     def estimate_context_tokens(messages, tools: nil)
@@ -185,13 +188,16 @@ module Tart
     end
 
     # pi getAssistantUsage (compaction.ts:144-158): skips messages without
-    # valid (non-nil, non-all-zero) usage. pi's aborted/error stop-reason
-    # skip is unobservable here and itemized as cut: the gem raises instead
-    # of appending failed/aborted responses (chat.rb provider_completion →
-    # record_generated_message only runs on success, chat.rb:1006/:1213;
-    # cancel raises CancelledError at raise_if_cancelled! inside it :1221),
-    # and Message#finish_reason (message.rb:63, :115) never carries
-    # :aborted/:error — a skip on those values would guard nothing.
+    # valid (non-nil, non-all-zero) usage. Since I60 a recorded
+    # finish_reason CAN carry "error" — the loop's synthesized failure
+    # message rides the normal machinery (error_message in tow, tokens:
+    # nil) — so the error stop-reason skip pi does is net-equivalent HERE
+    # through the nil-tokens guard below: the failure message reports no
+    # usage and is skipped by the same check that skips every unreported
+    # turn. The aborted premise stands as itemized: the chat raises
+    # instead of appending aborted responses (a cancelled stream unwinds
+    # with the Async::Cancel conversion — OQ-2's declared divergence
+    # records nothing).
     def assistant_usage(message)
       return nil unless message.respond_to?(:role) && message.role == :assistant
 
@@ -214,7 +220,7 @@ module Tart
     # normalizeContext) — and its estimate is content + sections +
     # JSON.stringify(toolsAdded).length, so pi's chars/4 estimate covers
     # the full wire request. The port's tools live on the chat, not in a
-    # message (ruby_llm Chat#with_tools): the estimate arms add the same
+    # message (the Chat's with_tools): the estimate arms add the same
     # component from the chat's tools — one component per context, never
     # per message — over the definitions the request sends ({name,
     # description, parameters}: the chat_completions function payload
@@ -266,7 +272,7 @@ module Tart
     # ==========================================================================
 
     # pi estimateTokens (compaction.ts:258-296), chars/4 heuristic, mapped
-    # onto ruby_llm message shapes: user/system/tool content; assistant
+    # onto the adapter's message shapes: user/system/tool content; assistant
     # text + thinking + tool calls (name + JSON arguments). The port's live
     # context holds none of pi's bashExecution/custom/branchSummary/
     # compactionSummary roles (pi-internal).
@@ -383,7 +389,7 @@ module Tart
     # Serialization
     # ==========================================================================
 
-    # pi serializeConversation (utils.ts:110-153), mapped onto ruby_llm
+    # pi serializeConversation (utils.ts:110-153), mapped onto the adapter's
     # message shapes: content strings, ToolCall#name/#arguments (pi's
     # `k=${JSON.stringify(v)}`), thinking via Message#thinking. System
     # messages are prompt state, not conversation (pi's convertToLlm).

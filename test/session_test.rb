@@ -9,7 +9,7 @@ module Tart
   # The JSONL session store (AC1/AC2): recording an agent turn to a session
   # file, parsing it back, resume seeding (the model sees prior turns on the
   # wire), and most-recent-session-for-cwd selection — against the real
-  # ruby_llm client over the local mock endpoint.
+  # fast-completions client over the local mock endpoint.
   class SessionTest < Test
     def setup
       @server = MockLLMServer.new.start
@@ -234,7 +234,7 @@ module Tart
     # (appendCompaction's `firstKeptEntryId ?? id`).
     def test_recorder_appends_compaction_entries
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
-      recorder.append_message(RubyLLM::Message.new(role: :user, content: "hi"))
+      recorder.append_message(Agent::Message.user("hi"))
       id = recorder.append_compaction(summary: "the summary", first_kept_entry_id: nil,
         tokens_before: 42, details: {"readFiles" => ["a.rb"], "modifiedFiles" => []})
 
@@ -256,7 +256,7 @@ module Tart
     # usage — JSON drops undefined).
     def test_recorder_persists_the_summarization_usage_on_the_compaction_entry
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
-      recorder.append_message(RubyLLM::Message.new(role: :user, content: "hi"))
+      recorder.append_message(Agent::Message.user("hi"))
       recorder.append_compaction(summary: "the summary", first_kept_entry_id: nil, tokens_before: 42,
         details: {}, usage: {"input" => 10, "output" => 5, "totalTokens" => 15})
       recorder.append_compaction(summary: "second", first_kept_entry_id: nil, tokens_before: 1, details: {})
@@ -267,19 +267,28 @@ module Tart
       refute entries[3].key?("usage")
     end
 
-    # AC3 (I30): the gem's Tokens readers map onto pi's Usage (types.ts
-    # :446) camelCase persisted shape — unreported counts drop,
-    # totalTokens is the component sum (the gem carries no total reader);
-    # nothing reported persists nothing (pi's usage-undefined entries).
-    def test_compaction_usage_maps_the_gem_tokens_to_pis_usage_shape
-      tokens = RubyLLM::Tokens.new(input: 10, output: 5, cache_read: 4, cache_write: 2,
-        thinking: 3, cache_write_by_ttl: {"5m" => 1, "1h" => 2})
+    # AC3 (I30): the gem's Usage readers map onto pi's Usage (types.ts
+    # :446) camelCase persisted shape — nothing unreported persists; the
+    # 1h-ttl cache-write sub-key died with the replaced client; the
+    # cache-write zero persists (the recorded parser default) while an
+    # unreported cache-read drops; totalTokens is the gem's NATIVE total
+    # (OQ-9); nothing reported persists nothing (pi's usage-undefined
+    # entries).
+    def test_compaction_usage_maps_the_gem_usage_to_pis_usage_shape
+      usage = Fast::Completions::Usage.new(input: 10, output: 5, cache_read: 4,
+        cache_write: 2, reasoning: 3, total_tokens: 24)
       assert_equal(
         {"input" => 10, "output" => 5, "cacheRead" => 4, "cacheWrite" => 2,
-         "cacheWrite1h" => 2, "reasoning" => 3, "totalTokens" => 21},
-        Agent::Session.compaction_usage(tokens))
+         "reasoning" => 3, "totalTokens" => 24},
+        Agent::Session.compaction_usage(usage))
 
-      assert_nil Agent::Session.compaction_usage(RubyLLM::Tokens.new)
+      # The frozen parser asymmetry: the reported zero cache WRITE
+      # persists, an unreported (zero) cache READ drops.
+      mocked = Fast::Completions::Usage.new(input: 10, output: 5, total_tokens: 15)
+      assert_equal({"input" => 10, "output" => 5, "cacheWrite" => 0, "totalTokens" => 15},
+        Agent::Session.compaction_usage(mocked))
+
+      assert_nil Agent::Session.compaction_usage(Fast::Completions::Usage::ZERO)
       assert_nil Agent::Session.compaction_usage(nil)
     end
 
@@ -289,9 +298,9 @@ module Tart
     # shape load_entries reads back.
     def test_recorder_context_entries_projects_the_kept_tail
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
-      recorder.append_message(RubyLLM::Message.new(role: :user, content: "old question"))
-      recorder.append_message(RubyLLM::Message.new(role: :system, content: "prompt state"))
-      kept_id = recorder.append_message(RubyLLM::Message.new(role: :assistant, content: "kept answer"))
+      recorder.append_message(Agent::Message.user("old question"))
+      recorder.append_message(Agent::Message.new(role: :system, content: "prompt state"))
+      kept_id = recorder.append_message(Agent::Message.new(role: :assistant, content: "kept answer"))
       recorder.append_compaction(summary: "the summary", first_kept_entry_id: kept_id,
         tokens_before: 1, details: {})
 
@@ -382,6 +391,54 @@ module Tart
         "no recorder, no files anywhere under the root"
     end
 
+    # --- I60 error_transcript: the failure entry (D1/D2) --------------------
+
+    # AC1: the synthesized failure message round-trips through the recorder
+    # — the file gains the entry on the leaf chain with the D1 byte family
+    # (no token keys), and the context projection reads it back as a plain
+    # assistant ContextMessage.
+    def test_error_transcript_failure_entry_round_trips_through_the_recorder
+      @server.script([{type: :error, status: 400, message: "The max_tokens parameter is illegal."}])
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      agent = agent_on_kernel(recorder:)
+      run_agent(agent, "hello")
+
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      assert_equal 3, entries.size, "header + user + the failure entry — the two-line defect is dead"
+      assert_equal({"role" => "assistant", "content" => "", "tool_calls" => {},
+                    "finish_reason" => "error",
+                    "error_message" => "400: The max_tokens parameter is illegal."},
+        entries.last["message"], "the D1 byte family — error_message rides, no token keys")
+      assert_equal entries[1]["id"], entries.last["parentId"], "the entry chains from the user turn"
+
+      # The context readback: a plain assistant context message (the wire
+      # conversion's empty-assistant skip keeps it off every request).
+      context = Agent::Session.context_messages(recorder.path)
+      assert_equal({role: :assistant, content: "", tool_calls: {}, finish_reason: "error",
+                    error_message: "400: The max_tokens parameter is illegal."},
+        context.last)
+    end
+
+    # AC1: the seed side — from_seed_hash reads declared fields only: a
+    # resumed failure message seeds content ""/finish_reason "error" while
+    # error_message stays display-side (replay renders from the RAW entry
+    # hash); pre-I60 files (no error_message key) seed byte-identically.
+    def test_error_transcript_seed_keeps_error_message_display_side
+      recorded = Agent::Message.error_failure(error_message: "400: boom")
+      seeded = Agent::Message.from_seed_hash(recorded.to_h.transform_keys(&:to_s))
+
+      assert_equal "", seeded.content
+      assert_equal "error", seeded.finish_reason
+      assert_nil seeded.error_message, "error_message is display-side — the seed never reads it"
+      assert_nil seeded.tokens&.input, "the seed's token duck carries no counts (no token keys recorded)"
+
+      pre_i60 = Agent::Message.new(role: :assistant, content: "done", tokens: nil, finish_reason: "stop")
+      reseeded = Agent::Message.from_seed_hash(pre_i60.to_h.transform_keys(&:to_s))
+      assert_equal "done", reseeded.content
+      assert_equal "stop", reseeded.finish_reason
+      assert_nil reseeded.error_message, "pre-I60 files: no error_message key, nothing changes"
+    end
+
     # Session.list (item 2/AC2, pi SessionManager.list's discovery shape):
     # the cwd's valid-header sessions, mtime descending, fixture-rooted.
     def test_lists_the_cwd_s_sessions_newest_first
@@ -421,7 +478,7 @@ module Tart
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
       refute recorder.persisted?, "a setup-only session leaves no file"
 
-      message = RubyLLM::Message.new(role: :user, content: "hi")
+      message = Agent::Message.user("hi")
       recorder.append_message(message)
       assert recorder.persisted?, "the file exists once a user message landed"
     end

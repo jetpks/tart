@@ -313,7 +313,7 @@ module Tart
 
     def test_fork_agent_prepends_the_preamble_and_resumes_the_parent_session
       recorder = Agent::Session::Recorder.new(cwd: @cwd, root: File.join(@home, "agent"))
-      recorder.append_message(RubyLLM::Message.new(role: :user, content: "inherited turn"))
+      recorder.append_message(Agent::Message.user("inherited turn"))
       @server.script([{type: :stream, content: "oracle answer"}])
       manager = new_manager
       run = manager.spawn_run(agent: "oracle", task: "advise", async: false,

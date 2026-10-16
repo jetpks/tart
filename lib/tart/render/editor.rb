@@ -17,9 +17,10 @@ module Tart
     # operations. Editing keys leave history browsing (pi:
     # exitHistoryBrowsing) while pure motions keep it (pi's dispatch —
     # moveCursor/moveToVisualLine never exit); edit units are chars where
-    # pi uses graphemes (the recorded simplification — paste markers, the
-    # other multi-grapheme unit, are cut with the large-paste
-    # compaction).
+    # pi uses graphemes (the recorded simplification — a paste marker's
+    # ATOMICITY lands only in the two deletion arms and the paste-over
+    # arm (I55); motion, word ops, and wrap stay char-unit and may walk
+    # into a marker, Grounds §5 reductions).
     #
     # Rendering (I35): {input_rows} lays the buffer out as visual rows
     # (pi layoutText) through the {word_wrap_line} chunker, windows them
@@ -36,6 +37,18 @@ module Tart
       # History depth (pi: editor.ts addToHistory caps at 100 entries).
       HISTORY_LIMIT = 100
 
+      # The paste-marker shapes (pi editor.ts:32/:35, byte-faithful): a
+      # large paste (> 10 lines or > 1000 chars, strictly greater, over the
+      # FILTERED text) stores its full text in the registry and inserts
+      # ONLY a marker at the cursor. Ruby's regexes are non-global (pi's
+      # /g realizes through gsub/scan iteration).
+      PASTE_MARKER_REGEX = /\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]/.freeze
+      PASTE_MARKER_SINGLE = /\A\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]\z/.freeze
+
+      # pi's JS \w at the path-prefix arm (editor.ts:1294) is ASCII-only —
+      # deliberately NOT the port's unicode-wide WORD_CHAR below.
+      PATH_PREFIX_WORD_CHAR = /[A-Za-z0-9_]/.freeze
+
       # The boundary classes of pi's word navigation (word-navigation.ts with
       # utils.ts:1006 PUNCTUATION_REGEX and :1011 isWhitespaceChar). The
       # Intl.Segmenter word-like segment is approximated by word-character
@@ -50,12 +63,11 @@ module Tart
       # column within the row text.
       LayoutRow = Struct.new(:text, :has_cursor, :cursor_pos, keyword_init: true)
 
-      # The undo snapshot (pi EditorSnapshot, editor.ts:225-229, minus
-      # its pastes/pasteCounter halves — the large-paste marker registry
-      # is a recorded I35 cut, itemized; the port's snapshot is exactly
-      # pi's EditorState triple). {UndoStack#push} deep-copies, so a
-      # snapshot is detached from the live buffer the moment it stacks.
-      Snapshot = Struct.new(:lines, :cursor_line, :cursor_col, keyword_init: true)
+      # The undo snapshot (pi EditorSnapshot, editor.ts:225-229 — the
+      # state triple PLUS the paste registry halves, which I55 brought
+      # back). {UndoStack#push} deep-copies, so a snapshot is detached
+      # from the live buffer and registry the moment it stacks.
+      Snapshot = Struct.new(:lines, :cursor_line, :cursor_col, :pastes, :paste_counter, keyword_init: true)
 
       # @return [Array<String>] the logical lines (always ≥ 1; pi
       #   EditorState.lines).
@@ -67,7 +79,8 @@ module Tart
       #   renderedVisibleLineCount) and the rows hidden below it (pi
       #   renderBottomBorder's linesBelow) — the Chat area-height and
       #   border readbacks.
-      attr_reader :lines, :cursor_line, :cursor_col, :scroll_offset, :rendered_rows, :hidden_below
+      attr_reader :lines, :cursor_line, :cursor_col, :scroll_offset, :rendered_rows, :hidden_below,
+        :pastes, :paste_counter
 
       # +rows_reader+ feeds max(5, floor(rows * 0.3)) (pi
       # editor.ts:538/1966 both read terminal.rows); Chat wires
@@ -89,16 +102,32 @@ module Tart
         @kill_ring = KillRing.new
         @last_action = nil
         @undo_stack = UndoStack.new # pi undoStack field, editor.ts:368
+        @pastes = {} # pi pastes Map (editor.ts:338): id → the full filtered paste text
+        @paste_counter = 0 # pi pasteCounter (editor.ts:339); invariant: ids 1..n, counter == size
       end
 
-      # The joined buffer (pi getText, editor.ts:1088) — the
-      # chat/autocomplete/submit callers' readback.
+      # The joined buffer (pi getText, editor.ts:1088) — the RAW readback
+      # (chat dequeue-restore, autocomplete, the input echo; pi :4753
+      # parity — markers stay literal bytes here).
       def input
         @lines.join("\n")
       end
 
       # pi getText's name for the join.
       def text = input
+
+      # pi getExpandedText (editor.ts:1100-1103 → expandPasteMarkers
+      # :1090-1097): every registry id replaces its marker id-driven and
+      # SUFFIX-AGNOSTICALLY — a hand-typed `[paste #N]` (any suffix form)
+      # whose id is in the registry expands too (pi quirk, parity).
+      # Block-form gsub ONLY (pi's replacer-function parity): a String
+      # replacement argument would interpret \1/\\-shaped paste bytes as
+      # backreferences and corrupt the expansion.
+      def expanded_text
+        @pastes.reduce(input) do |result, (id, content)|
+          result.gsub(/\[paste ##{id}( (\+\d+ lines|\d+ chars))?\]/) { content }
+        end
+      end
 
       # The cursor as a FLAT char offset over the joined text — the
       # pre-multiline readback shape the cursor-moving operations' tests
@@ -112,7 +141,10 @@ module Tart
       # reset is pi submitValue's scrollOffset = 0, editor.ts:921). pi
       # setText's push-if-content-differs (editor.ts:1120-1124) makes
       # these clears UNDOABLE — only the submit surface clears the stack
-      # (Chat#submit → clear_undo_stack, pi submitValue :1373).
+      # (Chat#submit → clear_undo_stack, pi submitValue :1373). The port's
+      # clear realizes interactive-mode's clearEditor → setText(""):
+      # the registry clears AFTER the push (pi :1124-1125 order — the
+      # snapshot carries the OLD registry; one undo restores it).
       def clear
         push_undo_snapshot unless input.empty?
         @lines = [""]
@@ -120,6 +152,7 @@ module Tart
         set_cursor_col(0)
         @last_action = nil
         @scroll_offset = 0
+        clear_paste_registry
       end
 
       # The completion-apply write surface (pi applyCompletion): the token
@@ -157,21 +190,35 @@ module Tart
         @last_action = :type_word
       end
 
-      # pi handlePaste's insert path (editor.ts:1260-1298 +
-      # insertTextAtCursorInternal :1156-1200), minus the CSI-u control
-      # decode (the gem's paste events carry decoded content), the
-      # path-prefix space, and the large-paste "[paste #N]" markers (CUT,
-      # itemized — never silent): normalize line endings + tabs, filter
-      # non-printables keeping \n, splice multi-line, cursor at the
-      # inserted tail.
+      # pi handlePaste (editor.ts:1259-1325), minus the CSI-u control
+      # decode (the gem's paste events carry decoded content — the I35
+      # ruling, re-verified inert on the rig path): ONE unconditional undo
+      # push (the whole composite below is ONE unit), the OWNER'S
+      # sanctioned paste-over arm (a valid marker ending exactly at the
+      # cursor expands to its full text inline — the claude-code behavior;
+      # the port's own arm, pi has NO analog), normalize + non-printable
+      # filter keeping \n, the path-prefix space (pi :1290-1299), then the
+      # large-paste check (pi :1300-1317): > 10 lines or > 1000 chars
+      # (both strictly greater, over the FILTERED text) stores the full
+      # text and inserts ONLY the marker; smaller pastes splice inline,
+      # cursor at the inserted tail.
       def insert_paste(text)
         exit_history_browsing
         @last_action = nil # pi handlePaste editor.ts:1263
         push_undo_snapshot # pi handlePaste editor.ts:1265 — unconditional, before the filters
+        expand_paste_over_marker
         filtered = self.class.normalize_text(text).each_char.select do |char|
           char == "\n" || char.ord >= 32
         end.join
-        insert_multiline(filtered) unless filtered.empty?
+        return if filtered.empty?
+
+        filtered = " #{filtered}" if path_prefix_space?(filtered)
+        lines = filtered.split("\n", -1) # JS-split semantics: trailing empties count (pi :1301)
+        if lines.length > 10 || filtered.length > 1000
+          store_paste_marker(lines.length, filtered.length, filtered)
+        else
+          insert_multiline(filtered)
+        end
       end
 
       # pi addNewLine (editor.ts:1329-1348): split the current line at
@@ -188,16 +235,37 @@ module Tart
       end
 
       # pi handleBackspace (editor.ts:1374-1445): delete the char before
-      # the cursor; at a line start, merge with the previous line (the
-      # plain backspace is not a kill op — no ring push).
+      # the cursor; a registry-valid marker ending exactly at the cursor
+      # deletes WHOLE with registry cleanup + renumber (:1395-1418 — a
+      # hand-typed marker whose id is not in the registry deletes
+      # char-wise, pi's unmerged segment); at a line start, merge with
+      # the previous line (the plain backspace is not a kill op — no ring
+      # push).
       def delete_backward
         exit_history_browsing
         @last_action = nil
         if @cursor_col.positive?
           push_undo_snapshot # pi handleBackspace editor.ts:1384
           line = @lines[@cursor_line]
-          @lines[@cursor_line] = line[0, @cursor_col - 1] + line[@cursor_col..]
-          set_cursor_col(@cursor_col - 1)
+          marker = valid_marker_ending_at(line, @cursor_col)
+          if marker
+            # pi :1398-1418 — the registry discipline runs FIRST (drop,
+            # decrement, shift higher ids down, renumber every line), THEN
+            # the line is RE-READ post-renumber (:1419 — a same-line higher
+            # marker renumbers too) and the span deletes by pi's
+            # cursor-relative arithmetic (cursorCol − graphemeLength): a
+            # same-line renumber that changes the length (id 10 → 9)
+            # shifts pi's window too — quirk preserved. The target marker
+            # itself never renumbers (its id equals the dropped one).
+            drop_paste_entry(Integer(marker[1]))
+            line = @lines[@cursor_line] # pi :1419 — the post-renumber bytes
+            span = @cursor_col - marker[0].length
+            @lines[@cursor_line] = line[0, span] + line[@cursor_col..]
+            set_cursor_col(span)
+          else
+            @lines[@cursor_line] = line[0, @cursor_col - 1] + line[@cursor_col..]
+            set_cursor_col(@cursor_col - 1)
+          end
         elsif @cursor_line.positive?
           push_undo_snapshot # pi handleBackspace editor.ts:1430
           merge_with_previous_line
@@ -205,14 +273,23 @@ module Tart
       end
 
       # pi handleForwardDelete (editor.ts:1781-1815): delete the char at
-      # the cursor; at a line end, merge with the next line.
+      # the cursor — a registry-valid marker starting exactly there
+      # deletes WHOLE (:1792-1800) but the registry entry is LEFT (pi's
+      # exact quirk: the stale entry is inert because expansion is
+      # marker-driven; deliberate parity, not an oversight — Grounds
+      # OQ-2); at a line end, merge with the next line.
       def delete_forward
         exit_history_browsing
         @last_action = nil
         line = @lines[@cursor_line]
         if @cursor_col < line.length
           push_undo_snapshot # pi handleForwardDelete editor.ts:1786
-          @lines[@cursor_line] = line[0, @cursor_col] + line[(@cursor_col + 1)..]
+          marker = valid_marker_starting_at(line, @cursor_col)
+          if marker
+            @lines[@cursor_line] = line[0, @cursor_col] + line[marker.end(0)..]
+          else
+            @lines[@cursor_line] = line[0, @cursor_col] + line[(@cursor_col + 1)..]
+          end
         elsif @cursor_line < @lines.length - 1
           push_undo_snapshot # pi handleForwardDelete editor.ts:1800
           @lines[@cursor_line] = line + @lines.delete_at(@cursor_line + 1)
@@ -495,6 +572,8 @@ module Tart
         @lines = snapshot.lines
         @cursor_line = snapshot.cursor_line
         @cursor_col = snapshot.cursor_col
+        @pastes = snapshot.pastes # pi undo :2130-2131 — the registry restores with the triple
+        @paste_counter = snapshot.paste_counter
         @last_action = nil # pi — undo closes the kill-accumulate and yank-pop windows
         @preferred_visual_col = nil
       end
@@ -503,6 +582,29 @@ module Tart
       # stack-clear site; Chat#submit calls this right after {clear}.
       def clear_undo_stack
         @undo_stack.clear
+      end
+
+      # pi setText (editor.ts:1115-1126 + setTextInternal :494-496, default
+      # cursorPlacement "end") — the dequeue-restore's write surface (I54):
+      # exit history browsing, normalize newlines, push an undo snapshot
+      # WHEN the normalized content differs from the current, replace the
+      # content, cursor at the END. The autocomplete context is surface-
+      # side ({Autocomplete}); the editor seam clears the kill/yank window
+      # state per the port's discipline ({last_action} — the same reset
+      # every write op makes). The registry clears AFTER the push-if-
+      # differs (pi :1124-1125 order — the snapshot carries the OLD
+      # registry, so one undo restores a live marker). The render window
+      # re-clamps at the next render.
+      def set_text(text)
+        exit_history_browsing
+        @last_action = nil
+        normalized = self.class.normalize_text(text)
+        push_undo_snapshot unless normalized == input
+        clear_paste_registry
+        @lines = normalized.empty? ? [""] : normalized.split("\n", -1)
+        @cursor_line = @lines.length - 1
+        set_cursor_col(@lines.last.length)
+        @scroll_offset = 0
       end
 
       # --- history ---
@@ -982,13 +1084,117 @@ module Tart
         set_cursor_col(previous.length)
       end
 
+      # --- the paste registry (I55: pi's marker ops + the owner's one
+      # sanctioned deviation, Grounds §3) ---
+
+      # The OWNER'S paste-over arm (pi has NO analog): with a valid marker
+      # ENDING exactly at the cursor, its span is replaced by the registry
+      # text inline — the {insert_multiline} splice shape (the span comes
+      # out, the content splices at the span start, the cursor lands at
+      # the expanded tail) — then the entry drops with the backspace
+      # arm's renumber discipline. Runs inside the ONE undo unit
+      # {insert_paste} opened; the NEW paste then walks the normal path
+      # (whose path-space rule reads the POST-expansion line).
+      def expand_paste_over_marker
+        marker = valid_marker_ending_at(@lines[@cursor_line], @cursor_col)
+        return unless marker
+
+        content = @pastes.fetch(Integer(marker[1]))
+        start = marker.begin(0)
+        @lines[@cursor_line] = @lines[@cursor_line][0, start] + @lines[@cursor_line][@cursor_col..]
+        set_cursor_col(start)
+        insert_multiline(content)
+        drop_paste_entry(Integer(marker[1]))
+      end
+
+      # pi's path-prefix readability space (:1290-1299): a filtered paste
+      # starting with /, ~, or . right after a word character gets ONE
+      # leading space. pi's JS \w is ASCII-only — NOT the port's
+      # unicode-wide WORD_CHAR; at col 0 pi's charBeforeCursor is "" and
+      # never matches.
+      def path_prefix_space?(filtered)
+        return false unless filtered.start_with?("/", "~", ".")
+        return false unless @cursor_col.positive?
+
+        PATH_PREFIX_WORD_CHAR.match?(@lines[@cursor_line][@cursor_col - 1])
+      end
+
+      # The large-paste arm (pi :1302-1317): store the FULL filtered text,
+      # insert ONLY the marker — the line form over 10 lines, the char
+      # form otherwise (both strictly greater). The 12-line calibration
+      # renders exactly "[paste #1 +12 lines]" (Grounds §4.2).
+      def store_paste_marker(line_count, char_count, filtered)
+        @paste_counter += 1
+        @pastes[@paste_counter] = filtered
+        marker = if line_count > 10
+          "[paste ##{@paste_counter} +#{line_count} lines]"
+        else
+          "[paste ##{@paste_counter} #{char_count} chars]"
+        end
+        insert_multiline(marker)
+      end
+
+      # The registry discipline shared by the backspace arm and the
+      # paste-over arm (pi handleBackspace :1399-1418): drop the id,
+      # decrement the counter, shift every higher id down in ASCENDING
+      # order (contiguity 1..n — independent of marker order in the
+      # text), then renumber every text marker with a higher id to id−1
+      # across ALL lines, each marker's suffix preserved verbatim
+      # (block-form gsub; a nil suffix interpolates empty — pi's JS
+      # ${suffixGroup} would stringify "undefined", the spec's D3 letter
+      # ("suffix preserved") governs).
+      def drop_paste_entry(id)
+        @pastes.delete(id)
+        @paste_counter -= 1
+        @pastes.keys.select { |key| key > id }.sort.each do |key|
+          @pastes[key - 1] = @pastes.delete(key)
+        end
+        @lines.map! do |line|
+          line.gsub(PASTE_MARKER_REGEX) do |marker|
+            higher = Integer(Regexp.last_match(1))
+            higher <= id ? marker : "[paste ##{higher - 1}#{Regexp.last_match(2)}]"
+          end
+        end
+      end
+
+      # The registry-valid marker whose span ENDS exactly at +col+ on
+      # +line+, or nil — the backspace arm's and the paste-over arm's
+      # shared detection (pi's merged-segment test, segmentWithMarkers
+      # :43-105: only registry-valid markers merge into one unit, so
+      # only those delete whole).
+      def valid_marker_ending_at(line, col)
+        pos = 0
+        while (match = PASTE_MARKER_REGEX.match(line, pos))
+          pos = match.end(0)
+          return match if match.end(0) == col && @pastes.key?(Integer(match[1]))
+        end
+        nil
+      end
+
+      # The registry-valid marker whose span STARTS exactly at +col+, or
+      # nil — the forward-delete arm's detection (pi :1792-1800).
+      def valid_marker_starting_at(line, col)
+        match = PASTE_MARKER_REGEX.match(line, col)
+        return nil unless match&.begin(0) == col && @pastes.key?(Integer(match[1]))
+
+        match
+      end
+
+      # pi setText's registry reset (:1124-1125) — shared by {set_text}
+      # and {clear} (the clearEditor → setText("") realization).
+      def clear_paste_registry
+        @pastes.clear
+        @paste_counter = 0
+      end
+
       # pi pushUndoSnapshot (editor.ts:2116-2119): the LIVE state fields
       # go into the snapshot (lines, cursor_line, cursor_col) and the
       # stack's push deep-copies — the mutation that follows can't reach
       # it. pi's snapshot also carries pastes/pasteCounter (editor.ts
-      # :225-229) — cut with the large-paste marker feature, itemized.
+      # :225-229) — the registry rides along (I55).
       def push_undo_snapshot
-        @undo_stack.push(Snapshot.new(lines: @lines, cursor_line: @cursor_line, cursor_col: @cursor_col))
+        @undo_stack.push(Snapshot.new(lines: @lines, cursor_line: @cursor_line, cursor_col: @cursor_col,
+          pastes: @pastes, paste_counter: @paste_counter))
       end
 
       def navigate_history(direction)

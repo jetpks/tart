@@ -168,8 +168,89 @@ module TuiSplitRig
       assert_match(/missing required field 'prompt'/, error.message)
     end
 
+    # The resize knob (I56, s16): a positive-integer pair or absent → nil;
+    # everything else is a rig error at load.
+    def test_resize_knob_parses_a_positive_pair_and_defaults_to_nil
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresize: [80, 40]\nresponses:\n  - type: stream\n    content: x\n")
+      assert_equal [80, 40], Scenario.load(path).resize
+
+      plain = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(plain, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert_nil Scenario.load(plain).resize, "absent by default — the no-knob path is byte-frozen"
+    end
+
+    def test_resize_knob_rejects_non_positive_and_non_pair_shapes
+      bad_shapes = [
+        "resize: 80\n",                    # not a pair
+        "resize: [80]\n",                  # one element
+        "resize: [80, 40, 20]\n",          # three elements
+        "resize: [0, 40]\n",               # non-positive width
+        "resize: [80, -1]\n",              # non-positive height
+        "resize: [\"80\", 40]\n",          # non-integer width
+        "resize: [80, 40.5]\n",            # non-integer height
+      ]
+      bad_shapes.each do |resize_line|
+        path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+        File.write(path, "name: s\nprompt: p\nexpected_requests: 1\n#{resize_line}responses:\n  - type: stream\n    content: x\n")
+        error = assert_raises(Error) { Scenario.load(path) }
+        assert_match(/resize must be a \[width, height\] pair of positive integers/, error.message)
+      end
+    end
+
+    # The shipped s16 instrument: the 120→80 mid-run resize with the s1
+    # reply — the scenario the SIGWINCH parity rides.
+    def test_resize_knob_loads_the_shipped_s16_resize_wrap_scenario
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s16_resize_wrap.yml"))
+      assert_equal "s16_resize_wrap", scenario.name
+      assert_equal [80, 40], scenario.resize
+      assert_equal 1, scenario.expected_requests
+      assert_equal [{type: :stream, content: "The mock reply is fixed and short for the spike."}], scenario.responses
+    end
+
     def test_absent_scenario_file_raises_a_rig_error
       assert_raises(Error) { Scenario.load("/nonexistent/scenario.yml") }
+    end
+
+    # The replay knob (I57, s17): absent → false (the no-knob path
+    # byte-frozen), true parses; anything non-boolean is a rig error.
+    def test_replay_knob_defaults_to_false_and_parses_true
+      plain = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(plain, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert_equal false, Scenario.load(plain).replay, "absent by default — the no-knob path is byte-frozen"
+
+      enabled = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(enabled, "name: s\nprompt: p\nexpected_requests: 1\nreplay: true\nresponses:\n  - type: stream\n    content: x\n")
+      assert_equal true, Scenario.load(enabled).replay
+    end
+
+    def test_replay_knob_rejects_non_boolean
+      bad_shapes = [
+        "replay: 1\n",
+        "replay: \"true\"\n",
+        "replay: nil\n",
+        "replay: [true]\n",
+      ]
+      bad_shapes.each do |replay_line|
+        path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+        File.write(path, "name: s\nprompt: p\nexpected_requests: 1\n#{replay_line}responses:\n  - type: stream\n    content: x\n")
+        error = assert_raises(Error) { Scenario.load(path) }
+        assert_match(/replay must be a boolean/, error.message)
+      end
+    end
+
+    # The shipped s17 instrument: write → edit → edit-error → reply with
+    # the replay leg armed — the edit-family bg surface's parity scenario.
+    def test_replay_knob_loads_the_shipped_s17_edit_tool_bg_scenario
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s17_edit_tool_bg.yml"))
+      assert_equal "s17_edit_tool_bg", scenario.name
+      assert_equal true, scenario.replay
+      assert_equal 4, scenario.expected_requests
+      assert_equal 4, scenario.responses.size
+      assert_equal "write", scenario.responses[0][:tool_calls][0][:name]
+      assert_equal "edit", scenario.responses[1][:tool_calls][0][:name]
+      assert_equal "edit", scenario.responses[2][:tool_calls][0][:name]
+      assert_equal "line two bravo", scenario.responses[1][:tool_calls][0][:arguments][:edits][0][:oldText]
     end
 
     # The context-window lever shrinks BOTH apps consistently: pi's staged
@@ -464,6 +545,76 @@ module TuiSplitRig
       assert_equal true, settings.fetch("memory")
       assert_equal({"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0},
         settings.fetch("compaction"), "the compaction rows survive the merge")
+    end
+
+    # --- the paste/submit knobs (I55, s14/s15) ---
+
+    # The canonical calibration block (Grounds §4): 12 short ASCII lines,
+    # no trailing newline — the byte-exact s14/s15 content.
+    PASTE_BLOCK = (<<~BLOCK).chomp.freeze
+      line alpha one
+      line bravo two
+      line charlie three
+      line delta four
+      line echo five
+      line foxtrot six
+      line golf seven
+      line hotel eight
+      line india nine
+      line juliet ten
+      line kilo eleven
+      line lima twelve
+    BLOCK
+
+    def test_paste_knob_defaults_to_nil_and_loads_from_the_shipped_s14
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 0\nresponses:\n  - type: stream\n    content: x\n")
+      assert_nil Scenario.load(path).paste, "no paste knob — today's behavior"
+
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s14_paste_marker_display.yml"))
+      assert_equal PASTE_BLOCK, scenario.paste, "the byte-exact calibrated block"
+      assert_equal "", scenario.prompt
+      refute scenario.submit, "s14 is paste-only: no Enter"
+      assert_equal 0, scenario.expected_requests, "the display flow makes no requests"
+    end
+
+    def test_paste_knob_non_string_is_a_rig_error
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\npaste: [not, a, string]\nexpected_requests: 0\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/paste must be a string/, error.message)
+    end
+
+    def test_submit_knob_defaults_to_true_and_loads_from_the_shipped_s15
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert Scenario.load(path).submit, "submit defaults TRUE — today's behavior"
+
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s15_paste_marker_submit.yml"))
+      assert_equal PASTE_BLOCK, scenario.paste
+      assert scenario.submit, "s15 submits (the default — no submit key in the file)"
+      assert_equal 1, scenario.expected_requests
+      assert_equal [{type: :stream, content: "copy that, twelve lines"}], scenario.responses
+    end
+
+    def test_submit_knob_non_boolean_is_a_rig_error
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nsubmit: maybe\n" \
+        "responses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/submit must be a boolean/, error.message)
+    end
+
+    def test_expected_requests_zero_is_accepted_and_negative_rejected
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 0\nresponses:\n  - type: stream\n    content: x\n")
+      scenario = Scenario.load(path)
+      assert_equal 0, scenario.expected_requests, "paste-only flows make zero requests (I55)"
+
+      File.write(path, "name: s\nprompt: p\nexpected_requests: -1\nresponses:\n  - type: stream\n    content: x\n")
+      error = assert_raises(Error) { Scenario.load(path) }
+      assert_match(/expected_requests must be a non-negative integer/, error.message)
     end
 
   end

@@ -10,7 +10,7 @@ module Tart
     # timed-out or aborted commands by negative-pid -TERM escalating to
     # -KILL, reaping every pid. Output is truncated to the last 2000 lines or
     # 50KB (whichever is hit first); full output spills to a temp file.
-    class Bash < RubyLLM::Tool
+    class Bash < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "bash"
@@ -19,13 +19,18 @@ module Tart
         "Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output " \
         "is saved to a temp file. Optionally provide a timeout in seconds."
 
+      # STRING-KEYED THROUGHOUT (I64): the gem's strict engine reads string
+      # keys (pi's JS node["type"] shape) — a symbol-keyed root makes the
+      # "prefer" declaration SILENTLY INERT (the resolver falls back loose
+      # with zero errors). Serialization-neutral: JSON.generate emits
+      # identical bytes for either key form, so the non-strict wire holds.
       PARAMETERS_SCHEMA = {
-        type: "object",
-        properties: {
-          "command" => {type: "string", description: "Shell command to execute"},
-          "timeout" => {type: "number", description: "Timeout in seconds (optional, no default timeout)"}
+        "type" => "object",
+        "properties" => {
+          "command" => {"type" => "string", "description" => "Shell command to execute"},
+          "timeout" => {"type" => "number", "description" => "Timeout in seconds (optional, no default timeout)"}
         },
-        required: ["command"]
+        "required" => ["command"]
       }.freeze
 
       # Grace after -TERM before escalating to -KILL (pi's killProcessTree is
@@ -86,6 +91,11 @@ module Tart
 
       parameters PARAMETERS_SCHEMA.dup
 
+      # pi bash.ts :260 — one of EXACTLY four core tools pi tags with
+      # constrainedSampling; the strict engine rewrites `parameters` and
+      # ships `strict: true` on a strict-capable dialect (I64).
+      constrained_sampling({"type" => "json_schema", "strict" => "prefer"})
+
       # The user-bash executor (pi bash-executor.ts executeBashWithOperations
       # — the !-prefix executor over the same spawn core as the tool):
       # pi's BashResult assembly — sanitized (the port strips \r; pi also
@@ -104,8 +114,8 @@ module Tart
       #   bytes agree with the settled ones). pi's executor skips empty
       #   sanitized text; the port's strip-only rule makes an empty call a
       #   no-op downstream, so the seam fires per read unconditionally.
-      #   Fires from the reader threads — push-only work (the bridge
-      #   queue), never render state.
+      #   Fires from the reader threads — push-only work (the caller's
+      #   chunk queue), never render state.
       def run_user(command, on_chunk: nil)
         raise Errno::ENOENT, "Working directory does not exist: #{@cwd}\nCannot execute bash commands." unless
           File.exist?(@cwd)
@@ -121,7 +131,7 @@ module Tart
         outcome =
           begin
             spawn_and_stream(command, output, nil, on_chunk:)
-          rescue RubyLLM::CancelledError, Async::Cancel
+          rescue Fast::Completions::CancelledError, Async::Cancel
             cancelled = true
             {exit_code: nil}
           end
@@ -238,24 +248,26 @@ module Tart
           deadline = timeout_seconds && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
 
           # Evented exit detection (pi's child "exit" event, bash.ts:112 —
-          # Node learns of exit without polling). Ruby has no evented child
-          # exit, so the idiomatic analog: a dedicated reaper thread does a
-          # BLOCKING Process.waitpid2 and hands the status over a Queue — the
-          # pop below returns the moment the child exits, so fast commands pay
-          # no poll quantum. The bounded pop keeps the deadline and
-          # cancellation checkpoints ticking while the command runs
-          # (cancellation is cooperative: the checkpoint raises in this
-          # thread, so the wait must yield).
+          # Node learns of exit without polling). The reaper is a REACTOR
+          # TASK (I50 de-bridge): the scheduler's process_wait is evented
+          # (async 2.46 scheduler.rb) — the dedicated wait parks the reaper
+          # fiber and hands the status over a Queue, so the pop below
+          # returns the moment the child exits and fast commands pay no
+          # poll quantum. A caller OFF the reactor (the subagents
+          # in-process drive — no task subtree on its bare thread) has no
+          # fiber to park: no reaper task, and the pop-loop below polls the
+          # exit itself — the base plain-thread behavior.
           completed = Queue.new
-          reaper = Thread.new { completed << Process.waitpid2(pid)[1] }
+          reaper = Async::Task.current?&.async { completed << Process.waitpid2(pid)[1] }
           status = nil
           term_sent = false
           killed = false
           loop do
             # Cancellation checkpoint: an interrupted turn kills the whole
             # process group (pi checks signal.aborted between events).
-            RubyLLM::Support::Cancellation.check
+            Fast::Completions::Cancellation.check
             status = completed.pop(timeout: CHECKPOINT_INTERVAL)
+            status ||= waitpid_no_hang(pid) unless reaper
             break if status
 
             now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -274,20 +286,25 @@ module Tart
             kill_process_group(pid, "KILL")
           end
           readers.each(&:join)
-          RubyLLM::Support::Cancellation.check
+          Fast::Completions::Cancellation.check
 
           exit_code = status.termsig ? 128 + status.termsig : status.exitstatus
           {exit_code:, timed_out:, cancelled: false}
-        rescue RubyLLM::CancelledError, Async::Cancel
+        rescue Fast::Completions::CancelledError, Async::Cancel
           # Interrupted mid-command: kill the whole group with a single -KILL
-          # and let cancellation propagate. The reaper thread reaps — this
-          # thread must not waitpid2 the pid itself (the reaper owns it; a
-          # second wait would raise ECHILD). Both cancellation classes:
-          # the agent-loop cancel rides RubyLLM's checkpoint error; the
-          # user-bash escape cancels the reactor task itself (Task#stop —
-          # Async::Cancel at the fiber's next yield), same group kill.
+          # and let cancellation propagate. SOMEONE must reap the killed
+          # child: the reaper task normally wins (it is parked in the
+          # scheduler's process_wait and the -KILL guarantees death), but a
+          # cancelled tool task takes its child reaper with it (async's
+          # stop_children) — so this fiber also self-reaps bounded: a WNOHANG
+          # poll every ~10 ms (cooperative), ECHILD-tolerant (the reaper won
+          # the race), capped at TERM_GRACE_SECONDS. A zombie never outlives
+          # the run. Both cancellation classes: the agent-loop cancel rides
+          # the gem checkpoint error; the user-bash escape stops the
+          # reactor task itself (Task#stop — Async::Cancel at the fiber's
+          # next yield), same group kill.
           kill_process_group(pid, "KILL") if pid
-          reaper&.join(TERM_GRACE_SECONDS)
+          reap_after_kill(pid)
           raise
         ensure
           readers&.each { |t| t.join(1) rescue nil }
@@ -306,6 +323,36 @@ module Tart
         rescue Errno::ESRCH, Errno::EPERM
           nil
         end
+      end
+
+      # The off-reactor caller's exit probe (no reaper task to feed the
+      # queue): WNOHANG — nil while the child lives, the status at exit.
+      # Never raises ECHILD (with no reaper, nobody else reaps).
+      def waitpid_no_hang(pid)
+        Process.waitpid2(pid, Process::WNOHANG)&.last
+      rescue Errno::ECHILD
+        nil
+      end
+
+      # The cancellation path's zombie guarantee: self-reap the -KILLed
+      # child unless the reaper task already did (ECHILD). WNOHANG never
+      # parks this fiber (a legitimate nil = still alive); the ~10 ms
+      # cadence stays cooperative; the TERM_GRACE_SECONDS cap bounds the
+      # unwind (after the group -KILL the death is immediate — the cap is
+      # a never-reached safety net).
+      def reap_after_kill(pid)
+        return unless pid
+
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + TERM_GRACE_SECONDS
+        loop do
+          reaped = Process.waitpid2(pid, Process::WNOHANG)
+          return if reaped&.first
+
+          return if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          sleep 0.01
+        end
+      rescue Errno::ECHILD
+        nil # the reaper task won the race — the pid is reaped
       end
 
       def drain_pipe(io, output, on_chunk)

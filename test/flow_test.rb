@@ -8,8 +8,10 @@ require "json"
 require "digest"
 
 module Tart
-  # The I45 flow contract (dry-rb-flow): the Bridge's Result terminal, the
-  # loop's step-boundary classification, the MCP client's call-surface
+  # The I45 flow contract (the step boundary): the loop's step-boundary
+  # rescue ladder (Async::Cancel, then CancelledError, then StandardError —
+  # the de-bridged I50 shape; the ladder reproduces the Bridge-era terminal
+  # classification exactly), the MCP client's call-surface
   # taxonomy, and the no-silent-swallow golden — a failure raised mid-tool
   # reaches every observable seam byte-identically (Grounds §2.3).
   class FlowTest < Test
@@ -28,55 +30,18 @@ module Tart
       FileUtils.rm_rf(@dir)
     end
 
-    # -- the Bridge Result contract ------------------------------------------
-
-    def test_bridge_returns_success_for_clean_work_and_yields_items_in_order
-      items = []
-      result = Agent::Bridge.new.run(->(sink) {
-        sink.call({chunk: "a"})
-        sink.call({chunk: "b"})
-      }) { |item| items << item }
-
-      assert result.success?
-      assert_equal [{chunk: "a"}, {chunk: "b"}], items
-    end
-
-    def test_bridge_failure_carries_the_worker_error_instance
-      error = StandardError.new("worker boom")
-      result = Agent::Bridge.new.run(->(_) { raise error }) { }
-
-      assert result.failure?
-      assert_same error, result.failure
-    end
-
-    def test_bridge_cancelled_work_is_a_failure_typed_by_cancelled_error
-      result = Agent::Bridge.new.run(->(_) { raise RubyLLM::CancelledError, "cancelled" }) { }
-
-      assert result.failure?
-      assert_kind_of RubyLLM::CancelledError, result.failure
-    end
-
-    def test_bridge_yields_streamed_items_before_the_error_terminal
-      items = []
-      result = Agent::Bridge.new.run(lambda { |sink|
-        sink.call({chunk: "a"})
-        raise RubyLLM::BadRequestError, "mid-stream 400"
-      }) { |item| items << item }
-
-      assert_equal [{chunk: "a"}], items
-      assert_kind_of RubyLLM::BadRequestError, result.failure
-    end
-
     # -- the step-boundary classification table (public surface) -------------
 
     def test_worker_http_error_classifies_as_bad_request
       server = mock_server([{type: :error, status: 400, message: "Extra inputs are not permitted"}])
       agent, events = run_agent_on_kernel(server, "hi")
 
-      assert_kind_of RubyLLM::BadRequestError, agent.last_error
+      assert_kind_of Fast::Completions::BadRequestError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
-      assert_kind_of RubyLLM::BadRequestError, end_event[:error]
-      assert_equal %i[user], agent.new_messages.map(&:role)
+      assert_kind_of Fast::Completions::BadRequestError, end_event[:error]
+      # I60 D6 (the declared re-pin): the failure now leaves pi's trace —
+      # the synthesized failure assistant rides new_messages beside the user.
+      assert_equal %i[user assistant], agent.new_messages.map(&:role)
     end
 
     def test_context_length_error_classifies_with_compaction_disabled
@@ -84,24 +49,20 @@ module Tart
                              message: "This model maximum context length is 8 tokens"}])
       agent, events = run_agent_on_kernel(server, "hi", compaction: {enabled: false})
 
-      assert_kind_of RubyLLM::ContextLengthExceededError, agent.last_error
+      assert_kind_of Fast::Completions::ContextLengthExceededError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
-      assert_kind_of RubyLLM::ContextLengthExceededError, end_event[:error]
+      assert_kind_of Fast::Completions::ContextLengthExceededError, end_event[:error]
     end
 
     def test_dead_endpoint_classifies_as_connection_failed
-      chat = RubyLLM.context do |config|
-        config.openai_api_key = "test"
-        config.openai_api_base = "http://127.0.0.1:1/v1"
-        config.request_timeout = 2
-        config.max_retries = 0
-      end.chat(model: "tart-test-model", provider: "openai",
-              protocol: :chat_completions, assume_model_exists: true)
+      chat = Agent::Chat.new(
+        client: Fast::Completions::Client.new(base_url: "http://127.0.0.1:1/v1", api_key: "test", timeout: 2),
+        model_id: "tart-test-model", provider_key: "openai")
       agent, events = run_agent_on_kernel_with_chat(chat)
 
-      assert_kind_of Faraday::ConnectionFailed, agent.last_error
+      assert_kind_of Fast::Completions::ConnectionError, agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
-      assert_kind_of Faraday::ConnectionFailed, end_event[:error]
+      assert_kind_of Fast::Completions::ConnectionError, end_event[:error]
     end
 
     # -- the MCP call-surface taxonomy (public API) ---------------------------

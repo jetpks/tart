@@ -28,6 +28,26 @@ module TuiSplitRig
 #                              # before the capture — the settled-screen
 #                              # instrument for post-reply key flows (s9's
 #                              # ctrl+o startup-help flip). Default: none.
+#   mid_run_keys:              # optional (I54): {after_request: N, keys:
+#     after_request: 1         # [...]} — after the prompt is sent, poll the
+#     keys: ["text", "Enter"]  # mock's NON-DRAINING request_count until it
+#                              # reaches N (HARD_CAP-bounded; a dead pane or
+#                              # a timeout fails the app's completed), then
+#                              # send the keys and let the reply settle —
+#                              # the mid-run submit instrument (s12/s13).
+#                              # Default: none (today's behavior).
+#   paste: |-                  # optional (I55): the text sent as a bracketed
+#     line one                 # paste BEFORE the prompt (tmux load-buffer +
+#                              # paste-buffer -p — the app sees ONE Paste
+#                              # event, exactly like a terminal paste).
+#   submit: false              # optional (I55, default TRUE): gates the
+#                              # Enter after the prompt — false is the
+#                              # paste-only display flows (s14). With paste
+#                              # unset and submit true (every pre-existing
+#                              # scenario) the runner sends EXACTLY today's
+#                              # single `tmux send-keys <prompt> Enter` call;
+#                              # expected_requests accepts 0 for the
+#                              # paste-only flows (negative still rejected).
 #   stage_project_resources: true  # optional: write the loaded-resource set
 #                              # into BOTH apps' run sandbox — AGENTS.md at
 #                              # the cwd, one project skill, one user skill
@@ -45,7 +65,25 @@ module TuiSplitRig
 #                              # the staged settings.json + the same index
 #                              # at .tart/memory/tart/MEMORY.md. Default:
 #                              # false.
-  #   env:                       # optional per-app env overrides (the
+  #   resize: [80, 40]           # optional (I56): the [width, height] pair the
+#                              # pane is resized to AFTER the boot settle and
+#                              # BEFORE the paste/prompt block (tmux
+#                              # resize-window — resize-PANE does not move a
+#                              # manual-size session). The SIGWINCH instrument
+#                              # (s16). Default: none (today's behavior).
+#   replay: true               # optional (I57): AFTER the completed turn and
+#                              # the primary teardown, re-boot the app on its
+#                              # RECORDED session (pi `--continue`; tart the
+#                              # `-r` flag APPENDED AFTER the workdir
+#                              # positional — OptionParser's optional [ID]
+#                              # placeholder greedily eats a following token)
+#                              # under the same staged home/sandbox, settle,
+#                              # and capture <app>.replay.capture{,.styled}.
+#                              # NO prompt is sent and no requests are
+#                              # expected; `completed` is computed BEFORE the
+#                              # replay leg and untouched by it. Default:
+#                              # false (the no-knob path byte-frozen).
+#   env:                       # optional per-app env overrides (the
   #     tart:                    # runner layers them over its staged
   #       TART_IDENTITY: tart    # env — the branding/staging seam)
   #
@@ -56,7 +94,8 @@ module TuiSplitRig
     APPS = %w[pi tart].freeze
 
     attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage,
-                :post_settle_keys, :stage_project_resources, :stage_memory
+                :post_settle_keys, :mid_run_keys, :stage_project_resources, :stage_memory, :paste, :submit,
+                :resize, :replay
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -74,8 +113,10 @@ module TuiSplitRig
       @name = require_field(data, "name")
       @prompt = require_field(data, "prompt")
       @expected_requests = require_field(data, "expected_requests")
-      unless @expected_requests.is_a?(Integer) && @expected_requests.positive?
-        raise Error, "#{path}: expected_requests must be a positive integer"
+      # Non-negative (I55): a paste-only display flow makes ZERO requests
+      # (s14). Negative stays a rig error.
+      unless @expected_requests.is_a?(Integer) && @expected_requests >= 0
+        raise Error, "#{path}: expected_requests must be a non-negative integer"
       end
 
       responses = require_field(data, "responses")
@@ -86,10 +127,15 @@ module TuiSplitRig
         symbolized[:type] = symbolized[:type].to_s.to_sym if symbolized.is_a?(Hash) && symbolized[:type]
         symbolized
       end
+      @paste = parse_paste(data)
+      @submit = parse_submit(data)
+      @resize = parse_resize(data)
+      @replay = parse_replay(data)
       @env = parse_env(data)
       @context_window = parse_context_window(data)
       @suppress_usage = parse_suppress_usage(data)
       @post_settle_keys = parse_post_settle_keys(data)
+      @mid_run_keys = parse_mid_run_keys(data)
       @stage_project_resources = parse_stage_project_resources(data)
       @stage_memory = parse_stage_memory(data)
     end
@@ -101,6 +147,53 @@ module TuiSplitRig
       return nil if raw.nil?
 
       raise Error, "#{@path}: context_window must be a positive integer" unless raw.is_a?(Integer) && raw.positive?
+
+      raw
+    end
+
+    # The paste knob (the s14/s15 instrument, I55): a String or absent →
+    # nil. Validated at load like the existing knobs.
+    def parse_paste(data)
+      raw = data["paste"]
+      return nil if raw.nil?
+
+      raise Error, "#{@path}: paste must be a string" unless raw.is_a?(String)
+
+      raw
+    end
+
+    # The submit knob (I55): gates the Enter after the prompt — false is
+    # the paste-only display flows (s14). Default TRUE: today's behavior.
+    def parse_submit(data)
+      raw = data["submit"]
+      return true if raw.nil?
+
+      raise Error, "#{@path}: submit must be a boolean" unless raw == true || raw == false
+
+      raw
+    end
+
+    # The resize knob (the s16 instrument, I56): a [width, height] pair of
+    # positive integers or absent → nil. Validated at load like the other
+    # knobs — everything else is a rig error.
+    def parse_resize(data)
+      raw = data["resize"]
+      return nil if raw.nil?
+
+      unless raw.is_a?(Array) && raw.length == 2 && raw.all? { |value| value.is_a?(Integer) && value.positive? }
+        raise Error, "#{@path}: resize must be a [width, height] pair of positive integers"
+      end
+
+      raw
+    end
+
+    # The replay knob (the s17 instrument, I57): a boolean or absent →
+    # false. Validated at load like the other knobs — the I55 discipline.
+    def parse_replay(data)
+      raw = data["replay"]
+      return false if raw.nil?
+
+      raise Error, "#{@path}: replay must be a boolean" unless raw == true || raw == false
 
       raw
     end
@@ -125,6 +218,24 @@ module TuiSplitRig
       raise Error, "#{@path}: post_settle_keys must be a list of key strings" unless raw.is_a?(Array) && raw.all?(String)
 
       raw.map { |key| String(key) }
+    end
+
+    # The optional mid-run key knob (the s12/s13 instrument, I54):
+    # {after_request: positive Integer, keys: [String]} or absent → nil.
+    # Validated at load like the existing knobs.
+    def parse_mid_run_keys(data)
+      raw = data["mid_run_keys"]
+      return nil if raw.nil?
+
+      raise Error, "#{@path}: mid_run_keys must be a mapping" unless raw.is_a?(Hash)
+      after = raw["after_request"]
+      unless after.is_a?(Integer) && after.positive?
+        raise Error, "#{@path}: mid_run_keys.after_request must be a positive integer"
+      end
+      keys = raw["keys"]
+      raise Error, "#{@path}: mid_run_keys.keys must be a list of key strings" unless keys.is_a?(Array) && keys.all?(String)
+
+      {after_request: after, keys: keys.map { |key| String(key) }}
     end
 
     # The optional loaded-resource staging knob (the s9 instrument): a

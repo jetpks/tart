@@ -16,7 +16,7 @@ module Tart
   #   order + snapshot, but NO isolation — the first truthy `block` result
   #   wins and ends dispatch, and a raised error PROPAGATES to the tool gate
   #   (Registry's wrapper), which converts it to the fail-safe block
-  #   (agent-session.ts:685-687). RubyLLM::CancelledError always escapes.
+  #   (agent-session.ts:685-687). Fast::Completions::CancelledError always escapes.
   # - nextTurn injection (sendCustomMessage :2293-2331): queue only — no
   #   append, no events at send time; the loop drains after the user
   #   message (:2086-2095).
@@ -123,7 +123,7 @@ module Tart
       @mutex.synchronize { drain = @next_turn; @next_turn = []; drain }
     end
 
-    # Registers a RubyLLM::Tool instance; Registry.build merges these
+    # Registers a tool instance; Registry.build merges these
     # AFTER built-ins + MCP (same name overrides — pi's registry merge).
     def register_tool(tool)
       @mutex.synchronize { @registered_tools << tool }

@@ -21,16 +21,6 @@ module Tart
     # Settings defaults and the error is reported, never a crash.
     ROOT_KEY = "models.json"
 
-    # The port's carried wire: the chat-completions seam on the openai
-    # slug (the recorded standing reduction — no other native provider).
-    # A models.json provider KEY names an ENDPOINT CONFIG (baseUrl/
-    # apiKey/api), not a wire provider: pi's api field picks the Api
-    # class; the port maps every non-native key onto this one seam
-    # (live-verified: ruby_llm 2.1 Models.resolve raises "Unknown
-    # provider" for anything but a registered slug — models.rb:203,
-    # provider.rb:608-611).
-    WIRE_PROVIDER = "openai"
-
     # The catalog shape: the typed providers (Shapes::Provider — the
     # endpoint block plus its typed models) keyed by the models.json key,
     # and the flattened typed model entries ({model_entries}).
@@ -121,14 +111,96 @@ module Tart
       Config.new(providers: {}, default: nil, error: "Failed to load models.json: #{e.message} (#{path})")
     end
 
-    # The wire provider for a provider key: a native ruby_llm slug
-    # passes through (the Settings defaultProvider contract preserved),
-    # everything else rides the port's single chat-completions seam.
-    def wire_provider(key)
-      return key.to_s if key && RubyLLM::Provider.providers.key?(key.to_sym)
+    # pi's modelFromJson definition defaults (provider-composer.ts:242-243):
+    # `contextWindow: definition.contextWindow ?? 128000`, `maxTokens:
+    # definition.maxTokens ?? 16384` — applied at model-DEFINITION time,
+    # i.e. ONLY where a models.json entry exists. They ride the
+    # facts-threading seam below (never catalog load — Shapes::Model#to_h
+    # stays DECLARED == the parsed entry — and never Settings
+    # .resolve_context_window); a NO-entry boot has no definition and the
+    # no-entry chain owns the window (Grounds §4-b: env → settings →
+    # known-tables → 0, the cap nil → wire_model's window fallback).
+    DEFAULT_ENTRY_CONTEXT_WINDOW = 128_000
+    DEFAULT_ENTRY_MAX_TOKENS = 16_384
 
-      WIRE_PROVIDER
+    # The entry's declared window, else pi's 128_000 definition default
+    # when an entry EXISTS; nil without an entry (the no-entry chain's
+    # signal — no default may leak into an entry-less boot).
+    def entry_context_window(entry)
+      return nil unless entry
+      entry.context_window || DEFAULT_ENTRY_CONTEXT_WINDOW
     end
+
+    # The entry's declared cap, else pi's 16_384 definition default when
+    # an entry EXISTS (never the window fallback — the big-declared-window
+    # fallback is the Face-1 400); nil without an entry.
+    def entry_max_tokens(entry)
+      return nil unless entry
+      entry.max_tokens || DEFAULT_ENTRY_MAX_TOKENS
+    end
+
+    # The wire model (Grounds D7): the catalog facts + the resolved
+    # window into the gem's Model. +context_window+ MUST arrive as an
+    # Integer — the caller runs the existing resolution chain (catalog →
+    # env → known-tables → Settings::MODEL_CONTEXT_WINDOWS default tier);
+    # the Chat's placeholder passes 0 (pi's `contextWindow ?? 0`, the
+    # threshold-disabled shape). +max_tokens+ falls back to the window —
+    # the gem's pi-clamp caps the key at context − estimate − 4096, so
+    # the fallback approximates the old key-omission semantics. The
+    # dialect rides by construction (D6): the compat translates to a
+    # Fast::Completions::Dialect inside {dialect_for}.
+    def wire_model(model_id:, provider_key:, reasoning:, context_window:,
+                   max_tokens: nil, thinking_level_map: nil, compat: nil)
+      Fast::Completions::Model.new(
+        id: model_id.to_s,
+        reasoning: reasoning == true,
+        context_window: context_window,
+        max_tokens: max_tokens || context_window,
+        thinking_level_map: thinking_level_map,
+        dialect: dialect_for(compat),
+        provider: provider_key
+      )
+    end
+
+    # The compat→Dialect translation (D6 — zai as data): the I46/I64 six-key
+    # compat subset maps onto the closed Dialect vocabulary — a zai
+    # thinkingFormat builds the zai-shaped declaration (the gem's shipped
+    # :zai values: max_tokens rename, no developer role, effort enabled,
+    # tool_stream, pi's zai store suppression, and I64's strict-sampling
+    # gate — supports_strict_mode threads the compat's
+    # supportsStrictMode; nil/false/absent stay false, pi detectCompat's
+    # "OpenAI compatibility alone does not imply it"); ANY other compat
+    # (nil, a non-zai thinkingFormat) rides the DEFAULT dialect — today's
+    # "only-zai arms" behavior verbatim (a non-zai compat declaring
+    # supportsStrictMode is tolerated-and-DROPPED: the frozen boundary).
+    #
+    # BOTH arms declare supports_finish_reason: false — pi's
+    # finish-inference arm (the gem infers the stop reason from the
+    # content when a stream ends without one, openai-completions.ts
+    # :690-692). RECEIVE-side only — the key never reaches the wire — so
+    # every wire byte holds; it exists because the hermetic mock's
+    # :slow_stream shape predates the gem's finish-reason discipline (the
+    # replaced client tolerated a finish-less stream; the gem errors), and
+    # the completing-slow-stream pins (steering, subagents e2e) speak that
+    # shape. The rig scenarios all carry finish_reason and never arm it.
+    def dialect_for(compat)
+      return DEFAULT_DIALECT unless compat&.thinking_format == "zai"
+
+      Fast::Completions::Dialect.new(
+        thinking_format: :zai,
+        max_tokens_field: compat.max_tokens_field == "max_tokens" ? "max_tokens" : "max_completion_tokens",
+        supports_developer_role: compat.supports_developer_role == true,
+        supports_reasoning_effort: compat.supports_reasoning_effort == true,
+        zai_tool_stream: compat.zai_tool_stream == true,
+        supports_strict_mode: compat.supports_strict_mode == true,
+        supports_store: false,
+        supports_finish_reason: false
+      )
+    end
+
+    # The plain arm (the nil/non-zai compat translation) — one frozen
+    # instance; see {dialect_for} for the finish-inference declaration.
+    DEFAULT_DIALECT = Fast::Completions::Dialect.new(supports_finish_reason: false).freeze
 
     # pi stripJsonComments (utils/json.ts:1-5) + the parse: // line
     # comments and trailing commas removed, string literals preserved —
@@ -196,7 +268,7 @@ module Tart
       )
     end
 
-    # The pi compat subset (I46): the five carried keys picked off the
+    # The pi compat subset (I46, I64): the six carried keys picked off the
     # parsed object (symbolized into the struct), UNKNOWN keys dropped —
     # the schema tolerates them (pi additionalProperties:true) and the
     # struct carries only the dialect the request seam reads. nil when the
@@ -211,7 +283,8 @@ module Tart
         max_tokens_field: raw["maxTokensField"],
         supports_developer_role: raw["supportsDeveloperRole"],
         supports_reasoning_effort: raw["supportsReasoningEffort"],
-        zai_tool_stream: raw["zaiToolStream"]
+        zai_tool_stream: raw["zaiToolStream"],
+        supports_strict_mode: raw["supportsStrictMode"]
       )
     end
 

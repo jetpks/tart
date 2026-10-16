@@ -90,6 +90,36 @@ module Tart
       assert_equal "A", editor.input, "history holds a single entry — walking past it is a no-op"
     end
 
+    # I54: pi setText (editor.ts:1115-1126 + setTextInternal :494-496) —
+    # the dequeue-restore's write surface: content replaced, cursor at the
+    # END, an undo snapshot pushed WHEN the content differs, history
+    # browsing exited, newlines normalized.
+    def test_set_text_replaces_content_cursor_at_end_and_pushes_undo
+      editor = Render::Editor.new
+      editor.insert("hello")
+      editor.set_text("queued one\n\nqueued two")
+      assert_equal "queued one\n\nqueued two", editor.input, "set_text replaces the content"
+      assert_equal "queued one\n\nqueued two".length, editor.cursor, "the cursor sits at the END (setTextInternal default)"
+      editor.undo
+      assert_equal "hello", editor.input, "the undo snapshot holds the PRIOR content"
+
+      editor.clear_undo_stack
+      editor.set_text("hello") # equal content
+      editor.undo
+      assert_equal "hello", editor.input, "an equal-content set_text pushes NO snapshot (pi :1120-1124)"
+
+      editor.add_to_history("old")
+      editor.add_to_history("older")
+      editor.history_previous # browsing the most recent entry ("older")
+      editor.set_text("fresh")
+      editor.history_previous
+      assert_equal "older", editor.input,
+        "history browsing EXITED (an up re-recalls from the top; a persisted browse would walk to \"old\")"
+
+      editor.set_text("x\r\ny\tz")
+      assert_equal "x\ny    z", editor.input, "newlines/tabs normalize (pi normalizeText)"
+    end
+
     # --- word-wise operations (I06/AC3): pi's word-navigation.ts boundary
     # semantics — skip trailing whitespace, then one word/punctuation run. ---
 

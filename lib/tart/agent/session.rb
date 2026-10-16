@@ -30,12 +30,13 @@ module Tart
     #   resolved header cwd (findMostRecentSession :749).
     #
     # Ported deviations (itemized in the iteration record): pi's message
-    # roles are "user"/"assistant"/"toolResult", the port's are ruby_llm's
+    # roles are "user"/"assistant"/"toolResult", the port's are the wire's
     # "user"/"assistant"/"tool" — the recorded message is the port's actual
-    # RubyLLM::Message (Message#to_h); and pi's null-content tolerance maps
+    # adapter Message ({Agent::Message#to_h}, the recorded empirical shape);
+    # and pi's null-content tolerance maps
     # user/assistant/toolResult content to [] (sessionEntryToContextMessages
-    # :439-474), which ruby_llm rejects (Message#normalize_content only takes
-    # String or nil), so the port maps it to "".
+    # :439-474), which the wire's message shape rejects (content is String
+    # or nil only), so the port maps it to "".
     #
     # Compaction (I08): compaction entries (pi CompactionEntry
     # session-manager.ts:91-104, appendCompaction :1260-1285) are appended
@@ -148,28 +149,29 @@ module Tart
 
       # The summarization call's persisted usage (pi Usage, types.ts:446 —
       # the CompactionEntry.usage field, session-manager.ts:99) from the
-      # gem's Tokens readers (tokens.rb:35-37): camelCase keys, unreported
-      # counts omitted; totalTokens is the component sum (pi
-      # calculateContextTokens's fallback — the gem carries no total
-      # reader). Nothing reported persists nothing (pi's usage-undefined
-      # entries). The cost object is cut: the port carries no pricing
-      # layer and no endpoint that reports one, and a fabricated zero
-      # would lie (the gem's own false-zero doctrine, cost.rb:19-20).
-      def compaction_usage(tokens)
-        return nil unless tokens
+      # gem's Usage readers: camelCase keys, nothing unreported persists.
+      # The nil/0 conventions are the recorded parser defaults, reproduced:
+      # an unreported cache READ drops (the parser's nil default) while
+      # the cache WRITE persists as the reported zero it defaults to (the
+      # AC's frozen pin carries "cacheWrite"=>0); reasoning drops at
+      # zero. totalTokens is the gem's NATIVE total (OQ-9 — pi
+      # calculateContextTokens's semantics, never re-summed). Nothing
+      # reported persists nothing (pi's usage-undefined entries). The
+      # cost object is cut: the port carries no pricing layer and no
+      # endpoint that reports one, and a fabricated zero would lie.
+      def compaction_usage(usage)
+        return nil unless usage
+        return nil unless [usage.input, usage.output, usage.cache_read, usage.cache_write].any?(&:positive?)
 
-        usage = {
-          "input" => tokens.input,
-          "output" => tokens.output,
-          "cacheRead" => tokens.cache_read,
-          "cacheWrite" => tokens.cache_write
+        persisted = {
+          "input" => usage.input,
+          "output" => usage.output,
+          "cacheRead" => usage.cache_read&.positive? ? usage.cache_read : nil,
+          "cacheWrite" => usage.cache_write || 0
         }
-        return nil unless usage.values.compact.any?
-
-        usage["cacheWrite1h"] = tokens.cache_write_by_ttl["1h"] if tokens.cache_write_by_ttl&.key?("1h")
-        usage["reasoning"] = tokens.thinking if tokens.thinking
-        usage["totalTokens"] = Compaction.calculate_context_tokens(tokens)
-        usage.compact
+        persisted["reasoning"] = usage.reasoning if usage.respond_to?(:reasoning) && usage.reasoning&.positive?
+        persisted["totalTokens"] = Compaction.calculate_context_tokens(usage)
+        persisted.compact
       end
 
       # pi sessionEntryToContextMessages :439 for the message subset: message
@@ -199,13 +201,20 @@ module Tart
 
         return bash_execution_context_message(envelope) if envelope.role == "bashExecution"
 
-        Shapes::ContextMessage.new(envelope.message)
+        message = envelope.message
+        # pi session-manager.ts:153 — the toolResult `details` are
+        # display-only and "not sent to LLM": the context projection drops
+        # the key for tool messages (defense in depth on top of
+        # from_seed_hash's declared-fields read — a `details` key is inert
+        # there; here it is GONE). I57 P3.
+        message = message.except("details") if envelope.role == "tool" && message.key?("details")
+        Shapes::ContextMessage.new(message)
       end
 
       # pi convertToLlm's bashExecution case (messages.ts:149-160): the
       # !!-prefixed execution is SKIPPED from context; a plain ! execution
       # rides as a USER message ("Ran `<cmd>`" + the fenced output, the
-      # bashExecutionToText bytes — messages.ts:82-97; ruby_llm supports
+      # bashExecutionToText bytes — messages.ts:82-97; the wire supports
       # no bashExecution role). The per-field guards stay verbatim — the
       # field reads go through the envelope's open body hash.
       def bash_execution_context_message(envelope)
@@ -232,7 +241,7 @@ module Tart
 
       # pi's compactionSummary projection (messages.ts:109-121 + :176-184):
       # the summary rides a user message wrapped in the prefix/suffix —
-      # ruby_llm supports no compactionSummary role. The summary's String
+      # the wire supports no compactionSummary role. The summary's String
       # guard stays here (the envelope's summary field is nominal).
       def compaction_summary_message(compaction)
         summary = compaction.summary
@@ -285,7 +294,7 @@ module Tart
 
       # The bashExecution message factory (pi BashExecutionMessage,
       # messages.ts:28-42 — pi's exact keys: the record format, not the
-      # port's ruby_llm serialization).
+      # port's adapter serialization).
       def bash_execution_message(command:, output:, exit_code:, cancelled:, truncated:,
                                  full_output_path:, timestamp: now_iso, exclude_from_context: false)
         {

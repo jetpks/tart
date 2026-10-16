@@ -1,8 +1,6 @@
 # frozen_string_literal: true
 
 require "fileutils"
-require "ruby_llm"
-
 require_relative "safe_execute"
 
 module Tart
@@ -15,7 +13,7 @@ module Tart
     # tools append after built-ins + MCP) with NO <tools> snippet row (no
     # promptSnippet — custom tools without one are omitted,
     # extensions/types.ts:572-587).
-    class Memory < RubyLLM::Tool
+    class Memory < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "memory"

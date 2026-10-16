@@ -28,8 +28,12 @@ module Tart
       # the CURRENT toggle state + the builder (re-invoked with the new
       # state at the ctrl+o toggle; the drain records the transcript
       # range). pi's expandable tool children — and, since I33, the MOTD
-      # header block + the loaded-resource sections.
-      MarkedRegion = Struct.new(:rows, :builder)
+      # header block + the loaded-resource sections. I56: +resize_live+
+      # marks the blocks the SIGWINCH rebuild sweeps (the header only —
+      # tool blocks / the compaction panel / custom blocks stay
+      # boot-width; the whole-transcript re-wrap is the PARKED
+      # divergence, Grounds §6).
+      MarkedRegion = Struct.new(:rows, :builder, :resize_live)
 
       # A persistent status waiting for the flush (pi showStatus,
       # interactive-mode.ts:3824-3842): a Spacer(1) + dim one-pad text row
@@ -43,7 +47,7 @@ module Tart
       # finalize pairs against, the queued {MarkedRegion} (identity — the
       # drain links it to its expandable registration), and the
       # registration hash once the region reached the buffer. nil = no
-      # tool mid-flight (execution is sequential — ruby_llm 2.1.0
+      # tool mid-flight (execution is sequential — the wire turn runs one batch
       # tool_concurrency defaults false).
       PendingTool = Struct.new(:tool, :region, :registration)
 
@@ -57,6 +61,11 @@ module Tart
       # non-bash keeps the generic ⎿ line (I17's ruling).
       WRITE_TOOL = "write".freeze
       READ_TOOL = "read".freeze
+
+      # The edit tool (I57): pi does NOT render edit through the generic
+      # family — it registers the diff-display renderer family
+      # (renderers/edit.ts), so edit dispatches to {EditBlock}.
+      EDIT_TOOL = "edit".freeze
 
       # @param width_reader [Proc] +call+ → Integer — the surface's
       #   viewport width ({Chat#viewport_width}): the width the enqueue
@@ -197,14 +206,16 @@ module Tart
 
       # The per-tool block dispatch (pi's per-tool renderCall/renderResult,
       # I18): bash owns the shell shapes (I17 — carries the duration),
-      # write/read their file-tool shapes, everything else the generic ⎿
-      # line. Shared by the live and replay paths (I17's shape-sharing
-      # ruling); +duration+ is nil on replay (the recorded gap). The
-      # finalize replaces the pending block with exactly these rows
-      # (same dispatch, same builders) — the settled bytes never moved.
-      def enqueue_tool_block(name, args, result, duration)
+      # write/read their file-tool shapes, edit the diff-display family
+      # (I57 — {EditBlock}, fed the per-call details side channel),
+      # everything else the generic ⎿ line. Shared by the live and replay
+      # paths (I17's shape-sharing ruling); +duration+ is nil on replay
+      # (the recorded gap). The finalize replaces the pending block with
+      # exactly these rows (same dispatch, same builders) — the settled
+      # bytes never moved.
+      def enqueue_tool_block(name, args, result, duration, details: nil)
         args = {} unless args.is_a?(Hash)
-        builder = tool_block_builder(name, args, result, duration)
+        builder = tool_block_builder(name, args, result, duration, details)
         @chat_started = true
         if builder
           push_expandable(builder)
@@ -229,7 +240,7 @@ module Tart
       # identically; the finalize swaps the builder for the real one).
       # A second enqueue while one is live appends sanely and SUPERSEDES
       # the registration (unreachable under sequential execution —
-      # ruby_llm tool_concurrency defaults false; the superseded block
+      # the executor runs the batch concurrently on the reactor; the superseded block
       # renders on as a plain expandable until its own end appends).
       def enqueue_pending_tool_block(name, args)
         args = {} unless args.is_a?(Hash)
@@ -249,13 +260,15 @@ module Tart
       # registration (the replay path never engages the pending
       # machinery; also the superseded-registration case) this falls
       # back to today's append.
-      def finalize_tool_block(name, args, result, duration)
+      def finalize_tool_block(name, args, result, duration, details: nil)
         args = {} unless args.is_a?(Hash)
         pending = @pending_tool
-        return enqueue_tool_block(name, args, result, duration) unless pending && pending.tool == [name, args]
+        unless pending && pending.tool == [name, args]
+          return enqueue_tool_block(name, args, result, duration, details:)
+        end
 
         @pending_tool = nil
-        builder = tool_block_builder(name, args, result, duration)
+        builder = tool_block_builder(name, args, result, duration, details)
         final_rows = builder ? builder.(@tool_output_expanded) : generic_tool_rows(name, result)
         if pending.registration
           replace_flushed_pending(pending.registration, final_rows, builder)
@@ -324,14 +337,19 @@ module Tart
       # markdown block ({replay_assistant}) — the old
       # strip-thinkings-before-record is gone.
       def replay_entries(entries, update_footer: true, populate_history: true)
-        results = entries.filter_map do |entry|
+        messages = entries.filter_map do |entry|
           next unless entry.is_a?(Hash) && entry["type"] == "message"
           message = entry["message"]
           next unless message.is_a?(Hash) && message["role"] == "tool" && message["tool_call_id"]
 
-          [message["tool_call_id"], message["content"]]
+          [message["tool_call_id"], message]
         end.to_h
-        entries.each { |entry| replay_entry(entry, results, update_footer:, populate_history:) }
+        results = messages.transform_values { |message| message["content"] }
+        # The recorded details side channel (I57 — pi records it on the
+        # toolResult; the replay re-renders the diff from it). Absent on
+        # sessions recorded pre-I57 → the header-only block.
+        recorded_details = messages.transform_values { |message| message["details"] }
+        entries.each { |entry| replay_entry(entry, results, recorded_details, update_footer:, populate_history:) }
       end
 
       # Completed lines move into the transcript buffer (pi: completed
@@ -348,7 +366,7 @@ module Tart
           case item
           when MarkedRegion
             registered = {start: @transcript.size, size: item.rows.length,
-                          builder: item.builder}
+                          builder: item.builder, resize_live: item.resize_live}
             @expandable_blocks << registered
             @transcript.concat(item.rows)
             # The pending block's drain links the region to its registry
@@ -393,6 +411,34 @@ module Tart
           registered[:size] = rows.length
         end
         true
+      end
+
+      # The resize rebuild's state half (I56): re-invoke every
+      # resize_live-registered builder at the CURRENT toggle state and
+      # splice in place — exactly {set_tool_output_expanded}'s arithmetic
+      # (the ascending-start walk carrying the row DELTA) WITHOUT the
+      # state flip and WITHOUT touching non-live registrations. Tool
+      # blocks / the compaction panel / the resource sections stay
+      # boot-width (Grounds §6: a full sweep would re-wrap the expandable
+      # tool rows while their neighbors stay boot-width — an inconsistent
+      # half-state). Returns whether anything rebuilt.
+      def rebuild_live_expandables
+        delta = 0
+        rebuilt = false
+        @expandable_blocks.each do |registered|
+          if registered[:resize_live]
+            start = registered[:start] + delta
+            rows = registered[:builder].call(@tool_output_expanded)
+            @transcript[start, registered[:size]] = rows
+            delta += rows.length - registered[:size]
+            registered[:start] = start
+            registered[:size] = rows.length
+            rebuilt = true
+          else
+            registered[:start] += delta # the rows stay; the range moves
+          end
+        end
+        rebuilt
       end
 
       # The /new + resume shared reset's component half (the coordinator's
@@ -610,7 +656,7 @@ module Tart
         rows
       end
 
-      def replay_entry(entry, results, update_footer:, populate_history:)
+      def replay_entry(entry, results, recorded_details, update_footer:, populate_history:)
         return unless entry.is_a?(Hash)
 
         case entry["type"]
@@ -620,7 +666,7 @@ module Tart
 
           case message["role"]
           when "user" then replay_user(message, populate_history:)
-          when "assistant" then replay_assistant(message, results, update_footer:)
+          when "assistant" then replay_assistant(message, results, recorded_details, update_footer:)
           when "bashExecution" then replay_user_bash(message)
           end
         when "compaction"
@@ -662,13 +708,21 @@ module Tart
         )
       end
 
-      def replay_assistant(message, results, update_footer:)
+      def replay_assistant(message, results, recorded_details, update_footer:)
         content = message["content"]
         has_content = content.is_a?(String) && !content.strip.empty?
         reasoning = message["thinking"]
         has_reasoning = reasoning.is_a?(String) && !reasoning.empty?
         tool_calls = message["tool_calls"].is_a?(Hash) ? message["tool_calls"] : {}
-        return unless has_content || has_reasoning || tool_calls.any?
+        # The failure row's readback (I60 D4 — pi assistant-message.ts
+        # :184-198's guard): a recorded finish_reason "error" with a
+        # non-empty error_message String. Pre-I60 files (no error_message
+        # key — and no "error" finish_reason) read has_error false: the
+        # old guard, byte-identical renders.
+        error_message = message["error_message"]
+        has_error = message["finish_reason"] == "error" && error_message.is_a?(String) &&
+                    !error_message.empty?
+        return unless has_content || has_reasoning || tool_calls.any? || has_error
 
         @reseed_sink.call(message) if update_footer
         # pi assistant-message.ts:103-105 — the spacer rides VISIBLE
@@ -680,14 +734,25 @@ module Tart
           @scrollback << [Panel.blank_line] if has_content # pi :172-174
         end
         enqueue_markdown(content) if has_content
+        if has_error
+          # pi :184-198 — the same component serves live AND replay (the
+          # resume renders through renderSessionEntries): Spacer(1), then
+          # the pad-led wrapped error-fg row AFTER any partial content —
+          # the same region shape the live :message_end arm enqueues (D3).
+          @scrollback << [Panel.blank_line,
+                          *Panel.padded_fg_rows("Error: #{error_message}", viewport_width,
+                            fg: Theme[:error])]
+        end
         tool_calls.each_value do |call|
           next unless call.is_a?(Hash) && call["name"].is_a?(String)
 
           # The replay dispatches through the same per-tool shapes (I18):
           # call lines from the recorded arguments, outputs from the
           # recorded results, NO duration — the recorded entries carry
-          # none (the frozen contract's replay gap, never invented).
-          enqueue_tool_block(call["name"], call["arguments"], results[call["id"]], nil)
+          # none (the frozen contract's replay gap, never invented). The
+          # recorded details ride their side channel (I57).
+          enqueue_tool_block(call["name"], call["arguments"], results[call["id"]], nil,
+                             details: recorded_details[call["id"]])
         end
       end
 
@@ -710,8 +775,10 @@ module Tart
       # failed call renders toolErrorBg — the s4 capture, Tools::Bash
       # bash.rb:126), write/read their file-tool shapes (I18 —
       # write_block_rows/read_block_rows' formatWriteResult/formatReadResult
-      # paths), everything else the generic ⎿ line.
-      def tool_block_builder(name, args, result, duration)
+      # paths), edit the diff-display family (I57 — a CONSTANT builder:
+      # pi's edit renderers ignore setExpanded, the rebuild is
+      # byte-identical), everything else the generic ⎿ line.
+      def tool_block_builder(name, args, result, duration, details = nil)
         case name
         when BASH_TOOL
           error = result.is_a?(Hash) && result[:error]
@@ -720,6 +787,8 @@ module Tart
           ->(expanded) { FileBlocks.write_block_rows(args, result, viewport_width, expanded:) }
         when READ_TOOL
           ->(expanded) { FileBlocks.read_block_rows(args, result, viewport_width, expanded:) }
+        when EDIT_TOOL
+          ->(_expanded) { EditBlock.edit_block_rows(args, result, details, viewport_width) }
         end
       end
 
@@ -728,20 +797,27 @@ module Tart
       # tool-execution.ts:271-277): the settled family truncated to the
       # call — Spacer blank (PLAIN), the pending-bg pad, the family's
       # CALL rows, the closing pending-bg pad. No output rows, no Took
-      # row, no expand hint — nothing exists to show yet.
+      # row, no expand hint — nothing exists to show yet. The edit family
+      # renders the header alone (the preview cut, Grounds §6).
       def pending_tool_rows(name, args)
         case name
         when BASH_TOOL then BashBlock.pending_block_rows(args["command"], viewport_width)
         when WRITE_TOOL then FileBlocks.pending_write_block_rows(args, viewport_width)
         when READ_TOOL then FileBlocks.pending_read_block_rows(args, viewport_width)
+        when EDIT_TOOL then EditBlock.pending_edit_block_rows(args, viewport_width)
         else generic_tool_rows(name, nil, bg: Theme[:tool_pending_bg])
         end
       end
 
       # The generic family's plain region (the arm {enqueue_tool_block}
       # composes — the constructor's Spacer, then the bg'd contentText
-      # panel); +bg:+ overrides the result-derived bg (the pending shape).
-      def generic_tool_rows(name, result, bg: nil)
+      # panel); the bg default IS the result-derived panel bg (I57 P1 —
+      # the root-cause cure: an absent key used to forward an explicit
+      # nil, suppressing generic_panel_rows' identical default and
+      # settling every live generic block bg-less while the replay arm
+      # painted). The pending arm overrides explicitly; its bytes are
+      # unchanged.
+      def generic_tool_rows(name, result, bg: Panel.tool_panel_bg(result))
         [Panel.blank_line, *ToolBlock.generic_panel_rows(name, result, viewport_width, bg:)]
       end
 
@@ -785,9 +861,11 @@ module Tart
       # {MarkedRegion} (the drain records its transcript range for the
       # ctrl+o toggle's in-place rebuild). Public — the coordinator's MOTD
       # header + resource-section blocks ride the same registry (I33, pi
-      # BuiltInHeader/setToolsExpanded's container sweep).
-      def push_expandable(builder)
-        @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder)
+      # BuiltInHeader/setToolsExpanded's container sweep). +resize_live+
+      # defaults false — every pre-I56 caller byte-identical (I56: only
+      # the header registers live).
+      def push_expandable(builder, resize_live: false)
+        @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder, resize_live)
       end
 
       public :push_expandable

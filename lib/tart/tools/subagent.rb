@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "ruby_llm"
-
 require_relative "safe_execute"
 
 module Tart
@@ -19,7 +17,7 @@ module Tart
     # registered-tools merge order; hooks.register_tool). With the gate
     # off this class is never instantiated and never reaches the wire —
     # the frozen digests hold.
-    class Subagent < RubyLLM::Tool
+    class Subagent < Fast::Completions::Tool
       include SafeExecute
 
       pi_name "subagent"
