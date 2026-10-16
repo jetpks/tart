@@ -102,11 +102,11 @@ module Tart
 
               # The per-model compat subset (I46 — pi ModelDefinitionSchema
               # declares compat last, so the rules ride AFTER
-              # contextWindow/maxTokens): the object check, then the five
+              # contextWindow/maxTokens): the object check, then the six
               # carried keys in pi's literal vocabulary. UNKNOWN compat keys
               # are tolerated with NO error (pi additionalProperties:true —
-              # the owner's live object with supportsStore/supportsStrictMode
-              # must load clean).
+              # the owner's live object with supportsStore must load clean;
+              # I64 carries supportsStrictMode instead of dropping it).
               compat = model["compat"]
               next if compat.nil?
               unless compat.is_a?(Hash)
@@ -124,7 +124,7 @@ module Tart
                 key([*model_path, :compat, :maxTokensField]).failure('expected "max_tokens" or "max_completion_tokens"')
               end
 
-              %w[supportsDeveloperRole supportsReasoningEffort zaiToolStream].each do |field|
+              %w[supportsDeveloperRole supportsReasoningEffort zaiToolStream supportsStrictMode].each do |field|
                 flag = compat[field]
                 key([*model_path, :compat, field]).failure("expected a boolean") if !flag.nil? && ![true, false].include?(flag)
               end

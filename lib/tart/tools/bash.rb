@@ -19,13 +19,18 @@ module Tart
         "Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output " \
         "is saved to a temp file. Optionally provide a timeout in seconds."
 
+      # STRING-KEYED THROUGHOUT (I64): the gem's strict engine reads string
+      # keys (pi's JS node["type"] shape) — a symbol-keyed root makes the
+      # "prefer" declaration SILENTLY INERT (the resolver falls back loose
+      # with zero errors). Serialization-neutral: JSON.generate emits
+      # identical bytes for either key form, so the non-strict wire holds.
       PARAMETERS_SCHEMA = {
-        type: "object",
-        properties: {
-          "command" => {type: "string", description: "Shell command to execute"},
-          "timeout" => {type: "number", description: "Timeout in seconds (optional, no default timeout)"}
+        "type" => "object",
+        "properties" => {
+          "command" => {"type" => "string", "description" => "Shell command to execute"},
+          "timeout" => {"type" => "number", "description" => "Timeout in seconds (optional, no default timeout)"}
         },
-        required: ["command"]
+        "required" => ["command"]
       }.freeze
 
       # Grace after -TERM before escalating to -KILL (pi's killProcessTree is
@@ -85,6 +90,11 @@ module Tart
       description DESCRIPTION
 
       parameters PARAMETERS_SCHEMA.dup
+
+      # pi bash.ts :260 — one of EXACTLY four core tools pi tags with
+      # constrainedSampling; the strict engine rewrites `parameters` and
+      # ships `strict: true` on a strict-capable dialect (I64).
+      constrained_sampling({"type" => "json_schema", "strict" => "prefer"})
 
       # The user-bash executor (pi bash-executor.ts executeBashWithOperations
       # — the !-prefix executor over the same spawn core as the tool):

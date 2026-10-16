@@ -1332,6 +1332,11 @@ module Tart
       @server.script([
         {type: :stream, content: "first answer"},
         {type: :error, status: 500, message: "summary endpoint down"},
+        # I64 re-pin: the I62 request-creation retry (gem default
+        # max_retries: 1) consumes ONE script entry PER ATTEMPT — without a
+        # second :error the retry succeeds and the compaction completes.
+        # The retry default itself is NOT touched (ruled at I62).
+        {type: :error, status: 500, message: "summary endpoint down"},
         {type: :stream, content: "second answer"},
       ])
       agent, events = agent_on_kernel(

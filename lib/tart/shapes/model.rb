@@ -20,12 +20,12 @@ module Tart
     # member here needs the JSON transform_keys idiom — that rides on the
     # session envelopes (shapes/session.rb), the parsed-JSON consumers.
 
-    # One model's pi-compat dialect subset (I46 — the port's carried five
-    # keys of pi's ProviderCompatSchema, providers/compat-schema.ts: every
-    # property Optional, the object additionalProperties true so UNKNOWN
-    # keys are tolerated at the schema and dropped here): thinkingFormat
-    # (a union of pi's 11 literals), maxTokensField (pi's two literals),
-    # and the three booleans. Every attribute is nil-defaulted and
+    # One model's pi-compat dialect subset (I46, I64 — the port's carried
+    # six keys of pi's ProviderCompatSchema, providers/compat-schema.ts:
+    # every property Optional, the object additionalProperties true so
+    # UNKNOWN keys are tolerated at the schema and dropped here):
+    # thinkingFormat (a union of pi's 11 literals), maxTokensField (pi's
+    # two literals), and the four booleans. Every attribute is nil-defaulted and
     # omittable at construction (.optional.default(nil) — reads nil, and
     # Model#to_h still emits the key) — pi's absent key means "use the
     # URL detection stand-in", which the request seam resolves per arm.
@@ -40,6 +40,11 @@ module Tart
       attribute :supports_developer_role, Types::Strict::Bool.optional.default(nil)
       attribute :supports_reasoning_effort, Types::Strict::Bool.optional.default(nil)
       attribute :zai_tool_stream, Types::Strict::Bool.optional.default(nil)
+      # I64: pi's constrainedSampling gate (detectCompat — OpenAI
+      # compatibility alone does not imply strict JSON-schema tool
+      # support). Declared after zai_tool_stream: the struct's declaration
+      # order is the documented carry order; nil default like the five.
+      attribute :supports_strict_mode, Types::Strict::Bool.optional.default(nil)
     end
 
     # One catalog model entry: {id:, name:, reasoning:, context_window:,

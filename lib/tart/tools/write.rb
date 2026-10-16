@@ -17,13 +17,18 @@ module Tart
       DESCRIPTION = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. " \
         "Automatically creates parent directories."
 
+      # STRING-KEYED THROUGHOUT (I64): the gem's strict engine reads string
+      # keys (pi's JS node["type"] shape) — a symbol-keyed root makes the
+      # "prefer" declaration SILENTLY INERT (the resolver falls back loose
+      # with zero errors). Serialization-neutral: JSON.generate emits
+      # identical bytes for either key form, so the non-strict wire holds.
       PARAMETERS_SCHEMA = {
-        type: "object",
-        properties: {
-          "path" => {type: "string", description: "Path to the file to write (relative or absolute)"},
-          "content" => {type: "string", description: "Content to write to the file"}
+        "type" => "object",
+        "properties" => {
+          "path" => {"type" => "string", "description" => "Path to the file to write (relative or absolute)"},
+          "content" => {"type" => "string", "description" => "Content to write to the file"}
         },
-        required: ["path", "content"]
+        "required" => ["path", "content"]
       }.freeze
 
       attr_reader :cwd, :details
@@ -39,6 +44,11 @@ module Tart
       description DESCRIPTION
 
       parameters PARAMETERS_SCHEMA.dup
+
+      # pi write.ts :57 — one of EXACTLY four core tools pi tags with
+      # constrainedSampling; the strict engine rewrites `parameters` and
+      # ships `strict: true` on a strict-capable dialect (I64).
+      constrained_sampling({"type" => "json_schema", "strict" => "prefer"})
 
       # @return [String] pi's success text, or {error:} on failure.
       def execute(path:, content:)

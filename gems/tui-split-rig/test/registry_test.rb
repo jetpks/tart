@@ -10,8 +10,11 @@ module TuiSplitRig
     SEED = File.join(RIG_ROOT, "registry.yml")
     # The one owner-ruled non-path pin: the footer model segment's
     # provider prefix (pi's >1-provider gate over a snapshot the port
-    # cannot reproduce — footer.ts:246-258).
-    SANCTIONED_NON_PATH = ["footer-provider-prefix", "compaction-token-estimate"].freeze
+    # cannot reproduce — footer.ts:246-258). I60 OQ-1: the two s18
+    # classes are ratified non-path (the integrator's deferred
+    # one-liner, landed here at I64).
+    SANCTIONED_NON_PATH = ["footer-provider-prefix", "compaction-token-estimate",
+                           "error-transcript-row-tail", "pi-bug-report-hint"].freeze
 
     def test_seed_registry_loads_and_classifies_staged_paths
       registry = Registry.load(SEED)

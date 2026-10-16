@@ -18,14 +18,19 @@ module Tart
         "(whichever is hit first). Use offset/limit for large files. When you need the full file, " \
         "continue with offset until complete."
 
+      # STRING-KEYED THROUGHOUT (I64): the gem's strict engine reads string
+      # keys (pi's JS node["type"] shape) — a symbol-keyed root makes the
+      # "prefer" declaration SILENTLY INERT (the resolver falls back loose
+      # with zero errors). Serialization-neutral: JSON.generate emits
+      # identical bytes for either key form, so the non-strict wire holds.
       PARAMETERS_SCHEMA = {
-        type: "object",
-        properties: {
-          "path" => {type: "string", description: "Path to the file to read (relative or absolute)"},
-          "offset" => {type: "number", description: "Line number to start reading from (1-indexed)"},
-          "limit" => {type: "number", description: "Maximum number of lines to read"}
+        "type" => "object",
+        "properties" => {
+          "path" => {"type" => "string", "description" => "Path to the file to read (relative or absolute)"},
+          "offset" => {"type" => "number", "description" => "Line number to start reading from (1-indexed)"},
+          "limit" => {"type" => "number", "description" => "Maximum number of lines to read"}
         },
-        required: ["path"]
+        "required" => ["path"]
       }.freeze
 
       attr_reader :cwd, :details
@@ -43,6 +48,11 @@ module Tart
       description DESCRIPTION
 
       parameters PARAMETERS_SCHEMA.dup
+
+      # pi read.ts :101 — one of EXACTLY four core tools pi tags with
+      # constrainedSampling; the strict engine rewrites `parameters` and
+      # ships `strict: true` on a strict-capable dialect (I64).
+      constrained_sampling({"type" => "json_schema", "strict" => "prefer"})
 
       # @return [String] the model-facing text, or {error:} on failure.
       def execute(path:, offset: nil, limit: nil)
