@@ -5572,15 +5572,27 @@ module Tart
       chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "done", tokens)})
     end
 
-    def tool_start(chat, name, arguments: {})
-      chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(name, arguments)})
+    def tool_start(chat, name, arguments: {}, id: next_tool_call_id)
+      @last_started_tool_call_id = id
+      chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(id, name, arguments)})
     end
 
     # `duration:` rides the frozen :tool_execution_end contract (Float
     # seconds, nil = absent); bash blocks read the call's arguments.
-    def tool_end(chat, name, result, duration: nil, arguments: {})
-      chat.on_agent_event({type: :tool_execution_end, tool_call: ToolCallDouble.new(name, arguments), result:,
+    # The id defaults to the START's generated one (I65 D2 — the
+    # transcript's pending registry keys by ToolCall#id, pi pendingTools
+    # Map interactive-mode.ts:3611-3621/:3645-3652): the sequential
+    # start/end pairs these pins drive settle in place with every call
+    # site untouched; an end with no live start carries nil (today's
+    # append fallback). Parallel pins pass explicit distinct `id:`s.
+    def tool_end(chat, name, result, duration: nil, arguments: {}, id: @last_started_tool_call_id)
+      chat.on_agent_event({type: :tool_execution_end, tool_call: ToolCallDouble.new(id, name, arguments), result:,
                            duration:})
+    end
+
+    def next_tool_call_id
+      @tool_call_seq = (@tool_call_seq || 0) + 1
+      "call_#{@tool_call_seq}"
     end
 
     # Types +text+ into the input line and presses Enter (direct key events
@@ -5806,8 +5818,10 @@ module Tart
 
     ChunkDouble = Struct.new(:content, :thinking)
     MessageDouble = Struct.new(:role, :content, :tokens)
-    ToolCallDouble = Struct.new(:name, :arguments) do
-      def initialize(name, arguments = {})
+    # The id rides FIRST (ToolCall member order — agent/message.rb:12); the
+    # I65 D2 registry keys the pending bookkeeping by it.
+    ToolCallDouble = Struct.new(:id, :name, :arguments) do
+      def initialize(id, name, arguments = {})
         super
       end
     end

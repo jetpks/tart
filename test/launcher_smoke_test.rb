@@ -336,5 +336,64 @@ module Tart
       server&.stop
       FileUtils.rm_rf(home)
     end
+
+    # I65 D3 (the footer context window `?` — the I59 D4 asymmetry):
+    # footer_data's context_window carries the SAME fallback the loop
+    # kwarg (bin/tart :475) and the print boot (:325) already carry —
+    # Settings.resolve_context_window(...) || Models.entry_context_window(entry).
+    # A staged zai/glm-5.3 catalog entry declaring contextWindow 1_000_000
+    # resolves from the FIRST frame (the boot snapshots footer_data before
+    # Agent::Loop exists — chat.model is the placeholder ModelFacts with a
+    # nil window, and the segment renders "?" on nil), identical in value
+    # to the loop kwarg's expression; the env tier (PI_CONTEXT_WINDOW,
+    # identity-namespaced) still wins over the entry; the models-nil legacy
+    # shape keeps window nil.
+    def test_footer_data_carries_the_boot_entry_context_window_and_env_still_wins
+      launcher
+      # The boot's env tier outranks the staged catalog (PI_MODEL/PI_PROVIDER
+      # name a boot pair without an entry) — neutralize the boot-relevant
+      # PI_* tiers exactly like the frozen footer-window gate's env-strip
+      # prefix; restored in ensure.
+      pi_keys = %w[PI_MODEL PI_PROVIDER PI_CONTEXT_WINDOW PI_MODEL_REASONING PI_API_KEY PI_API_BASE]
+      saved_env = pi_keys.to_h { |key| [key, ENV[key]] }
+      home = nil
+      pi_keys.each { |key| ENV.delete(key) }
+      home = Dir.mktmpdir("tart-footer-window-")
+      FileUtils.mkdir_p(File.join(home, ".tart"))
+      File.write(File.join(home, ".tart", "models.json"), JSON.generate(
+        "default" => "zai/glm-5.3",
+        "providers" => {"zai" => {"name" => "ZAI", "baseUrl" => "http://localhost:1/v1", "apiKey" => "k",
+                                  "models" => [{"id" => "glm-5.3", "contextWindow" => 1_000_000,
+                                                "maxTokens" => 65_536}]}}))
+      settings = Settings.load(cwd: home, root: home).settings
+      models = Models.load(root: File.join(home, ".tart"))
+      resolved = Shapes::ResolvedSettings.from_load(settings, identity: Identity::DEFAULT)
+      boot = Models.resolve_boot_model(models, settings, identity: Identity::DEFAULT)
+      chat = Agent::Chat.new(
+        client: Fast::Completions::Client.new(base_url: "http://localhost:1/v1", api_key: "k"),
+        model_id: boot.id, provider_key: boot.provider)
+
+      data = Executable.footer_data(home, settings, boot:, chat:, identity: Identity::DEFAULT,
+                                    models:, resolved:)
+      loop_window = Settings.resolve_context_window(settings:, model: chat.model,
+        identity: Identity::DEFAULT) || Models.entry_context_window(Executable.resolve_boot_entry(models, boot))
+      assert_equal 1_000_000, data[:context_window], "the entry window resolves from the first frame (no ?)"
+      assert_equal loop_window, data[:context_window],
+        "identical in value to the loop kwarg's expression (one asymmetry measurement)"
+
+      # The models-nil legacy call sites keep today's behavior: no catalog,
+      # no entry, and a nil Settings ladder — the window stays nil (Footer
+      # #context_segment renders ?).
+      legacy = Executable.footer_data("/somewhere", settings, chat: chat)
+      assert_nil legacy[:context_window], "entry nil without a catalog — the legacy shape"
+
+      ENV["PI_CONTEXT_WINDOW"] = "999"
+      data = Executable.footer_data(home, settings, boot:, chat:, identity: Identity::DEFAULT,
+                                    models:, resolved:)
+      assert_equal 999, data[:context_window], "the env tier still wins over the entry"
+    ensure
+      saved_env&.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
+      FileUtils.rm_rf(home)
+    end
   end
 end

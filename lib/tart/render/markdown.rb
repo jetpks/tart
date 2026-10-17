@@ -289,8 +289,13 @@ module Tart
           elsif (body = m[:em])
             inner = body[1..-2]
             if padded?(inner) # padded delimiters are literal (flanking approximation)
-              spans << span(src[pos], fg, modifiers)
-              consumed = pos + 1
+              # I65 D1: on reject, emit the delimiter AT THE MATCH POSITION
+              # and advance past IT. src[pos]/pos+1 re-emitted the pre-text
+              # the loop top already emitted (minus one char) on every
+              # iteration — the repeated-prefix explosion (new_problems.md,
+              # 2026-10-16). The remainder re-scans as ordinary text.
+              spans << span(src[m.begin(0)], fg, modifiers)
+              consumed = m.begin(0) + 1
             else
               spans.concat(inline_spans(inner, fg, modifiers + [:italic])) # :689-693
             end
@@ -299,8 +304,11 @@ module Tart
             if strict_strikethrough?(inner)
               spans.concat(inline_spans(inner, fg, modifiers + [:crossed_out])) # :725-729
             else # StrictStrikethroughTokenizer (markdown.ts:9-21) rejects it → literal
-              spans << span(src[pos], fg, modifiers)
-              consumed = pos + 1
+              # I65 D1: the same emission cure as the em arm above — the
+              # delimiter character at the match position, scan resumes
+              # at m.begin(0) + 1 (never src[pos]/pos + 1).
+              spans << span(src[m.begin(0)], fg, modifiers)
+              consumed = m.begin(0) + 1
             end
           elsif m[:link]
             text = m[:link][1...m[:link].index("](")]

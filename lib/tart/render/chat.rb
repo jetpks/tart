@@ -574,7 +574,13 @@ module Tart
             # interactive-mode.ts:3611-3621): paints on the next frame
             # while the tool runs; the finalize replaces it in place.
             call = event[:tool_call]
-            @transcript_state.enqueue_pending_tool_block(call.name, call.arguments)
+            # I65 D2: the registry keys by the call id (pi pendingTools is
+            # a Map keyed by toolCallId, interactive-mode.ts:3611-3621).
+            # The reader-guard is the details idiom below — reader-less
+            # display doubles (render_perf) stay inert, the id threads
+            # nil, and the transcript's id-less arms keep today's shape.
+            id = call.respond_to?(:id) ? call.id : nil
+            @transcript_state.enqueue_pending_tool_block(id, call.name, call.arguments)
           when :tool_execution_end
             @tool = nil
             call = event[:tool_call]
@@ -587,7 +593,8 @@ module Tart
             # guard keeps the recorded ToolCall-shape doubles without the
             # member inert; the rest the generic ⎿ line).
             # No live pending (the replay path) falls back to the append.
-            @transcript_state.finalize_tool_block(call.name, call.arguments, event[:result], event[:duration],
+            id = call.respond_to?(:id) ? call.id : nil
+            @transcript_state.finalize_tool_block(id, call.name, call.arguments, event[:result], event[:duration],
                                                   details: call.respond_to?(:details) ? call.details : nil)
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after

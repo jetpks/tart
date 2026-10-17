@@ -43,13 +43,14 @@ module Tart
       StatusEntry = Struct.new(:text)
 
       # The live pending tool-call registration (I34 — pi's pendingTools
-      # Map, interactive-mode.ts:3532): the [name, args] identity the
-      # finalize pairs against, the queued {MarkedRegion} (identity — the
-      # drain links it to its expandable registration), and the
-      # registration hash once the region reached the buffer. nil = no
-      # tool mid-flight (execution is sequential — the wire turn runs one batch
-      # tool_concurrency defaults false).
-      PendingTool = Struct.new(:tool, :region, :registration)
+      # Map, interactive-mode.ts:3532; I65 D2 re-keys the bookkeeping by
+      # the TOOL CALL ID — the I34 single slot SUPERSEDED on every
+      # enqueue, orphaning the executor's concurrent batch): the settle
+      # payload (the name + args the error finalize re-dispatches), the
+      # queued {MarkedRegion} (identity — the drain links it to its
+      # expandable registration), and the registration hash once the
+      # region reached the buffer.
+      PendingTool = Struct.new(:name, :args, :region, :registration)
 
       # The tool name that dispatches to pi's shell renderers (bash.ts:115
       # createShellRenderers — shared by bash and powershell; the port
@@ -99,6 +100,9 @@ module Tart
         # survives expandable rebuilds above the pair, which shift indexes
         # but never row objects).
         @status_pair = nil
+        # The live pending tool calls, keyed by the tool call id (I65 D2 —
+        # the I34 single slot's registry successor; empty = none mid-flight).
+        @pending_tools = {}
         # pi's chat container is a separate component from the header
         # (interactive-mode.ts:633-639); its leading-spacer gate (children
         # non-empty, :3930-3931) reads this — any chat region since the
@@ -238,36 +242,36 @@ module Tart
       # expandable registry with a CONSTANT-SIZE builder (the pending
       # shape reads no toggle state — a mid-flight ctrl+o rebuilds it
       # identically; the finalize swaps the builder for the real one).
-      # A second enqueue while one is live appends sanely and SUPERSEDES
-      # the registration (unreachable under sequential execution —
-      # the executor runs the batch concurrently on the reactor; the superseded block
-      # renders on as a plain expandable until its own end appends).
-      def enqueue_pending_tool_block(name, args)
+      # A second enqueue while one is live ADDS a registry entry keyed by
+      # its call id, never supersedes (pi pendingTools.set — a component
+      # per call, interactive-mode.ts:3611-3621; the executor runs the
+      # batch concurrently on the reactor, so a batch's ends arrive out
+      # of start order and each call settles its OWN block).
+      def enqueue_pending_tool_block(id, name, args)
         args = {} unless args.is_a?(Hash)
         @chat_started = true
         region = MarkedRegion.new(pending_tool_rows(name, args), ->(_expanded) { pending_tool_rows(name, args) })
         @scrollback << region
-        @pending_tool = PendingTool.new([name, args], region)
+        @pending_tools[id] = PendingTool.new(name, args, region)
       end
 
       # The tool end's settle (I34 — pi :tool_execution_end's
-      # updateResult mutates the SAME component in place, never a second
-      # block, interactive-mode.ts:3645-3652): the live pending block is
-      # replaced IN PLACE with the rows {enqueue_tool_block} composes —
-      # same dispatch, same builders, the toggle state read at
-      # replacement time — and the expandable registry re-points to the
-      # final block at the updated start. With NO live pending
-      # registration (the replay path never engages the pending
-      # machinery; also the superseded-registration case) this falls
-      # back to today's append.
-      def finalize_tool_block(name, args, result, duration, details: nil)
+      # updateResult GETS THE COMPONENT BY toolCallId and mutates the
+      # SAME component in place, never a second block,
+      # interactive-mode.ts:3645-3652): the live pending block keyed by
+      # the call id is replaced IN PLACE with the rows
+      # {enqueue_tool_block} composes — same dispatch, same builders,
+      # the toggle state read at replacement time — and the expandable
+      # registry re-points to the final block at the updated start. With
+      # NO live registration for the id (nil id — reader-less display
+      # doubles; the replay path never engages the pending machinery; a
+      # post-reset or unknown id) this falls back to today's append.
+      def finalize_tool_block(id, name, args, result, duration, details: nil)
         args = {} unless args.is_a?(Hash)
-        pending = @pending_tool
-        unless pending && pending.tool == [name, args]
-          return enqueue_tool_block(name, args, result, duration, details:)
-        end
+        pending = id && @pending_tools[id]
+        return enqueue_tool_block(name, args, result, duration, details:) unless pending
 
-        @pending_tool = nil
+        @pending_tools.delete(id)
         builder = tool_block_builder(name, args, result, duration, details)
         final_rows = builder ? builder.(@tool_output_expanded) : generic_tool_rows(name, result)
         if pending.registration
@@ -277,18 +281,20 @@ module Tart
         end
       end
 
-      # The orphaned pending block's finalize (I34 — pi's message_end
-      # abort/error arm loops pendingTools with updateResult({content:
-      # [errorMessage], isError: true}, interactive-mode.ts:3573-3586):
-      # the SAME component re-renders the call rows + the error text
-      # under toolErrorBg). Routing the synthetic error result through
-      # the settle dispatch is exactly that re-render — the settled
-      # error block, no second composition path.
+      # The orphaned pending blocks' finalize (I34 — pi's message_end
+      # abort/error arm LOOPS pendingTools with updateResult({content:
+      # [errorMessage], isError: true}) then clears the map,
+      # interactive-mode.ts:3573-3586): EVERY live pending settles as the
+      # error block with today's exact bytes (the settle dispatch, no
+      # second composition path — the loop runs in START order, Hash
+      # insertion order), then the registry clears. An id-less entry
+      # (reader-less double) rides the append fallback like its finalize.
       def finalize_pending_as_error(text)
-        pending = @pending_tool
-        return unless pending
-
-        finalize_tool_block(pending.tool.first, pending.tool.last, {error: text}, nil)
+        @pending_tools.keys.each do |id|
+          pending = @pending_tools[id]
+          finalize_tool_block(id, pending.name, pending.args, {error: text}, nil)
+        end
+        @pending_tools.clear
       end
 
       # The compaction panel enqueue (pi addMessageToChat case
@@ -369,9 +375,13 @@ module Tart
                           builder: item.builder, resize_live: item.resize_live}
             @expandable_blocks << registered
             @transcript.concat(item.rows)
-            # The pending block's drain links the region to its registry
-            # entry — the finalize replaces through this registration.
-            @pending_tool.registration = registered if @pending_tool&.region&.equal?(item)
+            # The pending blocks' drain links EVERY registry entry's
+            # flushed region to its registration by region identity (I65
+            # D2 — the I34 single-slot link orphaned the batch siblings):
+            # the finalize replaces through these registrations.
+            @pending_tools.each_value do |pending|
+              pending.registration = registered if pending.region.equal?(item)
+            end
           when StatusEntry
             flush_status(item.text)
           else
@@ -452,7 +462,7 @@ module Tart
         @transcript = []
         @scrollback.clear
         @expandable_blocks.clear
-        @pending_tool = nil
+        @pending_tools.clear
         @status_pair = nil
         @chat_started = false
       end
