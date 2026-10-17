@@ -58,11 +58,15 @@ module Tart
       # ZERO observable change for every existing config (no tool, no
       # injection, no MOTD row). The env tier reads <IDENTITY>_MEMORY.
       "memory" => false,
-      # The native subagents module's gate (I48 — OQ-1): the memory row's
-      # opt-in pattern again — off = no subagent tool, no watcher, no run
-      # dirs, every existing byte unchanged (the frozen wire digests are
-      # the zero-behavior bar). The env tier reads <IDENTITY>_SUBAGENTS.
-      "subagents" => false
+      # The native subagents module's gate (I48 — OQ-1; I70 default-on
+      # ruling, owner 2026-10-17): DEFAULT ON — the crash cure and the flip
+      # land together (the MOTD prompt-scope package tier). The opt-out is
+      # a settings row {"subagents": false} or the <IDENTITY>_SUBAGENTS env
+      # tier — any non-on value ("1"/"true" stay the on spellings, bin/tart
+      # subagents_enabled?). Off = no subagent tool, no watcher, no run dirs
+      # (the frozen wire digests are the I48-off bar). The env tier reads
+      # <IDENTITY>_SUBAGENTS.
+      "subagents" => true
     }.freeze
 
     # pi's ThinkingLevel vocabulary (model-schema.ts:2-3, agent types.ts:349).
@@ -161,7 +165,21 @@ module Tart
     # precedence arithmetic itself stays here (a schema cannot express it
     # honestly — pi's semantics).
     def resolve_setting(key, settings, identity: Identity::DEFAULT, env: ENV)
-      env[Identity.env_key(identity, RESOLUTION_ENV.fetch(key))] || settings[key] || DEFAULTS[key]
+      # The tiers stay env > file > default, env values RAW. The I70
+      # false-presence cure (itemized deviation): the bare `||` chain read
+      # a PRESENT-but-false file row as absent — harmless while the
+      # subagents default was false, but post-flip it made the file
+      # opt-out {"subagents": false} unresolvable (false || true → true),
+      # breaking the frozen subagents-default-law/opt-out gates and the
+      # rig's R3 staged opt-out. A PRESENT file value — false included —
+      # now beats the built-in default; a NIL row still falls through
+      # (the malformed-file semantics unchanged). No other key carries a
+      # meaningful false file value (memory's callers pin its off shape
+      # through the same ladder — outcome identical there).
+      resolved = env[Identity.env_key(identity, RESOLUTION_ENV.fetch(key))]
+      resolved = settings[key] if resolved.nil? && settings.key?(key)
+      resolved = DEFAULTS[key] if resolved.nil?
+      resolved
     end
 
     # Explicit kwarg → <IDENTITY>_CONTEXT_WINDOW → settings.contextWindow →

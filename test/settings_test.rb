@@ -79,25 +79,36 @@ module Tart
 
     # --- I48: the subagents gate rows + the thinkingLevel env tier (OQ-1) ---
 
-    def test_subagents_gate_rows_default_off_with_the_identity_env_suffix
-      assert_equal false, Settings::DEFAULTS["subagents"]
+    # I70 move (was …_default_off_…): the gate defaults ON — the row pin
+    # moves with the flip, the env-suffix discrimination preserved.
+    def test_subagents_gate_rows_default_on_with_the_identity_env_suffix
+      assert_equal true, Settings::DEFAULTS["subagents"], "the I70 default-on flip"
       assert_equal "SUBAGENTS", Settings::RESOLUTION_ENV["subagents"]
       assert_equal "THINKING_LEVEL", Settings::RESOLUTION_ENV["thinkingLevel"]
       assert_equal "PI_SUBAGENTS", Identity.env_key("pi", Settings::RESOLUTION_ENV["subagents"])
       assert_equal "TART_SUBAGENTS", Identity.env_key("tart", Settings::RESOLUTION_ENV["subagents"])
     end
 
+    # I70 move (the known-key load's default tier flips to true) + the
+    # opt-out tiers gain pins so the off shape stays pinned: file tier,
+    # env tier, env-over-file.
     def test_subagents_is_a_known_key_and_resolves_env_over_file_over_default
       result = load_settings
       assert_empty result.diagnostics, "the subagents row is known — no unknown-key warning"
-      assert_equal false, result.settings["subagents"]
+      assert_equal true, result.settings["subagents"], "the DEFAULTS tier is on (the I70 flip)"
 
-      write_settings(@user_path, '{"subagents": true}')
-      assert_equal true, load_settings.settings["subagents"]
+      write_settings(@user_path, '{"subagents": false}')
+      assert_equal false, load_settings.settings["subagents"], "the file opt-out tier"
 
       assert_equal "1", Settings.resolve_setting("subagents", {}, identity: "pi", env: {"PI_SUBAGENTS" => "1"})
-      assert_equal false, Settings.resolve_setting("subagents", {}, identity: "tart", env: {}),
-        "the DEFAULTS tier is false"
+      assert_equal true, Settings.resolve_setting("subagents", {}, identity: "tart", env: {}),
+        "the DEFAULTS tier is on (the I70 flip)"
+      assert_equal false, Settings.resolve_setting("subagents", {"subagents" => false}, identity: "tart", env: {}),
+        "the file opt-out tier resolves off"
+      assert_equal "0", Settings.resolve_setting("subagents", {}, identity: "tart", env: {"TART_SUBAGENTS" => "0"}),
+        "the env opt-out tier (any non-on value)"
+      assert_equal "1", Settings.resolve_setting("subagents", {"subagents" => false}, identity: "tart", env: {"TART_SUBAGENTS" => "1"}),
+        "the env tier beats the file tier"
     end
 
     def test_project_deep_merges_over_user
