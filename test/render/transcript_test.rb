@@ -14,6 +14,14 @@ module Tart
     class TranscriptTest < Test
       WIDTH = 40
 
+      # The owner's exploded items 5-6 slice (new_problems.md, 2026-10-16/17
+      # — the thinking text the repeated-prefix render blew up on), verbatim
+      # — the markdown_test OWNER_PAYLOAD slice's exact bytes.
+      OWNER_PAYLOAD_SLICE = <<~'PAYLOAD'.chomp.freeze
+5. The space commits d926dcb/c5d0b80: model-window routing (z.ai peak schedule flips loop models between zai/* and openrouter/z-ai-*); architect.yaml currently on the zai/* side.
+6. Env quirk affecting THIS session: BUNDLE_GEMFILE is exported pointing at repos/tart/Gemfile, which breaks every bare `architect` call (bundler picks tart's bundle, gem not included → error). Workaround: `env -u BUNDLE_GEMFILE architect ...`. Worth flagging to the human — likely leaked from a shell that ran tart/bundle. Also that's presumably why I was launched with it.
+      PAYLOAD
+
       def setup
         @transcript = Transcript.new(
           width_reader: -> { WIDTH }, history_sink: ->(_text) {}, reseed_sink: ->(_message) {}
@@ -40,7 +48,7 @@ module Tart
       # Spacer blank, pending pad, the bold toolTitle `$ <command>`
       # header, pending pad. No output, no Took, no hint.
       def test_pending_bash_renders_the_call_rows_under_the_pending_bg
-        @transcript.enqueue_pending_tool_block("bash", {"command" => "sleep 6"})
+        @transcript.enqueue_pending_tool_block("c1", "bash", {"command" => "sleep 6"})
         flush
 
         assert_equal ["", " $ sleep 6", ""], texts.drop(1), "blank + pad + header + pad"
@@ -59,7 +67,7 @@ module Tart
       # The pending write block: the call rows alone (the content exists
       # mid-call but pi renders renderCall only).
       def test_pending_write_renders_the_call_rows_alone
-        @transcript.enqueue_pending_tool_block("write", {"file_path" => "/tmp/x.rb", "content" => "puts 1"})
+        @transcript.enqueue_pending_tool_block("c1", "write", {"file_path" => "/tmp/x.rb", "content" => "puts 1"})
         flush
 
         assert_equal [" write /tmp/x.rb", ""], texts.drop(2), "pad + call row + pad"
@@ -74,7 +82,7 @@ module Tart
       # !expanded — the pending call renders the collapsed resource shape
       # (wrapped at width 40, exactly as the settled collapsed call).
       def test_pending_read_renders_the_collapsed_call
-        @transcript.enqueue_pending_tool_block("read", {"path" => "AGENTS.md"})
+        @transcript.enqueue_pending_tool_block("c1", "read", {"path" => "AGENTS.md"})
         flush
 
         assert_equal ["", " read resource AGENTS.md (ctrl+o to", " expand)", ""], texts.drop(1),
@@ -85,7 +93,7 @@ module Tart
       # The pending generic block: the wrapped `  ⎿ <name>` call line
       # between the pads (ToolBlock.tool_line(name, nil) — no result yet).
       def test_pending_generic_renders_the_mark_line_alone
-        @transcript.enqueue_pending_tool_block("grep", nil)
+        @transcript.enqueue_pending_tool_block("c1", "grep", nil)
         flush
 
         assert_equal ["", "  ⎿ grep", ""], texts.drop(1), "blank + pad + ⎿ line + pad"
@@ -94,7 +102,7 @@ module Tart
 
       # Guard nil arguments the way enqueue_tool_block does.
       def test_pending_bash_guards_nil_args_to_the_placeholder_header
-        @transcript.enqueue_pending_tool_block("bash", nil)
+        @transcript.enqueue_pending_tool_block("c1", "bash", nil)
         flush
 
         assert_equal " $ ...", texts[2], "the empty command renders the ... placeholder"
@@ -118,9 +126,9 @@ module Tart
       # finalize splices the final rows at the recorded start.
       def test_flushed_pending_settles_byte_identical_to_the_control
         args = {"command" => "sleep 6"}
-        @transcript.enqueue_pending_tool_block("bash", args)
+        @transcript.enqueue_pending_tool_block("c1", "bash", args)
         flush
-        @transcript.finalize_tool_block("bash", args, "out", 1.0)
+        @transcript.finalize_tool_block("c1", "bash", args, "out", 1.0)
         flush
 
         assert_equal control_texts([], "bash", args, "out", 1.0), texts, "rows and position byte-identical"
@@ -133,8 +141,8 @@ module Tart
         args = {"command" => "fast"}
         history = [->(t) { t.enqueue_user_submission("run it") }]
         history.each { |step| step.call(@transcript) }
-        @transcript.enqueue_pending_tool_block("bash", args)
-        @transcript.finalize_tool_block("bash", args, "res", nil)
+        @transcript.enqueue_pending_tool_block("c1", "bash", args)
+        @transcript.finalize_tool_block("c1", "bash", args, "res", nil)
         flush
 
         assert_equal control_texts(history, "bash", args, "res", nil), texts,
@@ -146,13 +154,13 @@ module Tart
       # with the row delta, and the toggle still rebuilds it in place.
       def test_flushed_settle_threads_the_row_delta_to_later_blocks
         args = {"command" => "sleep 6"}
-        @transcript.enqueue_pending_tool_block("bash", args)
+        @transcript.enqueue_pending_tool_block("c1", "bash", args)
         flush
         @transcript.enqueue_user_bash_block("ls", content: "f", exit_code: 0, cancelled: false,
           truncated: false, full_output_path: nil, excluded: false)
         flush
         before = texts.length
-        @transcript.finalize_tool_block("bash", args, "out", 1.0)
+        @transcript.finalize_tool_block("c1", "bash", args, "out", 1.0)
         flush
 
         assert_operator texts.length, :>, before, "the final block is taller than the pending one"
@@ -168,9 +176,9 @@ module Tart
       # the settle drops the pending registration instead of registering
       # the final block.
       def test_generic_settle_drops_the_registration_and_matches_the_control
-        @transcript.enqueue_pending_tool_block("grep", {})
+        @transcript.enqueue_pending_tool_block("c1", "grep", {})
         flush
-        @transcript.finalize_tool_block("grep", {}, "hit", nil)
+        @transcript.finalize_tool_block("c1", "grep", {}, "hit", nil)
         flush
 
         assert_equal control_texts([], "grep", {}, "hit", nil), texts
@@ -185,7 +193,7 @@ module Tart
       # error block, same position.
       def test_orphaned_pending_finalizes_as_the_error_block
         args = {"command" => "sleepy"}
-        @transcript.enqueue_pending_tool_block("bash", args)
+        @transcript.enqueue_pending_tool_block("c1", "bash", args)
         flush
         @transcript.finalize_pending_as_error("Operation aborted")
         flush
@@ -199,42 +207,166 @@ module Tart
         refute_includes texts.join, "Took", "no duration — the abort carries none (pi's updateResult)"
       end
 
-      # A finalize with no live pending registration falls back to the
-      # append (the replay path's shape).
-      def test_finalize_without_a_pending_registration_appends
-        @transcript.finalize_tool_block("bash", {"command" => "x"}, "out", nil)
+      # The id-MISS finalize (an unknown id — no live registration; also
+      # the replay path, which never engages the pending machinery) falls
+      # back to today's append (pi :3645-3652's get-by-id miss arm).
+      def test_pending_registry_id_miss_finalize_appends
+        @transcript.finalize_tool_block("c1", "bash", {"command" => "x"}, "out", nil)
         flush
 
         assert_equal control_texts([], "bash", {"command" => "x"}, "out", nil), texts
       end
 
-      # A second enqueue while one is live appends sanely and SUPERSEDES
-      # the registration (unreachable under sequential execution —
-      # the executor's batch is the only concurrency; the documented caveat):
-      # the superseded block renders on under the pending bg (its end
-      # falls back to the append below it), the live one replaces.
-      def test_second_pending_supersedes_and_the_stale_end_appends
-        @transcript.enqueue_pending_tool_block("bash", {"command" => "first"})
-        @transcript.enqueue_pending_tool_block("bash", {"command" => "second"})
+      # --- I65 D2: the id-keyed pending registry (pi's pendingTools Map
+      # --- keyed by toolCallId — interactive-mode.ts:3611-3621/:3645-3652) ---
+
+      # REPLACES the I34 supersede pin (test_second_pending_supersedes_and
+      # _the_stale_end_appends — the supersede WAS the defect: the owner's
+      # parallel batch orphaned the superseded block, its end appended, and
+      # grey rows survived forever). N=2 concurrent calls, B completing
+      # FIRST: each block settles IN PLACE — exactly one block per call,
+      # start order kept, zero pending-bg survivors, no appended duplicate.
+      def test_pending_registry_two_concurrent_calls_settle_in_place_b_first
+        @transcript.enqueue_pending_tool_block("a", "bash", {"command" => "sleep 3"})
+        @transcript.enqueue_pending_tool_block("b", "bash", {"command" => "echo hi"})
         flush
-        @transcript.finalize_tool_block("bash", {"command" => "first"}, "one", nil)
+        @transcript.finalize_tool_block("b", "bash", {"command" => "echo hi"}, "hi", 0.01)
         flush
-        assert_includes texts, " one", "the stale end falls back to the append"
-        assert_includes texts.join, "$ second", "the live pending renders on"
-        @transcript.finalize_tool_block("bash", {"command" => "second"}, "two", nil)
+        @transcript.finalize_tool_block("a", "bash", {"command" => "sleep 3"}, "done", 3.0)
         flush
-        assert_includes texts, " two", "the live end replaces in place"
-        assert_includes bgs, Theme[:tool_pending_bg],
-          "the superseded block rides on (the documented caveat — unreachable sequentially)"
+
+        assert_equal 1, texts.count { |row| row.include?("sleep 3") }, "A settles in place, never appended"
+        assert_equal 1, texts.count { |row| row.include?("echo hi") }
+        assert_operator texts.index(" $ sleep 3"), :<, texts.index(" $ echo hi"), "blocks stay in START order"
+        refute_includes bgs, Theme[:tool_pending_bg], "zero pending-bg rows survive"
       end
 
-      # reset clears the pending registration with the buffer — the
+      # The same batch, A completing first — BOTH completion orders settle
+      # identically.
+      def test_pending_registry_two_concurrent_calls_settle_in_place_a_first
+        @transcript.enqueue_pending_tool_block("a", "bash", {"command" => "sleep 3"})
+        @transcript.enqueue_pending_tool_block("b", "bash", {"command" => "echo hi"})
+        flush
+        @transcript.finalize_tool_block("a", "bash", {"command" => "sleep 3"}, "done", 3.0)
+        flush
+        @transcript.finalize_tool_block("b", "bash", {"command" => "echo hi"}, "hi", 0.01)
+        flush
+
+        assert_equal 1, texts.count { |row| row.include?("sleep 3") }
+        assert_equal 1, texts.count { |row| row.include?("echo hi") }
+        assert_operator texts.index(" $ sleep 3"), :<, texts.index(" $ echo hi")
+        refute_includes bgs, Theme[:tool_pending_bg]
+      end
+
+      # The case [name, args] equality could not discriminate: identical
+      # calls with DISTINCT ids each settle their own block in place,
+      # byte-identical to two sequential settles.
+      def test_pending_registry_identical_calls_distinct_ids_settle_in_place
+        args = {"command" => "same"}
+        control = Transcript.new(
+          width_reader: -> { WIDTH }, history_sink: ->(_text) {}, reseed_sink: ->(_message) {}
+        )
+        control.enqueue_tool_block("bash", args, "first", nil)
+        control.enqueue_tool_block("bash", args, "second", nil)
+        control.flush_scrollback
+
+        @transcript.enqueue_pending_tool_block("call_1", "bash", args)
+        @transcript.enqueue_pending_tool_block("call_2", "bash", args)
+        flush
+        @transcript.finalize_tool_block("call_2", "bash", args, "second", nil)
+        flush
+        @transcript.finalize_tool_block("call_1", "bash", args, "first", nil)
+        flush
+
+        assert_equal control.lines.map { |line| line.spans.map(&:content).join.rstrip }, texts,
+          "two settled blocks, one per call id, in start order"
+        refute_includes bgs, Theme[:tool_pending_bg]
+      end
+
+      # The QUEUED variant: neither region drained yet — B's finalize swaps
+      # ITS OWN region in the queue (the registry holds every entry's
+      # region; the I34 slot swapped only the current one), then A's.
+      def test_pending_registry_queued_settles_swap_the_right_region
+        @transcript.enqueue_pending_tool_block("a", "bash", {"command" => "sleep 3"})
+        @transcript.enqueue_pending_tool_block("b", "bash", {"command" => "echo hi"})
+        @transcript.finalize_tool_block("b", "bash", {"command" => "echo hi"}, "hi", nil)
+        @transcript.finalize_tool_block("a", "bash", {"command" => "sleep 3"}, "done", nil)
+        flush
+
+        assert_equal 1, texts.count { |row| row.include?("sleep 3") }
+        assert_equal 1, texts.count { |row| row.include?("echo hi") }
+        assert_operator texts.index(" $ sleep 3"), :<, texts.index(" $ echo hi"),
+          "start order preserved through the queue swaps"
+        refute_includes bgs, Theme[:tool_pending_bg], "no pending rows ever painted"
+      end
+
+      # finalize_pending_as_error loops EVERY live pending (pi :3573-3586's
+      # abort arm walks the whole Map): both blocks settle in place as the
+      # error block, then a later finalize appends — the registry cleared.
+      def test_pending_registry_error_finalize_settles_both_and_clears
+        @transcript.enqueue_pending_tool_block("a", "bash", {"command" => "sleep 3"})
+        @transcript.enqueue_pending_tool_block("b", "bash", {"command" => "echo hi"})
+        flush
+        @transcript.finalize_pending_as_error("Operation aborted")
+        flush
+
+        assert_equal 2, texts.count { |row| row.include?("Operation aborted") }, "BOTH pendings settle"
+        assert_equal 2, texts.count { |row| row.include?("$ sleep 3") || row.include?("$ echo hi") },
+          "each block keeps its call rows"
+        refute_includes bgs, Theme[:tool_pending_bg]
+        @transcript.finalize_tool_block("a", "bash", {"command" => "sleep 3"}, "late", nil)
+        flush
+        assert_includes texts, " late", "the post-error finalize appends — the registry cleared"
+      end
+
+      # --- I65 D1: the reasoning seam rides the cured converter (inline_scan) ---
+
+      # The at-most-once cover walk over the reasoning seam's spans (the
+      # markdown_test twin, pad/indent spans skipped): every non-whitespace
+      # span a source substring at-or-after the previous span's window end.
+      def assert_source_cover(spans_texts, source)
+        cursor = 0
+        spans_texts.reject { |text| text.strip.empty? }.each do |text|
+          idx = source.index(text, cursor)
+          refute_nil idx, "span #{text[0, 60].inspect} not found at-or-after #{cursor} — invented or duplicated bytes"
+          cursor = idx + text.length
+        end
+      end
+
+      # The owner's exploded items 5-6 slice through Transcript.reasoning_lines
+      # (the live reasoning buffer's seam): readable wrapped rows — every
+      # row's display width fits the width, every span a source substring
+      # in source order, the trigger fragment rendered once (no explosion).
+      def test_inline_scan_owner_payload_reasoning_lines_cover_the_source
+        lines = Transcript.reasoning_lines(OWNER_PAYLOAD_SLICE, 94)
+        spans = lines.flat_map { |line| line.spans.map(&:content) }
+
+        assert_source_cover(spans, OWNER_PAYLOAD_SLICE)
+        lines.each do |line|
+          assert_operator TUI.text_width(line.spans.map(&:content).join), :<=, 94,
+            "row fits the width: #{line.spans.map(&:content).join[0, 40].inspect}"
+        end
+        assert_operator lines.size, :>, 1, "the payload wraps into readable rows"
+        assert_equal 1, spans.join.scan("zai/*").size, "the trigger fragment renders once — no explosion"
+      end
+
+      # The minimal trigger through the same seam — passthrough text, once.
+      def test_inline_scan_minimal_trigger_reasoning_lines_render_once
+        src = "between zai/* and openrouter/z-ai-*); tail"
+        lines = Transcript.reasoning_lines(src, 94)
+        joined = lines.flat_map { |line| line.spans.map(&:content) }.join
+
+        assert_includes joined, src
+        assert_equal 1, joined.scan("between zai/").size, "the pre-text renders exactly once"
+      end
+
+      # reset clears the whole registry with the buffer — the
       # post-reset finalize appends (the I33-class stale latent).
-      def test_reset_clears_the_pending_registration
-        @transcript.enqueue_pending_tool_block("bash", {"command" => "sleepy"})
+      def test_pending_registry_reset_clears_and_the_post_reset_finalize_appends
+        @transcript.enqueue_pending_tool_block("c1", "bash", {"command" => "sleepy"})
         flush
         @transcript.reset
-        @transcript.finalize_tool_block("bash", {"command" => "sleepy"}, "out", nil)
+        @transcript.finalize_tool_block("c1", "bash", {"command" => "sleepy"}, "out", nil)
         flush
 
         assert_equal control_texts([], "bash", {"command" => "sleepy"}, "out", nil), texts,
@@ -374,7 +506,7 @@ module Tart
       # generic_panel_rows' default); now the finalize arm paints exactly
       # like the replay arm — success #254131, pads included.
       def test_generic_bg_live_settle_paints_the_success_bg
-        @transcript.finalize_tool_block("grep", {}, "hit", nil)
+        @transcript.finalize_tool_block("c1", "grep", {}, "hit", nil)
         flush
 
         assert_equal ["", "", "  ⎿ grep: hit", ""], texts, "the generic shape is unchanged (pads are blank text)"
@@ -383,7 +515,7 @@ module Tart
 
       # The error arm: a failed generic settle paints toolErrorBg.
       def test_generic_bg_live_settle_paints_the_error_bg
-        @transcript.finalize_tool_block("grep", {}, { error: "boom" }, nil)
+        @transcript.finalize_tool_block("c1", "grep", {}, { error: "boom" }, nil)
         flush
 
         assert_equal Theme[:tool_error_bg], bgs.first, "the error bg"
@@ -392,7 +524,7 @@ module Tart
 
       # The pending arm's bytes are UNCHANGED by the cure (explicit bg).
       def test_generic_bg_pending_arm_stays_byte_frozen
-        @transcript.enqueue_pending_tool_block("grep", {})
+        @transcript.enqueue_pending_tool_block("c1", "grep", {})
         flush
 
         assert_equal ["", "  ⎿ grep", ""], texts.drop(1), "the pending shape"
@@ -404,12 +536,12 @@ module Tart
       # row, the diff from the details, the success bg).
       def test_edit_block_dispatch_settles_from_the_call_details
         args = { "path" => "f.txt" }
-        @transcript.enqueue_pending_tool_block("edit", args)
+        @transcript.enqueue_pending_tool_block("c1", "edit", args)
         flush
         pending_size = @transcript.lines.size
 
         details = { diff: "-1 line two bravo\n+1 line two charlie", patch: "", firstChangedLine: 1 }
-        @transcript.finalize_tool_block("edit", args, "Successfully replaced 1 block(s) in f.txt.", nil,
+        @transcript.finalize_tool_block("c1", "edit", args, "Successfully replaced 1 block(s) in f.txt.", nil,
                                         details: details)
         flush
 
@@ -463,7 +595,7 @@ module Tart
       # AC3: the pending edit block — the header alone under the pending
       # bg (the preview cut, Grounds §6).
       def test_edit_block_pending_renders_the_header_under_the_pending_bg
-        @transcript.enqueue_pending_tool_block("edit", { "path" => "f.txt" })
+        @transcript.enqueue_pending_tool_block("c1", "edit", { "path" => "f.txt" })
         flush
 
         assert_equal ["", "", " edit f.txt", ""], texts, "the 4-row pending frame"

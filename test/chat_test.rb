@@ -4468,6 +4468,256 @@ module Tart
       end
     end
 
+    # --- the jump-to-bottom pill (I66 AC1, pi compositeScrollToEndIndicator
+    # tui-alt-screen.ts:1638-1667) ---
+    #
+    # Geometry at width 40 / screen_height 12: the transcript area is 6
+    # rows (terminal rows 0-5) and the pill composites on its LAST row (5),
+    # centered at column (40 − 26) / 2 = 7 across the exact 26-cell label
+    # " ↓ Jump to latest message " (flanking spaces included). At width 26
+    # the label fills the row (column 0) and the visible rail (column 25)
+    # truncates it to 25 cells — the left part kept.
+
+    def test_jump_pill_following_renders_no_pill
+      with_chat(width: 40, screen_height: 12) do |chat, session, _kernel|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session) # settle: follow is armed
+        assert_nil chat.jump_pill_rect, "following: no indicator (pi isFollowingEnd true)"
+        (7...33).each do |x|
+          refute_equal Theme[:selected_bg], session.cell_bg(x, 5),
+            "no pill bg on the last transcript row while following (x=#{x})"
+        end
+      end
+    end
+
+    def test_jump_pill_content_fits_renders_no_pill
+      with_chat(width: 40, screen_height: 12) do |chat, session, _kernel|
+        2.times { |i| finish_message(chat, "line#{i}") } # fits the 6-row area
+        draw(chat, session)
+        assert_nil chat.jump_pill_rect, "a fitting view re-arms follow by construction — no pill"
+        (7...33).each do |x|
+          refute_equal Theme[:selected_bg], session.cell_bg(x, 5),
+            "no pill bg anywhere on the last row (x=#{x})"
+        end
+      end
+    end
+
+    def test_jump_pill_detached_composites_centered_on_the_last_row
+      with_chat(width: 40, screen_height: 12) do |chat, session, _kernel|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session) # settle
+        wheel_page_back(chat) # detach
+        draw(chat, session)
+        assert_equal({row: 5, column: 7, width: 26}, chat.jump_pill_rect, "the click rect latches (pi scrollToEndIndicatorRect)")
+        label = " ↓ Jump to latest message "
+        label.each_char.with_index do |char, i|
+          assert_equal char, session.cell_symbol(7 + i, 5), "pill byte #{i} at column #{7 + i}"
+        end
+        assert_equal Theme[:text], session.cell_fg(8, 5), "the pill's fg is the text token (tui-renderer.ts:30-34)"
+        assert_equal Theme[:selected_bg], session.cell_bg(8, 5), "the pill's bg is the selected_bg token (dark.json:27)"
+        assert_equal Theme[:text], session.cell_fg(10, 5)
+        assert_equal Theme[:selected_bg], session.cell_bg(32, 5), "the pill carries its bg to its last cell"
+        assert_nil session.cell_bg(6, 5), "the neighbor cell keeps its own style (pi compositeTuiLine)"
+        assert_nil session.cell_bg(33, 5), "the neighbor cell keeps its own style (pi compositeTuiLine)"
+      end
+    end
+
+    def test_jump_pill_truncates_left_of_the_rail_column
+      with_chat(width: 26, screen_height: 12) do |chat, session, _kernel|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session) # settle
+        chat.scrollbar_hide_delay_ms = 10_000 # keep the wheel's mark fresh
+        wheel_page_back(chat) # detach + the rail is visible
+        draw(chat, session)
+        assert_equal({row: 5, column: 0, width: 25}, chat.jump_pill_rect,
+          "the label truncates to the left of the rail column (rightEdge = scrollbarColumn)")
+        truncated = " ↓ Jump to latest message" # the left part kept — the trailing space cut
+        truncated.each_char.with_index do |char, i|
+          assert_equal char, session.cell_symbol(i, 5), "truncated pill byte #{i}"
+        end
+        assert_equal Theme[:selected_bg], session.cell_bg(24, 5), "the truncation keeps the pill styling"
+        assert_equal "│", session.cell_symbol(25, 5), "the rail glyph survives at the rail column"
+      end
+    end
+
+    def test_jump_pill_press_inside_the_rect_jumps_to_the_end_and_rearms_follow
+      with_chat(width: 40, screen_height: 12) do |chat, session, kernel|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        chat.scrollbar_hide_delay_ms = 10_000 # the jump marks activity — keep the rail fresh for the pin
+        draw(chat, session) # settle: following
+        wheel_page_back(chat)
+        draw(chat, session)
+        assert_equal({row: 5, column: 7, width: 26}, chat.jump_pill_rect)
+
+        capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "down", x: 10, y: 5, button: "left"))
+        end
+        assert_equal chat.display_lines.size - 6, chat.scroll_offset, "the offset pins to max (pi scrollToBottom → scrollToEnd)"
+        draw(chat, session)
+        assert_nil chat.jump_pill_rect, "follow re-armed — the pill is gone on the next draw"
+        assert session.buffer_content[5].include?("line19"), "the tail re-followed"
+        glyphs = (0...6).map { |y| session.cell_symbol(39, y) }
+        assert glyphs.all? { |g| g == "│" || g == "┃" },
+          "the rail is fresh — scroll activity marked on the jump (pi scrollToEnd): #{glyphs.inspect}"
+      end
+    end
+
+    def test_jump_pill_press_outside_the_rect_falls_through_to_the_selection
+      with_chat(width: 40, screen_height: 12) do |chat, session, _kernel|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        draw(chat, session) # settle
+        wheel_page_back(chat)
+        draw(chat, session)
+        offset_before = chat.scroll_offset
+
+        capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "down", x: 2, y: 5, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "drag", x: 5, y: 5, button: "left"))
+          chat.on_event(TUI.mouse_event(kind: "up", x: 5, y: 5, button: "left"))
+        end
+        assert_equal offset_before, chat.scroll_offset, "a press outside the rect is not consumed — no jump"
+        draw(chat, session)
+        assert_equal({row: 5, column: 7, width: 26}, chat.jump_pill_rect, "still detached — the pill latches again")
+        (2..5).each do |x|
+          assert_equal [:reversed], session.cell_modifiers(x, 5),
+            "today's selection press routed on the same row (x=#{x})"
+        end
+      end
+    end
+
+    def test_jump_pill_leaves_every_other_mouse_shape_to_todays_arms
+      with_chat(width: 40, screen_height: 12) do |chat, session, _kernel|
+        20.times { |i| finish_message(chat, "line#{i}") }
+        chat.scrollbar_hide_delay_ms = 10_000
+        draw(chat, session) # settle
+        wheel_page_back(chat)
+        draw(chat, session)
+        assert chat.jump_pill_rect, "precondition: the pill is latched"
+
+        offset = chat.scroll_offset
+        chat.on_event(TUI.mouse_event(kind: "scroll_up", x: 0, y: 0))
+        assert_equal offset - 1, chat.scroll_offset, "the wheel arm is untouched by the pill route"
+
+        capture_stdout do
+          chat.on_event(TUI.mouse_event(kind: "down", x: 10, y: 5, button: "right"))
+        end
+        assert_equal offset - 1, chat.scroll_offset, "a non-left press is not consumed by the pill route"
+      end
+    end
+
+    # --- the rail's background parity + the wide-grapheme straddle (I66
+    # AC2, pi replaceScrollbarCell preserveTargetBackground layout.ts:249-278
+    # + getGraphemeCellRange utils.ts:335-352) ---
+
+    def test_rail_background_full_width_panel_row_carries_the_panel_bg
+      vp = Render::Viewport.new
+      track = TUI.line("│", fg: Theme[:scrollbarTrack])
+      row = Render::Panel.padded_fg_rows("grep ok", 20, fg: Theme[:toolTitle], bg: Theme[:tool_success_bg]).first
+      composed = vp.overlay_rail_cell(row, track, 20)
+      cells = []
+      composed.spans.each do |span|
+        span.content.each_char do |char|
+          cells << [char, span.style&.fg, span.style&.bg]
+          cells << nil if TUI.text_width(char) == 2
+        end
+      end
+      assert_equal 20, cells.size, "the composed line is exactly width cells"
+      cells.each_with_index do |cell, i|
+        assert_equal Theme[:tool_success_bg], cell[2], "cell #{i} carries the panel bg — no neutral cell inserted"
+      end
+      assert_equal ["│", Theme[:scrollbarTrack], Theme[:tool_success_bg]], cells.last,
+        "the glyph keeps its own theme fg over the target bg"
+    end
+
+    def test_rail_background_short_panel_row_pads_with_the_panel_bg
+      vp = Render::Viewport.new
+      track = TUI.line("│", fg: Theme[:scrollbarTrack])
+      row = TUI.line([TUI.span(" hi", bg: Theme[:tool_success_bg])])
+      composed = vp.overlay_rail_cell(row, track, 20)
+      cells = []
+      composed.spans.each do |span|
+        span.content.each_char do |char|
+          cells << [char, span.style&.fg, span.style&.bg]
+          cells << nil if TUI.text_width(char) == 2
+        end
+      end
+      assert_equal 20, cells.size
+      (3...19).each do |i|
+        assert_equal Theme[:tool_success_bg], cells[i][2], "pad cell #{i} carries the panel bg too (the owner's letter)"
+      end
+      assert_equal "│", cells.last[0], "the glyph lands at the last column"
+    end
+
+    def test_rail_background_plain_row_keeps_the_neutral_look
+      vp = Render::Viewport.new
+      track = TUI.line("│", fg: Theme[:scrollbarTrack])
+      composed = vp.overlay_rail_cell(TUI.line(" plain text"), track, 20)
+      assert_equal 20, composed.spans.sum { |span| TUI.text_width(span.content) }
+      assert_nil composed.spans.last.style&.bg, "no bg invented on a plain row (the target bg is nil)"
+      assert_equal "│", composed.spans.last.content
+      assert_equal Theme[:scrollbarTrack], composed.spans.last.style&.fg
+    end
+
+    def test_rail_background_straddle_replaces_the_wide_grapheme_whole
+      vp = Render::Viewport.new
+      track = TUI.line("│", fg: Theme[:scrollbarTrack])
+      row = TUI.line([TUI.span(" " * 18, bg: Theme[:tool_success_bg]),
+        TUI.span("漢", fg: Theme[:text], bg: Theme[:tool_success_bg])])
+      composed = vp.overlay_rail_cell(row, track, 20)
+      cells = []
+      composed.spans.each do |span|
+        span.content.each_char do |char|
+          cells << [char, span.style&.fg, span.style&.bg]
+          cells << nil if TUI.text_width(char) == 2
+        end
+      end
+      assert_equal 20, cells.size, "exactly width cells — the base defect measured 21 in a 20-wide area"
+      refute cells.compact.any? { |cell| cell[0] == "漢" }, "the straddling grapheme does not survive (pi getGraphemeCellRange)"
+      assert_equal [" ", nil, Theme[:tool_success_bg]], cells[18], "the head clips at the straddler's start; the pad carries the target bg"
+      assert_equal ["│", Theme[:scrollbarTrack], Theme[:tool_success_bg]], cells[19], "the glyph lands at the LAST column"
+    end
+
+    def test_rail_background_straddle_paints_the_glyph_at_the_last_column_in_buffer
+      with_chat(width: 20, screen_height: 12) do |chat, session, _kernel|
+        bg = Theme[:tool_success_bg]
+        straddle = TUI.line([TUI.span(" " * 18, bg:), TUI.span("漢", fg: Theme[:text], bg:)])
+        panel = Render::Panel.padded_fg_rows("grep ok", 20, fg: Theme[:toolTitle], bg: bg).first
+        rows = [panel, panel, straddle, panel, panel, panel, panel, panel, panel, panel]
+        chat.instance_variable_get(:@transcript_state).enqueue_region(rows)
+        draw(chat, session) # settle: the region flushes, follow pins to the end
+        chat.scrollbar_hide_delay_ms = 10_000 # keep the wheel's mark fresh
+        wheel_page_back(chat) # detach (10 rows > the 6-row area) + rail fresh
+        draw(chat, session)
+        assert_equal "┃", session.cell_symbol(19, 2),
+          "the rail glyph paints at the LAST column on the straddle row (base measured \" \" there)"
+        assert_equal bg, session.cell_bg(19, 2), "the glyph carries the target bg in the buffer"
+        assert_equal " ", session.cell_symbol(18, 2), "the straddler is gone — the pad cell stands"
+        assert_equal bg, session.cell_bg(18, 2), "the pad carries the panel bg in the buffer"
+        assert_equal "│", session.cell_symbol(19, 4), "a neighbor row's glyph is untouched"
+      end
+    end
+
+    def test_rail_background_fade_restores_the_underlying_row_state
+      with_chat(width: 20, screen_height: 12) do |chat, session, kernel|
+        bg = Theme[:tool_success_bg]
+        rows = 10.times.flat_map { |i| Render::Panel.padded_fg_rows("row #{i}", 20, fg: Theme[:toolTitle], bg: bg) }
+        chat.instance_variable_get(:@transcript_state).enqueue_region(rows)
+        draw(chat, session) # settle: the region flushes, follow pins to the end
+        chat.scrollbar_hide_delay_ms = 10_000
+        wheel_page_back(chat) # detach + rail fresh
+        draw(chat, session)
+        assert_equal "│", session.cell_symbol(19, 4), "the rail is visible over the panel"
+        assert_equal bg, session.cell_bg(19, 4), "the railed cell carries the panel bg (the cure)"
+
+        chat.scrollbar_hide_delay_ms = 0 # the timer reads the delay at fire time
+        kernel.fire_timers
+        draw(chat, session)
+        assert_equal " ", session.cell_symbol(19, 4), "the rail faded"
+        assert_equal bg, session.cell_bg(19, 4),
+          "the former rail column reads the underlying row's own state again (the hide frame rebuilds the original line)"
+      end
+    end
+
     # --- mouse: wheel scroll + transcript selection (I14 items 6/10,
     # driven through the synthetic-seam event shapes) ---
 
@@ -5572,15 +5822,27 @@ module Tart
       chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "done", tokens)})
     end
 
-    def tool_start(chat, name, arguments: {})
-      chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(name, arguments)})
+    def tool_start(chat, name, arguments: {}, id: next_tool_call_id)
+      @last_started_tool_call_id = id
+      chat.on_agent_event({type: :tool_execution_start, tool_call: ToolCallDouble.new(id, name, arguments)})
     end
 
     # `duration:` rides the frozen :tool_execution_end contract (Float
     # seconds, nil = absent); bash blocks read the call's arguments.
-    def tool_end(chat, name, result, duration: nil, arguments: {})
-      chat.on_agent_event({type: :tool_execution_end, tool_call: ToolCallDouble.new(name, arguments), result:,
+    # The id defaults to the START's generated one (I65 D2 — the
+    # transcript's pending registry keys by ToolCall#id, pi pendingTools
+    # Map interactive-mode.ts:3611-3621/:3645-3652): the sequential
+    # start/end pairs these pins drive settle in place with every call
+    # site untouched; an end with no live start carries nil (today's
+    # append fallback). Parallel pins pass explicit distinct `id:`s.
+    def tool_end(chat, name, result, duration: nil, arguments: {}, id: @last_started_tool_call_id)
+      chat.on_agent_event({type: :tool_execution_end, tool_call: ToolCallDouble.new(id, name, arguments), result:,
                            duration:})
+    end
+
+    def next_tool_call_id
+      @tool_call_seq = (@tool_call_seq || 0) + 1
+      "call_#{@tool_call_seq}"
     end
 
     # Types +text+ into the input line and presses Enter (direct key events
@@ -5806,8 +6068,10 @@ module Tart
 
     ChunkDouble = Struct.new(:content, :thinking)
     MessageDouble = Struct.new(:role, :content, :tokens)
-    ToolCallDouble = Struct.new(:name, :arguments) do
-      def initialize(name, arguments = {})
+    # The id rides FIRST (ToolCall member order — agent/message.rb:12); the
+    # I65 D2 registry keys the pending bookkeeping by it.
+    ToolCallDouble = Struct.new(:id, :name, :arguments) do
+      def initialize(id, name, arguments = {})
         super
       end
     end

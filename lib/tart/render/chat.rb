@@ -168,6 +168,11 @@ module Tart
         # this surface's live transcript through its content seam.
         @viewport = Viewport.new
         @selection_state = Selection.new(line_reader: ->(row) { selection_line(row) })
+        # The jump pill's latched click rect (pi scrollToEndIndicatorRect,
+        # tui-alt-screen.ts:1658-1666 — latched at composite, nil whenever
+        # the pill is absent; {handle_mouse}'s indicator-first route and
+        # the {jump_pill_rect} readback read it).
+        @jump_pill_rect = nil
         # The running compaction's reason (the border-status label's key).
         @compaction_reason = nil
         # Whether the boot/new header block is on screen (the compaction
@@ -423,6 +428,13 @@ module Tart
         @mutex.synchronize { @viewport.offset }
       end
 
+      # The jump pill's click readback (pi scrollToEndIndicatorRect) —
+      # nil whenever the pill is absent (following, content fits, or the
+      # label truncates away).
+      def jump_pill_rect
+        @mutex.synchronize { @jump_pill_rect }
+      end
+
       # The kernel renderer proc: builds the fullscreen three-area widget.
       # A String result would be wrapped in TUI.status_panel by the kernel;
       # this returns the widget itself.
@@ -574,7 +586,13 @@ module Tart
             # interactive-mode.ts:3611-3621): paints on the next frame
             # while the tool runs; the finalize replaces it in place.
             call = event[:tool_call]
-            @transcript_state.enqueue_pending_tool_block(call.name, call.arguments)
+            # I65 D2: the registry keys by the call id (pi pendingTools is
+            # a Map keyed by toolCallId, interactive-mode.ts:3611-3621).
+            # The reader-guard is the details idiom below — reader-less
+            # display doubles (render_perf) stay inert, the id threads
+            # nil, and the transcript's id-less arms keep today's shape.
+            id = call.respond_to?(:id) ? call.id : nil
+            @transcript_state.enqueue_pending_tool_block(id, call.name, call.arguments)
           when :tool_execution_end
             @tool = nil
             call = event[:tool_call]
@@ -587,7 +605,8 @@ module Tart
             # guard keeps the recorded ToolCall-shape doubles without the
             # member inert; the rest the generic ⎿ line).
             # No live pending (the replay path) falls back to the append.
-            @transcript_state.finalize_tool_block(call.name, call.arguments, event[:result], event[:duration],
+            id = call.respond_to?(:id) ? call.id : nil
+            @transcript_state.finalize_tool_block(id, call.name, call.arguments, event[:result], event[:duration],
                                                   details: call.respond_to?(:details) ? call.details : nil)
           when :compaction_start
             # The frozen I12 contract (Agent::Loop#run_compaction, after
@@ -1376,6 +1395,7 @@ module Tart
       # viewport state + geometry) and threaded into the selection.
       def handle_mouse(event)
         return menu_mouse(event) if @menu
+        return consume_jump_pill(event) if jump_pill_hit?(event)
         return wheel(event) if event.scroll?
         return unless event.left?
 
@@ -1384,6 +1404,26 @@ module Tart
         when "drag" then @selection_state.drag(content_point(event.y, event.x))
         when "up" then @selection_state.release(content_point(event.y, event.x))
         end
+      end
+
+      # The jump pill's click (pi handleScrollToEndIndicatorMouseEvent,
+      # tui-alt-screen.ts:1037-1044, checked FIRST in the SGR mouse route
+      # :940 — before scrollbar and selection): a plain left PRESS inside
+      # the latched rect ({jump_pill_hit?} — event.y === rect.row,
+      # rect.column <= event.x < rect.column + rect.width) is CONSUMED →
+      # scrollToBottom (:497-510) → {Viewport#scroll_to_end} (pi
+      # scroll-view.ts:177-187 — the offset pins to max, follow re-arms,
+      # scrollbar activity marks iff the offset moved — the epoch arms
+      # the hide timer) + one render.
+      def jump_pill_hit?(event)
+        rect = @jump_pill_rect
+        event.left? && event.kind == "down" && rect &&
+          event.y == rect[:row] && event.x >= rect[:column] && event.x < rect[:column] + rect[:width]
+      end
+
+      def consume_jump_pill(_event)
+        mark_scrollbar_activity(@viewport.scroll_to_end(display_lines.size, transcript_area_rows))
+        @kernel.request_draw
       end
 
       # The open menu's click-to-select (pi: mouse events route to the
@@ -1661,7 +1701,8 @@ module Tart
         window = @viewport.window(lines, rows).map.with_index do |line, i|
           @selection_state.highlight_row(line, @viewport.offset + i)
         end
-        if @viewport.scrollbar_visible?(lines, rows)
+        rail_visible = @viewport.scrollbar_visible?(lines, rows)
+        if rail_visible
           glyphs = @viewport.scrollbar_glyphs(lines.size, rows)
           window = window.map.with_index { |line, i| @viewport.overlay_rail_cell(line, glyphs[i], width) }
         end
@@ -1669,7 +1710,86 @@ module Tart
         # land over the finished screen from row 0, right-aligned —
         # row 0 is the transcript area's first row.
         window[0] = flash_row(window[0], width) if @flash && window[0]
+        # pi's jump pill composites over the FINISHED window (pi's order:
+        # the indicator lands after the rail — compositeScrollToEndIndicator
+        # tui-alt-screen.ts:1638-1667); the click rect latches for the
+        # mouse (nil whenever the pill is absent).
+        @jump_pill_rect = compose_jump_pill(window, width, rows, rail_visible)
         TUI.paragraph(text: window, wrap: false)
+      end
+
+      # The jump-to-bottom pill (pi compositeScrollToEndIndicator,
+      # tui-alt-screen.ts:1638-1667): composites while the viewport is
+      # DETACHED from the end (`scrollView.followEnd &&
+      # !scrollView.isFollowingEnd`) — never while following, and never
+      # when the content fits (a fitting view re-arms follow by
+      # construction, {Viewport#window}'s rule). Row = the transcript
+      # area's LAST row; the label centers floor; while the rail is
+      # visible the label truncates LEFT of the rail column (rightEdge =
+      # scrollbarColumn — the left part kept; zero available width → no
+      # pill). Returns the click rect {row:, column:, width:} or nil.
+      # The shortcut segment is OMITTED (itemized deviation: tart has NO
+      # tui.altScreen.bottom analog — the transcript is wheel-only since
+      # I35; no keybinding is invented).
+      def compose_jump_pill(window, width, rows, rail_visible)
+        return nil if @viewport.following?
+
+        label = " ↓ Jump to latest message " # pi tui-renderer.ts:30-34, shortcut segment omitted
+        column = (width - TUI.text_width(label)) / 2 # floor (pi :1654-1656)
+        return nil if column.negative?
+
+        if rail_visible
+          available = width - 1 - column # rightEdge = the scrollbar column (pi :1650-1652)
+          return nil if available <= 0
+
+          label = Text.take_cells(label, available)
+        end
+        row = window[rows - 1]
+        return nil unless row
+
+        window[rows - 1] = pill_row(row, column, label)
+        {row: rows - 1, column:, width: TUI.text_width(label)}
+      end
+
+      # The pill's cell-level composite (pi compositeTuiLine, tui.ts
+      # :426-452): the overlay's cells REPLACE the row's across
+      # [column, column + label width); cells before/after keep their own
+      # styles. The row walks span-wise into per-cell graphemes, the
+      # overlay range is overwritten, and the cells re-group into spans —
+      # each group re-emits under its own span's style, the pill under
+      # text fg / selected_bg (tui-renderer.ts:30-34), blanks under none.
+      def pill_row(line, column, label)
+        cells = []
+        line.spans.each do |span|
+          span.content.each_char do |ch|
+            cells << [ch, span]
+            (TUI.text_width(ch) - 1).times { cells << [nil, span] }
+          end
+        end
+        cells.concat([[" ", :blank]] * ([viewport_width - cells.size, 0].max))
+        label.each_char.with_index { |ch, i| cells[column + i] = [ch, :pill] }
+        spans = []
+        group = nil
+        cells.each do |ch, owner|
+          if group && owner.equal?(group[0])
+            group[1] << ch unless ch.nil?
+          else
+            spans << pill_group_span(group[0], group[1]) if group
+            group = [owner, ch ? +"#{ch}" : +""]
+          end
+        end
+        spans << pill_group_span(group[0], group[1]) if group
+        TUI.line(spans)
+      end
+
+      # One re-grouped cell run's span: the pill's own SGR, the screen's
+      # blanks unstyled, the row's neighbors under their own span's style.
+      def pill_group_span(owner, content)
+        case owner
+        when :pill then TUI.span(content, fg: Theme[:text], bg: Theme[:selected_bg])
+        when :blank then TUI.span(content)
+        else TUI.span(content, fg: owner.style&.fg, bg: owner.style&.bg, modifiers: owner.style&.modifiers.to_a)
+        end
       end
 
       # The footer's widget with the selection highlight over its rows
