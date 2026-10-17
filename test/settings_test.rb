@@ -171,21 +171,23 @@ module Tart
       write_settings(@user_path,
         '{"defaultModel": "m-file", "defaultProvider": "p-file", "apiBase": "https://file.example", "apiKey": "file-key"}')
 
-      assert_equal "m-file", Settings.resolve_setting("defaultModel", load_settings.settings)
+      # I69: the PI_* literals ride an EXPLICIT pi identity — the pin tests
+      # the pi-parity opt-in's env tier, not the (now tart) default.
+      assert_equal "m-file", Settings.resolve_setting("defaultModel", load_settings.settings, identity: "pi")
       ENV["PI_MODEL"] = "m-env"
-      assert_equal "m-env", Settings.resolve_setting("defaultModel", load_settings.settings)
+      assert_equal "m-env", Settings.resolve_setting("defaultModel", load_settings.settings, identity: "pi")
 
-      assert_equal "p-file", Settings.resolve_setting("defaultProvider", load_settings.settings)
+      assert_equal "p-file", Settings.resolve_setting("defaultProvider", load_settings.settings, identity: "pi")
       ENV["PI_PROVIDER"] = "p-env"
-      assert_equal "p-env", Settings.resolve_setting("defaultProvider", load_settings.settings)
+      assert_equal "p-env", Settings.resolve_setting("defaultProvider", load_settings.settings, identity: "pi")
 
-      assert_equal "https://file.example", Settings.resolve_setting("apiBase", load_settings.settings)
+      assert_equal "https://file.example", Settings.resolve_setting("apiBase", load_settings.settings, identity: "pi")
       ENV["PI_API_BASE"] = "https://env.example"
-      assert_equal "https://env.example", Settings.resolve_setting("apiBase", load_settings.settings)
+      assert_equal "https://env.example", Settings.resolve_setting("apiBase", load_settings.settings, identity: "pi")
 
-      assert_equal "file-key", Settings.resolve_setting("apiKey", load_settings.settings)
+      assert_equal "file-key", Settings.resolve_setting("apiKey", load_settings.settings, identity: "pi")
       ENV["PI_API_KEY"] = "env-key"
-      assert_equal "env-key", Settings.resolve_setting("apiKey", load_settings.settings)
+      assert_equal "env-key", Settings.resolve_setting("apiKey", load_settings.settings, identity: "pi")
     end
 
     # The namespace follows the identity (owner ruling 3): pi reads PI_,
@@ -205,11 +207,14 @@ module Tart
     # table; any non-empty value names a face ---
 
     def test_identity_resolves_cli_over_env_over_settings_over_default
-      assert_equal "pi", Identity.resolve(settings: {}, env: {}), "no config → the default"
-      assert_equal "tart", Identity.resolve(settings: {"identity" => "tart"}, env: {}), "settings row"
+      # Owner ruling 2026-10-17: the default face is tart (I69); "pi" is
+      # the explicit pi-parity opt-in. The rest of the precedence table is
+      # byte-unchanged.
+      assert_equal "tart", Identity.resolve(settings: {}, env: {}), "no config → the default"
+      assert_equal "pi", Identity.resolve(settings: {"identity" => "pi"}, env: {}), "a settings pi row opts into pi-parity"
       assert_equal "tart", Identity.resolve(settings: {"identity" => "pi"}, env: {"TART_IDENTITY" => "tart"}),
         "env over settings"
-      assert_equal "pi", Identity.resolve(cli: "pi", settings: {"identity" => "tart"}, env: {"TART_IDENTITY" => "tart"}),
+      assert_equal "my-face", Identity.resolve(cli: "my-face", settings: {"identity" => "pi"}, env: {"TART_IDENTITY" => "tart"}),
         "CLI over everything"
     end
 
@@ -226,7 +231,7 @@ module Tart
 
     def test_settings_layer_defaults_the_identity_key
       assert_equal Identity::DEFAULT, load_settings.settings["identity"],
-        "the identity key rides Settings::DEFAULTS (no unknown-key warning, the pi default)"
+        "the identity key rides Settings::DEFAULTS (no unknown-key warning, the tart default)"
       write_settings(@user_path, '{"identity": "tart"}')
       assert_equal "tart", load_settings.settings["identity"]
       assert load_settings.diagnostics.none? { |d| d.message.include?("identity") },
@@ -285,13 +290,15 @@ module Tart
       # declared window (the placeholder's zero reads as nil on the view).
       windowless = wire_model("accounts/fireworks/models/glm-5p3-flash")
 
-      assert_equal 9, Settings.resolve_context_window(explicit: 9, model:)
+      assert_equal 9, Settings.resolve_context_window(explicit: 9, model:, identity: "pi")
+      # I69: the PI_* env tier rides an EXPLICIT pi identity (the default
+      # resolved tart — the pin tests the pi-parity opt-in's tier).
       ENV["PI_CONTEXT_WINDOW"] = "99"
-      assert_equal 99, Settings.resolve_context_window(model:)
+      assert_equal 99, Settings.resolve_context_window(model:, identity: "pi")
       ENV.delete("PI_CONTEXT_WINDOW")
-      assert_equal 5000, Settings.resolve_context_window(model:)
-      assert_equal 1_048_573, Settings.resolve_context_window(model: windowless)
-      assert_nil Settings.resolve_context_window(model: wire_model("unknown-model"))
+      assert_equal 5000, Settings.resolve_context_window(model:, identity: "pi")
+      assert_equal 1_048_573, Settings.resolve_context_window(model: windowless, identity: "pi")
+      assert_nil Settings.resolve_context_window(model: wire_model("unknown-model"), identity: "pi")
 
       write_settings(@project_path, '{"contextWindow": 12345}')
       assert_equal 12_345, Settings.resolve_context_window(settings: load_settings.settings, model: windowless)
@@ -559,11 +566,11 @@ module Tart
 
       ["abc", "-5", "+5", " 5", "5.5", ""].each do |junk|
         ENV["PI_CONTEXT_WINDOW"] = junk
-        assert_equal 5000, Settings.resolve_context_window(model:), "env #{junk.inspect} falls through"
+        assert_equal 5000, Settings.resolve_context_window(model:, identity: "pi"), "env #{junk.inspect} falls through"
       end
 
       ENV["PI_CONTEXT_WINDOW"] = "007"
-      assert_equal 7, Settings.resolve_context_window(model:), "a digit-string coerces (leading zeros included)"
+      assert_equal 7, Settings.resolve_context_window(model:, identity: "pi"), "a digit-string coerces (leading zeros included)"
       ENV.delete("PI_CONTEXT_WINDOW")
 
       [0, -1, "5", 5.5].each do |junk|

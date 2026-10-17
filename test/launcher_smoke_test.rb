@@ -111,7 +111,7 @@ module Tart
         client: Fast::Completions::Client.new(base_url: "http://localhost:1/v1", api_key: "k"),
         model_id: "assumed-mapless-reasoner", provider_key: "openai")
 
-      data = Executable.footer_data("/somewhere", settings, chat: chat)
+      data = Executable.footer_data("/somewhere", settings, chat: chat, identity: "pi")
       assert_equal "high", data[:thinking_level],
         "the boot level clamps through the map-less rule (no known map for the id)"
       assert_equal "xhigh", data[:default_thinking_level], "the badge source stays unclamped"
@@ -233,6 +233,42 @@ module Tart
       FileUtils.rm_rf(home)
     end
 
+    # I69 new pin (owner ruling 2026-10-17): the DEFAULT-mode real boot —
+    # no TART_IDENTITY staged, TART_* env only — resolves tart and reaches
+    # the wire with the tart preamble and the TART_* namespace bullet.
+    def test_default_mode_boot_speaks_the_tart_preamble_and_tart_namespace
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "ok"}])
+      home = Dir.mktmpdir("tart-default-boot-")
+      # The staged env carries ONLY the default-mode keys: TART_API_KEY /
+      # TART_API_BASE name the mock (the resolved tart identity's
+      # namespace); every identity-ish env tier is nil-scrubbed so nothing
+      # rides the parent (a herdr pane's TART_IDENTITY must not leak in).
+      stdout, stderr, status = Open3.capture3(
+        {"PATH" => ENV.fetch("PATH", nil), "HOME" => home,
+         "TART_MCP_CONFIG" => File.join(home, "absent-mcp.json"),
+         "TART_API_KEY" => "default-key", "TART_API_BASE" => server.url,
+         "TART_IDENTITY" => nil, "TART_MODEL" => nil, "TART_PROVIDER" => nil,
+         "TART_CONTEXT_WINDOW" => nil, "TART_MODEL_REASONING" => nil,
+         "PI_MODEL" => nil, "PI_PROVIDER" => nil, "PI_API_KEY" => nil,
+         "PI_API_BASE" => nil, "PI_CONTEXT_WINDOW" => nil, "PI_MODEL_REASONING" => nil},
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "hello",
+        chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "the default-mode boot runs (stderr: #{stderr})"
+      system_message = server.captured_request_logs.first.fetch(:body)
+        .fetch("messages").first.fetch("content")
+      assert_includes system_message, "operating inside tart, a coding agent harness",
+        "the default identity's preamble"
+      assert_includes system_message, "You can inspect TART_* environment variables",
+        "the env namespace follows the resolved default"
+      refute_includes system_message, "You can inspect PI_* environment variables",
+        "no pi namespace leaks into the default boot"
+    ensure
+      server.stop
+      FileUtils.rm_rf(home)
+    end
+
     # AC1's foo smoke, end to end: the free-form identity boots print mode
     # through its OWN namespace (FOO_API_KEY/FOO_API_BASE) and the request
     # carries the foo-named preamble and the FOO_* env-rule bullet.
@@ -262,6 +298,9 @@ module Tart
       {
         "PATH" => ENV.fetch("PATH", nil),
         "HOME" => home,
+        # I69 move: the real-boot pins test the PI_-parity opt-in — stage
+        # the identity EXPLICITLY so the (now tart) default never rides.
+        "TART_IDENTITY" => "pi",
         "PI_API_KEY" => "smoke-key",
         "PI_API_BASE" => server.url,
         "TART_MCP_CONFIG" => File.join(home, "absent-mcp.json")
@@ -353,8 +392,11 @@ module Tart
       # The boot's env tier outranks the staged catalog (PI_MODEL/PI_PROVIDER
       # name a boot pair without an entry) — neutralize the boot-relevant
       # PI_* tiers exactly like the frozen footer-window gate's env-strip
-      # prefix; restored in ensure.
-      pi_keys = %w[PI_MODEL PI_PROVIDER PI_CONTEXT_WINDOW PI_MODEL_REASONING PI_API_KEY PI_API_BASE]
+      # prefix; restored in ensure. I69 move: the scrub gains the TART_*
+      # model-shaping keys (the RESOLVED DEFAULT identity reads TART_* —
+      # the frozen gate's prefix carries both families).
+      pi_keys = %w[PI_MODEL PI_PROVIDER PI_CONTEXT_WINDOW PI_MODEL_REASONING PI_API_KEY PI_API_BASE
+        TART_MODEL TART_PROVIDER TART_CONTEXT_WINDOW TART_MODEL_REASONING TART_API_KEY TART_API_BASE]
       saved_env = pi_keys.to_h { |key| [key, ENV[key]] }
       home = nil
       pi_keys.each { |key| ENV.delete(key) }
@@ -387,7 +429,9 @@ module Tart
       legacy = Executable.footer_data("/somewhere", settings, chat: chat)
       assert_nil legacy[:context_window], "entry nil without a catalog — the legacy shape"
 
-      ENV["PI_CONTEXT_WINDOW"] = "999"
+      # I69 move: the env tier rides the RESOLVED DEFAULT identity's key
+      # (tart → TART_CONTEXT_WINDOW; pre-flip the default was pi).
+      ENV["TART_CONTEXT_WINDOW"] = "999"
       data = Executable.footer_data(home, settings, boot:, chat:, identity: Identity::DEFAULT,
                                     models:, resolved:)
       assert_equal 999, data[:context_window], "the env tier still wins over the entry"

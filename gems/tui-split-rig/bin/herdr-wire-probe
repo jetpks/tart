@@ -1,0 +1,178 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# herdr-wire-probe — the I69 live herdr GATE (AC2's live leg).
+#
+# Drives ONE tart boot through TuiSplitRig::Runner (app: "tart", runs: 1,
+# a Hash-built Scenario — the render-perf-probe precedent, NO yaml file,
+# NO scenario-content edit) staging env.tart TART_IDENTITY=tart +
+# HERDR_ENV=1 + HERDR_SOCKET_PATH + HERDR_PANE_ID, against a fake herdr
+# UNIX-socket listener in --out DIR (the tmp/probe-herdr/listener.rb
+# pattern: accept-loop thread, one log line per request, reply one byte).
+# The scripted prompt runs one mock turn; after the settle a bounded
+# post-settle wait (≤ ~5 s) covers the final idle report's delivery race.
+# Then the RECEIVED bytes are asserted:
+#
+#   - every pane.report_agent / pane.report_agent_session carries
+#     source == "tart" AND agent == "tart" (never a "herdr:" source
+#     prefix — the reserved native pair herdr gauntlet-drops,
+#     detect/mod.rs:330-348);
+#   - every seq sits in pi's Date.now()*1000 class (>= 10^15) and the
+#     seqs are strictly increasing in arrival order;
+#   - the state ladder is idle (the forced session_start publish) →
+#     working (agent_start) → idle (agent_end) across the mock turn;
+#   - every ref-carrying report carries
+#     resume_argv == ["tart", "-r", <that report's agent_session_id or
+#     path>].
+#
+#   herdr-wire-probe [--out DIR]
+#
+# On pass prints HERDR_WIRE_OK and exits 0; otherwise the failing line
+# and exit 1. Stdlib only — runs without Bundler. The caller strips the
+# parent session's HERDR_* vars (the frozen gate command carries the
+# env -u prefix); this bin additionally scrubs them from its own ENV so
+# a direct run inside a herdr pane never dials the REAL owner socket.
+
+require "fileutils"
+require "json"
+require "optparse"
+require "socket"
+
+require_relative "../lib/tui_split_rig"
+
+options = {out: "tmp/herdr-wire-probe-#{Time.now.to_i}"}
+parser = OptionParser.new do |p|
+  p.on("--out DIR", "output directory (default tmp/herdr-wire-probe-<ts>)") { |d| options[:out] = d }
+end
+parser.parse!(ARGV)
+
+# HERDR discipline (this repo's sessions run inside herdr panes): the
+# probe's OWN process env must not leak the owner's pane coordinates —
+# the staged env below is the only herdr config the booted tart sees.
+ENV.keys.grep(/\AHERDR_/).each { |key| ENV.delete(key) }
+
+stage = File.expand_path(options[:out])
+FileUtils.mkdir_p(stage)
+sock_path = File.join(stage, "herdr.sock")
+File.unlink(sock_path) if File.exist?(sock_path)
+received_path = File.join(stage, "received.log")
+
+# The fake herdr listener (tmp/probe-herdr/listener.rb pattern): an
+# accept-loop thread, one log line per newline-terminated request, reply
+# one byte (ANY received byte = delivered on tart's side).
+listener = Thread.new do
+  server = UNIXServer.new(sock_path)
+  loop do
+    client = server.accept
+    Thread.new(client) do |io|
+      while (line = io.gets)
+        File.open(received_path, "a") { |log| log.puts(line.chomp) }
+        io.write("1")
+      end
+    rescue StandardError
+      nil
+    ensure
+      begin
+        io.close
+      rescue StandardError
+        nil
+      end
+    end
+  end
+rescue StandardError
+  nil
+end
+sleep 0.1 # the socket file lands before the pane env stages it
+
+# The Hash-built Scenario (render-perf-probe precedent): one tart boot,
+# one mock turn, the herdr staging. The responses field is the mock's
+# real script (a single reply — expected_requests 1).
+scenario = TuiSplitRig::Scenario.new("herdr-wire-probe", {
+  "name" => "herdr-wire-probe",
+  "prompt" => "hello",
+  "expected_requests" => 1,
+  "responses" => [{"type" => "stream", "content" => "ok"}],
+  "env" => {"tart" => {
+    "TART_IDENTITY" => "tart",
+    "HERDR_ENV" => "1",
+    "HERDR_SOCKET_PATH" => sock_path,
+    "HERDR_PANE_ID" => "herdr-wire-probe-1"
+  }}
+})
+runner = TuiSplitRig::Runner.new(scenario: scenario, runs: 1, app: "tart", out: File.join(stage, "unused"))
+
+mock = MockLLMServer.new.script(scenario.responses).start
+session = nil
+begin
+  mock.rearm!
+  boot = runner.boot_session("tart", mock, 1, stage)
+  session = boot.fetch(:session)
+  runner.settle(session, "boot")
+  system("tmux", "send-keys", "-t", session, scenario.prompt, "Enter") or raise "send-keys failed"
+  runner.settle(session, "turn")
+
+  # The bounded post-settle wait: the final idle report races the settle
+  # loop's exit — poll the log up to ~5 s for the full 5-report ladder
+  # (session, idle, session, working, idle), then take what arrived.
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5.0
+  lines = []
+  loop do
+    lines = File.exist?(received_path) ? File.readlines(received_path).map(&:chomp).reject(&:empty?) : []
+    break if lines.size >= 5 || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+    sleep 0.1
+  end
+
+  # ---- the received-bytes asserts ----
+  fail = lambda do |msg|
+    puts "HERDR_WIRE_FAIL: #{msg}"
+    puts "received #{lines.size} report(s) at #{received_path}:"
+    lines.each { |line| puts "  #{line}" }
+    exit 1
+  end
+
+  fail.call("no reports received") if lines.empty?
+
+  reports = lines.map do |line|
+    (JSON.parse(line) rescue nil) || fail.call("unparseable report line: #{line.inspect}")
+  end
+  reports.each do |request|
+    method = request["method"]
+    fail.call("unexpected method: #{method.inspect}") unless method == "pane.report_agent" || method == "pane.report_agent_session"
+    params = request.fetch("params")
+    fail.call("#{method}: source #{params["source"].inspect}, want \"tart\"") unless params["source"] == "tart"
+    fail.call("#{method}: agent #{params["agent"].inspect}, want \"tart\"") unless params["agent"] == "tart"
+    fail.call("#{method}: herdr: source prefix leaked: #{params["source"].inspect}") if params["source"].start_with?("herdr:")
+    fail.call("#{method}: herdr: id prefix leaked: #{request["id"].inspect}") if request["id"].start_with?("herdr:")
+  end
+
+  seqs = reports.map { |r| r.fetch("params").fetch("seq") }
+  fail.call("seq #{seqs.min} below the 10^15 class (want the Date.now()*1000 scale)") if seqs.min < 1_000_000_000_000_000
+  fail.call("seqs not strictly increasing in arrival order: #{seqs.inspect}") unless seqs.each_cons(2).all? { |a, b| b > a }
+
+  states = reports.select { |r| r["method"] == "pane.report_agent" }.map { |r| r["params"]["state"] }
+  fail.call("state ladder #{states.inspect}, want [idle, working, idle] (forced session_start publish → agent_start → agent_end)") unless states == %w[idle working idle]
+
+  reports.each do |request|
+    params = request["params"]
+    id = params["agent_session_id"]
+    path = params["agent_session_path"]
+    next if id.nil? && path.nil?
+
+    want = ["tart", "-r", id || path]
+    fail.call("#{request["method"]}: resume_argv #{params["resume_argv"].inspect}, want #{want.inspect} (id #{id.inspect} path #{path.inspect})") unless params["resume_argv"] == want
+  end
+
+  # The received-bytes digest (the log lines, one per report).
+  puts "herdr-wire-probe received #{reports.size} report(s):"
+  reports.each do |request|
+    params = request["params"]
+    puts format("  %s seq=%d state=%s source=%s agent=%s resume_argv=%s",
+      request["method"], params["seq"], params["state"].to_s, params["source"], params["agent"],
+      params["resume_argv"].to_s)
+  end
+ensure
+  mock.stop
+  runner.teardown(session) if session
+end
+
+puts "HERDR_WIRE_OK"

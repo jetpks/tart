@@ -209,18 +209,21 @@ module Tart
       Settings::DEFAULTS.merge("defaultModel" => "settings-model", "defaultProvider" => "settings-provider")
     end
 
+    # I69: the PI_* env-tier legs ride an EXPLICIT pi identity — the pins
+    # test the pi-parity opt-in's env tier, not the (now tart) default.
     def test_boot_resolves_env_over_all
-      boot = Models.resolve_boot_model(catalog, settings, env: {"PI_MODEL" => "m-env", "PI_PROVIDER" => "p-env"})
+      boot = Models.resolve_boot_model(catalog, settings, identity: "pi",
+        env: {"PI_MODEL" => "m-env", "PI_PROVIDER" => "p-env"})
       assert_equal ({provider: "p-env", id: "m-env"}), boot.to_h
     end
 
     def test_boot_env_model_alone_keeps_the_settings_provider
-      boot = Models.resolve_boot_model(catalog, settings, env: {"PI_MODEL" => "m-env"})
+      boot = Models.resolve_boot_model(catalog, settings, identity: "pi", env: {"PI_MODEL" => "m-env"})
       assert_equal ({provider: "settings-provider", id: "m-env"}), boot.to_h
     end
 
     def test_boot_env_provider_alone_keeps_the_settings_model
-      boot = Models.resolve_boot_model(catalog, settings, env: {"PI_PROVIDER" => "p-env"})
+      boot = Models.resolve_boot_model(catalog, settings, identity: "pi", env: {"PI_PROVIDER" => "p-env"})
       assert_equal ({provider: "p-env", id: "settings-model"}), boot.to_h
     end
 

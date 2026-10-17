@@ -17,12 +17,18 @@ module Tart
   # embedded strings): newline-terminated JSON request over the UNIX
   # socket; ANY received byte = delivered; error/EOF/timeout =
   # undelivered; one attempt then ONE retry; all failures swallowed. The
-  # wire values stay pi's (source "herdr:pi", agent "pi" — OQ-5: the
-  # identity seam is presentation-only and herdr has no tart key; identical
-  # bytes keep the owner's panes working).
+  # wire values are tart's OWN name (source "tart", agent "tart") — the
+  # GENERIC first-class interface herdr actually accepts (the owner
+  # ruling 2026-10-17 reversing OQ-5: the old "identical bytes" source
+  # "herdr:pi"/agent "pi" pair is a RESERVED native integration
+  # (repos/herdr/src/detect/mod.rs:330-348 full_lifecycle_hook_authority)
+  # routed through a trust gauntlet a foreign reporter cannot pass
+  # (repos/herdr/src/terminal/state.rs:931) — every report was silently
+  # DROPPED. Live-proven: source "tart"/agent "tart" lights the pane up.
+  # Cite: notes/plan-20261017T183001Z-tart-standalone.md ENTRY 1.
   module Herdr
-    SOURCE = "herdr:pi"
-    AGENT = "pi"
+    SOURCE = "tart"
+    AGENT = "tart"
 
     module_function
 
@@ -147,10 +153,12 @@ module Tart
         @state_slot = nil
         @last_state = nil
         @last_message = nil
-        # pi: reportSeq starts at Date.now() * 1000, +1 per report,
-        # monotonic across the process (the Spec's Time.now.to_i * 1000
-        # base).
-        @seq = Time.now.to_i * 1000
+        # pi's v9: reportSeq starts at Date.now() * 1000, +1 per report,
+        # monotonic across the process (epoch-ms × 1000 ≈ 1.79×10¹⁵ — the
+        # pre-I69 Time.now.to_i * 1000 base was the wrong ~10¹² scale; herdr's
+        # hook_report_is_newer is per-source, and the fresh "tart" source
+        # starts clean).
+        @seq = epoch_ms * 1000
         @sender = Thread.new { drain_loop }
       end
 
@@ -164,6 +172,13 @@ module Tart
         params["session_start_source"] = reason if reason
         params["agent_session_path"] = session_ref["agent_session_path"] if session_ref["agent_session_path"]
         params["agent_session_id"] = session_ref["agent_session_id"] if session_ref["agent_session_id"]
+        # The resume command rides EVERY session-ref report (docs/
+        # socket-api.mdx:692 + panes.rs report_agent_resume — herdr holds
+        # the pane via the state report and keeps the command while the
+        # same source+agent hold it).
+        if (argv = resume_argv_for(session_ref))
+          params["resume_argv"] = argv
+        end
         request = {
           "id" => "#{SOURCE}:session:#{epoch_ms}:#{rand36}",
           "method" => "pane.report_agent_session",
@@ -190,6 +205,7 @@ module Tart
           if session_ref.is_a?(Hash)
             params["agent_session_path"] = session_ref["agent_session_path"] if session_ref["agent_session_path"]
             params["agent_session_id"] = session_ref["agent_session_id"] if session_ref["agent_session_id"]
+            params["resume_argv"] = resume_argv_for(session_ref) if resume_argv_for(session_ref)
           end
           @last_state = state
           @last_message = message
@@ -250,6 +266,25 @@ module Tart
 
       def next_seq
         @seq += 1
+      end
+
+      # herdr's resume_argv validation predicate (add-herdr-support.mdx +
+      # docs/socket-api.mdx:692 + src/app/api/panes.rs:1561/:1603 —
+      # validate_optional_resume_argv runs BEFORE the state event in BOTH
+      # handlers, so an invalid argv fails the WHOLE report): the first
+      # element a PLAIN command name on PATH ("tart" — never a path), ≤64
+      # elements / ≤8KiB total (the 3-element shape trivially satisfies
+      # both), and NO element may carry an apostrophe or a control
+      # character. The ref's agent_session_id wins over agent_session_path
+      # (bin/tart -r accepts either); a ref with neither — or any element
+      # failing the predicate — attaches NOTHING (a poisoned argv must
+      # never kill a state report).
+      def resume_argv_for(session_ref)
+        target = session_ref["agent_session_id"] || session_ref["agent_session_path"]
+        return nil unless target.is_a?(String) && !target.empty?
+
+        argv = ["tart", "-r", target]
+        argv.none? { |element| element.include?("'") || element.match?(/[[:cntrl:]]/) } ? argv : nil
       end
 
       def epoch_ms

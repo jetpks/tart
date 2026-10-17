@@ -19,6 +19,29 @@ module Tart
       refute_includes wordmark_line("foo"), "tart v", "no tart wordmark leaks into the foo header"
     end
 
+    # I69 new pin (owner ruling 2026-10-17): the RESOLVED DEFAULT face is
+    # the tart family — the chat dispatch (render/chat.rb:829) sends the
+    # default down the tart_header_lines branch, under Tart::VERSION,
+    # never the oracle version.
+    def test_the_resolved_default_face_is_the_tart_family
+      id = Identity.resolve(settings: {}, env: {})
+      assert_equal "tart", id, "the default identity (the flip)"
+      rows = id == Identity::PI ? Render::Motd.pi_header_lines(expanded: false, width: 60)
+                               : Render::Motd.tart_header_lines(60, id, expanded: false)
+      joined = rows.map { |line| line.spans.map(&:content).join }.join("\n")
+      assert_includes joined, "tart v#{Tart::VERSION}", "the default face's tart wordmark"
+      refute_includes joined, "v#{Identity::ORACLE_VERSION}", "the oracle version never leaks into the default face"
+    end
+
+    # I69 new pin: the EXPLICIT pi-parity opt-in face stays byte-pi — the
+    # oracle version line and pi's onboarding row, untouched by the flip.
+    def test_the_explicit_pi_face_stays_byte_pi
+      rows = Render::Motd.pi_header_lines(expanded: false, width: 120)
+      joined = rows.map { |line| line.spans.map(&:content).join }.join("\n")
+      assert_includes joined, "v#{Identity::ORACLE_VERSION}", "pi-mode's logo line renders the oracle version"
+      assert_includes joined, Render::Motd::PI_ONBOARDING_LINE
+    end
+
     private
 
     # The version row's span contents joined (RatatuiRuby::Text::Line#to_s

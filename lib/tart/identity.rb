@@ -8,7 +8,9 @@ module Tart
   # resolved value, never the sources directly.
   #
   # Resolution order: CLI flag > TART_IDENTITY env > settings "identity" >
-  # default "pi". The value is FREE-FORM (owner ruling 2026-10-12): any
+  # default "tart" (owner ruling 2026-10-17 — the default face is tart;
+  # "pi" is the explicit pi-parity opt-in). The value is FREE-FORM (owner
+  # ruling 2026-10-12): any
   # non-empty string names a face — "pi" keeps pi's byte-exact rendering,
   # any other value renders the tart-family face under its own name, and
   # the env namespace follows it ({env_prefix}: pi → PI_, tart → TART_,
@@ -17,7 +19,7 @@ module Tart
   module Identity
     PI = "pi"
     TART = "tart"
-    DEFAULT = PI
+    DEFAULT = TART
     # The bootstrap knob stays launcher-owned and literally spelled
     # TART_IDENTITY: the identity key cannot depend on its own output.
     ENV_KEY = "TART_IDENTITY"

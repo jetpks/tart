@@ -421,6 +421,25 @@ module TuiSplitRig
       refute_includes command, "PI_MODEL="
     end
 
+    # I69 R3: the runner OWNS the explicit staging — an override staging a
+    # BLANK or NIL TART_IDENTITY is refused loudly (TuiSplitRig::Error
+    # naming the requirement), never composed into the pane command (a
+    # blank used to ride through as TART_IDENTITY='' with a blank
+    # model-namespace prefix and abort the boot — measured).
+    def test_blank_or_nil_staged_identity_is_refused_loudly
+      [nil, "", "   "].each do |blank|
+        error = assert_raises(TuiSplitRig::Error) do
+          data = {"name" => "x", "prompt" => "hi", "expected_requests" => 1,
+                  "responses" => [{"type" => "stream", "content" => "r"}],
+                  "env" => {"tart" => {"TART_IDENTITY" => blank}}}
+          Runner.new(scenario: Scenario.new("x", data), out: File.join(Dir.mktmpdir("tui-split-rig-blank-")))
+            .tart_command("/sandbox", "/home", 4711)
+        end
+        assert_includes error.message, "explicit non-empty identity",
+          "the refusal names the requirement (got: #{error.message})"
+      end
+    end
+
     # The parent environment's PI_*/TART_* keys are scrubbed (-u) — the
     # operator's real PI_API_KEY must not leak into a staged run — while
     # the staged keys themselves always win (never scrubbed).

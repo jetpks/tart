@@ -392,6 +392,9 @@ module Tart
       {
         "PATH" => ENV.fetch("PATH", nil),
         "HOME" => @home,
+        # I69 move: the parent boots stage the PI_-parity opt-in
+        # EXPLICITLY (the (now tart) default never rides these pins).
+        "TART_IDENTITY" => "pi",
         "PI_API_KEY" => "e2e-key",
         "PI_API_BASE" => @server.url,
         "PI_MODEL" => ROUTED_MODEL,
@@ -406,6 +409,7 @@ module Tart
       {
         "PATH" => ENV.fetch("PATH", nil),
         "HOME" => @home,
+        "TART_IDENTITY" => "pi", # I69 move: explicit pi-parity staging
         "PI_API_KEY" => "e2e-key",
         "PI_API_BASE" => @server.url,
         "PI_SUBAGENTS_HOME" => @subagents_home
