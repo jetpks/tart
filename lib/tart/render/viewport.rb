@@ -69,6 +69,27 @@ module Tart
         scroll_by(WHEEL_DIRECTION.fetch(event.kind) * lines, content_size, rows)
       end
 
+      # The follow readback (pi ScrollView.isFollowingEnd, scroll-view.ts
+      # :172): true iff follow is armed — the jump pill's trigger reads it
+      # (detached = !following? composites the indicator).
+      def following?
+        @follow
+      end
+
+      # The jump-to-end op (pi ScrollView.scrollToEnd, scroll-view.ts
+      # :177-187): the offset pins to max_offset, follow re-arms
+      # (followingEnd = followEnd), and scrollbar activity is MARKED iff
+      # the offset moved (pi marks on the jump — the pill press lights
+      # the rail). Returns {mark}'s epoch for the Chat coordinator's
+      # kernel arm; nil on a no-op.
+      def scroll_to_end(content_size, rows)
+        max_offset = [content_size - rows, 0].max
+        previous = @offset
+        @offset = max_offset
+        @follow = true
+        mark if @offset != previous
+      end
+
       # Whether +epoch+'s hide timer is retired (a newer mark superseded
       # it — the armed block's pi clearTimeout analog).
       def stale?(epoch)
@@ -119,19 +140,45 @@ module Tart
       end
 
       # One rail row (pi paintScrollbar layout.ts:307-330 via
-      # replaceScrollbarCell): the glyph REPLACES the last column's cell —
-      # content clips at width−1, plain padding spaces carry it to the
-      # rail column, the glyph keeps its theme fg (grafted from
-      # {scrollbar_glyphs}' own span — scrollbarTrack/scrollbarThumb).
-      # pi's hover-driven active thumb `█` (setScrollbarActive,
-      # tui-alt-screen.ts:1057-1065) has no port seam and is unreachable
-      # in the rig — cut, itemized; the at-rest `┃` is the reachable
-      # subset.
+      # replaceScrollbarCell :249-278 with preserveTargetBackground — TRUE
+      # for the auto rail): the glyph REPLACES the last column's cell, and
+      # BOTH the pad span and the glyph span carry the TARGET bg —
+      # getActiveBackgroundAnsi (utils.ts:786-790): the underlying cell's
+      # active background re-applied after the segment reset; the glyph
+      # keeps its own theme fg (grafted from {scrollbar_glyphs}' own span
+      # — scrollbarTrack/scrollbarThumb). The target bg is the original
+      # line's span whose cell range covers column width−1; when no span
+      # reaches that column the line's own bg provenance stands (the last
+      # bg-carrying span — a short-content panel row's pad carries the
+      # panel bg too, the owner's letter); nil when the line carries no bg
+      # at all — a plain row keeps today's neutral look, the fix never
+      # invents a bg. pi's hover-driven active thumb `█`
+      # (setScrollbarActive, tui-alt-screen.ts:1057-1065) has no port seam
+      # and is unreachable in the rig — cut, itemized; the at-rest `┃` is
+      # the reachable subset.
+      #
+      # The clip is a span-level walk mirroring Text.take_cells'
+      # discipline (text.rb:252-260 — widths stay additive): a wide
+      # grapheme straddling the width−1 bound is REPLACED WHOLE (pi
+      # getGraphemeCellRange utils.ts:335-352 — the head clips at the
+      # straddler's start cell, the straddler does not survive), so the
+      # composed line is EXACTLY width cells, never width+1. The walk
+      # lives here because lib/tart/render/text.rb is out of the touch
+      # set — fit's force-progress arm (:243) is load-bearing for the
+      # wrap loop.
       def overlay_rail_cell(line, glyph, width)
-        head = Text.clip_spans(line.spans, width - 1)
-        pad = width - 1 - head.sum { |span| TUI.text_width(span.content) }
-        spans = pad.positive? ? [*head, TUI.span(" " * pad)] : head
-        TUI.line([*spans, glyph.spans.first])
+        rail_col = width - 1
+        head, used, target_bg = clip_before_rail(line.spans, rail_col)
+        pad = rail_col - used
+        spans = pad.positive? ? [*head, TUI.span(" " * pad, bg: target_bg)] : head
+        glyph_span = glyph.spans.first
+        glyph_out = if target_bg
+          TUI.span(glyph_span.content, fg: glyph_span.style&.fg, bg: target_bg,
+            modifiers: glyph_span.style&.modifiers.to_a)
+        else
+          glyph_span
+        end
+        TUI.line([*spans, glyph_out])
       end
 
       # The right-gutter scrollbar (pi layout.ts:307-330 paintScrollbar:
@@ -152,6 +199,49 @@ module Tart
       end
 
       private
+
+      # The straddle-safe span-level clip behind {overlay_rail_cell}: spans
+      # emit whole while they fit before +rail_col+ (styles untouched); the
+      # FIRST span whose cell range crosses the bound clips cell-wise at
+      # its graphemes (Text.take_cells' discipline — a wide grapheme that
+      # would straddle is dropped whole, never credited partially) and
+      # names the target bg (its cell range covers the rail column); later
+      # spans are unreachable (the rail replaces the rest). With no
+      # crossing span the target bg falls back to the last bg-carrying
+      # span seen (the short-content panel row's pad — the owner's
+      # letter); a bg-less line yields nil. Returns [spans, cells_used,
+      # target_bg].
+      def clip_before_rail(spans, rail_col)
+        out = []
+        used = 0
+        target_bg = nil
+        spans.each do |span|
+          style = span.style
+          if used + TUI.text_width(span.content) <= rail_col
+            out << span
+            used += TUI.text_width(span.content)
+            target_bg = style&.bg if style&.bg
+            next
+          end
+          # The span's cell range covers the rail column — clip at the
+          # graphemes fitting before it (pi getGraphemeCellRange: the
+          # straddling grapheme widens start..end over its whole cell
+          # range and is REPLACED, so the head stops at its start cell).
+          target_bg = style&.bg
+          taken = +""
+          span.content.each_char do |ch|
+            break if TUI.text_width(taken) + TUI.text_width(ch) > rail_col - used
+
+            taken << ch
+          end
+          unless taken.empty?
+            out << TUI.span(taken, fg: style&.fg, bg: style&.bg, modifiers: style&.modifiers.to_a)
+            used += TUI.text_width(taken)
+          end
+          break
+        end
+        [out, used, target_bg]
+      end
 
       # Scrolls the transcript by +lines+ rows (pi ScrollView.scrollBy,
       # scroll-view.ts:127-135): any move away from the end detaches; the
