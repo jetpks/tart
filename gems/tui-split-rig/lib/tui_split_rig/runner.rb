@@ -532,7 +532,22 @@ module TuiSplitRig
       # AC4): the parity scenarios run tart in pi mode → PI_*; s1_tart
       # stages TART_IDENTITY=tart → TART_*. TART_IDENTITY itself stays the
       # launcher-owned bootstrap knob, always spelled literally.
-      identity = @scenario.env.fetch("tart", {}).fetch("TART_IDENTITY", "pi")
+      #
+      # I69 R3: the runner OWNS the explicit staging — the fetch default
+      # stays "pi" (no scenario path ever rides the app default, which the
+      # I69 flip turned into tart), and an override staging a BLANK or NIL
+      # identity is REFUSED LOUDLY: a blank would compose through as
+      # TART_IDENTITY='' with a blank _MODEL namespace and abort the boot
+      # (measured via the rig-identity-assert probe). Parity scenarios
+      # always carry an explicit non-empty identity.
+      tart_env = @scenario.env.fetch("tart", {})
+      if tart_env.key?("TART_IDENTITY") && (tart_env["TART_IDENTITY"].nil? || tart_env["TART_IDENTITY"].to_s.strip.empty?)
+        raise TuiSplitRig::Error,
+          "scenario env tart.TART_IDENTITY must stage an explicit non-empty identity " \
+          "(pi for the parity face, tart for the tart face) — got #{tart_env["TART_IDENTITY"].inspect}; " \
+          "a blank or nil identity must never compose into the pane command"
+      end
+      identity = tart_env["TART_IDENTITY"] || "pi"
       prefix = "#{identity.upcase}_"
       staged = staged_env("tart",
         "HOME" => home,

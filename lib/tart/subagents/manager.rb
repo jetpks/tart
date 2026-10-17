@@ -371,7 +371,13 @@ module Tart
         env = {}
         env["PATH"] = @env["PATH"] if @env["PATH"]
         env["HOME"] = @env["HOME"] if @env["HOME"]
-        env[key.("IDENTITY")] = @identity
+        # The bootstrap key rides LITERALLY TART_IDENTITY (identity.rb: the
+        # identity key cannot depend on its own output — the child's
+        # resolve_identity reads only this literal before any namespace is
+        # knowable). The pre-I69 namespaced <IDENTITY>_IDENTITY write was a
+        # dead key nothing read — it only worked while DEFAULT was "pi";
+        # the I69 flip exposed it (the child clean-aborted on TART_API_KEY).
+        env[Identity::ENV_KEY] = @identity
         api_key = @env[key.("API_KEY")] || @endpoint&.dig(:api_key) || @endpoint&.dig("api_key")
         env[key.("API_KEY")] = api_key if api_key
         api_base = @env[key.("API_BASE")] || @endpoint&.dig(:api_base) || @endpoint&.dig("api_base")

@@ -200,12 +200,15 @@ module Tart
       settings = Settings::DEFAULTS.merge("defaultModel" => "settings-model", "defaultProvider" => "settings-provider")
       empty = Models::Config.new(providers: {}, default: nil, error: nil)
 
+      # I69: the PI_* env-tier legs ride an EXPLICIT pi identity (the pin
+      # tests the pi-parity opt-in's tiers; the default resolves tart).
       assert_equal({provider: "p-env", id: "m-env"},
-        Models.resolve_boot_model(empty, settings, env: {"PI_MODEL" => "m-env", "PI_PROVIDER" => "p-env"}).to_h)
+        Models.resolve_boot_model(empty, settings, identity: "pi",
+          env: {"PI_MODEL" => "m-env", "PI_PROVIDER" => "p-env"}).to_h)
       assert_equal({provider: "settings-provider", id: "m-env"},
-        Models.resolve_boot_model(empty, settings, env: {"PI_MODEL" => "m-env"}).to_h)
+        Models.resolve_boot_model(empty, settings, identity: "pi", env: {"PI_MODEL" => "m-env"}).to_h)
       assert_equal({provider: "p-env", id: "settings-model"},
-        Models.resolve_boot_model(empty, settings, env: {"PI_PROVIDER" => "p-env"}).to_h)
+        Models.resolve_boot_model(empty, settings, identity: "pi", env: {"PI_PROVIDER" => "p-env"}).to_h)
       assert_equal({provider: "p-env2", id: "m-env2"},
         Models.resolve_boot_model(empty, settings, identity: "tart",
           env: {"TART_MODEL" => "m-env2", "TART_PROVIDER" => "p-env2"}).to_h)

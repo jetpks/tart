@@ -275,7 +275,9 @@ module Tart
 
     # (a) the five vars present with correct sources.
     def test_session_environment_exposes_pis_five_vars_from_the_readers
-      env = child_env(env_tool(session_env: {
+      # I69 move: EXPLICIT pi identity (the default resolved tart; the pin
+      # tests the pi-parity opt-in's five-var exposure).
+      env = child_env(env_tool(identity: "pi", session_env: {
         "SESSION_ID" => -> { "sess-1" }, "SESSION_FILE" => -> { "/tmp/s-1.jsonl" },
         "PROVIDER" => -> { "mock" }, "MODEL" => -> { "glm-5.3" },
         "REASONING_LEVEL" => -> { "high" }
@@ -304,7 +306,8 @@ module Tart
     # happens even when NOTHING is exposed.
     def test_session_environment_inherited_parent_var_never_reaches_the_child
       ENV["PI_SESSION_ID"] = "parent-leak"
-      env = child_env(env_tool(session_env: {}))
+      # I69 move: EXPLICIT pi identity (the PI_* scrub is pi-mode's shape).
+      env = child_env(env_tool(identity: "pi", session_env: {}))
 
       refute env.key?("PI_SESSION_ID"), "the parent's value leaks past the scrub"
     ensure
@@ -357,7 +360,8 @@ module Tart
     # two executes is honored twice (pi's per-command-start resolution).
     def test_session_environment_values_resolve_at_spawn_time
       model = "first"
-      exposing = env_tool(session_env: {"MODEL" => -> { model }})
+      # I69 move: EXPLICIT pi identity (the PI_* exposure is pi-mode's shape).
+      exposing = env_tool(identity: "pi", session_env: {"MODEL" => -> { model }})
 
       assert_equal "first", child_env(exposing)["PI_MODEL"]
       model = "second"
@@ -369,7 +373,8 @@ module Tart
     # rule: only its own five are scrubbed, bash.ts:187-191).
     def test_session_environment_pi_mode_shape_is_exactly_pis_five_keys
       composed = Tools::Bash::SESSION_ENV_SUFFIXES.map { |suffix| "PI_#{suffix}" }
-      env = child_env(env_tool(session_env: {
+      # I69 move: EXPLICIT pi identity (the pin tests pi-mode's exact shape).
+      env = child_env(env_tool(identity: "pi", session_env: {
         "SESSION_ID" => -> { "s" }, "SESSION_FILE" => -> { "f" }, "PROVIDER" => -> { "p" },
         "MODEL" => -> { "m" }, "REASONING_LEVEL" => -> { "l" }
       }))

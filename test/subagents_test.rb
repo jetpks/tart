@@ -284,14 +284,18 @@ module Tart
       # The CLOSED env (OQ-7): exactly the §4 key set, nil keys omitted,
       # NO subagents gate row (children never nest), NO MCP config. I49
       # adds exactly TWO keys: the intercom channel dir + the agent label.
-      sanctioned = %w[PATH HOME PI_IDENTITY PI_API_KEY PI_API_BASE PI_MODEL PI_PROVIDER
+      # I69 deviation (supervisor ruling 2026-10-17): the child identity
+      # rides the LITERAL bootstrap key TART_IDENTITY (the child's
+      # resolve_identity reads only that literal; the old namespaced
+      # PI_IDENTITY write was a dead key nothing read).
+      sanctioned = %w[PATH HOME TART_IDENTITY PI_API_KEY PI_API_BASE PI_MODEL PI_PROVIDER
                       PI_MODEL_REASONING PI_THINKING_LEVEL PI_CONTEXT_WINDOW PI_TOOL_TIMEOUT_MS
                       PI_RUN_DEADLINE_MS PI_SUBAGENTS_HOME PI_SUPERVISOR_CHANNEL PI_SUBAGENTS_AGENT]
       assert_empty(env.keys - sanctioned, "spawn env closure violated: #{(env.keys - sanctioned).inspect}")
       assert env.key?("PATH")
       assert env.key?("HOME")
       assert_equal @home, env["HOME"]
-      assert_equal "pi", env["PI_IDENTITY"]
+      assert_equal "pi", env["TART_IDENTITY"]
       assert_equal File.join(@home, "subagents"), env["PI_SUBAGENTS_HOME"]
       refute env.key?("PI_SUBAGENTS"), "children must not carry the gate row"
       refute env.key?("TART_MCP_CONFIG")

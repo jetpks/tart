@@ -1799,8 +1799,10 @@ module Tart
     # boot-time expandable range.
     def test_ctrl_o_flips_the_startup_header_in_place
       TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        # I69 move: EXPLICIT pi identity — the pin tests the pi face's
+        # ctrl+o flip; the default face resolved tart.
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
-          footer_data: {cwd: @dir})
+          footer_data: {cwd: @dir}, identity: "pi")
         draw(chat, session)
         collapsed = chat.transcript_lines
 
@@ -1885,7 +1887,9 @@ module Tart
     # AC2: the compaction rebuild restores the header AT ITS CURRENT
     # expansion state — and never resurrects the sections (I31 ruling).
     def test_compaction_rebuild_restores_the_header_at_its_current_state
-      with_chat(width: 60, screen_height: 24, motd: true,
+      # I69 move: EXPLICIT pi identity — the pin tests the pi face's
+      # ctrl+o state surviving the compaction rebuild.
+      with_chat(width: 60, screen_height: 24, motd: true, identity: "pi",
         footer_data: {cwd: @dir, model: "m", context_window: 1000, auto_compact: true}) do |chat, session|
         draw(chat, session)
         chat.on_event(TUI.key_event("o", modifiers: ["ctrl"])) # flip BEFORE the compaction
@@ -1952,8 +1956,10 @@ module Tart
     # rebuilt rows (composed from the session area, no re-wrap).
     def test_sigwinch_rebuilds_the_header_block_at_the_new_width
       TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        # I69 move: EXPLICIT pi identity — the pin tests the pi face's
+        # sigwinch header rebuild.
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
-          footer_data: {cwd: @dir})
+          footer_data: {cwd: @dir}, identity: "pi")
         draw(chat, session)
         assert_includes chat.transcript_lines.join, "! bash · ctrl+o more", "single-row hints at 120"
 
@@ -2093,8 +2099,10 @@ module Tart
     # block); none loaded here → none render. No tart art/version/hints.
     def test_motd_renders_pi_header_bytes_in_pi_mode
       TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 24) do |session|
+        # I69 move: EXPLICIT pi identity — the pin is the pi face's
+        # byte-exact header record (the default face resolved tart).
         chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
-          settings_root: @dir, footer_data: {cwd: @dir})
+          settings_root: @dir, footer_data: {cwd: @dir}, identity: "pi")
         draw(chat, session)
         lines = chat.transcript_lines
 
@@ -5428,7 +5436,9 @@ module Tart
     def test_compaction_rebuilds_kept_entries_then_the_panel
       FileUtils.mkpath(File.join(@dir, ".tart"))
       File.write(File.join(@dir, ".tart", "settings.json"), "{}") # the [Context] section's input
-      with_chat(width: 60, screen_height: 24, motd: true,
+      # I69 move: EXPLICIT pi identity — the pin tests the pi face's header
+      # surviving the compaction rebuild (the default face resolved tart).
+      with_chat(width: 60, screen_height: 24, motd: true, identity: "pi",
         footer_data: {cwd: @dir, model: "m", context_window: 1000, auto_compact: true}) do |chat, session|
         draw(chat, session)
         assert_includes chat.transcript_lines.join, "[Context]", "the boot MOTD renders before the compaction"
@@ -5781,11 +5791,12 @@ module Tart
     # kernel: injectable (the I38 animation-window pins record animate
     # calls; default IdleKernel unchanged).
     def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false,
-      models: nil, settings_root: nil, clock: nil, kernel: nil)
+      models: nil, settings_root: nil, clock: nil, kernel: nil, identity: nil)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
         kernel ||= IdleKernel.new
         kwargs = {session:, kernel:, footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
           models:, settings_root: settings_root || @dir}
+        kwargs[:identity] = identity if identity # the I69 move seam (pi-face header pins opt in explicitly)
         kwargs[:clock] = clock if clock # the spinner's fake-time seam (pi's 80ms dwell pinned, zero sleeps)
         chat = Render::Chat.new(**kwargs)
         yield(chat, session, kernel)

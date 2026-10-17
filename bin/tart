@@ -68,7 +68,7 @@ module Tart
           -r, --resume [ID]   resume a session in WORKDIR: ID is a session id
                               or session-file path; default: the most recent
           --identity IDENTITY the face to show: any non-empty name (default
-                              pi) — branding, prompt preamble and the app
+                              tart) — branding, prompt preamble and the app
                               env namespace follow it
           --steer-inbox DIR   print mode only: consume steering/stop request
                               files from DIR at this run's turn boundaries
@@ -169,8 +169,8 @@ module Tart
                              context window; the default fireworks model resolves to
                              #{Settings::MODEL_CONTEXT_WINDOWS[Settings::DEFAULTS["defaultModel"]]})
           TART_MCP_CONFIG    MCP config path (default: ~/.tart/mcp.json)
-          TART_IDENTITY      the face to show: any non-empty name — pi (default),
-                             tart, or your own (--identity overrides)
+          TART_IDENTITY      the face to show: any non-empty name — tart (default),
+                             pi, or your own (--identity overrides)
 
         Keys: type + Enter to send (steers a running agent); Escape
         interrupts a running turn; Ctrl+C clears the input (twice exits);
@@ -197,7 +197,7 @@ module Tart
           options[:resume_given] = true
         end
         parser.on("--identity IDENTITY",
-          "the face to show: any non-empty name (default pi) — branding, prompt preamble and the app env namespace follow it") do |identity|
+          "the face to show: any non-empty name (default tart) — branding, prompt preamble and the app env namespace follow it") do |identity|
           options[:identity] = identity
         end
         # The print-child harness flags (I48 §5.2) — print mode ONLY:
