@@ -49,6 +49,10 @@ module Tart
       # applyBackgroundToLine).
       user_message_text: "#dee0e1",
       user_message_bg: "#213b49",
+      # dark.json:27 selectedBg = blueBg — the same var userMessageBg
+      # (:33) resolves to; the jump pill's bg (tui-renderer.ts:30-34
+      # renders the scroll-to-end indicator on selectedBg).
+      selected_bg: "#213b49",
       # dark.json:34-36: customMessageBg = okhsl(295 42% 24%),
       # customMessageText = muted var, customMessageLabel = violet var —
       # the skill-invocation panel (skill-invocation-message.ts Box(1,1)).
