@@ -4,12 +4,11 @@ source "https://rubygems.org"
 
 gemspec
 
-# The fiber-native LLM wire (I52 — Grounds D8): the PATH pin resolves the
-# GEMSPEC'S directory, not the monorepo root. The relative default is the
-# canonical, landing-relevant form (repos/tart checkout); a lane worktree
-# resolves it through the FAST_COMPLETIONS_PATH override (exported per
-# run, never committed).
-gem "fast-completions", "0.4.0"
+# The fiber-native LLM wire (I52 — Grounds D8): published-gem pin. The
+# pre-0.4.0 form was a relative path pin (lane worktrees escaped via a
+# per-run, never-committed FAST_COMPLETIONS_PATH override) — retired with
+# the rubygems pin.
+gem "fast-completions", "0.5.0"
 
 # Dev deps live here (not the gemspec): minitest 5.x is required — 6.x
 # dropped minitest/mock, which ratatui_ruby's test tooling depends on.
