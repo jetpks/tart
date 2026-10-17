@@ -98,14 +98,19 @@ module Tart
       assert_raises(ArgumentError) { Subagents.resolve_model("no-slash:high", catalog: nil, fallback: nil) }
     end
 
-    def test_settings_gate_rows_and_the_opt_in_build
-      assert_equal false, Settings::DEFAULTS["subagents"], "the gate must default OFF"
+    # I70 move (was test_settings_gate_rows_and_the_opt_in_build, the
+    # default-off pin): the gate defaults ON now — the pin re-words to the
+    # OPT-OUT shape, the register mechanics byte-unchanged.
+    def test_settings_gate_rows_and_the_opt_out_build
+      assert_equal true, Settings::DEFAULTS["subagents"], "the I70 default-on flip"
       assert_equal "SUBAGENTS", Settings::RESOLUTION_ENV["subagents"]
       assert_equal "THINKING_LEVEL", Settings::RESOLUTION_ENV["thinkingLevel"]
 
-      # Off: the loadout never carries the tool.
+      # Opt-out: the loadout never carries the tool unless the register
+      # seam ran — the off tiers (settings false / env off) keep the I48
+      # build shape: no subagent tool, no watcher.
       off = Tools::Registry.build(selected: %w[read], cwd: @cwd, hooks: Hooks.new)
-      refute off.key?("subagent"), "gate off must leave the wire unchanged"
+      refute off.key?("subagent"), "the opt-out tiers must leave the wire unchanged"
 
       # On: registered through the I47 seam, declared LAST.
       hooks = Hooks.new

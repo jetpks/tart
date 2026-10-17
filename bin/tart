@@ -600,9 +600,11 @@ module Tart
       resolved == true || resolved == "true" || resolved == "1"
     end
 
-    # The subagents gate (I48 — OQ-1): the memory gate's idiom — the
-    # resolved settings row or the <IDENTITY>_SUBAGENTS env tier, default
-    # off.
+    # The subagents gate (I48 — OQ-1; I70 default-on law): the memory
+    # gate's idiom — the resolved settings row or the <IDENTITY>_SUBAGENTS
+    # env tier, DEFAULT ON since the I70 flip; the opt-out is a settings
+    # row {"subagents": false} or any non-on env value ("1"/"true" stay
+    # the on spellings).
     def subagents_enabled?(settings, identity)
       resolved = Settings.resolve_setting("subagents", settings, identity:)
       resolved == true || resolved == "true" || resolved == "1"

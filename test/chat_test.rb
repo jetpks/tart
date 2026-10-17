@@ -2156,6 +2156,24 @@ module Tart
       end
     end
 
+    # I70: the builtin workflow tier's nil file_path in the LIVE chat MOTD
+    # (the base defect killed the first frame at motd.rb:306): the section
+    # renders, no crash, and the collapsed compact row carries the name.
+    def test_motd_renders_nil_path_prompt_templates_without_crashing
+      template = Prompts::Template.new(name: "council", description: "d", content: "body", file_path: nil)
+      TUI.run(headless: true, viewport: :fullscreen, width: 60, screen_height: 24) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true,
+          settings_root: @dir, footer_data: {cwd: @dir},
+          prompts: [template], extensions: [])
+        draw(chat, session)
+        lines = chat.transcript_lines
+
+        prompts_i = lines.index { |line| line.include?("[Prompts]") }
+        refute_nil prompts_i, "the [Prompts] section renders with a nil-path template"
+        assert_includes lines[prompts_i + 1].strip, "/council", "the collapsed row carries the name"
+      end
+    end
+
     # /new (item 11/AC8): the Commands handler's reset seam — pi
     # handleClearCommand → renderCurrentSessionState clears the chat
     # container, then the accent "✓ New session started" line

@@ -315,8 +315,24 @@ module Tart
 
       def prompt_scope_entries(prompts, user_root:, project_root:)
         prompts.map do |template|
-          {path: template.file_path, display: "/#{template.name}",
-           group: scope_group(template.file_path, user_root:, project_root:)}
+          # pi's package tier (interactive-mode.ts getScopeGroup :1610-1619):
+          # pi's installed packages carry sourceInfo {source:
+          # "npm:pi-subagents", scope: "user"} (package-manager.ts:2126-2134,
+          # resource-loader.ts:864-883), so a pi template NEVER lacks a
+          # path. The port's builtin workflow tier (workflows.rb ships
+          # file_path: nil — programmatic by design, I49) IS its subagents
+          # source: classified into pi's user scope under the port's own
+          # package label (declared mapping — pi's row reads
+          # "npm:pi-subagents", the port's "subagents"). File-backed
+          # templates classify EXACTLY as today (the classification is
+          # total: nil file_path ⇒ the builtin tier, prompts.rb's only
+          # nil-path producer).
+          if template.file_path.nil?
+            {path: nil, display: "/#{template.name}", group: "user", package: "subagents"}
+          else
+            {path: template.file_path, display: "/#{template.name}",
+             group: scope_group(template.file_path, user_root:, project_root:)}
+          end
         end
       end
 
@@ -326,11 +342,22 @@ module Tart
       # indented entries sorted by path within the group. Every row
       # through {wrap_resource_row} (pi's Text word-wrap — the staged
       # path rows reproduce its byte shape, the s9 instrument).
+      #
+      # I70's package tier (formatScopeGroups :1675-1685 — pi's
+      # isPackageSource sub-lists): AFTER the group's plain path members,
+      # each package renders a label row (`    <label>` — 4-space indent
+      # UNSTYLED + the label in mdLink, the group-label row's two-span
+      # shape) then its member rows (`      /name` — one dim span incl.
+      # the indent), label-sorted then name-sorted (pi's localeCompare;
+      # byte-equal to the plain sort for ASCII labels/names).
       def scope_group_rows(entries, width)
         rows = []
         %w[project user path].each do |group|
-          members = entries.select { |entry| entry[:group] == group }.sort_by { |entry| entry[:path] }
-          next if members.empty?
+          members = entries.select { |entry| entry[:group] == group && entry[:package].nil? }
+                           .sort_by { |entry| entry[:path] }
+          packages = entries.select { |entry| entry[:group] == group && entry[:package] }
+                            .group_by { |entry| entry[:package] }
+          next if members.empty? && packages.empty?
 
           # pi renders the label row's indent UNSTYLED and the scope name
           # accent (formatScopeGroups :1670 — `  ${theme.fg("accent", group.scope)}`:
@@ -338,6 +365,12 @@ module Tart
           rows << TUI.line([TUI.span("  "), TUI.span(group, fg: Theme[:accent])])
           members.each do |entry|
             rows.concat(wrap_resource_row("    #{entry[:display]}", width).map { |row| TUI.line(row, fg: Theme[:dim]) })
+          end
+          packages.sort_by { |label, _| label }.each do |label, package_members|
+            rows << TUI.line([TUI.span("    "), TUI.span(label, fg: Theme[:md_link])])
+            package_members.sort_by { |entry| entry[:display] }.each do |entry|
+              rows.concat(wrap_resource_row("      #{entry[:display]}", width).map { |row| TUI.line(row, fg: Theme[:dim]) })
+            end
           end
         end
         rows
