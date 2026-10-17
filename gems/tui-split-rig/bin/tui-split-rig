@@ -23,7 +23,7 @@ def run_verb(argv)
     p.on("--app NAME", %w[both pi tart], "which app(s): both|pi|tart (default both)") { |a| options[:app] = a }
     p.on("--out DIR", "output directory (default tmp/parity/<timestamp>)") { |d| options[:out] = d }
     p.on("--tart-dir PATH", "tart checkout to run (default: this repo)") { |d| options[:tart_dir] = d }
-    p.on("--pi-bin PATH", "installed pi binary (default: command -v pi)") { |d| options[:pi_bin] = d }
+    p.on("--pi-bin PATH", "oracle pi binary (default: the pinned repos/pi clone @ v1.1.0)") { |d| options[:pi_bin] = d }
   end
   parser.parse!(argv)
   scenario_path = argv.shift

@@ -10,6 +10,54 @@ require "shellwords"
 require_relative "../../../../test/support/mock_llm_server"
 
 module TuiSplitRig
+  # The oracle resolution seam (I67 R1): the pinned repos/pi clone @ v1.1.0
+  # is the rig's ONLY oracle — the system pi on PATH is never consulted.
+  # Resolution order, frozen: the --pi-bin flag (kept verbatim) → the
+  # TUI_SPLIT_RIG_PI_BIN env escape hatch → the pinned clone default
+  # <pi-root>/packages/coding-agent/dist/bundle/cli.js (the clone's built
+  # entry — package.json "bin": {"pi": "dist/bundle/cli.js"}).
+  # pi_root is the sibling `pi` of the tart repo root; the default-root
+  # case alone falls back to the CANONICAL checkout (git rev-parse
+  # --git-common-dir, dirname'd — the worktree case) when the direct
+  # sibling is missing. An explicit tart_root gets NO git fallback (the
+  # pure testability contract). Unresolvable → Error naming the expected
+  # clone path. Direct oracle execs must strip PI_PACKAGE_DIR — pi's
+  # getPackageDir prefers the env over the __dirname walk
+  # (coding-agent config.ts:393-405); the rig's pane env scrub
+  # (env_flags) already covers the in-pane class.
+  def self.resolve_pi_bin(flag: nil, env: ENV, tart_root: nil)
+    return flag unless flag.nil? || flag.to_s.empty?
+
+    from_env = env["TUI_SPLIT_RIG_PI_BIN"]
+    return from_env unless from_env.nil? || from_env.to_s.empty?
+
+    cli = File.join(pi_root_for(tart_root), "packages", "coding-agent", "dist", "bundle", "cli.js")
+    return File.expand_path(cli) if File.executable?(cli)
+
+    raise Error, "pinned pi clone not found: expected #{cli} " \
+                 "(repos/pi on tag v1.1.0 with a built dist/bundle/cli.js)"
+  end
+
+  # The pi clone root: the sibling `pi` of the tart repo root. Explicit
+  # tart_root → sibling, no fallback. Default root → the rig's own repo
+  # root, and when the direct sibling clone is missing there, the
+  # canonical checkout via git rev-parse --git-common-dir (a worktree's
+  # git-common-dir points at the canonical .git — dirname is the
+  # canonical checkout; git failure degrades to the direct sibling, whose
+  # missing cli.js raises with the named path).
+  def self.pi_root_for(tart_root)
+    repo = tart_root ? File.expand_path(tart_root) : File.expand_path("../../../..", __dir__)
+    sibling = File.expand_path("../pi", repo)
+    return sibling if tart_root
+    return sibling if File.executable?(File.join(sibling, "packages", "coding-agent", "dist", "bundle", "cli.js"))
+
+    git_dir = Open3.capture2("git", "-C", repo, "rev-parse", "--git-common-dir")[0].to_s.strip
+    return sibling if git_dir.empty?
+
+    canonical = File.expand_path("..", File.expand_path(git_dir, repo))
+    File.expand_path("../pi", canonical)
+  end
+
   # Drives one scenario: for each run, boots ONE mock LLM server, stages
   # isolated environments under the out dir, runs pi and tart side by side
   # in 120x40 tmux panes against the same byte-identical response script,
@@ -301,6 +349,15 @@ module TuiSplitRig
         },
       }
       File.write(File.join(dir, "models.json"), JSON.pretty_generate(models))
+      # I67 R2: the tart-pane docs pin — stage bin/pi as a SYMLINK to the
+      # resolved @pi_bin (the same pinned clone the pi pane runs) and
+      # prepend that bin dir to the staged PATH (see tart_command):
+      # tart's SystemPrompt.pi_package_dir realpath walk (system_prompt.rb
+      # :173-191) then realpaths into the pinned clone, making both
+      # panes' <docs> segments byte-identical (the s8 cure).
+      bin_dir = File.join(home, "bin")
+      FileUtils.mkdir_p(bin_dir)
+      FileUtils.ln_sf(@pi_bin, File.join(bin_dir, "pi"))
       return unless @scenario.context_window
 
       File.write(File.join(dir, "settings.json"), JSON.pretty_generate(
@@ -479,7 +536,9 @@ module TuiSplitRig
       prefix = "#{identity.upcase}_"
       staged = staged_env("tart",
         "HOME" => home,
-        "PATH" => "#{File.dirname(@bundle_bin)}:#{ENV.fetch('PATH', '')}",
+        # I67 R2: the staged bin/pi symlink FIRST — tart's pi_package_dir
+        # walk resolves the pinned clone, not the system install.
+        "PATH" => "#{File.join(home, 'bin')}:#{File.dirname(@bundle_bin)}:#{ENV.fetch('PATH', '')}",
         "BUNDLE_FROZEN" => "true",
         "TART_IDENTITY" => identity,
         "#{prefix}MODEL" => "mock-1",
@@ -705,10 +764,9 @@ module TuiSplitRig
     end
 
     def default_pi_bin
-      pi = Open3.capture2("sh", "-c", "command -v pi")[0].to_s.strip
-      raise Error, "pi binary not found on PATH" if pi.empty?
-
-      pi
+      # I67 R1: the pinned repos/pi clone @ v1.1.0 — `command -v pi` is
+      # GONE (the system pi on PATH, 1.2.0+, is never the oracle again).
+      TuiSplitRig.resolve_pi_bin(env: ENV)
     end
 
     def resolve_bundle_bin
