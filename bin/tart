@@ -654,7 +654,13 @@ module Tart
       # pair from the view alone.
       resolved ||= Shapes::ResolvedSettings.from_load(settings, identity:)
       boot ||= Shapes::ModelRef.new(provider: resolved.default_provider, id: resolved.default_model)
-      facts = Settings.thinking_facts(models && resolve_boot_entry(models, boot),
+      # The boot catalog entry, hoisted once (I65 D3): thinking_facts
+      # consumed it inline; the context_window below reuses the SAME
+      # resolve — the I59 D4 asymmetry cure, the footer's boot call site
+      # shaped like the print boot and the loop kwarg. The models-nil
+      # legacy shape keeps entry nil (window nil).
+      entry = models && resolve_boot_entry(models, boot)
+      facts = Settings.thinking_facts(entry,
         settings, model_id: boot.id, model: chat.model, identity:)
       # No provider label: pi prefixes the provider only when MORE THAN
       # one provider is available (footer.ts:246-258) — the port resolves
@@ -671,7 +677,13 @@ module Tart
         default_provider: boot.provider,
         reasoning: facts.reasoning,
         thinking_level_map: facts.thinking_level_map,
-        context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:),
+        # I59 D4/I65 D3: the whole Settings ladder (explicit > env tier >
+        # settings > model > known tables) resolves FIRST — the entry's
+        # declared window is the FALLBACK, so a set PI_CONTEXT_WINDOW
+        # still wins; without a catalog entry the chain lands nil (the
+        # loop's fetch arm catches it, bin/tart :475's shape).
+        context_window: Settings.resolve_context_window(settings:, model: chat.model, identity:) ||
+          Models.entry_context_window(entry),
         auto_compact: Settings.compaction_kwargs(settings).fetch(:enabled, true),
         thinking_level: Models.clamp_thinking_level(level, map: facts.thinking_level_map,
           reasoning: facts.reasoning),
