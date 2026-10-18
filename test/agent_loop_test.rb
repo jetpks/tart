@@ -1036,14 +1036,16 @@ module Tart
 
     # P2(i) — the no-entry precedence pin (Grounds §4-a/§4-b; the
     # workaround's verified shape, tmp/repro6_workaround.rb): a set
-    # PI_CONTEXT_WINDOW still wins over everything — the wire carries
+    # CONTEXT_WINDOW still wins over everything — the wire carries
     # 120_000/120_000 (no cap threaded → wire_model's window fallback)
     # and the clamp sends ≤ 120_000 − 4096 (the safety margin holds).
+    # I69 move: the staged key is the one the RESOLVED DEFAULT identity
+    # reads (tart → TART_CONTEXT_WINDOW; pre-flip the default was pi).
     def test_zai_max_tokens_env_tier_still_wins_no_entry_window_fallback
       chat = TestChat.build(@server, system_prompt: "test prompt")
       @server.script([{type: :message, content: "ok"}])
-      saved = ENV["PI_CONTEXT_WINDOW"]
-      ENV["PI_CONTEXT_WINDOW"] = "120000"
+      saved = ENV["TART_CONTEXT_WINDOW"]
+      ENV["TART_CONTEXT_WINDOW"] = "120000"
       begin
         agent = Agent::Loop.new(chat:, tools: empty_tools)
 
@@ -1057,7 +1059,7 @@ module Tart
         assert_operator max, :<=, 120_000 - 4_096, "the clamp subtracts the safety margin"
         assert_operator max, :>=, 1
       ensure
-        saved ? ENV["PI_CONTEXT_WINDOW"] = saved : ENV.delete("PI_CONTEXT_WINDOW")
+        saved ? ENV["TART_CONTEXT_WINDOW"] = saved : ENV.delete("TART_CONTEXT_WINDOW")
       end
     end
 
@@ -1113,13 +1115,16 @@ module Tart
 
     # I41 (AC4, the tier readback): the loop's env tier speaks the
     # identity's namespace — the resolved face decides which CONTEXT_WINDOW
-    # var the compaction denominator reads (tart → TART_, default pi →
-    # PI_). Direct readback on the private resolver (the mcp_test send
-    # precedent); the print path's forwarding is pinned in print_test.
+    # var the compaction denominator reads (tart → TART_, pi → PI_).
+    # I69 move: the pi leg is now an EXPLICIT pi identity — the default
+    # resolves tart, and the pin's discrimination is the namespace
+    # CONTRAST between the two faces. Direct readback on the private
+    # resolver (the mcp_test send precedent); the print path's forwarding
+    # is pinned in print_test.
     def test_env_tier_reads_the_identity_namespaced_context_window
       chat = TestChat.build(@server, system_prompt: "test prompt")
       tart_agent = Agent::Loop.new(chat:, tools: empty_tools, identity: "tart")
-      pi_agent = Agent::Loop.new(chat:, tools: empty_tools)
+      pi_agent = Agent::Loop.new(chat:, tools: empty_tools, identity: "pi")
       saved_tart = ENV["TART_CONTEXT_WINDOW"]
       saved_pi = ENV["PI_CONTEXT_WINDOW"]
       begin

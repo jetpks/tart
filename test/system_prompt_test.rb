@@ -93,8 +93,10 @@ module Tart
     # AC2: the composed prompt IS pi's captured system message, byte for
     # byte, at the same tool loadout, cwd normalized.
     def test_pi_mode_composition_is_byte_identical_to_pis_captured_request
+      # I69 move: EXPLICIT pi identity — the pin tests the pi-parity
+      # opt-in's captured bytes; the default face resolved tart.
       built = Agent::SystemPrompt.build(selected_tools: %w[read bash edit write],
-        cwd: "CWD_PLACEHOLDER", docs_paths: DOCS)
+        cwd: "CWD_PLACEHOLDER", docs_paths: DOCS, identity: "pi")
       assert_equal PI_CAPTURE.chomp, built
     end
 
@@ -109,8 +111,9 @@ module Tart
     # (pi's DEFAULT_TOOL_NAMES order, settings-manager.ts:82 — the order
     # the wire tools array follows too).
     def test_default_loadout_sections_are_pis_captured_bytes
+      # I69 move: EXPLICIT pi identity (the captured bytes are pi-mode's).
       built = Agent::SystemPrompt.build(selected_tools: Settings.selected_tools({}),
-        cwd: "/p", docs_paths: DOCS)
+        cwd: "/p", docs_paths: DOCS, identity: "pi")
       assert_equal GOLDEN_TOOLS, built[/<tools>\n(.*?)\n<\/tools>/m, 1]
       assert_equal GOLDEN_RULES, built[/<rules>\n(.*?)\n<\/rules>/m, 1]
     end
@@ -131,7 +134,9 @@ module Tart
     # --- the identity templating (I32 AC1/AC2) ---
 
     def test_preamble_and_bash_env_rule_follow_the_identity
-      pi = Agent::SystemPrompt.build(cwd: "/p", docs_paths: DOCS)
+      # I69 move: EXPLICIT pi identity for the pi leg (the default face
+      # resolved tart; the pin's discrimination is the per-face bytes).
+      pi = Agent::SystemPrompt.build(cwd: "/p", docs_paths: DOCS, identity: "pi")
       assert_includes pi, "operating inside pi, a coding agent harness"
       assert_includes pi, "You can inspect PI_* environment variables",
         "pi mode is byte-identical to pi's bash.ts:47 bullet"

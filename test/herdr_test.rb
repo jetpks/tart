@@ -53,18 +53,26 @@ module Tart
 
     def test_session_report_shape_and_the_path_preferred_ref
       reporter = Herdr::Reporter.new(socket_path: @sock, timeouts: [20, 20])
-      reporter.report_session({"agent_session_path" => "/tmp/s.json"}, pane_id: "p7", reason: "startup")
+      reporter.report_session({"agent_session_path" => "/tmp/s.json", "agent_session_id" => "sid-9"},
+        pane_id: "p7", reason: "startup")
       request = read_one
 
       assert_equal "pane.report_agent_session", request["method"]
-      assert request["id"].start_with?("herdr:pi:session:"), "the session id format (herdr:pi:session:<ms>:<rand>)"
+      # I69 wire: tart's OWN name (source never starts "herdr:" — the
+      # reserved native pair was gauntlet-dropped; detect/mod.rs:330-348).
+      assert request["id"].start_with?("tart:session:"), "the session id format (tart:session:<ms>:<rand>)"
       params = request["params"]
       assert_equal "p7", params["pane_id"]
-      assert_equal "herdr:pi", params["source"]
-      assert_equal "pi", params["agent"]
+      assert_equal "tart", params["source"]
+      assert_equal "tart", params["agent"]
       assert_equal "startup", params["session_start_source"]
       assert_equal "/tmp/s.json", params["agent_session_path"]
-      assert params["seq"].is_a?(Integer)
+      # I69 wire: the seq base sits in pi's Date.now()*1000 class (epoch-ms
+      # × 1000 ≈ 1.79×10¹⁵; the old ~10¹² Time.now.to_i scale is gone).
+      assert_operator params["seq"], :>=, 1_000_000_000_000_000, "the Date.now()*1000 seq class"
+      # I69 wire: the resume command rides every session-ref report
+      # (socket-api.mdx:692); the id wins over the path.
+      assert_equal ["tart", "-r", "sid-9"], params["resume_argv"]
     end
 
     def test_session_report_without_a_reason_omits_the_source_field
@@ -75,6 +83,15 @@ module Tart
 
       refute params.key?("session_start_source")
       assert_equal "sid", params["agent_session_id"], "the id ref rides when no path exists"
+      assert_equal ["tart", "-r", "sid"], params["resume_argv"]
+    end
+
+    # I69 wire: the id-less ref falls back to the session-file PATH.
+    def test_session_resume_argv_falls_back_to_the_path
+      reporter = Herdr::Reporter.new(socket_path: @sock, timeouts: [20, 20])
+      reporter.report_session({"agent_session_path" => "/tmp/p2.jsonl"}, pane_id: "p7")
+
+      assert_equal ["tart", "-r", "/tmp/p2.jsonl"], read_one["params"]["resume_argv"]
     end
 
     def test_session_report_without_a_ref_sends_nothing
@@ -101,6 +118,40 @@ module Tart
       blocked = read_one
       assert_equal "blocked", blocked["params"]["state"]
       assert_equal "needs approval", blocked["params"]["message"]
+    end
+
+    # I69 wire: ref-carrying state reports carry the resume command too.
+    def test_state_report_carries_resume_argv_on_a_session_ref
+      reporter = Herdr::Reporter.new(socket_path: @sock, timeouts: [20, 20])
+      reporter.report_state("working", session_ref: {"agent_session_id" => "sid-11"}, pane_id: "p7")
+
+      assert_equal ["tart", "-r", "sid-11"], read_one["params"]["resume_argv"]
+    end
+
+    # I69 wire (panes.rs:1561 — validate_optional_resume_argv runs BEFORE
+    # the state event in both handlers, so an invalid argv fails the WHOLE
+    # report): an apostrophe-bearing path drops the resume_argv, NEVER the
+    # report. The same rule covers control characters (socket-api.mdx:692).
+    def test_poisoned_session_ref_drops_resume_argv_never_the_report
+      reporter = Herdr::Reporter.new(socket_path: @sock, timeouts: [20, 20])
+      reporter.report_state("idle", session_ref: {"agent_session_path" => "/tmp/e's.jsonl"}, pane_id: "p7")
+      poisoned = read_one
+      assert_equal "tart", poisoned["params"]["source"], "the report still sends"
+      refute poisoned["params"].key?("resume_argv"), "the poisoned argv attaches NOTHING"
+
+      reporter.report_state("working", session_ref: {"agent_session_path" => "/tmp/e\ts.jsonl"}, pane_id: "p7")
+      refute read_one["params"].key?("resume_argv"), "a control character fails the predicate too"
+
+      reporter.report_state("idle", session_ref: {"agent_session_id" => ""}, pane_id: "p7")
+      refute read_one["params"].key?("resume_argv"), "an empty target builds nothing"
+    end
+
+    # I69 wire: a ref-LESS state report carries no resume_argv.
+    def test_refless_state_report_carries_no_resume_argv
+      reporter = Herdr::Reporter.new(socket_path: @sock, timeouts: [20, 20])
+      reporter.report_state("blocked", message: "ask", session_ref: nil, pane_id: "p7")
+
+      refute read_one["params"].key?("resume_argv")
     end
 
     def test_same_state_and_message_reports_dedup
@@ -171,16 +222,19 @@ module Tart
     def test_register_full_lifecycle_over_the_seam
       hooks = Hooks.new
       Herdr.register(hooks: hooks, env: @env)
-      ctx = {cwd: @dir, mode: "tui", session: {"agent_session_path" => "/tmp/s.json"}, identity: "pi"}
+      ctx = {cwd: @dir, mode: "tui", session: {"agent_session_path" => "/tmp/s.json", "agent_session_id" => "sid"}, identity: "pi"}
 
       hooks.emit({"type" => "session_start", "reason" => "resume"}, context: ctx)
       session_report = read_one
       forced = read_one
       assert_equal "pane.report_agent_session", session_report["method"]
       assert_equal "resume", session_report["params"]["session_start_source"]
+      assert_equal "tart", session_report["params"]["source"], "the wire speaks tart's own name in BOTH modes"
+      assert_equal ["tart", "-r", "sid"], session_report["params"]["resume_argv"]
       assert_equal "pane.report_agent", forced["method"]
       assert_equal "idle", forced["params"]["state"], "the forced publish at session_start"
       refute forced["params"].key?("message")
+      assert_equal ["tart", "-r", "sid"], forced["params"]["resume_argv"], "the forced publish carries the ref's resume command"
 
       hooks.emit({"type" => "agent_start"}, context: ctx)
       agent_session = read_one

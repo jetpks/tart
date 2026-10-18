@@ -275,5 +275,36 @@ Keep it tight. No code changes needed. This is a "what's going on" question — 
       source = File.read(File.expand_path("../lib/tart/render/markdown.rb", __dir__))
       refute_includes source, "RatatuiRuby", "the tui-seam gate scans all of lib"
     end
+
+    # --- I68 markdown-parity battery: the frozen 48-case oracle fixture ---
+
+    # The spec-frozen oracle captures (tmp/i68-spec/markdown_battery.json,
+    # sha-pinned 4ecd9cc2… by the md-battery-fixture gate): DATA, copied
+    # verbatim, never regenerated. 36 cases pin the measured base spans
+    # (oracle-equal at base); 11 carry the frozen post-cure expectations.
+    BATTERY = JSON.parse(
+      File.read(File.expand_path("fixtures/markdown_battery.json", __dir__))
+    )["cases"].freeze
+
+    # Field-wise compare at the frozen width 94: a row's spans map to
+    # [text, fg name or nil, sorted-unique modifier names] — zero-width
+    # spans dropped, fg null ↔ span.fg.nil?, modifiers as a SET. Public
+    # interface only (Markdown.rows).
+    def assert_md_battery_case(src, expected_rows)
+      rows = Render::Markdown.rows(src, width: 94)
+      actual = rows.map do |row|
+        row.reject { |sp| sp.text.empty? }
+           .map { |sp| [sp.text, sp.fg&.to_s, sp.modifiers.map(&:to_s).uniq.sort] }
+      end
+      assert_equal expected_rows, actual
+    end
+
+    # Exactly one test per fixture case; the `md_battery` token in the name
+    # is load-bearing (the gate filter reads -n "/md_battery/").
+    BATTERY.each do |battery_case|
+      define_method("test_md_battery_#{battery_case['name']}") do
+        assert_md_battery_case(battery_case["src"], battery_case["rows"])
+      end
+    end
   end
 end

@@ -79,25 +79,36 @@ module Tart
 
     # --- I48: the subagents gate rows + the thinkingLevel env tier (OQ-1) ---
 
-    def test_subagents_gate_rows_default_off_with_the_identity_env_suffix
-      assert_equal false, Settings::DEFAULTS["subagents"]
+    # I70 move (was …_default_off_…): the gate defaults ON — the row pin
+    # moves with the flip, the env-suffix discrimination preserved.
+    def test_subagents_gate_rows_default_on_with_the_identity_env_suffix
+      assert_equal true, Settings::DEFAULTS["subagents"], "the I70 default-on flip"
       assert_equal "SUBAGENTS", Settings::RESOLUTION_ENV["subagents"]
       assert_equal "THINKING_LEVEL", Settings::RESOLUTION_ENV["thinkingLevel"]
       assert_equal "PI_SUBAGENTS", Identity.env_key("pi", Settings::RESOLUTION_ENV["subagents"])
       assert_equal "TART_SUBAGENTS", Identity.env_key("tart", Settings::RESOLUTION_ENV["subagents"])
     end
 
+    # I70 move (the known-key load's default tier flips to true) + the
+    # opt-out tiers gain pins so the off shape stays pinned: file tier,
+    # env tier, env-over-file.
     def test_subagents_is_a_known_key_and_resolves_env_over_file_over_default
       result = load_settings
       assert_empty result.diagnostics, "the subagents row is known — no unknown-key warning"
-      assert_equal false, result.settings["subagents"]
+      assert_equal true, result.settings["subagents"], "the DEFAULTS tier is on (the I70 flip)"
 
-      write_settings(@user_path, '{"subagents": true}')
-      assert_equal true, load_settings.settings["subagents"]
+      write_settings(@user_path, '{"subagents": false}')
+      assert_equal false, load_settings.settings["subagents"], "the file opt-out tier"
 
       assert_equal "1", Settings.resolve_setting("subagents", {}, identity: "pi", env: {"PI_SUBAGENTS" => "1"})
-      assert_equal false, Settings.resolve_setting("subagents", {}, identity: "tart", env: {}),
-        "the DEFAULTS tier is false"
+      assert_equal true, Settings.resolve_setting("subagents", {}, identity: "tart", env: {}),
+        "the DEFAULTS tier is on (the I70 flip)"
+      assert_equal false, Settings.resolve_setting("subagents", {"subagents" => false}, identity: "tart", env: {}),
+        "the file opt-out tier resolves off"
+      assert_equal "0", Settings.resolve_setting("subagents", {}, identity: "tart", env: {"TART_SUBAGENTS" => "0"}),
+        "the env opt-out tier (any non-on value)"
+      assert_equal "1", Settings.resolve_setting("subagents", {"subagents" => false}, identity: "tart", env: {"TART_SUBAGENTS" => "1"}),
+        "the env tier beats the file tier"
     end
 
     def test_project_deep_merges_over_user
@@ -171,21 +182,23 @@ module Tart
       write_settings(@user_path,
         '{"defaultModel": "m-file", "defaultProvider": "p-file", "apiBase": "https://file.example", "apiKey": "file-key"}')
 
-      assert_equal "m-file", Settings.resolve_setting("defaultModel", load_settings.settings)
+      # I69: the PI_* literals ride an EXPLICIT pi identity — the pin tests
+      # the pi-parity opt-in's env tier, not the (now tart) default.
+      assert_equal "m-file", Settings.resolve_setting("defaultModel", load_settings.settings, identity: "pi")
       ENV["PI_MODEL"] = "m-env"
-      assert_equal "m-env", Settings.resolve_setting("defaultModel", load_settings.settings)
+      assert_equal "m-env", Settings.resolve_setting("defaultModel", load_settings.settings, identity: "pi")
 
-      assert_equal "p-file", Settings.resolve_setting("defaultProvider", load_settings.settings)
+      assert_equal "p-file", Settings.resolve_setting("defaultProvider", load_settings.settings, identity: "pi")
       ENV["PI_PROVIDER"] = "p-env"
-      assert_equal "p-env", Settings.resolve_setting("defaultProvider", load_settings.settings)
+      assert_equal "p-env", Settings.resolve_setting("defaultProvider", load_settings.settings, identity: "pi")
 
-      assert_equal "https://file.example", Settings.resolve_setting("apiBase", load_settings.settings)
+      assert_equal "https://file.example", Settings.resolve_setting("apiBase", load_settings.settings, identity: "pi")
       ENV["PI_API_BASE"] = "https://env.example"
-      assert_equal "https://env.example", Settings.resolve_setting("apiBase", load_settings.settings)
+      assert_equal "https://env.example", Settings.resolve_setting("apiBase", load_settings.settings, identity: "pi")
 
-      assert_equal "file-key", Settings.resolve_setting("apiKey", load_settings.settings)
+      assert_equal "file-key", Settings.resolve_setting("apiKey", load_settings.settings, identity: "pi")
       ENV["PI_API_KEY"] = "env-key"
-      assert_equal "env-key", Settings.resolve_setting("apiKey", load_settings.settings)
+      assert_equal "env-key", Settings.resolve_setting("apiKey", load_settings.settings, identity: "pi")
     end
 
     # The namespace follows the identity (owner ruling 3): pi reads PI_,
@@ -205,11 +218,14 @@ module Tart
     # table; any non-empty value names a face ---
 
     def test_identity_resolves_cli_over_env_over_settings_over_default
-      assert_equal "pi", Identity.resolve(settings: {}, env: {}), "no config → the default"
-      assert_equal "tart", Identity.resolve(settings: {"identity" => "tart"}, env: {}), "settings row"
+      # Owner ruling 2026-10-17: the default face is tart (I69); "pi" is
+      # the explicit pi-parity opt-in. The rest of the precedence table is
+      # byte-unchanged.
+      assert_equal "tart", Identity.resolve(settings: {}, env: {}), "no config → the default"
+      assert_equal "pi", Identity.resolve(settings: {"identity" => "pi"}, env: {}), "a settings pi row opts into pi-parity"
       assert_equal "tart", Identity.resolve(settings: {"identity" => "pi"}, env: {"TART_IDENTITY" => "tart"}),
         "env over settings"
-      assert_equal "pi", Identity.resolve(cli: "pi", settings: {"identity" => "tart"}, env: {"TART_IDENTITY" => "tart"}),
+      assert_equal "my-face", Identity.resolve(cli: "my-face", settings: {"identity" => "pi"}, env: {"TART_IDENTITY" => "tart"}),
         "CLI over everything"
     end
 
@@ -226,7 +242,7 @@ module Tart
 
     def test_settings_layer_defaults_the_identity_key
       assert_equal Identity::DEFAULT, load_settings.settings["identity"],
-        "the identity key rides Settings::DEFAULTS (no unknown-key warning, the pi default)"
+        "the identity key rides Settings::DEFAULTS (no unknown-key warning, the tart default)"
       write_settings(@user_path, '{"identity": "tart"}')
       assert_equal "tart", load_settings.settings["identity"]
       assert load_settings.diagnostics.none? { |d| d.message.include?("identity") },
@@ -285,13 +301,15 @@ module Tart
       # declared window (the placeholder's zero reads as nil on the view).
       windowless = wire_model("accounts/fireworks/models/glm-5p3-flash")
 
-      assert_equal 9, Settings.resolve_context_window(explicit: 9, model:)
+      assert_equal 9, Settings.resolve_context_window(explicit: 9, model:, identity: "pi")
+      # I69: the PI_* env tier rides an EXPLICIT pi identity (the default
+      # resolved tart — the pin tests the pi-parity opt-in's tier).
       ENV["PI_CONTEXT_WINDOW"] = "99"
-      assert_equal 99, Settings.resolve_context_window(model:)
+      assert_equal 99, Settings.resolve_context_window(model:, identity: "pi")
       ENV.delete("PI_CONTEXT_WINDOW")
-      assert_equal 5000, Settings.resolve_context_window(model:)
-      assert_equal 1_048_573, Settings.resolve_context_window(model: windowless)
-      assert_nil Settings.resolve_context_window(model: wire_model("unknown-model"))
+      assert_equal 5000, Settings.resolve_context_window(model:, identity: "pi")
+      assert_equal 1_048_573, Settings.resolve_context_window(model: windowless, identity: "pi")
+      assert_nil Settings.resolve_context_window(model: wire_model("unknown-model"), identity: "pi")
 
       write_settings(@project_path, '{"contextWindow": 12345}')
       assert_equal 12_345, Settings.resolve_context_window(settings: load_settings.settings, model: windowless)
@@ -405,6 +423,45 @@ module Tart
       assert_equal true, facts.reasoning
       assert_equal Settings.known_thinking_level_map(entry.id), facts.thinking_level_map,
         "a map-less entry falls back to the known table (catalog-entry-first, known-tables-second)"
+    end
+
+    # The vendored tier's slot (I71 R2): the map tiers entry → vendored →
+    # known-tables; the reasoning flag rides the entry's flag → vendored —
+    # with NO vendored match the chain is byte-today.
+    def test_thinking_facts_vendored_tier_slots_between_the_entry_and_the_known_tables
+      dir = Dir.mktmpdir("tart-settings-vendored-")
+      begin
+        File.write(File.join(dir, "models.json"), JSON.generate({"providers" => {
+          "zai" => {"name" => "Z.AI", "baseUrl" => "https://api.z.ai/api/coding/paas/v4", "apiKey" => "k",
+            "models" => [{"id" => "glm-5.3", "reasoning" => true}]},
+          "local" => {"name" => "L", "baseUrl" => "http://localhost:1/v1", "apiKey" => "k",
+            "models" => [{"id" => "glm-5.3", "reasoning" => false}]}}}))
+        zai, local = Models.load(root: dir).model_entries
+
+        # entry map nil + vendored match ⇒ the vendored map (the middle tier).
+        facts = Settings.thinking_facts(zai, model_id: zai.id)
+        assert_equal "high", facts.thinking_level_map.fetch(:high),
+          "the vendored map fills the map-less entry"
+        assert_nil facts.thinking_level_map.fetch(:medium), "the vendored nulls ride verbatim"
+        assert_equal true, facts.reasoning,
+          "the loaded gap entry's (omitted) flag fills from the vendored reasoning"
+
+        # the entry's DECLARED map beats the vendored tier (fill-only).
+        declared = Shapes::Model.new(id: "glm-5.3", name: "g", reasoning: true, context_window: nil,
+          max_tokens: nil, thinking_level_map: {low: "mine"}, compat: nil, provider: "zai")
+        assert_equal ({low: "mine"}),
+          Settings.thinking_facts(declared, model_id: declared.id).thinking_level_map,
+          "the declared map ALWAYS wins (the vendored tier never fires)"
+
+        # NO match ⇒ the known-tables tier intact (byte-today).
+        assert_equal Settings.known_thinking_level_map("accounts/fireworks/models/glm-5p3-flash"),
+          Settings.thinking_facts(local, model_id: "accounts/fireworks/models/glm-5p3-flash").thinking_level_map,
+          "no vendored match ⇒ the known table (the third tier)"
+        assert_equal false, Settings.thinking_facts(local, model_id: local.id).reasoning,
+          "no vendored match ⇒ today's flag"
+      ensure
+        FileUtils.rm_rf(dir)
+      end
     end
 
     def test_thinking_facts_without_a_catalog_entry
@@ -559,11 +616,11 @@ module Tart
 
       ["abc", "-5", "+5", " 5", "5.5", ""].each do |junk|
         ENV["PI_CONTEXT_WINDOW"] = junk
-        assert_equal 5000, Settings.resolve_context_window(model:), "env #{junk.inspect} falls through"
+        assert_equal 5000, Settings.resolve_context_window(model:, identity: "pi"), "env #{junk.inspect} falls through"
       end
 
       ENV["PI_CONTEXT_WINDOW"] = "007"
-      assert_equal 7, Settings.resolve_context_window(model:), "a digit-string coerces (leading zeros included)"
+      assert_equal 7, Settings.resolve_context_window(model:, identity: "pi"), "a digit-string coerces (leading zeros included)"
       ENV.delete("PI_CONTEXT_WINDOW")
 
       [0, -1, "5", 5.5].each do |junk|

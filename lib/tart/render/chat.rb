@@ -145,11 +145,20 @@ module Tart
       def initialize(session:, kernel:, footer_data: nil, branch_reader: Footer::DEFAULT_BRANCH_READER, autocomplete: nil,
         motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
         prompts: [], skills: [], context_files: [], extensions: [], models: nil,
-        clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) })
+        clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }, endpoint: nil)
         @session = session
         @kernel = kernel
         @footer_data = footer_data
         @agent = nil
+        # The threaded boot endpoint facts (I71 R5 — the launcher's
+        # build_surface threads the same `endpoint_facts` chain build_chat
+        # speaks: {api_key:, api_base:}); the live-listing fallback tier.
+        # nil = no listing fallback (every existing test construction).
+        @endpoint = endpoint
+        # The live listing's open generation (I71 R4): bumped per menu
+        # open; a landed fetch merges only when its open is still the
+        # latest — a closed/superseded menu never merges stale rows.
+        @listing_seq = 0
         @mutex = Mutex.new
         # The multi-line input editor (pi's Editor — the visual-line state
         # and operations) and its suggestion list over the injected
@@ -2278,11 +2287,13 @@ module Tart
       end
 
       # The /model selector (pi showModelSelector :5342-5361): the
-      # catalog is models.json (the static snapshot — the network
-      # refresh is cut, itemized); an empty catalog degenerates to the
-      # boot model so ctrl+s set-as-default works out of the box
-      # (itemized port extension). +seed+ pre-fills the search (/model
-      # <unknown-arg>, pi's initialSearchInput).
+      # catalog is models.json (the static snapshot — the I27 network
+      # refresh is cut, itemized; the I71 live listing rides the
+      # owner-ruled form — the CONFIGURED provider's own /v1/models,
+      # one bounded fetch per open, merged in when it lands). An empty
+      # catalog degenerates to the boot model so ctrl+s set-as-default
+      # works out of the box (itemized port extension). +seed+ pre-fills
+      # the search (/model <unknown-arg>, pi's initialSearchInput).
       def open_model_menu(seed = nil)
         @mutex.synchronize do
           @menu = ModelMenu.model(
@@ -2291,6 +2302,116 @@ module Tart
             on_select_as_default: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: true) }
           )
         end
+        spawn_listing_fetch
+      end
+
+      # The live-listing spawn (I71 R3/R4): ONE fetch per menu open —
+      # NEVER at boot (construction never calls this), NEVER print mode /
+      # subagent children (no interactive surface), NEVER the /model <ref>
+      # direct-switch path ({switch_model}). The endpoint resolves at open
+      # time for the CURRENT model ref's provider: the catalog provider
+      # block's baseUrl/apiKey, each field falling back to the threaded
+      # boot endpoint facts; a pair that still does not resolve ⇒ NO
+      # attempt (the menu stays user-entries-only, no failure row).
+      # Callback form: the merge lands on the listing thread (the one
+      # sanctioned background-thread site — Models::Listing), under THIS
+      # surface's mutex, then requests a redraw.
+      def spawn_listing_fetch
+        fetch_base, fetch_key, block_base, live_facts_for = listing_endpoint_parts
+        return unless fetch_base && fetch_key
+
+        # Lazily loaded (I71 R3): the listing's async-http stack never
+        # loads at boot — only the menu-open demand path pulls it in.
+        require_relative "../models/listing"
+        seq = @mutex.synchronize { @listing_seq += 1 }
+        Models::Listing.fetch(base_url: fetch_base, api_key: fetch_key,
+          on_result: ->(ids) { merge_listing(seq, ids, block_base, &live_facts_for) })
+      end
+
+      # The endpoint resolution (I71 R3 — frozen): the current model
+      # ref's provider block baseUrl/apiKey from the user catalog, with
+      # the per-field fallback to the threaded boot facts; returns
+      # [resolved_base, resolved_key, block_base_url, live_facts_proc] —
+      # the resolved pair drives the fetch, the BLOCK's own baseUrl (nil
+      # = the KEY arm) drives the vendored enrichment/registration — the
+      # same match rule, not the env-fallback URL. nil parts ⇒ no
+      # attempt.
+      def listing_endpoint_parts
+        provider = current_model_ref && @models&.provider(current_model_ref.provider)
+        return nil unless provider
+
+        block_base = provider.respond_to?(:base_url) ? provider.base_url : provider[:baseUrl]
+        block_key = provider.respond_to?(:api_key) ? provider.api_key : provider[:apiKey]
+        base = block_base || @endpoint&.fetch(:api_base, nil)
+        key = block_key || @endpoint&.fetch(:api_key, nil)
+        return nil unless base.is_a?(String) && !base.empty? && key.is_a?(String) && !key.empty?
+
+        [base, key, block_base,
+         ->(id) { Models::Vendored.facts_for(current_model_ref.provider, block_base, id) }]
+      end
+
+      # The merge (I71 R4): the user entries render IMMEDIATELY (the menu
+      # opened before this spawn); when the fetch lands the listed ids
+      # merge in — typed Shapes::Model entries under the CONFIGURED
+      # provider key, vendored-enriched through the same match rule (no
+      # match ⇒ bare entry, name = id), deduped against the user entries
+      # (user wins on provider+id collision); when the fetch failed, the
+      # menu flags its ONE muted failure row. Runs ON the listing thread —
+      # every state touch under the surface mutex; a closed or superseded
+      # menu never merges.
+      def merge_listing(seq, ids, block_base, &live_facts_for)
+        merged = @mutex.synchronize do
+          next false if seq != @listing_seq || @menu.nil?
+
+          if ids
+            @menu.refresh(entries: merged_listing_entries(ids, block_base, &live_facts_for))
+          else
+            @menu.listing_failed!
+          end
+          true
+        end
+        @kernel.request_draw if merged
+      end
+
+      # The merged menu list: the user entries (the catalog — or the
+      # degenerate boot entry) + the live entries not already covered
+      # (user wins on provider+id collision, case-insensitive).
+      def merged_listing_entries(ids, block_base, &live_facts_for)
+        entries = model_menu_entries
+        covered = entries.map { |entry| [entry_attr_for(entry, :provider).to_s.downcase, entry_attr_for(entry, :id).to_s.downcase] }
+        live = ids.filter_map { |id| live_listing_entry(id, block_base, live_facts_for) }
+        entries + live.reject { |entry| covered.include?([entry.provider.downcase, entry.id.downcase]) }
+      end
+
+      # The entry's field read for the dedup keys — the typed attribute
+      # with the legacy raw-hash read (the {ModelMenu.entry_attr} bridge).
+      def entry_attr_for(entry, field)
+        entry.respond_to?(field) ? entry.public_send(field) : entry.fetch(field)
+      end
+
+      # One live entry (I71 R4): a typed Shapes::Model under the
+      # CONFIGURED provider key — id verbatim from the listing; the fill
+      # fields from the vendored tier through the same match rule (no
+      # match ⇒ bare entry, name = id); context_window/max_tokens stay nil
+      # (the entry-fact seams resolve them — a vendored match fills, no
+      # match ⇒ the definition defaults). The entry is REGISTERED against
+      # the provider block's baseUrl (the tier's load-path record — here
+      # the live-path equivalent) so the seams re-derive the same match
+      # the enrichment used.
+      def live_listing_entry(id, block_base, live_facts_for)
+        facts = live_facts_for.call(id)
+        entry = Shapes::Model.new(
+          id: id,
+          name: (facts&.[]("name") if facts.is_a?(Hash)) || id,
+          reasoning: facts.is_a?(Hash) ? facts["reasoning"] == true : false,
+          context_window: nil,
+          max_tokens: nil,
+          thinking_level_map: facts.is_a?(Hash) ? Models.build_thinking_level_map(facts["thinkingLevelMap"]) : nil,
+          compat: facts.is_a?(Hash) ? Models.build_compat(facts["compat"]) : nil,
+          provider: current_model_ref.provider
+        )
+        Models::Vendored.register_entries(block_base, [entry])
+        entry
       end
 
       # The /model <ref> direct switch (pi handleModelCommand's
@@ -2370,6 +2491,11 @@ module Tart
         # re-resolve in the loop seam (the entry's flag/map, the known
         # tables when the entry declares none — Settings.thinking_facts).
         facts = Settings.thinking_facts(entry, model_id: entry.id)
+        # The compat threading rides the vendored fill (I71 R2 —
+        # `dialect_for_entry`'s substrate): the entry's declared compat,
+        # else the matched vendored compat (a live entry constructed with
+        # its fill already carries it).
+        compat = Models.resolved_compat(entry)
         # The cwd resolution is the launcher-facts-else-process idiom the
         # MOTD/commands sections already use (@footer_data[:cwd] || Dir.pwd).
         level = Settings.declared_thinking_level(root: @settings_root,
@@ -2387,7 +2513,7 @@ module Tart
           max_tokens: Models.entry_max_tokens(entry),
           model_reasoning: facts.reasoning,
           thinking_level_map: facts.thinking_level_map,
-          compat: entry.compat)
+          compat:)
         @agent&.set_thinking_level(effective)
         Settings.save(@settings_root, "defaultProvider" => entry.provider, "defaultModel" => entry.id) if persist
         @kernel.request_draw

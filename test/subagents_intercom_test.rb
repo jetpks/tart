@@ -77,9 +77,11 @@ module Tart
 
     def test_ask_timeout_env_tiers
       assert_equal 600_000, Subagents::Supervisor.ask_timeout_ms(env: {})
-      assert_equal 250, Subagents::Supervisor.ask_timeout_ms(env: {Subagents::Supervisor::ASK_TIMEOUT_ENV_SUFFIX.gsub("INTERCOM", "PI_INTERCOM") => "250"})
-      assert_equal 600_000, Subagents::Supervisor.ask_timeout_ms(env: {"PI_INTERCOM_ASK_TIMEOUT_MS" => "soon"})
-      assert_equal 600_000, Subagents::Supervisor.ask_timeout_ms(env: {"PI_INTERCOM_ASK_TIMEOUT_MS" => "-5"})
+      # I69 move: the PI_* tiers ride an EXPLICIT pi identity (the default
+      # resolved tart — the tart tier leg below already passes it).
+      assert_equal 250, Subagents::Supervisor.ask_timeout_ms(env: {Subagents::Supervisor::ASK_TIMEOUT_ENV_SUFFIX.gsub("INTERCOM", "PI_INTERCOM") => "250"}, identity: "pi")
+      assert_equal 600_000, Subagents::Supervisor.ask_timeout_ms(env: {"PI_INTERCOM_ASK_TIMEOUT_MS" => "soon"}, identity: "pi")
+      assert_equal 600_000, Subagents::Supervisor.ask_timeout_ms(env: {"PI_INTERCOM_ASK_TIMEOUT_MS" => "-5"}, identity: "pi")
       assert_equal 900, Subagents::Supervisor.ask_timeout_ms(
         env: {"TART_INTERCOM_ASK_TIMEOUT_MS" => "900"}, identity: "tart")
     end
@@ -121,7 +123,9 @@ module Tart
       env = {"PATH" => ENV["PATH"], "HOME" => @home,
              "PI_SUPERVISOR_CHANNEL" => ctrl, "PI_SUBAGENTS_AGENT" => agent}
       env["PI_INTERCOM_ASK_TIMEOUT_MS"] = timeout_ms if timeout_ms
-      Tools::ContactSupervisor.new(cwd: @cwd, env: env)
+      # I69 move: EXPLICIT pi identity — the tool's PI_* channel keys are
+      # the pi-parity opt-in's namespace (the default resolved tart).
+      Tools::ContactSupervisor.new(cwd: @cwd, env: env, identity: "pi")
     end
 
     def test_child_tool_progress_update_writes_and_returns_immediately

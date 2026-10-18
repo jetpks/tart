@@ -261,8 +261,10 @@ module Tart
 
     def test_register_wires_the_recall_and_the_tool
       hooks = Hooks.new
+      # I69 move: EXPLICIT pi identity — the staged PI_MEMORY_HOME tier is
+      # the pi-parity opt-in's namespace (the default resolved tart).
       ENV["PI_MEMORY_HOME"] = @home
-      Memory.register(hooks: hooks)
+      Memory.register(hooks: hooks, identity: "pi")
       write_index("- [a](a.md): one\n")
 
       hooks.emit({"type" => "session_start", "reason" => "startup"},

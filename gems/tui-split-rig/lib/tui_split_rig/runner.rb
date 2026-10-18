@@ -122,6 +122,23 @@ module TuiSplitRig
       [home, sandbox].each { |dir| FileUtils.mkdir_p(dir) }
       agent_dir = app == "pi" ? stage_pi_agent(stage, mock.port) : nil
       stage_tart_home(home, mock.port) if app == "tart"
+      # I70 (declared deviation, measured): the always-staged settings.json
+      # is ITSELF a [Context] source (motd.rb context_sources — the port
+      # lists its config files; pi's contextFiles never lists settings —
+      # the registry leaves the port-only [Context] heading an
+      # unknown-candidate BY DESIGN), so booting with the file in place
+      # breaks the non-compaction scenarios' parity. The explicit opt-out
+      # for those boots rides the env tier instead ({tart_command}'s
+      # identity-namespaced SUBAGENTS=0 row); the staged file moves aside
+      # (byte-preserved, the {stage_tart_home} product) so the boot's
+      # [Context] section stays byte-identical to the pre-I70 shape. The
+      # compaction scenarios KEEP the file (the zeroed-knob lever) — their
+      # final captures are the compaction rebuild, where no MOTD section
+      # survives.
+      hide_staged_settings(home) if app == "tart" && !@scenario.context_window
+      # BEFORE the boot (the apps scan resources at startup — a staged file
+      # landing after the scan is a race): the scenario's loaded-resource
+      # set, byte-identical per app (the s9 instrument).
       # BEFORE the boot (the apps scan resources at startup — a staged file
       # landing after the scan is a race): the scenario's loaded-resource
       # set, byte-identical per app (the s9 instrument).
@@ -358,11 +375,25 @@ module TuiSplitRig
       bin_dir = File.join(home, "bin")
       FileUtils.mkdir_p(bin_dir)
       FileUtils.ln_sf(@pi_bin, File.join(bin_dir, "pi"))
-      return unless @scenario.context_window
+      # The I70 explicit-staging ruling (the I69 law, extended): the runner
+      # OWNS explicit staging — NO parity path rides the app default, which
+      # flipped ON this iteration. The staged settings.json is written
+      # ALWAYS, carrying {"subagents" => false} — the explicit opt-out, the
+      # I48-off shape. The compaction rows still ride ONLY the
+      # context_window scenarios (same zeroed knobs as before; row values
+      # byte-identical when present) and stage_memory's deep-merge composes
+      # unchanged.
+      settings = {"subagents" => false}
+      settings["compaction"] = {"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0} if @scenario.context_window
+      File.write(File.join(dir, "settings.json"), JSON.pretty_generate(settings))
+    end
 
-      File.write(File.join(dir, "settings.json"), JSON.pretty_generate(
-        "compaction" => {"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0}
-      ))
+    # The staged opt-out file, moved aside for the boot (see boot_session's
+    # comment): byte-preserved next to its own path, invisible to the
+    # [Context] section's File.file? filter. Public for the staging pins.
+    def hide_staged_settings(home)
+      staged = File.join(home, ".tart", "settings.json")
+      FileUtils.mv(staged, "#{staged}.optout") if File.exist?(staged)
     end
 
     # The loaded-resource set the [Context]/[Skills]/[Prompts] sections
@@ -532,7 +563,22 @@ module TuiSplitRig
       # AC4): the parity scenarios run tart in pi mode → PI_*; s1_tart
       # stages TART_IDENTITY=tart → TART_*. TART_IDENTITY itself stays the
       # launcher-owned bootstrap knob, always spelled literally.
-      identity = @scenario.env.fetch("tart", {}).fetch("TART_IDENTITY", "pi")
+      #
+      # I69 R3: the runner OWNS the explicit staging — the fetch default
+      # stays "pi" (no scenario path ever rides the app default, which the
+      # I69 flip turned into tart), and an override staging a BLANK or NIL
+      # identity is REFUSED LOUDLY: a blank would compose through as
+      # TART_IDENTITY='' with a blank _MODEL namespace and abort the boot
+      # (measured via the rig-identity-assert probe). Parity scenarios
+      # always carry an explicit non-empty identity.
+      tart_env = @scenario.env.fetch("tart", {})
+      if tart_env.key?("TART_IDENTITY") && (tart_env["TART_IDENTITY"].nil? || tart_env["TART_IDENTITY"].to_s.strip.empty?)
+        raise TuiSplitRig::Error,
+          "scenario env tart.TART_IDENTITY must stage an explicit non-empty identity " \
+          "(pi for the parity face, tart for the tart face) — got #{tart_env["TART_IDENTITY"].inspect}; " \
+          "a blank or nil identity must never compose into the pane command"
+      end
+      identity = tart_env["TART_IDENTITY"] || "pi"
       prefix = "#{identity.upcase}_"
       staged = staged_env("tart",
         "HOME" => home,
@@ -545,7 +591,14 @@ module TuiSplitRig
         "#{prefix}PROVIDER" => "openai",
         "#{prefix}API_KEY" => "mock-key",
         "#{prefix}API_BASE" => "http://127.0.0.1:#{port}",
-        "#{prefix}CONTEXT_WINDOW" => (@scenario.context_window || 32_768).to_s
+        "#{prefix}CONTEXT_WINDOW" => (@scenario.context_window || 32_768).to_s,
+        # I70: the explicit subagents opt-out rides the env tier (any
+        # non-on value — the app's own semantics) for EVERY parity boot:
+        # no parity path rides the app default, which flipped ON this
+        # iteration. Identity-namespaced like every staged key; the
+        # non-compaction boots need it because their staged opt-out file
+        # is moved aside (see boot_session — the [Context] listing).
+        "#{prefix}SUBAGENTS" => "0"
       )
       "cd #{Shellwords.escape(@tart_dir)} && exec env #{env_flags(staged)} #{Shellwords.escape(@bundle_bin)} exec bin/tart #{Shellwords.escape(sandbox)}"
     end
@@ -649,7 +702,7 @@ module TuiSplitRig
     # methods are public for the same reason (the load pin asserts their
     # staged files and env).
     public :capture, :capture_styled, :settle, :teardown, :boot_session,
-      :stage_pi_agent, :stage_tart_home, :stage_project_resources, :stage_memory, :session_name, :pi_command, :tart_command
+      :stage_pi_agent, :stage_tart_home, :hide_staged_settings, :stage_project_resources, :stage_memory, :session_name, :pi_command, :tart_command
 
     def pane_pid_tree(session)
       out = Open3.capture2("tmux", "list-panes", "-t", session, "-F", PANE_PID_FORMAT)[0].to_s

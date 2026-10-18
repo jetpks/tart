@@ -1,0 +1,236 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# subagents-motd-probe — the I70 live MOTD gate (AC1's live leg).
+#
+# Boots tart DIRECTLY in tmux (the tmp/probe-subag boot pattern — NOT
+# through TuiSplitRig::Runner, whose stage_tart_home stages the explicit
+# opt-out; this boot must ride the APP default): a staged HOME with NO
+# settings.json (the default-on boot), a staged sandbox cwd, a CLOSED pane
+# env staging ONLY the TART_MODEL/TART_API_KEY/TART_API_BASE mock facts
+# (no request is made — the MOTD renders at boot, before any fetch), and
+# the DEFAULT identity (no TART_IDENTITY staged — the post-I69 default
+# boot shape). Pane stderr is redirected to a log.
+#
+# Boot → bounded settle → ctrl+o → capture-pane (plain + -e) → assert →
+# teardown (kill -9 the pane pid tree, tmux kill-session — token-scoped
+# session name, the I27 discipline):
+#
+#   1. NO crash: the pane is alive with the chat surface and the stderr
+#      log carries no NoMethodError/motd trace (the base defect killed the
+#      first frame at motd.rb:306).
+#   2. The collapsed [Prompts] row lists the six builtin workflow names
+#      sorted.
+#   3. The expanded [Prompts] block byte-matches the frozen oracle shape
+#      (tmp/probe-subag capture) with the port's label: the `  user` row
+#      (accent SGR 38;2;167;152;215), the `    subagents` label row
+#      (mdLink SGR 38;2;105;173;208), the six `      /<name>` rows (dim
+#      SGR 38;2;126;136;142) alphabetical.
+#
+#   subagents-motd-probe [--out DIR]
+#
+# On pass prints SUBAGENTS_MOTD_OK and exits 0; otherwise the failing
+# line and exit 1. Stdlib only — runs without Bundler. The caller strips
+# the parent session's HERDR_* vars (the frozen gate command carries the
+# env -u prefix); this bin additionally scrubs them from its own ENV so a
+# direct run inside a herdr pane never dials the REAL owner socket.
+
+require "fileutils"
+require "open3"
+require "optparse"
+require "shellwords"
+
+options = {out: "tmp/subagents-motd-probe-#{Time.now.to_i}"}
+parser = OptionParser.new do |p|
+  p.on("--out DIR", "output directory (default tmp/subagents-motd-probe-<ts>)") { |d| options[:out] = d }
+end
+parser.parse!(ARGV)
+
+# HERDR discipline (this repo's sessions run inside herdr panes): the
+# probe's OWN process env must not leak the owner's pane coordinates.
+ENV.keys.grep(/\AHERDR_/).each { |key| ENV.delete(key) }
+
+# The failing-line convention (one load-bearing stdout token per gate —
+# the probe-naming rule).
+fail = lambda do |message|
+  puts "SUBAGENTS_MOTD_FAIL: #{message}"
+  exit 1
+end
+
+# The tart repo root (the probe lives at <repo>/gems/tui-split-rig/bin).
+repo = File.expand_path("../..", File.expand_path("..", __dir__))
+bundle = Open3.capture2("sh", "-c", "command -v bundle")[0].to_s.strip
+fail.call("bundle binary not found on PATH") if bundle.empty?
+
+stage = File.expand_path(options[:out])
+home = File.join(stage, "home")
+sandbox = File.join(stage, "sandbox")
+FileUtils.mkdir_p([home, sandbox])
+# The DEFAULT-ON boot condition, self-pinned: the staged HOME carries NO
+# settings.json — the boot resolves the DEFAULTS tier (the I70 flip).
+fail.call("the staged HOME must NOT carry a settings.json") if File.exist?(File.join(home, ".tart", "settings.json"))
+stderr_log = File.join(stage, "tart.stderr")
+
+# The pane command: the runner's tart_command shape (exec-wrapped so
+# pane_pid IS the app process; BUNDLE_FROZEN so bundler never writes),
+# MINUS the Runner's staging — no TART_IDENTITY (the default boot shape),
+# no staged settings.json. The API facts point at a dead port: no request
+# is made, the MOTD renders at boot.
+staged = {
+  "HOME" => home,
+  "PATH" => "#{File.dirname(bundle)}:#{ENV.fetch('PATH', '')}",
+  "BUNDLE_FROZEN" => "true",
+  "TART_MODEL" => "mock-1",
+  "TART_API_KEY" => "mock-key",
+  "TART_API_BASE" => "http://127.0.0.1:9/v1"
+}
+# The CLOSED pane env: scrub the parent's PI_*/TART_*/HERDR_*/BUNDLE_*/
+# BUNDLER_*/RUBYOPT/RUBYLIB keys not staged above — no owner state may
+# leak into the boot (the runner's env_flags discipline, widened to the
+# bundler vars this lane's environment gotcha warns about).
+scrub = (ENV.keys.grep(/\A(?:PI|TART|HERDR|BUNDLE|BUNDLER)_/) + %w[RUBYOPT RUBYLIB]) - staged.keys
+flags = [*scrub.flat_map { |key| ["-u", key] },
+         *staged.map { |key, value| "#{key}=#{Shellwords.escape(value)}" }].join(" ")
+command = "cd #{Shellwords.escape(repo)} && exec env #{flags} #{Shellwords.escape(bundle)} exec bin/tart " \
+  "#{Shellwords.escape(sandbox)} 2>#{Shellwords.escape(stderr_log)}"
+
+# The token-scoped session name (I27): teardown owns exactly its own
+# session, and a concurrent probe never collides.
+token = format("%04x%04x", rand(65_536), rand(65_536))
+session = "subagents-motd-#{token}"
+
+system("tmux", "kill-session", "-t", session, out: IO::NULL, err: IO::NULL) if
+  system("tmux", "has-session", "-t", session, out: IO::NULL, err: IO::NULL)
+system("tmux", "new-session", "-d", "-x", "120", "-y", "40", "-c", sandbox, "-s", session, command) or
+  fail.call("tmux new-session failed")
+
+POLL = 0.25
+QUIET_POLLS = 3
+HARD_CAP = 30.0
+
+capture = lambda do |styled|
+  Open3.capture2("tmux", "capture-pane", styled ? "-e" : "-p", "-p", "-t", session, err: IO::NULL)[0].to_s
+end
+settle = lambda do
+  started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  last = nil
+  same = 0
+  loop do
+    current = capture.call(false)
+    same = current == last ? same + 1 : 0
+    last = current
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    break if same >= QUIET_POLLS || elapsed >= HARD_CAP
+
+    sleep POLL
+  end
+  last
+end
+
+session_alive = lambda do
+  system("tmux", "has-session", "-t", session, out: IO::NULL, err: IO::NULL)
+end
+
+# The descendant walk for the teardown discipline (the I01 finding: tmux
+# kill-session alone leaves tart SIGHUP-spinning; kill -9 the pane pid
+# tree first). pgrep -P is macOS/BSD-safe.
+descendants = lambda do |pid|
+  out = Open3.capture2("pgrep", "-P", pid.to_s)[0].to_s
+  out.split.flat_map { |child| [child.to_i, *descendants.call(child.to_i)] }
+rescue StandardError
+  []
+end
+
+begin
+  plain = settle.call
+
+  # ---- assert 1: NO crash ----
+  fail.call("the pane died during boot") unless session_alive.call
+  stderr = File.exist?(stderr_log) ? File.read(stderr_log) : ""
+  fail.call("the boot crashed (the base defect class) — stderr:\n#{stderr}") if stderr.match?(/NoMethodError|motd\.rb/)
+  fail.call("the chat surface is missing (no hints line in the capture)") unless plain.include?("ctrl+c interrupt/quit")
+
+  # ---- assert 2: the collapsed [Prompts] row lists the six names sorted ----
+  names = %w[/council /gather-context-and-clarify /parallel-cleanup /parallel-research /parallel-review /review-loop]
+  prompts_block = plain.lines.drop_while { |line| !line.include?("[Prompts]") }
+  fail.call("the collapsed [Prompts] section is missing") if prompts_block.empty?
+  prompts_block = prompts_block[1..].take_while { |line| !line.match?(/^\[/) }.join
+  indexes = names.map { |name| prompts_block.index(name) }
+  if indexes.any?(&:nil?) || indexes != indexes.sort
+    fail.call("the collapsed [Prompts] row does not list the six names sorted:\n#{prompts_block}")
+  end
+
+  # ---- the flip: ctrl+o, re-settle, styled capture ----
+  system("tmux", "send-keys", "-t", session, "C-o") or fail.call("send-keys failed")
+  settle.call
+  styled = capture.call(true)
+
+  # The styled capture parsed into runs: [text, active SGR string] per
+  # contiguous run (nil SGR = unstyled). tmux normalizes the escapes, so
+  # a difference is the APP's, not the terminal's.
+  runs_of = lambda do |line|
+    runs = []
+    current = nil
+    buffer = +""
+    pos = 0
+    while (match = /\e\[([0-9;]*)m/.match(line, pos))
+      buffer << line[pos...match.begin(0)]
+      code = match[1]
+      runs << [buffer, current] unless buffer.empty?
+      buffer = +""
+      current = nil if code.empty? || %w[0 39].include?(code)
+      current = code if code&.start_with?("38;")
+      pos = match.end(0)
+    end
+    buffer << line[pos..] if pos < line.length
+    runs << [buffer, current] unless buffer.empty?
+    runs
+  end
+
+  styled_lines = styled.lines.map(&:chomp)
+
+  # ---- assert 3: the expanded [Prompts] block byte-matches the frozen
+  # ---- oracle shape with the port's label + the styled SGR runs.
+  user_i = styled_lines.index { |line| runs_of.call(line).map { |text, _| text }.join == "  user" }
+  fail.call("the expanded `  user` group row is missing") unless user_i
+  want_label_rows = [
+    ["  user", [["  ", nil], ["user", "38;2;167;152;215"]]],
+    ["    subagents", [["    ", nil], ["subagents", "38;2;105;173;208"]]]
+  ]
+  want_label_rows.each_with_index do |(plain_text, want_runs), offset|
+    got_runs = runs_of.call(styled_lines[user_i + offset])
+    got_plain = got_runs.map { |text, _| text }.join
+    fail.call("expanded row #{offset}: #{got_plain.inspect}, want #{plain_text.inspect}") unless got_plain == plain_text
+    fail.call("expanded row #{offset} runs: #{got_runs.inspect}, want #{want_runs.inspect}") unless got_runs == want_runs
+  end
+  want_members = %w[/council /gather-context-and-clarify /parallel-cleanup /parallel-research /parallel-review /review-loop]
+  styled_lines[(user_i + 2), 6].each_with_index do |line, offset|
+    got_runs = runs_of.call(line)
+    want_plain = "      #{want_members[offset]}"
+    fail.call("member row #{offset}: #{got_runs.map { |text, _| text }.join.inspect}, want #{want_plain.inspect}") unless
+      got_runs == [[want_plain, "38;2;126;136;142"]]
+  end
+
+  # The captured block (the assert evidence for the builder report).
+  puts "subagents-motd-probe expanded [Prompts] block (plain bytes):"
+  styled_lines[user_i, 8].each { |line| puts "  |#{line.gsub(/\e\[[0-9;]*m/, '')}|" }
+rescue StandardError => e
+  fail.call("probe error: #{e.class}: #{e.message}")
+ensure
+  if defined?(session) && session_alive.call
+    pid_line, = Open3.capture2("tmux", "list-panes", "-t", session, "-F", '#{pane_pid}', err: IO::NULL)
+    pids = pid_line.to_s.strip.split.map(&:to_i).flat_map { |pid| [pid, *descendants.call(pid)] }
+    pids.each do |pid|
+      begin
+        Process.kill("KILL", pid)
+      rescue StandardError
+        nil
+      end
+    end
+    sleep 0.2 unless pids.empty?
+  end
+  system("tmux", "kill-session", "-t", session, out: IO::NULL, err: IO::NULL) if defined?(session)
+end
+
+puts "SUBAGENTS_MOTD_OK"
+exit 0

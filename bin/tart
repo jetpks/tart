@@ -32,6 +32,7 @@ end
 
 require "optparse"
 require_relative "../lib/tart"
+require_relative "../lib/tart/session_sink"
 
 module Tart
   module Executable
@@ -68,7 +69,7 @@ module Tart
           -r, --resume [ID]   resume a session in WORKDIR: ID is a session id
                               or session-file path; default: the most recent
           --identity IDENTITY the face to show: any non-empty name (default
-                              pi) — branding, prompt preamble and the app
+                              tart) — branding, prompt preamble and the app
                               env namespace follow it
           --steer-inbox DIR   print mode only: consume steering/stop request
                               files from DIR at this run's turn boundaries
@@ -169,8 +170,8 @@ module Tart
                              context window; the default fireworks model resolves to
                              #{Settings::MODEL_CONTEXT_WINDOWS[Settings::DEFAULTS["defaultModel"]]})
           TART_MCP_CONFIG    MCP config path (default: ~/.tart/mcp.json)
-          TART_IDENTITY      the face to show: any non-empty name — pi (default),
-                             tart, or your own (--identity overrides)
+          TART_IDENTITY      the face to show: any non-empty name — tart (default),
+                             pi, or your own (--identity overrides)
 
         Keys: type + Enter to send (steers a running agent); Escape
         interrupts a running turn; Ctrl+C clears the input (twice exits);
@@ -197,7 +198,7 @@ module Tart
           options[:resume_given] = true
         end
         parser.on("--identity IDENTITY",
-          "the face to show: any non-empty name (default pi) — branding, prompt preamble and the app env namespace follow it") do |identity|
+          "the face to show: any non-empty name (default tart) — branding, prompt preamble and the app env namespace follow it") do |identity|
           options[:identity] = identity
         end
         # The print-child harness flags (I48 §5.2) — print mode ONLY:
@@ -289,6 +290,12 @@ module Tart
       memory_on = memory_enabled?(settings, identity)
       Memory.register(hooks:, identity:) if memory_on
       Herdr.register(hooks:)
+      # The observation-deck sink (I74): silent ambient capture — registers
+      # unconditionally, resolves config per bind (unconfigured/disabled =
+      # fully inert). NO MOTD row (the ruling — the sink is not an
+      # extension-module row; the deck contract's own no-noise discipline).
+      prompt = nil # pre-declared: the sink's lazy system-prompt ref (assigned below)
+      SessionSink.register(hooks:, identity:, env: ENV, system_prompt: -> { prompt })
       # The subagents gate (I48 — OQ-1): register ONLY when on — no tool,
       # no watcher, no run dirs when off (the frozen digests hold). The
       # returned Manager owns the agent-end drain below (pi's auto-drain).
@@ -355,6 +362,10 @@ module Tart
                                          display: pending[:display])
         end
       end
+      # The sink's terminal flush (I74): post-drain, pre-exit — the quit
+      # emission point (the terminal POST rides this handler, bounded ≤ ~3 s).
+      hooks.emit({"type" => "session_shutdown", "reason" => "quit"},
+        context: {cwd: workdir, mode: "print", session: session_ref(recorder), identity:})
       exit code
     end
 
@@ -418,9 +429,16 @@ module Tart
         extensions << "memory.ts" if memory_on
         extensions << "herdr-agent-state" if Herdr.enabled?(ENV)
         surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
-          mcp_servers:, resume: resume_path, identity:, models:, context_files:, extensions:, hooks:)
+          mcp_servers:, resume: resume_path, identity:, models:, context_files:, extensions:, hooks:,
+          endpoint: endpoint_facts(models, Models.resolve_boot_model(models, settings, identity:),
+            identity:, resolved:))
         Memory.register(hooks:, identity:) if memory_on
         Herdr.register(hooks:)
+        # The observation-deck sink (I74): the same silent ambient capture
+        # as the print boot — registers unconditionally, config resolves
+        # per bind. NO MOTD row (the ruling).
+        prompt = nil # pre-declared: the sink's lazy system-prompt ref (assigned below)
+        SessionSink.register(hooks:, identity:, env: ENV, system_prompt: -> { prompt })
         # The subagents gate (I48 — OQ-1): registered BEFORE build_tools so
         # the tool merges into the loadout (declared LAST). The kernel is
         # the WAKE BRIDGE (the Manager's kick ferries onto the reactor
@@ -479,7 +497,10 @@ module Tart
             thinking_level: facts.fetch(:thinking_level),
             model_reasoning: facts.fetch(:reasoning),
             thinking_level_map: facts.fetch(:thinking_level_map),
-            compat: entry&.compat
+            # I71 R2: the compat rides the vendored fill (the boot kwargs'
+            # same seam — the entry's declared compat, else the matched
+            # vendored compat).
+            compat: Models.resolved_compat(entry)
           )
           # The session_start emission (pi extensions/types.ts:744 —
           # reasons startup|new|resume; fork/reload have no port surface):
@@ -543,6 +564,11 @@ module Tart
           end
         end
         kernel.run
+        # The sink's terminal flush (I74): post-kernel.run — the quit path
+        # (all of ctrl+d / ctrl+c-quit / /quit land here); the chat
+        # surface's event case has no :session_shutdown arm (ignored).
+        hooks.emit({"type" => "session_shutdown", "reason" => "quit"},
+          context: {cwd: workdir, mode: "tui", session: session_ref(current_recorder), identity:})
       end
 
       # The exit resume hint (item 1, pi interactive-mode.ts:4324-4327 +
@@ -600,9 +626,11 @@ module Tart
       resolved == true || resolved == "true" || resolved == "1"
     end
 
-    # The subagents gate (I48 — OQ-1): the memory gate's idiom — the
-    # resolved settings row or the <IDENTITY>_SUBAGENTS env tier, default
-    # off.
+    # The subagents gate (I48 — OQ-1; I70 default-on law): the memory
+    # gate's idiom — the resolved settings row or the <IDENTITY>_SUBAGENTS
+    # env tier, DEFAULT ON since the I70 flip; the opt-out is a settings
+    # row {"subagents": false} or any non-on env value ("1"/"true" stay
+    # the on spellings).
     def subagents_enabled?(settings, identity)
       resolved = Settings.resolve_setting("subagents", settings, identity:)
       resolved == true || resolved == "true" || resolved == "1"
@@ -703,7 +731,10 @@ module Tart
       {model_reasoning: facts.reasoning, thinking_level_map: facts.thinking_level_map,
        thinking_level: Models.clamp_thinking_level(Settings.resolve_thinking_level(settings),
          map: facts.thinking_level_map, reasoning: facts.reasoning),
-       compat: entry&.compat}
+       # I71 R2: the compat rides the vendored fill (the entry's declared
+       # compat, else the matched vendored compat — the fill-only law; the
+       # wire model's dialect derivation consumes it verbatim).
+       compat: Models.resolved_compat(entry)}
     end
 
     # The catalog entry for a boot pair (the I28 cross-resolve): the boot
@@ -748,8 +779,13 @@ module Tart
     # of silently degenerating the /model menu to the boot model (the
     # defect the post-integration probe caught: the launcher wired the
     # catalog into build_chat/the handler/footer_data but not here).
+    # I71 R5: +endpoint:+ threads the boot endpoint facts (the same
+    # `endpoint_facts` chain build_chat speaks) into the surface — the
+    # live listing's per-field fallback tier (the I27 live-defect lesson:
+    # every new surface kwarg ships with a launcher-seam regression pin,
+    # launcher_smoke_test's /listing_endpoint/ leg).
     def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:,
-                      context_files: [], extensions: nil, hooks: nil)
+                      context_files: [], extensions: nil, hooks: nil, endpoint: nil)
       Render::Chat.new(
         session:, kernel:,
         # Autocomplete sources (AC1): the builtin slash commands + the
@@ -770,7 +806,8 @@ module Tart
         # the active module rows (I47 §5 — merged, sorted comma-joined by
         # the section renderer).
         extensions: extensions || mcp_servers.keys,
-        models:
+        models:,
+        endpoint:
       )
     end
 

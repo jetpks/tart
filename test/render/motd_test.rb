@@ -245,6 +245,66 @@ module Tart
         assert_equal "    /council", prompt_rows[1], "the template renders as /name (pi :1881-1896)"
       end
 
+      # --- I70: the prompt-scope PACKAGE tier (the builtin workflow
+      # --- templates, file_path: nil — the crash cure, default-on's
+      # --- [Prompts] shape; the oracle capture tmp/probe-subag).
+
+      # A nil-file_path builtin template classifies into pi's user scope
+      # under the port's own package label: the accent group label, the
+      # mdLink package label row (two spans, indent UNSTYLED), then the
+      # six /name member rows (ONE dim span incl. the 6-space indent),
+      # name-sorted. The collapsed compact list shape is unchanged.
+      def test_nil_path_prompt_templates_render_the_package_tier
+        section = Motd.sections(120, context: [], skills: [], prompts: Subagents::WORKFLOW_TEMPLATES,
+          extensions: [], user_root: "/u/.tart", project_root: "/p/.tart")[0]
+        rows = section.expanded_rows.map { |row| row.spans.map(&:content).join }
+        assert_equal "  user", rows[0], "pi's installed-package scope is user"
+        assert_equal "    subagents", rows[1], "the port's package label (pi reads npm:pi-subagents)"
+        assert_equal %w[/council /gather-context-and-clarify /parallel-cleanup /parallel-research /parallel-review
+                        /review-loop], rows[2..].map(&:strip), "the six members name-sorted"
+        assert_nil section.expanded_rows[0].spans[0].style&.fg, "the group label's indent renders UNSTYLED"
+        assert_equal Theme[:accent], section.expanded_rows[0].spans[1].style.fg, "the group label renders accent"
+        assert_nil section.expanded_rows[1].spans[0].style&.fg, "the package label's indent renders UNSTYLED"
+        assert_equal Theme[:md_link], section.expanded_rows[1].spans[1].style.fg, "the package label renders md_link"
+        member = section.expanded_rows[2]
+        assert_equal 1, member.spans.size, "the member row is ONE span — the indent rides the dim run"
+        assert_equal "      /council", member.spans[0].content, "6-space indent + display inside one dim span"
+        assert_equal Theme[:dim], member.spans[0].style.fg
+        collapsed = section.collapsed_rows.map { |row| row.spans.map(&:content).join }.join
+        %w[/council /gather-context-and-clarify /parallel-cleanup /parallel-research /parallel-review /review-loop].each do |name|
+          assert_includes collapsed, name, "the collapsed compact list carries #{name}"
+        end
+      end
+
+      # Mixed tiers: file-backed templates keep today's plain path rows
+      # (project → user groups, path-sorted, dim) BEFORE the user group's
+      # package sub-list.
+      def test_mixed_prompt_tiers_keep_the_plain_path_rows
+        user = Prompts::Template.new(name: "zulu", description: "d", argument_hint: nil, content: "b",
+          file_path: "/u/.tart/prompts/zulu.md")
+        project = Prompts::Template.new(name: "alpha", description: "d", argument_hint: nil, content: "b",
+          file_path: "/p/.tart/prompts/alpha.md")
+        section = Motd.sections(120, context: [], skills: [],
+          prompts: Subagents::WORKFLOW_TEMPLATES + [user, project], extensions: [],
+          user_root: "/u/.tart", project_root: "/p/.tart")[0]
+        rows = section.expanded_rows.map { |row| row.spans.map(&:content).join }
+        assert_equal ["  project", "    /alpha", "  user", "    /zulu", "    subagents",
+          "      /council", "      /gather-context-and-clarify", "      /parallel-cleanup",
+          "      /parallel-research", "      /parallel-review", "      /review-loop"], rows,
+          "plain path rows render EXACTLY as today, then the package sub-list"
+        assert_equal Theme[:dim], section.expanded_rows[1].spans[0].style.fg, "the plain path rows stay dim"
+      end
+
+      # The nil-crash class stays dead: a nil file_path NEVER reaches
+      # scope_group/under? (the base defect: NoMethodError at motd.rb:306),
+      # and the rows build at a narrow width through the wrap.
+      def test_nil_path_templates_never_crash_the_scope_path
+        entries = Motd.prompt_scope_entries(Subagents::WORKFLOW_TEMPLATES, user_root: "/u/.tart", project_root: "/p/.tart")
+        assert entries.all? { |entry| entry[:group] == "user" && entry[:package] == "subagents" && entry[:path].nil? }
+        rows = Motd.scope_group_rows(entries, 40)
+        assert_equal 8, rows.size, "label + package label + six members, no crash at width 40"
+      end
+
       # [Extensions] stays compact in BOTH states (pi's default
       # expandedBody IS the collapsed body — addLoadedSection :1810): the
       # port's extensions are names, not paths.

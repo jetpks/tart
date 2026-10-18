@@ -246,6 +246,9 @@ module Tart
       {
         "PATH" => ENV.fetch("PATH", nil),
         "HOME" => @home,
+        # I69 move: the e2e legs test the PI_-parity opt-in — stage the
+        # identity EXPLICITLY so the (now tart) default never rides.
+        "TART_IDENTITY" => "pi",
         "PI_API_KEY" => "e2e-key",
         "PI_API_BASE" => @server.url,
         "TART_MCP_CONFIG" => File.join(@home, "absent-mcp.json")

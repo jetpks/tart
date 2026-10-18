@@ -273,6 +273,10 @@ module TuiSplitRig
       tart_settings = JSON.parse(File.read(File.join(home, ".tart", "settings.json")))
       assert_equal({"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0},
         tart_settings.fetch("compaction"), "tart's knobs zeroed too (settings.rb compaction_kwargs)")
+      # I70: the explicit opt-out COEXISTS with the compaction rows — the
+      # runner's always-written staging row never clobbers the lever.
+      assert_equal false, tart_settings.fetch("subagents"),
+        "the explicit subagents opt-out rides the context_window staging too"
     end
 
     # I27: sessions carry the per-Runner token and the leftover check greps
@@ -290,8 +294,11 @@ module TuiSplitRig
 
     # I27: the tart menu staging mirrors pi's models.json shape with ≥2 mock
     # models so the /model menu has something to select; staged unconditionally
-    # (the menu probe needs it without a context_window), settings.json stays
-    # context_window-gated.
+    # (the menu probe needs it without a context_window). I70 MOVE (was: the
+    # settings.json-stays-context_window-gated refute — inverted by the R3
+    # always-written staging): the staged settings.json is ALWAYS present,
+    # carrying the explicit subagents opt-out — no parity path rides the
+    # app default (the I69 explicit-staging ruling, extended by the flip).
     def test_tart_home_stages_two_mock_models
       scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_text_turn.yml"))
       runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
@@ -303,8 +310,47 @@ module TuiSplitRig
       assert_equal "http://127.0.0.1:4711/v1", provider.fetch("baseUrl")
       assert_operator provider.fetch("models").size, :>=, 2, "the menu needs ≥2 mock models"
       assert_equal %w[mock-1 mock-2], provider.fetch("models").map { |m| m.fetch("id") }
+      settings = JSON.parse(File.read(File.join(home, ".tart", "settings.json")))
+      assert_equal false, settings.fetch("subagents"),
+        "the always-staged settings.json carries the explicit opt-out (the I48-off shape)"
+      refute settings.key?("compaction"),
+        "the compaction rows still ride ONLY the context_window scenarios"
+    end
+
+    # I70: the non-compaction parity boots carry the explicit opt-out via
+    # the env tier (the staged settings.json is moved aside — the [Context]
+    # listing conflict, boot_session's comment): identity-namespaced
+    # PI_SUBAGENTS/TART_SUBAGENTS=0, "0" = the app's non-on opt-out
+    # spelling.
+    def test_tart_command_stages_the_identity_namespaced_subagents_opt_out
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_text_turn.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      cmd = runner.tart_command("/sbx", "/home", 4711)
+      assert_includes cmd, "PI_SUBAGENTS=0",
+        "the pi-parity boot stages the explicit opt-out env row"
+
+      tart = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_tart.yml"))
+      tart_runner = Runner.new(scenario: tart, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      tart_cmd = tart_runner.tart_command("/sbx", "/home", 4711)
+      assert_includes tart_cmd, "TART_SUBAGENTS=0",
+        "the tart-mode boot namespaces the opt-out to the staged identity"
+      refute_includes tart_cmd, "PI_SUBAGENTS=0",
+        "never the pi spelling (the scrub's -u PI_SUBAGENT_* flags are not stagings)"
+    end
+
+    # I70: the boot-time hide step (boot_session's non-compaction path):
+    # the staged opt-out file moves aside byte-preserved — invisible to
+    # the [Context] File.file? filter, the compaction scenarios excluded.
+    def test_hide_staged_settings_moves_the_opt_out_aside
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_text_turn.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      home = File.join(Dir.mktmpdir("tui-split-rig-home-"))
+      runner.stage_tart_home(home, 4711)
+      runner.hide_staged_settings(home)
       refute File.exist?(File.join(home, ".tart", "settings.json")),
-        "settings.json stays context_window-gated (s1–s6 don't stage it)"
+        "the boot's [Context] section must not see the staged file"
+      hidden = JSON.parse(File.read(File.join(home, ".tart", "settings.json.optout")))
+      assert_equal false, hidden.fetch("subagents"), "the staged opt-out bytes survive the hide"
     end
 
     # The usage-suppression knob (I29, the Case-3 instrument): a boolean
@@ -419,6 +465,25 @@ module TuiSplitRig
       assert_includes command, "TART_API_KEY=mock-key"
       assert_includes command, "TART_CONTEXT_WINDOW=32768"
       refute_includes command, "PI_MODEL="
+    end
+
+    # I69 R3: the runner OWNS the explicit staging — an override staging a
+    # BLANK or NIL TART_IDENTITY is refused loudly (TuiSplitRig::Error
+    # naming the requirement), never composed into the pane command (a
+    # blank used to ride through as TART_IDENTITY='' with a blank
+    # model-namespace prefix and abort the boot — measured).
+    def test_blank_or_nil_staged_identity_is_refused_loudly
+      [nil, "", "   "].each do |blank|
+        error = assert_raises(TuiSplitRig::Error) do
+          data = {"name" => "x", "prompt" => "hi", "expected_requests" => 1,
+                  "responses" => [{"type" => "stream", "content" => "r"}],
+                  "env" => {"tart" => {"TART_IDENTITY" => blank}}}
+          Runner.new(scenario: Scenario.new("x", data), out: File.join(Dir.mktmpdir("tui-split-rig-blank-")))
+            .tart_command("/sandbox", "/home", 4711)
+        end
+        assert_includes error.message, "explicit non-empty identity",
+          "the refusal names the requirement (got: #{error.message})"
+      end
     end
 
     # The parent environment's PI_*/TART_* keys are scrubbed (-u) — the

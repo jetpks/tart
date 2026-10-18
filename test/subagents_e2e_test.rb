@@ -392,6 +392,9 @@ module Tart
       {
         "PATH" => ENV.fetch("PATH", nil),
         "HOME" => @home,
+        # I69 move: the parent boots stage the PI_-parity opt-in
+        # EXPLICITLY (the (now tart) default never rides these pins).
+        "TART_IDENTITY" => "pi",
         "PI_API_KEY" => "e2e-key",
         "PI_API_BASE" => @server.url,
         "PI_MODEL" => ROUTED_MODEL,
@@ -406,6 +409,7 @@ module Tart
       {
         "PATH" => ENV.fetch("PATH", nil),
         "HOME" => @home,
+        "TART_IDENTITY" => "pi", # I69 move: explicit pi-parity staging
         "PI_API_KEY" => "e2e-key",
         "PI_API_BASE" => @server.url,
         "PI_SUBAGENTS_HOME" => @subagents_home
@@ -837,6 +841,13 @@ module Tart
       @home = Dir.mktmpdir("i49-e2e-home-")
       @project_dir = File.join(@home, "project")
       FileUtils.mkdir_p(@project_dir)
+      # I70 explicit-staging law (the runner's R3, mirrored): the staged
+      # HOME carries the EXPLICIT subagents opt-out — the child print boot
+      # never rides the app default (which flipped ON in I70), so the leg F
+      # child wire stays the allowlist + bridge shape. Leg E's stage_home
+      # overwrites this with its explicit opt-in row after.
+      FileUtils.mkdir_p(File.join(@home, ".tart"))
+      File.write(File.join(@home, ".tart", "settings.json"), JSON.generate({"subagents" => false}))
       puts "[i48-e2e] i49 staged HOME: #{@home}"
       puts "[i48-e2e] i49 project cwd: #{@project_dir}"
     end
@@ -906,6 +917,181 @@ module Tart
     def assert_i49_hygiene
       assert_empty Dir.glob(File.join(Dir.tmpdir, "i49-e2e-*")),
         "no i49-e2e-* scratch dirs survive the leg"
+    end
+
+    # (minitest discovers public test methods only — the i49 helper block
+    # above ended in a `private` region; the E legs must be discovered.)
+    public
+
+    # *****************************************************************
+    # I70 subagents-default-on, the E1–E4 legs: the I48/I49 harness driven
+    # with NO settings.json staged — the parent boots DEFAULT-ON (the
+    # flip), riding only the staged <IDENTITY>_SUBAGENTS_HOME + the closed
+    # env + explicit TART_IDENTITY=pi + the PI_* mock facts (the harness
+    # convention). Each leg mirrors its A–D shape with the opt-in staging
+    # REMOVED; the A–D legs above stay byte-unchanged (the opt-in tier is
+    # not re-litigated). Leg names carry default_on (the gate's -n filter).
+    # *****************************************************************
+
+    # The default-on condition itself, pinned on every E leg before the
+    # boot: the staged HOME carries NO settings.json and the env carries
+    # no subagents row — the boot resolves the DEFAULTS tier.
+    def assert_no_staged_settings
+      refute File.exist?(File.join(@home, ".tart", "settings.json")),
+        "the E legs stage NO settings.json — the parent must boot default-on"
+      refute child_env["PI_SUBAGENTS"], "no subagents env row rides the E legs"
+    end
+
+    # E1 (the leg-A shape): foreground child round-trip on the DEFAULT-ON
+    # wire — the parent request carries read/bash/edit/write + subagent
+    # (declared LAST, the I47 merge order) with no settings staged at all.
+    def test_default_on_e1_foreground_child_round_trip
+      stage_subagents_home
+      assert_no_staged_settings
+      @server.script([
+        {type: :stream, tool_calls: [{id: "c1", name: "subagent",
+                                      arguments: {agent: "worker", task: A_CHILD_TASK, async: false}}]},
+        {type: :stream, content: A_CHILD_ANSWER},
+        {type: :stream, content: A_FINAL}
+      ])
+
+      stdout, stderr, status = tart_sub(A_PROMPT)
+      assert_equal 0, status.exitstatus, "leg E1 parent exits 0 (stderr: #{stderr})"
+      assert_includes stdout, A_FINAL, "the parent's final response lands on stdout"
+
+      drain_captures
+      assert_equal 3, @captures.size, "parent request, child request, parent tool-result turn"
+      parent_req, child_req, parent_req2 = @captures
+      assert_equal %w[read bash edit write subagent], parent_req["tools"].to_a.map { |t| t.dig("function", "name") },
+        "the DEFAULT-ON wire (no staged settings): the subagent tool declared LAST"
+      assert_equal ROUTED_MODEL, child_req["model"], "the child rides the routed model"
+      assert_includes child_req["messages"].last["content"].to_s, A_CHILD_TASK,
+        "the child request carries the delegated task"
+      tool_result = tool_message(parent_req2, "c1")
+      assert_equal A_CHILD_ANSWER, tool_result.strip,
+        "the foreground result is the child's final text"
+
+      run_dir = the_only_run_dir
+      assert_equal "completed", status_json(run_dir)["state"]
+      assert_equal A_CHILD_ANSWER, result_json(run_dir)["output"].to_s.strip
+      assert_equal 1, Dir.glob(File.join(run_dir, "sessions", "**", "*.jsonl")).size,
+        "the child records its session under the staged run dir"
+      puts "[i48-e2e] leg E1: default-on boot (no staged settings), foreground round-trip completed"
+    end
+
+    # E2 (the leg-B shape): async detached + completion notify + the
+    # print-parent drain — the parent boots default-on with no settings.
+    def test_default_on_e2_async_detached_notify_and_print_drain
+      stage_subagents_home
+      assert_no_staged_settings
+      # The leg-B script-order bet: the parent's tool-result turn is issued
+      # ~instantly after the start message, so the child's request arrives
+      # LAST and takes the slow stream.
+      @server.script([
+        {type: :stream, tool_calls: [{id: "c1", name: "subagent",
+                                      arguments: {agent: "worker", task: B_CHILD_TASK, async: true}}]},
+        {type: :stream, content: B_FINAL},
+        {type: :slow_stream, content: B_CHILD_SLOW, chunk_every: 0.05}
+      ])
+
+      stdout, stderr, status = tart_sub(B_PROMPT)
+      assert_equal 0, status.exitstatus, "leg E2 parent exits 0 (stderr: #{stderr})"
+      assert_equal B_FINAL, stdout.strip, "the drain adds no extra stdout"
+
+      drain_captures
+      parent_req2 = @captures.find do |r|
+        r["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "c1" }
+      end
+      assert parent_req2, "the parent's tool-result turn was captured"
+      start_message = tool_message(parent_req2, "c1")
+      assert start_message.start_with?("Async: worker ["), "the §7 async start headline"
+      run_id = start_message[/\[([0-9a-f-]{36})\]/, 1]
+      assert run_id, "the start message names the run id"
+      assert_equal [run_id], Dir.children(@subagents_home).sort, "one run dir under the staged home"
+
+      files = session_files
+      assert_equal 1, files.size, "exactly one parent session under the staged HOME"
+      entries = Agent::Session.load_entries(files.first)
+      notice = entries.last
+      assert_equal "custom_message", notice["type"], "session tail: #{entries.last(2).map { |e| e["type"] }.inspect}"
+      assert_equal "subagent-notify", notice["customType"]
+      assert notice["content"].start_with?("Background task completed: **worker**"), "the §7 notification header"
+      assert_equal false, notice["display"], "completed notices are model-visible only"
+
+      run_dir = File.join(@subagents_home, run_id)
+      assert_equal "completed", status_json(run_dir)["state"], "the child settled completed on disk"
+      puts "[i48-e2e] leg E2: default-on boot, async drain recorded run #{run_id} completed"
+    end
+
+    # E3 (the leg-C shape): the steering receipt — correlated consumption
+    # by request id, the in-process Manager with the default-on HOME.
+    def test_default_on_e3_steering_receipt
+      home = stage_subagents_home
+      assert_no_staged_settings
+      @server.script([
+        {type: :slow_stream, content: C_LONG, chunk_every: 0.05},
+        {type: :stream, content: C_STEERED_ANSWER}
+      ])
+      @hooks = Hooks.new
+      @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
+        identity: "pi", hooks: @hooks)
+
+      tool = Tart::Tools::Subagent.new(manager: @manager)
+      start = tool.execute(agent: "worker", task: C_TASK, timeout_ms: 0).to_s
+      run = @manager.runs.first
+      assert run, "the dispatch registered the run"
+      id = run[:id]
+      assert_equal "Async: worker [#{id}]", start.split("\n").first, "the §7 start message"
+
+      wait_for_captures(15, "the child's first request") { child_requests(C_TASK).size == 1 }
+      assert_equal :running, @manager.runs.first[:state]
+
+      receipt = @manager.steer(id: id, message: C_STEER, mode: "steer", ack_timeout_ms: 30_000)
+      assert_equal :delivered, receipt[:state],
+        "the receipt reports the child's correlated consumption: #{receipt.inspect}"
+      assert_equal 36, receipt[:request_id].to_s.length
+      assert_equal "Steering delivered to async run #{id} (request #{receipt[:request_id]}).",
+        receipt[:text], "the §7 steer receipt bytes"
+
+      log = File.readlines(File.join(run[:dir], "control", "steer-log.jsonl")).map { |line| JSON.parse(line) }
+      assert log.any? { |entry| entry["requestId"] == receipt[:request_id] },
+        "the child's steer log names the SAME request id (T1)"
+
+      wait_until_bounded(25, "the steered run to complete") { !@manager.outstanding? }
+      assert_equal :completed, @manager.runs.first[:state]
+      drain_captures
+      steered = @captures.find do |r|
+        r["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(C_STEER) }
+      end
+      assert steered, "the steer text rode a captured child request"
+      first_child = child_requests(C_TASK).first
+      assert_operator @captures.index(steered), :>, @captures.index(first_child),
+        "the steer reached the child's NEXT request, not the first"
+      assert_equal C_STEERED_ANSWER, result_json(run[:dir])["output"].to_s.strip
+      assert_ps_clean(@manager.runs.first[:pid])
+      puts "[i48-e2e] leg E3: default-on home, steer delivered (request #{receipt[:request_id]}), completed"
+    end
+
+    # E4 (the leg-D shape): stop — graceful interrupt, state stopped,
+    # timedOut false, no zombie — on the default-on HOME.
+    def test_default_on_e4_stop
+      home = stage_subagents_home
+      assert_no_staged_settings
+      @hooks = Hooks.new
+      @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
+        identity: "pi", hooks: @hooks)
+
+      @server.script([{type: :slow_stream, content: D_STOP_STREAM, chunk_every: 0.05}])
+      run = @manager.spawn_run(agent: "worker", task: D_STOP_TASK, async: true, timeout_ms: 0)
+      wait_for_captures(15, "the stop target's first request") { child_requests(D_STOP_TASK).size == 1 }
+      receipt = @manager.stop(id: run[:id])
+      assert_equal "Stop requested for async run #{run[:id]}.", receipt.to_s, "the §7 stop receipt bytes"
+      wait_until_bounded(10, "the stopped state") { run_state(run[:id]) == :stopped }
+      sj = status_json(run[:dir])
+      assert_equal "stopped", sj["state"]
+      assert_equal false, sj.fetch("timedOut", nil), "a user stop never sets timedOut"
+      assert_ps_clean(run[:pid])
+      puts "[i48-e2e] leg E4: default-on home, stop lands stopped/timedOut false, no zombies"
     end
   end
 end

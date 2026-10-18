@@ -275,7 +275,9 @@ module Tart
 
     # (a) the five vars present with correct sources.
     def test_session_environment_exposes_pis_five_vars_from_the_readers
-      env = child_env(env_tool(session_env: {
+      # I69 move: EXPLICIT pi identity (the default resolved tart; the pin
+      # tests the pi-parity opt-in's five-var exposure).
+      env = child_env(env_tool(identity: "pi", session_env: {
         "SESSION_ID" => -> { "sess-1" }, "SESSION_FILE" => -> { "/tmp/s-1.jsonl" },
         "PROVIDER" => -> { "mock" }, "MODEL" => -> { "glm-5.3" },
         "REASONING_LEVEL" => -> { "high" }
@@ -304,17 +306,20 @@ module Tart
     # happens even when NOTHING is exposed.
     def test_session_environment_inherited_parent_var_never_reaches_the_child
       ENV["PI_SESSION_ID"] = "parent-leak"
-      env = child_env(env_tool(session_env: {}))
+      # I69 move: EXPLICIT pi identity (the PI_* scrub is pi-mode's shape).
+      env = child_env(env_tool(identity: "pi", session_env: {}))
 
       refute env.key?("PI_SESSION_ID"), "the parent's value leaks past the scrub"
     ensure
       ENV.delete("PI_SESSION_ID")
     end
 
-    # (d) run_user exposes NOTHING and does NOT scrub — pi's user-bash
-    # executor passes no env (bash-executor.ts:48-100): the inherited
-    # values ride unscrubbed, the readers never fire. (Vars the test sets
-    # itself — the parent harness may carry live PI_* of its own.)
+    # (d) run_user exposes NOTHING session-shaped — the session readers
+    # never fire (pi's user-bash executor, bash-executor.ts:48-100). I73
+    # mechanism note: the child env is now the explicit ChildEnv.scrub
+    # copy rather than bare inheritance (OQ-1), which for these vars is
+    # observably identical — the law touches bundler keys only, so the
+    # inherited values still ride UNSCRUBBED. Pinned behavior unchanged.
     def test_session_environment_run_user_exposes_nothing_and_never_scrubs
       ENV["PI_SESSION_ID"] = "parent-leak"
       ENV["PI_REASONING_LEVEL"] = "parent-level"
@@ -357,7 +362,8 @@ module Tart
     # two executes is honored twice (pi's per-command-start resolution).
     def test_session_environment_values_resolve_at_spawn_time
       model = "first"
-      exposing = env_tool(session_env: {"MODEL" => -> { model }})
+      # I69 move: EXPLICIT pi identity (the PI_* exposure is pi-mode's shape).
+      exposing = env_tool(identity: "pi", session_env: {"MODEL" => -> { model }})
 
       assert_equal "first", child_env(exposing)["PI_MODEL"]
       model = "second"
@@ -369,7 +375,8 @@ module Tart
     # rule: only its own five are scrubbed, bash.ts:187-191).
     def test_session_environment_pi_mode_shape_is_exactly_pis_five_keys
       composed = Tools::Bash::SESSION_ENV_SUFFIXES.map { |suffix| "PI_#{suffix}" }
-      env = child_env(env_tool(session_env: {
+      # I69 move: EXPLICIT pi identity (the pin tests pi-mode's exact shape).
+      env = child_env(env_tool(identity: "pi", session_env: {
         "SESSION_ID" => -> { "s" }, "SESSION_FILE" => -> { "f" }, "PROVIDER" => -> { "p" },
         "MODEL" => -> { "m" }, "REASONING_LEVEL" => -> { "l" }
       }))
@@ -378,6 +385,50 @@ module Tart
         "the parent's PI_* minus the five scrubbed, plus the five composed — nothing else"
       assert_equal({"PI_SESSION_ID" => "s", "PI_SESSION_FILE" => "f", "PI_PROVIDER" => "p",
                     "PI_MODEL" => "m", "PI_REASONING_LEVEL" => "l"}, env.slice(*composed))
+    end
+
+    # ---- I73 child-env pins: the scrubbed base under BOTH arms ----
+
+    # The tool arm's composed base is the scrub (I73 seam (a)): a poisoned
+    # in-process ENV — bundler's own record shape — yields the recorded
+    # user env, and the session keys ride ON TOP of the scrubbed base.
+    def test_child_env_tool_arm_composes_the_scrubbed_base_with_session_keys_on_top
+      saved = seed_bundler_poison("BUNDLE_GEMFILE" => "/t/Gemfile",
+                                  "BUNDLER_ORIG_BUNDLE_GEMFILE" => "/u/proj/Gemfile",
+                                  "BUNDLER_ORIG_PATH" => "/u/bin:/usr/bin:/bin")
+      begin
+        env = child_env(env_tool(identity: "tart", session_env: {"SESSION_ID" => -> { "s-73" }}))
+
+        assert_equal "/u/proj/Gemfile", env["BUNDLE_GEMFILE"],
+                     "the bundler key restored to its record value in the tool arm's child"
+        assert_equal "/u/bin:/usr/bin:/bin", env["PATH"], "the child PATH is the user-shell PATH"
+        assert_empty env.keys.grep(/\ABUNDLER_ORIG_/), "zero ORIG residue in the child"
+        assert_equal "s-73", env["TART_SESSION_ID"], "the session key rides ON TOP of the scrubbed base"
+      ensure
+        saved.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
+      end
+    end
+
+    # The run_user child env is the scrubbed parent (I73 seam (b), the OQ-1
+    # ruling): a bundler key with an INTENTIONALLY_NIL record is DELETED,
+    # and the PI_* ride-through is preserved — the law touches bundler
+    # keys only, so the standing session-env behavior holds (nothing
+    # deleted, the readers never fire here).
+    def test_child_env_run_user_child_env_is_the_scrubbed_parent_with_pi_ride_through
+      saved = seed_bundler_poison("BUNDLE_GEMFILE" => "/t/Gemfile",
+                                  "BUNDLER_ORIG_BUNDLE_GEMFILE" => ChildEnv::INTENTIONALLY_NIL)
+      begin
+        ENV["PI_SESSION_ID"] = "parent-leak"
+        outcome = run_user_tool("env", tool: env_tool(identity: Identity::PI))
+        env = outcome_env(outcome)
+
+        refute env.key?("BUNDLE_GEMFILE"), "the NIL record deleted the bundler key in the run_user child"
+        assert_equal "parent-leak", env["PI_SESSION_ID"], "PI_* rides through unscrubbed (bundler keys only)"
+        assert_empty env.keys.grep(/\ABUNDLER_ORIG_/), "zero ORIG residue in the child"
+      ensure
+        ENV.delete("PI_SESSION_ID")
+        saved.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
+      end
     end
 
     private
@@ -414,6 +465,20 @@ module Tart
       raise "env failed: #{result[:error]}" if result.is_a?(Hash)
 
       result.split("\n").select { |line| line.include?("=") }.to_h { |line| line.split("=", 2) }
+    end
+
+    # The run_user outcome's content as an env hash (same parse rule as
+    # child_env).
+    def outcome_env(outcome)
+      outcome.content.split("\n").select { |line| line.include?("=") }.to_h { |line| line.split("=", 2) }
+    end
+
+    # Seeds the given bundler-shaped poison into the process ENV and
+    # returns the saved values for the ensure-restore.
+    def seed_bundler_poison(pairs)
+      saved = pairs.keys.to_h { |key| [key, ENV[key]] }
+      pairs.each { |key, value| ENV[key] = value }
+      saved
     end
 
     # No zombie, no leaked process: nothing matching the unique marker may

@@ -7,7 +7,18 @@ require "rbconfig"
 require "time"
 
 require_relative "../agent/session"
+require_relative "../child_env"
 require_relative "../identity"
+
+# I74: the session-sink module rides THIS require site — the sink is
+# coupled to the child-capture law (child_env's five picks feed the
+# sink's env law), and the frozen `require "tart"` gate legs
+# (session-sink-config-units / -projection-units) reach Tart::SessionSink
+# only through this chain: lib/tart.rb and agent/loop.rb (herdr's
+# require site) are hard-frozen by the scope gate, and the touch set
+# carries no other require-"tart"-reachable path. bin/tart also requires
+# the file directly.
+require_relative "../session_sink"
 
 module Tart
   module Subagents
@@ -362,25 +373,50 @@ module Tart
         nil
       end
 
+      # The live parent recorder ID (I74 — the child sink's
+      # X-Parent-Session-Id plumbing). The same @agent resolution as
+      # current_session_path; nil when unavailable.
+      def parent_session_id
+        loop = @agent.respond_to?(:call) ? @agent.call : @agent
+        loop&.recorder&.id
+      rescue StandardError
+        nil
+      end
+
       private
 
       # --- spawn internals ---
 
       def child_env(run)
         key = ->(suffix) { Identity.env_key(@identity, suffix) }
+        # I73: the pick source is the scrubbed parent env — under a
+        # bundle-exec'd parent the raw PATH carries bundler's bin dir
+        # PREPENDED (shared_helpers.rb#set_path); the scrub restores the
+        # user's shell PATH from bundler's own BUNDLER_ORIG_* records.
+        # The pick list is byte-unchanged, and the law touches bundler
+        # keys only, so every <IDENTITY>_* pick reads identically to the
+        # pre-I73 @env reads (the child still re-bundles itself —
+        # bin/tart's BUNDLE_GEMFILE ||= boot).
+        source = ChildEnv.scrub(@env.to_h)
         env = {}
-        env["PATH"] = @env["PATH"] if @env["PATH"]
-        env["HOME"] = @env["HOME"] if @env["HOME"]
-        env[key.("IDENTITY")] = @identity
-        api_key = @env[key.("API_KEY")] || @endpoint&.dig(:api_key) || @endpoint&.dig("api_key")
+        env["PATH"] = source["PATH"] if source["PATH"]
+        env["HOME"] = source["HOME"] if source["HOME"]
+        # The bootstrap key rides LITERALLY TART_IDENTITY (identity.rb: the
+        # identity key cannot depend on its own output — the child's
+        # resolve_identity reads only this literal before any namespace is
+        # knowable). The pre-I69 namespaced <IDENTITY>_IDENTITY write was a
+        # dead key nothing read — it only worked while DEFAULT was "pi";
+        # the I69 flip exposed it (the child clean-aborted on TART_API_KEY).
+        env[Identity::ENV_KEY] = @identity
+        api_key = source[key.("API_KEY")] || @endpoint&.dig(:api_key) || @endpoint&.dig("api_key")
         env[key.("API_KEY")] = api_key if api_key
-        api_base = @env[key.("API_BASE")] || @endpoint&.dig(:api_base) || @endpoint&.dig("api_base")
+        api_base = source[key.("API_BASE")] || @endpoint&.dig(:api_base) || @endpoint&.dig("api_base")
         env[key.("API_BASE")] = api_base if api_base
         env[key.("MODEL")] = run[:model_id] if run[:model_id]
         env[key.("PROVIDER")] = run[:provider] if run[:provider]
-        env[key.("MODEL_REASONING")] = @env[key.("MODEL_REASONING")] if @env[key.("MODEL_REASONING")]
+        env[key.("MODEL_REASONING")] = source[key.("MODEL_REASONING")] if source[key.("MODEL_REASONING")]
         env[key.("THINKING_LEVEL")] = run[:level] if run[:level]
-        env[key.("CONTEXT_WINDOW")] = @env[key.("CONTEXT_WINDOW")] if @env[key.("CONTEXT_WINDOW")]
+        env[key.("CONTEXT_WINDOW")] = source[key.("CONTEXT_WINDOW")] if source[key.("CONTEXT_WINDOW")]
         env[key.("TOOL_TIMEOUT_MS")] = run[:tool_timeout_ms].to_s if run[:tool_timeout_ms]
         # The child self-deadline (T2 both-sides): the deadline EPOCH —
         # Print.run arms sleep(remaining) → TERM on its own pgroup.
@@ -392,6 +428,27 @@ module Tart
         # never inert in a real child.
         env[key.("SUPERVISOR_CHANNEL")] = File.join(run[:dir], "control")
         env[key.("SUBAGENTS_AGENT")] = run[:agent]
+        # I74 — the session-sink child capture (AC4): the pi extension's
+        # known boundary (foreground subagent children never load ambient
+        # extensions) closed natively — the child IS a full tart boot, and
+        # these five identity-namespaced picks arm its own sink. HOST/
+        # TOKEN/DISABLED are present-non-empty pass-throughs from the
+        # scrubbed source env (env-configured parents propagate;
+        # FILE-configured parents need no pick — the child reads the same
+        # file via its HOME); AGENT_NAME is the run's agent label
+        # (unconditional — pi-subagents tags prompts, the port plumbs the
+        # label, keeping the child LLM wire untouched); PARENT_SESSION_ID
+        # is the live parent recorder id (the same @agent resolution
+        # current_session_path uses; nil → key omitted).
+        sink_host = source[key.("SESSION_SINK_HOST")]
+        env[key.("SESSION_SINK_HOST")] = sink_host if sink_host && !sink_host.empty?
+        sink_token = source[key.("SESSION_SINK_TOKEN")]
+        env[key.("SESSION_SINK_TOKEN")] = sink_token if sink_token && !sink_token.empty?
+        sink_disabled = source[key.("SESSION_SINK_DISABLED")]
+        env[key.("SESSION_SINK_DISABLED")] = sink_disabled if sink_disabled && !sink_disabled.empty?
+        env[key.("SESSION_SINK_AGENT_NAME")] = run[:agent]
+        parent_id = parent_session_id
+        env[key.("SESSION_SINK_PARENT_SESSION_ID")] = parent_id if parent_id
         env
       end
 
