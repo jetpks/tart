@@ -876,7 +876,12 @@ module Tart
 
       entries = Agent::Session.load_entries(recorder.path)
       assistants = entries.select { |entry| entry.dig("message", "role") == "assistant" }
-      frozen = {"role" => "assistant", "tool_calls" => {}, "finish_reason" => "stop",
+      # I77 RE-PIN (AMENDMENT 2026-10-18T19:56Z, escalation-seat ruling): the
+      # identity law projects the running model identity on every MODEL-BEARING
+      # assistant — this mock chat's pair rides immediately after tool_calls;
+      # the model-less/failure/user/tool shapes stay untouched.
+      frozen = {"role" => "assistant", "tool_calls" => {}, "provider" => "mock",
+                "model" => "tart-test-model", "finish_reason" => "stop",
                 "input_tokens" => 10, "output_tokens" => 5, "cache_write_tokens" => 0}
       assert_equal frozen.merge("content" => "the frozen reply"),
         assistants[0]["message"],

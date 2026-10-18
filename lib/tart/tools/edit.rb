@@ -87,9 +87,13 @@ module Tart
         result
       end
 
-      # Port of pi's prepareEditArguments.
+      # Port of pi's prepareEditArguments, plus the I77 folded-into-`path`
+      # recovery first (a DECLARED DIVERGENCE — pi does not recover this
+      # shape, edit.ts:103-141): the 06:58Z session recorded six
+      # byte-identical edit calls with the whole intended payload folded
+      # INTO the `path` string beside a literal `"edits": []`.
       def self.normalize_arguments(arguments)
-        args = arguments.dup
+        args = recover_folded_path(arguments.dup)
         edits = args[:edits]
         if edits.is_a?(String)
           begin
@@ -119,6 +123,69 @@ module Tart
         value.is_a?(Hash) &&
           (value["oldText"] || value[:oldText]).is_a?(String) &&
           (value["newText"] || value[:newText]).is_a?(String)
+      end
+
+      # The I77 recovery (the spike's frozen recommendation 3): detect the
+      # folded shape and rebuild the call. Trigger, ALL of it — on ANY
+      # failure the arguments come back UNCHANGED, so the pinned rejection
+      # (PINNED_EDITS_MESSAGE, byte-frozen to pi edit.ts:138) applies
+      # byte-identically and no new error path opens:
+      #   - no real edits (absent, nil, or an empty Array — either root-key
+      #     spelling; a NON-empty edits beside a folded-looking path WINS),
+      #   - `path` a String with ≥1 real newline whose tail — everything
+      #     after the FIRST newline — matches /\Aedits:\s*\[/ (lowercase),
+      #   - the tail from that first `[` parsing (the frozen two-step:
+      #     strict first, then the gem's public control-char repair) as a
+      #     JSON Array whose every element satisfies single_edit?.
+      # Transform: `path` = the first line, `edits` = the parsed Array
+      # VERBATIM (string keys, exactly like the JSON-string branch above —
+      # normalize_edit_shapes accepts them downstream), every other key
+      # unchanged. The wire declarations never move; this is argument-side
+      # only.
+      def self.recover_folded_path(args)
+        path_key = args.key?(:path) ? :path : "path"
+        # Neither edits spelling present → grow the key in the path's
+        # spelling, so a symbol-keyed call (the executor's form) grows a
+        # symbol `:edits`, a string-keyed one a string `"edits"`.
+        edits_key = args.key?(:edits) ? :edits : args.key?("edits") ? "edits" : (path_key == :path ? :edits : "edits")
+        edits = args[edits_key]
+        return args unless edits.nil? || (edits.is_a?(Array) && edits.empty?)
+
+        path = args[path_key]
+        return args unless path.is_a?(String) && path.include?("\n")
+
+        first_line, tail = path.split("\n", 2)
+        return args unless tail.match?(/\Aedits:\s*\[/)
+
+        parsed = parse_folded_tail(tail)
+        return args unless parsed.is_a?(Array) && parsed.all? { |item| single_edit?(item) }
+
+        args[path_key] = first_line
+        args[edits_key] = parsed
+        args
+      end
+
+      # The two-step tail parse: STRICT JSON.parse of the tail from its
+      # first `[`; on JSON::ParserError the gem's public repair
+      # (Fast::Completions::Protocol.repair_json — escape raw control
+      # characters inside strings, the same discipline the wire path itself
+      # applies at finalize; the raw-newline class is NOT strict JSON),
+      # then reparse. A tail neither step parses (e.g. `edits: [oops`) is a
+      # trigger failure — nil, never a raise.
+      def self.parse_folded_tail(tail)
+        source = tail.sub(/\Aedits:\s*\[/, "[")
+        strict = begin
+          JSON.parse(source)
+        rescue JSON::ParserError
+          nil
+        end
+        return strict unless strict.nil?
+
+        begin
+          JSON.parse(Fast::Completions::Protocol.repair_json(tail).sub(/\Aedits:\s*\[/, "["))
+        rescue JSON::ParserError
+          nil
+        end
       end
 
       # @return [String] pi's success text, or {error:} on failure.
