@@ -32,6 +32,7 @@ end
 
 require "optparse"
 require_relative "../lib/tart"
+require_relative "../lib/tart/session_sink"
 
 module Tart
   module Executable
@@ -289,6 +290,12 @@ module Tart
       memory_on = memory_enabled?(settings, identity)
       Memory.register(hooks:, identity:) if memory_on
       Herdr.register(hooks:)
+      # The observation-deck sink (I74): silent ambient capture — registers
+      # unconditionally, resolves config per bind (unconfigured/disabled =
+      # fully inert). NO MOTD row (the ruling — the sink is not an
+      # extension-module row; the deck contract's own no-noise discipline).
+      prompt = nil # pre-declared: the sink's lazy system-prompt ref (assigned below)
+      SessionSink.register(hooks:, identity:, env: ENV, system_prompt: -> { prompt })
       # The subagents gate (I48 — OQ-1): register ONLY when on — no tool,
       # no watcher, no run dirs when off (the frozen digests hold). The
       # returned Manager owns the agent-end drain below (pi's auto-drain).
@@ -355,6 +362,10 @@ module Tart
                                          display: pending[:display])
         end
       end
+      # The sink's terminal flush (I74): post-drain, pre-exit — the quit
+      # emission point (the terminal POST rides this handler, bounded ≤ ~3 s).
+      hooks.emit({"type" => "session_shutdown", "reason" => "quit"},
+        context: {cwd: workdir, mode: "print", session: session_ref(recorder), identity:})
       exit code
     end
 
@@ -423,6 +434,11 @@ module Tart
             identity:, resolved:))
         Memory.register(hooks:, identity:) if memory_on
         Herdr.register(hooks:)
+        # The observation-deck sink (I74): the same silent ambient capture
+        # as the print boot — registers unconditionally, config resolves
+        # per bind. NO MOTD row (the ruling).
+        prompt = nil # pre-declared: the sink's lazy system-prompt ref (assigned below)
+        SessionSink.register(hooks:, identity:, env: ENV, system_prompt: -> { prompt })
         # The subagents gate (I48 — OQ-1): registered BEFORE build_tools so
         # the tool merges into the loadout (declared LAST). The kernel is
         # the WAKE BRIDGE (the Manager's kick ferries onto the reactor
@@ -548,6 +564,11 @@ module Tart
           end
         end
         kernel.run
+        # The sink's terminal flush (I74): post-kernel.run — the quit path
+        # (all of ctrl+d / ctrl+c-quit / /quit land here); the chat
+        # surface's event case has no :session_shutdown arm (ignored).
+        hooks.emit({"type" => "session_shutdown", "reason" => "quit"},
+          context: {cwd: workdir, mode: "tui", session: session_ref(current_recorder), identity:})
       end
 
       # The exit resume hint (item 1, pi interactive-mode.ts:4324-4327 +
