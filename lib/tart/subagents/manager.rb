@@ -7,6 +7,7 @@ require "rbconfig"
 require "time"
 
 require_relative "../agent/session"
+require_relative "../child_env"
 require_relative "../identity"
 
 module Tart
@@ -368,9 +369,18 @@ module Tart
 
       def child_env(run)
         key = ->(suffix) { Identity.env_key(@identity, suffix) }
+        # I73: the pick source is the scrubbed parent env — under a
+        # bundle-exec'd parent the raw PATH carries bundler's bin dir
+        # PREPENDED (shared_helpers.rb#set_path); the scrub restores the
+        # user's shell PATH from bundler's own BUNDLER_ORIG_* records.
+        # The pick list is byte-unchanged, and the law touches bundler
+        # keys only, so every <IDENTITY>_* pick reads identically to the
+        # pre-I73 @env reads (the child still re-bundles itself —
+        # bin/tart's BUNDLE_GEMFILE ||= boot).
+        source = ChildEnv.scrub(@env.to_h)
         env = {}
-        env["PATH"] = @env["PATH"] if @env["PATH"]
-        env["HOME"] = @env["HOME"] if @env["HOME"]
+        env["PATH"] = source["PATH"] if source["PATH"]
+        env["HOME"] = source["HOME"] if source["HOME"]
         # The bootstrap key rides LITERALLY TART_IDENTITY (identity.rb: the
         # identity key cannot depend on its own output — the child's
         # resolve_identity reads only this literal before any namespace is
@@ -378,15 +388,15 @@ module Tart
         # dead key nothing read — it only worked while DEFAULT was "pi";
         # the I69 flip exposed it (the child clean-aborted on TART_API_KEY).
         env[Identity::ENV_KEY] = @identity
-        api_key = @env[key.("API_KEY")] || @endpoint&.dig(:api_key) || @endpoint&.dig("api_key")
+        api_key = source[key.("API_KEY")] || @endpoint&.dig(:api_key) || @endpoint&.dig("api_key")
         env[key.("API_KEY")] = api_key if api_key
-        api_base = @env[key.("API_BASE")] || @endpoint&.dig(:api_base) || @endpoint&.dig("api_base")
+        api_base = source[key.("API_BASE")] || @endpoint&.dig(:api_base) || @endpoint&.dig("api_base")
         env[key.("API_BASE")] = api_base if api_base
         env[key.("MODEL")] = run[:model_id] if run[:model_id]
         env[key.("PROVIDER")] = run[:provider] if run[:provider]
-        env[key.("MODEL_REASONING")] = @env[key.("MODEL_REASONING")] if @env[key.("MODEL_REASONING")]
+        env[key.("MODEL_REASONING")] = source[key.("MODEL_REASONING")] if source[key.("MODEL_REASONING")]
         env[key.("THINKING_LEVEL")] = run[:level] if run[:level]
-        env[key.("CONTEXT_WINDOW")] = @env[key.("CONTEXT_WINDOW")] if @env[key.("CONTEXT_WINDOW")]
+        env[key.("CONTEXT_WINDOW")] = source[key.("CONTEXT_WINDOW")] if source[key.("CONTEXT_WINDOW")]
         env[key.("TOOL_TIMEOUT_MS")] = run[:tool_timeout_ms].to_s if run[:tool_timeout_ms]
         # The child self-deadline (T2 both-sides): the deadline EPOCH —
         # Print.run arms sleep(remaining) → TERM on its own pgroup.
