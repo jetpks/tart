@@ -425,6 +425,45 @@ module Tart
         "a map-less entry falls back to the known table (catalog-entry-first, known-tables-second)"
     end
 
+    # The vendored tier's slot (I71 R2): the map tiers entry → vendored →
+    # known-tables; the reasoning flag rides the entry's flag → vendored —
+    # with NO vendored match the chain is byte-today.
+    def test_thinking_facts_vendored_tier_slots_between_the_entry_and_the_known_tables
+      dir = Dir.mktmpdir("tart-settings-vendored-")
+      begin
+        File.write(File.join(dir, "models.json"), JSON.generate({"providers" => {
+          "zai" => {"name" => "Z.AI", "baseUrl" => "https://api.z.ai/api/coding/paas/v4", "apiKey" => "k",
+            "models" => [{"id" => "glm-5.3", "reasoning" => true}]},
+          "local" => {"name" => "L", "baseUrl" => "http://localhost:1/v1", "apiKey" => "k",
+            "models" => [{"id" => "glm-5.3", "reasoning" => false}]}}}))
+        zai, local = Models.load(root: dir).model_entries
+
+        # entry map nil + vendored match ⇒ the vendored map (the middle tier).
+        facts = Settings.thinking_facts(zai, model_id: zai.id)
+        assert_equal "high", facts.thinking_level_map.fetch(:high),
+          "the vendored map fills the map-less entry"
+        assert_nil facts.thinking_level_map.fetch(:medium), "the vendored nulls ride verbatim"
+        assert_equal true, facts.reasoning,
+          "the loaded gap entry's (omitted) flag fills from the vendored reasoning"
+
+        # the entry's DECLARED map beats the vendored tier (fill-only).
+        declared = Shapes::Model.new(id: "glm-5.3", name: "g", reasoning: true, context_window: nil,
+          max_tokens: nil, thinking_level_map: {low: "mine"}, compat: nil, provider: "zai")
+        assert_equal ({low: "mine"}),
+          Settings.thinking_facts(declared, model_id: declared.id).thinking_level_map,
+          "the declared map ALWAYS wins (the vendored tier never fires)"
+
+        # NO match ⇒ the known-tables tier intact (byte-today).
+        assert_equal Settings.known_thinking_level_map("accounts/fireworks/models/glm-5p3-flash"),
+          Settings.thinking_facts(local, model_id: "accounts/fireworks/models/glm-5p3-flash").thinking_level_map,
+          "no vendored match ⇒ the known table (the third tier)"
+        assert_equal false, Settings.thinking_facts(local, model_id: local.id).reasoning,
+          "no vendored match ⇒ today's flag"
+      ensure
+        FileUtils.rm_rf(dir)
+      end
+    end
+
     def test_thinking_facts_without_a_catalog_entry
       model = wire_model("mock-1")
       facts = Settings.thinking_facts(nil, {}, model_id: "mock-1", model: model)

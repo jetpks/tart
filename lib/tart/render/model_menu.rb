@@ -73,11 +73,22 @@ module Tart
       # and ref shapes (the frozen menu-surface pins) — every read ducks
       # through {entry_attr}/{ref_key}. Reductions, itemized: no catalog
       # network refresh, no scoped/all tab toggle, no isDefaultSearch
-      # query boost, no /login hint line.
+      # query boost, no /login hint line. (The I71 R4 live-listing merge
+      # restores a refresh path — {refresh} — over the SAME row shape.)
       def self.model(entries:, current:, default:, seed: nil, on_select:, on_select_as_default:)
+        new(variant: :model, items: build_model_items(entries, current, default), query_seed: seed,
+          search_text: MODEL_SEARCH_TEXT,
+          on_select:, on_select_as_default:, current_ref: current, default_ref: default)
+      end
+
+      # The model variant's item build (the sort + row mapping above,
+      # extracted — {ModelMenu.model} at construction and {#refresh} at
+      # the live-listing merge share it verbatim; the row shape/sort/
+      # markers are UNCHANGED).
+      def self.build_model_items(entries, current, default)
         current_key = ref_key(current)
         default_key = ref_key(default)
-        items = entries.sort_by do |entry|
+        entries.sort_by do |entry|
           key = ref_key(entry)
           rank = key == current_key ? 0 : (default_key && key == default_key ? 1 : 2)
           [rank, entry_attr(entry, :provider), entry_attr(entry, :id)]
@@ -87,9 +98,12 @@ module Tart
            name: entry_attr(entry, :name),
            current: current_key == ref_key(entry), default: default_key == ref_key(entry)}
         end
-        new(variant: :model, items:, query_seed: seed,
-          search_text: ->(item) { "#{item[:provider]} #{item[:provider]}/#{item[:id]} #{item[:provider]} #{item[:id]} #{item[:name]}" },
-          on_select:, on_select_as_default:)
+      end
+
+      # The model menu's search text (pi getModelSelectorSearchText,
+      # model-search.ts:15-19) — extracted so {#refresh} reuses it.
+      MODEL_SEARCH_TEXT = ->(item) do
+        "#{item[:provider]} #{item[:provider]}/#{item[:id]} #{item[:provider]} #{item[:id]} #{item[:name]}"
       end
 
       # The entry's field — the typed attribute read, with the raw-hash
@@ -111,12 +125,17 @@ module Tart
       # readbacks' targets.
       attr_reader :selected
 
-      def initialize(variant:, items:, query_seed:, search_text:, on_select:, on_select_as_default:)
+      def initialize(variant:, items:, query_seed:, search_text:, on_select:, on_select_as_default:,
+                     current_ref: nil, default_ref: nil)
         @variant = variant
         @items = items
         @search_text = search_text
         @on_select = on_select
         @on_select_as_default = on_select_as_default
+        # The ✓/· marker refs (model variant) — re-applied verbatim by
+        # {#refresh} so the merged list re-sorts around them.
+        @current_ref = current_ref
+        @default_ref = default_ref
         @query = +query_seed.to_s
         @filtered = filter(@query)
         # pi buildSelectList's preselect (thinking-selector.ts:103-107):
@@ -125,6 +144,36 @@ module Tart
         @selected = [@filtered.index { |item| item[:current] } || 0, [@filtered.size - 1, 0].max].min
         @mouse_pressed = nil
         @closed = false
+        @listing_failed = false
+      end
+
+      # The live-listing merge (I71 R4): rebuild the item list from the
+      # merged entries, re-run the fuzzy filter with the CURRENT query
+      # preserved, and clamp the selection per the existing empty-query
+      # rule (a query re-filters to the top row; a cleared query rides the
+      # edit_query form — [@selected, size-1].max — PLUS the in-range
+      # bound, which a SHRINKING restored list needs and edit_query never
+      # sees: the frozen form clamps the position within the list). The
+      # row shape, the sort, the ✓/· markers and the `Model Name:` row are
+      # UNCHANGED — no new glyphs. Clears the failure flag (a landed
+      # rebuild is a fresh presentation); model variant only.
+      def refresh(entries:)
+        return self unless @variant == :model
+
+        @items = self.class.build_model_items(entries, @current_ref, @default_ref)
+        @filtered = filter(@query)
+        @selected = @query.empty? ? [[@selected, @filtered.size - 1].max, [@filtered.size - 1, 0].max].min : 0
+        @mouse_pressed = nil
+        @listing_failed = false
+        self
+      end
+
+      # The listing-failure flag (I71 R4): ONE muted
+      # `  (live listing unavailable)` row renders after the list rows
+      # when the fetch failed; absent on success and before it settles.
+      def listing_failed!
+        @listing_failed = true
+        self
       end
 
       # The menu owns every key while open (pi: the selector takes focus
@@ -168,10 +217,13 @@ module Tart
 
       # The content rows: heading, search input, the visible list window
       # (+ the (n/N) info line when it scrolls), the model menu's
-      # "  Model Name:" line, then the dim help line.
+      # "  Model Name:" line, then the dim help line. I71 R4: the ONE
+      # muted listing-failure row rides between the list rows and the
+      # `Model Name:` line, only when the fetch failed.
       def lines(width)
         rows = heading_rows + [input_row, blank]
         rows.concat(list_rows(width))
+        rows << listing_failure_row if @variant == :model && @listing_failed
         rows << model_name_row if @variant == :model && !@filtered.empty?
         rows << blank << help_row
         rows
@@ -350,6 +402,12 @@ module Tart
           TUI.span(" [#{item[:provider]}]", fg: Theme[:muted]),
           item[:default] ? TUI.span(" · default", fg: Theme[:muted]) : nil
         ].compact, width - 1))
+      end
+
+      # The live-listing failure row (I71 R4) — muted, exactly one, after
+      # the list rows.
+      def listing_failure_row
+        TUI.line("  (live listing unavailable)", fg: Theme[:muted])
       end
 
       # The model menu's bottom line (pi updateList :374-379): the

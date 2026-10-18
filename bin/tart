@@ -418,7 +418,9 @@ module Tart
         extensions << "memory.ts" if memory_on
         extensions << "herdr-agent-state" if Herdr.enabled?(ENV)
         surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
-          mcp_servers:, resume: resume_path, identity:, models:, context_files:, extensions:, hooks:)
+          mcp_servers:, resume: resume_path, identity:, models:, context_files:, extensions:, hooks:,
+          endpoint: endpoint_facts(models, Models.resolve_boot_model(models, settings, identity:),
+            identity:, resolved:))
         Memory.register(hooks:, identity:) if memory_on
         Herdr.register(hooks:)
         # The subagents gate (I48 — OQ-1): registered BEFORE build_tools so
@@ -479,7 +481,10 @@ module Tart
             thinking_level: facts.fetch(:thinking_level),
             model_reasoning: facts.fetch(:reasoning),
             thinking_level_map: facts.fetch(:thinking_level_map),
-            compat: entry&.compat
+            # I71 R2: the compat rides the vendored fill (the boot kwargs'
+            # same seam — the entry's declared compat, else the matched
+            # vendored compat).
+            compat: Models.resolved_compat(entry)
           )
           # The session_start emission (pi extensions/types.ts:744 —
           # reasons startup|new|resume; fork/reload have no port surface):
@@ -705,7 +710,10 @@ module Tart
       {model_reasoning: facts.reasoning, thinking_level_map: facts.thinking_level_map,
        thinking_level: Models.clamp_thinking_level(Settings.resolve_thinking_level(settings),
          map: facts.thinking_level_map, reasoning: facts.reasoning),
-       compat: entry&.compat}
+       # I71 R2: the compat rides the vendored fill (the entry's declared
+       # compat, else the matched vendored compat — the fill-only law; the
+       # wire model's dialect derivation consumes it verbatim).
+       compat: Models.resolved_compat(entry)}
     end
 
     # The catalog entry for a boot pair (the I28 cross-resolve): the boot
@@ -750,8 +758,13 @@ module Tart
     # of silently degenerating the /model menu to the boot model (the
     # defect the post-integration probe caught: the launcher wired the
     # catalog into build_chat/the handler/footer_data but not here).
+    # I71 R5: +endpoint:+ threads the boot endpoint facts (the same
+    # `endpoint_facts` chain build_chat speaks) into the surface — the
+    # live listing's per-field fallback tier (the I27 live-defect lesson:
+    # every new surface kwarg ships with a launcher-seam regression pin,
+    # launcher_smoke_test's /listing_endpoint/ leg).
     def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:,
-                      context_files: [], extensions: nil, hooks: nil)
+                      context_files: [], extensions: nil, hooks: nil, endpoint: nil)
       Render::Chat.new(
         session:, kernel:,
         # Autocomplete sources (AC1): the builtin slash commands + the
@@ -772,7 +785,8 @@ module Tart
         # the active module rows (I47 §5 — merged, sorted comma-joined by
         # the section renderer).
         extensions: extensions || mcp_servers.keys,
-        models:
+        models:,
+        endpoint:
       )
     end
 

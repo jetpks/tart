@@ -5,6 +5,7 @@ require "fileutils"
 require_relative "agent/session"
 require_relative "shapes/types"
 require_relative "shapes/model"
+require_relative "models/vendored"
 
 module Tart
   module Settings
@@ -324,10 +325,21 @@ module Tart
     # catalog's typed model (Shapes::Model — nil when there is no catalog
     # match) and +settings+ nil (the switch path — the entry always
     # decides) is legal.
+    #
+    # I71 R2: the VENDORED tier slots BETWEEN the entry's declared facts
+    # and the known tables — the map (entry → vendored → known-tables) and
+    # the reasoning flag (entry's flag → vendored → today's flag, the
+    # false a loaded entry always carries when it omits the field — the
+    # load normalizes `reasoning == true`, so a no-vendored-match entry is
+    # byte-today). Fill-only: a user-declared value always wins; no match
+    # ⇒ today's chain exactly.
     def thinking_facts(entry, settings = nil, model_id: nil, model: nil, identity: Identity::DEFAULT)
+      vendored = entry ? Models::Vendored.facts_for_entry(entry) : nil
       Shapes::ThinkingFacts.new(
-        reasoning: entry ? entry.reasoning : model_reasoning_capable(settings, model, identity:),
-        thinking_level_map: entry&.thinking_level_map || known_thinking_level_map(model_id)
+        reasoning: entry ? entry.reasoning == true || vendored&.[]("reasoning") == true : model_reasoning_capable(settings, model, identity:),
+        thinking_level_map: entry&.thinking_level_map ||
+          Models.build_thinking_level_map(vendored&.[]("thinkingLevelMap")) ||
+          known_thinking_level_map(model_id)
       )
     end
 
