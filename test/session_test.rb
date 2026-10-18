@@ -537,6 +537,95 @@ module Tart
       assert_nil Agent::Session.read_header(File.join(@dir, "absent.jsonl"))
     end
 
+    # ---- I77: the model identity battery (AC3) — every assistant from a
+    # live chat records its running `provider` + `model` (pi's own
+    # per-assistant pair), present-only, so the 06:58Z forensics gap (six
+    # malformed calls, no model identity anywhere in the file) cannot recur.
+
+    # A model-bearing assistant projects the pair at the frozen key
+    # position (immediately after tool_calls) with the usage conventions
+    # intact.
+    def test_model_identity_assistant_to_h_emits_the_pair_at_the_frozen_key_position
+      message = Agent::Message.new(role: :assistant, content: "hi", provider: "openrouter",
+        model: "reflection/beam-1.0-501b-a23b:nitro",
+        tokens: Agent::Tokens.new(input: 5, output: 4, cache_write: 0), finish_reason: "stop")
+      assert_equal [:role, :content, :tool_calls, :provider, :model, :finish_reason,
+                    :input_tokens, :output_tokens, :cache_write_tokens], message.to_h.keys,
+        "the pair rides immediately after tool_calls, before thinking/usage"
+      assert_equal "openrouter", message.to_h[:provider]
+      assert_equal "reflection/beam-1.0-501b-a23b:nitro", message.to_h[:model]
+    end
+
+    # The pair sits between tool_calls and thinking when a thinking text
+    # rides too (the frozen position is relative, not trailing).
+    def test_model_identity_pair_precedes_the_thinking_keys
+      message = Agent::Message.new(role: :assistant, content: "hi", provider: "zai", model: "glm-5.3",
+        thinking: Agent::Thinking.new(text: "because", signature: "reasoning_content"))
+      keys = message.to_h.keys
+      assert keys.index(:tool_calls) < keys.index(:provider), "after tool_calls"
+      assert keys.index(:model) < keys.index(:thinking), "before thinking"
+      assert_equal [:role, :content, :tool_calls, :provider, :model, :thinking, :thinking_signature], keys
+    end
+
+    # The nil-gated byte shape: a model-less assistant (the fixture-seed
+    # class) keeps the exact frozen key set — session-golden holds with NO
+    # re-pin.
+    def test_model_identity_model_less_assistant_keeps_the_frozen_key_set
+      plain = Agent::Message.new(role: :assistant, content: "hi").to_h
+      assert_equal [:role, :content, :tool_calls], plain.keys
+      tokened = Agent::Message.new(role: :assistant, content: "hi",
+        tokens: Agent::Tokens.new(input: 5, output: 4, cache_write: 0), finish_reason: "stop").to_h
+      assert_equal [:role, :content, :tool_calls, :finish_reason, :input_tokens, :output_tokens,
+                    :cache_write_tokens], tokened.keys, "no identity keys without a model"
+    end
+
+    # The pair survives the recorder round trip (the recorded line carries
+    # the string keys, parse-back equal) — the forensics gap is closed.
+    def test_model_identity_pair_survives_the_recorder_round_trip
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      # a lone assistant never opens the file (pi's conversation-bearing
+      # gate) — the user turn opens it, the assistant rides the flush
+      recorder.append_message(Agent::Message.user("hi"))
+      recorder.append_message(Agent::Message.new(role: :assistant, content: "the answer",
+        provider: "openrouter", model: "reflection/beam-1.0-501b-a23b:nitro"))
+
+      entry = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+        .find { |line| line["message"] && line["message"]["role"] == "assistant" }["message"]
+      assert_equal "openrouter", entry["provider"]
+      assert_equal "reflection/beam-1.0-501b-a23b:nitro", entry["model"]
+    end
+
+    # Replay safety: from_seed_hash reads DECLARED fields only — a
+    # model-bearing recorded body seeds model-inert (the wire re-stamp is
+    # the live model) — wire-delta EXACT holds with no re-pin.
+    def test_model_identity_seed_from_a_model_bearing_body_is_model_inert
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_message(Agent::Message.user("hi"))
+      recorder.append_message(Agent::Message.new(role: :assistant, content: "the answer",
+        provider: "openrouter", model: "reflection/beam-1.0-501b-a23b:nitro"))
+      entry = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+        .find { |line| line["message"] && line["message"]["role"] == "assistant" }["message"]
+
+      seed = Agent::Message.from_seed_hash(entry)
+      assert_nil seed.model
+      assert_nil seed.provider
+      assert_equal "the answer", seed.content
+    end
+
+    # The synthesized failure assistant (error_failure — no model stamped)
+    # gains no keys.
+    def test_model_identity_error_failure_assistant_gains_no_keys
+      failure = Agent::Message.error_failure(error_message: "boom")
+      assert_equal [:role, :content, :tool_calls, :finish_reason, :error_message], failure.to_h.keys
+    end
+
+    # User and tool messages gain no keys.
+    def test_model_identity_user_and_tool_messages_gain_no_keys
+      assert_equal [:role, :content], Agent::Message.user("hi").to_h.keys
+      tool = Agent::Message.tool(tool_call_id: "c1", content: "x").to_h
+      assert_equal [:role, :content, :tool_call_id], tool.keys
+    end
+
     private
 
     def agent_on_kernel(tools: {}, recorder: nil, seed_messages: [])

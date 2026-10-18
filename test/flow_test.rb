@@ -254,7 +254,11 @@ module Tart
       digest = Digest::SHA256.hexdigest(
         File.readlines(recorder.path).map { |l| JSON.generate(norm.call(JSON.parse(l))) }.join("\n")
       )
-      assert_equal "0b220daa136898e8494bb446f29cd3a92a1f38ed9cc657cd1f7230683420ebef", digest
+      # I77 RE-PIN (AMENDMENT 2026-10-18T19:56Z, escalation-seat ruling): the
+      # recorded assistant now carries its running model identity (the law's
+      # present-only provider/model pair), so the VOLATILE-normalized session
+      # digest moves.
+      assert_equal "ba7b092fb16db0aae79c294188749ebe54c8d0e210b522cc99db692181908e0b", digest
     end
 
     private
