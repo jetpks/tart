@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "strscan" # the inline probes: anchored scans with no tail-slice allocation
+
 module Tart
   module Render
     # The markdown converter (BRIEF §7.1): the pi `markdown.ts` subset —
@@ -27,11 +29,12 @@ module Tart
     # code modifier. The observable distinctions of markdown.ts are ported
     # (heading hierarchy markdown.ts:473-493, strict strikethrough :9-21,
     # link text/URL handling :699-719, list normalization :775-789), not the
-    # marked/ink mechanism. Deviations itemized in the I06 markdown report:
-    # paragraph soft breaks render as separate rows, delimiter-flanking rules
-    # are approximated by a no-padded-content check, intraword +__+ emphasis
-    # is allowed, OSC-8 hyperlinks are out of scope (the linkUrl fallback is
-    # always taken).
+    # marked/ink mechanism. Deviations itemized in the I06/I68 reports:
+    # paragraph soft breaks render as separate rows, emphasis resolves by
+    # the CommonMark delimiter-run law (I68 — the I06 no-padded-content
+    # approximation and the intraword +__+ sanction are retired), inline
+    # code stays line-bound, OSC-8 hyperlinks are out of scope (the
+    # linkUrl fallback is always taken).
     class Markdown
       # One styled run within a row: +text+, +fg+ (+TUI.style+ color symbol
       # or nil), +modifiers+ (+TUI.style+ modifier symbols), +bg+ (the
@@ -96,17 +99,387 @@ module Tart
       LIST_ITEM = /\A( {0,3})([-+*]|\d{1,9}[.)])[ \t]+(.*)\z/
       BLOCK_START = /\A {0,3}(?:[#]{1,6}\s|>|`{3,}|~{3,}|[-+*][ \t]|\d{1,9}[.)][ \t]|[-*_][ \t]*[-*_][ \t]*[-*_])/
 
-      # Inline delimiter scan (earliest match wins; alternation is rule
-      # priority): escape, code, strong, em, del, link — the markdown.ts
-      # inline token cases (:677-733).
-      INLINE_SCAN = /
-        (?<escape>\\.)
-      | (?<code>`[^`\n]+`)
-      | (?<strong>\*\*.+?\*\*(?!\*)|__.+?__(?!_))
-      | (?<em>\*[^*\n]+\*|_[^_\n]+_)
-      | (?<del>~~.+?~~)
-      | (?<link>\[[^\]\n]+\]\([^)\n]+\))
-      /mx
+      # CommonMark's escapable set: backslash + ASCII punctuation ONLY
+      # (R5) — a backslash before anything else is literal text.
+      ESCAPABLE = /[!"#$%&'()*+,\-\/:;<=>?@\[\\\]^_`{|}~]/.freeze
+      WHITESPACE = /\s/.freeze
+      PUNCT = /[\p{P}\p{S}]/u.freeze # marked's punctuation class (_=/[\p{P}\p{S}]/u)
+      # STRICT_STRIKETHROUGH_REGEX (markdown.ts:9): pi's del tokenizer
+      # override — a `~~` pair whose content starts/ends with neither
+      # whitespace nor `~`, the closer followed by a non-~ (or the end).
+      # No match at the scan position → the tilde falls to the one-char
+      # text fallback (marked's flow when the override returns undefined).
+      # I72: anchored with StringScanner at the scan position (the \A-free
+      # twin of the I68 STRICT_DEL.match(src[i..]) probe — no tail-slice
+      # allocation); the caller pre-gates on a literal `~~`, so the probe
+      # never runs at a position that cannot open the construct.
+      STRICT_DEL = /(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|\z)/.freeze
+      # A run carrying no character that can OPEN an inline construct — one
+      # text node (the I72 boring-segment fast path: per-CHARACTER text-Node
+      # emission was the linear-constant hog, ~7,000 Struct allocations per
+      # 80-line paragraph). `]` and the parens are plain text at the scan
+      # level (they only matter inside link parsing, which scans its own
+      # window); `~` breaks the run only because the del probe re-checks
+      # its own `~~` opening pair.
+      BORING_RUN = /[^\\`*_~\[]+/.freeze
+
+      # One inline parse node: +kind+ is :text, :code (raw codespan
+      # content), :link (+text+ the raw label, +href+, +children+ the
+      # parsed label), :delim (a maximal +*+/+_+ run: +ch+, +count+,
+      # +orig+ the original run length, the flanking verdicts), :del
+      # (strict strikethrough, +children+), or a resolved :em/:strong
+      # (+children+). Plain data — resolution and rendering are plain
+      # functions over token arrays. +prev+/+next+ carry the doubly-linked
+      # scan order during emphasis resolution (I72: O(1) splices — the
+      # I68 cure's per-closer toks.index identity scans over the whole
+      # token array made delimiter-dense text quadratic).
+      Node = Struct.new(:kind, :text, :href, :children, :ch, :count, :orig, :can_open, :can_close,
+        :prev, :next, keyword_init: true)
+
+      # Inline tokens → nodes. At each position: escape, codespan, link,
+      # delimiter run, strict-del pair — the markdown.ts inline token
+      # cases (:677-733); anything else joins the plain-text run. The I65
+      # D1 reject semantics fall out of that fallback: a delimiter that
+      # can't pair (flanking law, strict content, unclosed span) renders
+      # AT ITS POSITION and the scan advances one character, so the
+      # remainder still pairs later delimiters.
+      #
+      # I72 O(n) guard: every probe is pre-gated on its opening character
+      # and the strict-del probe only fires at a literal `~~` — a character
+      # that cannot open a construct never pays for regex or slice work
+      # (the I68 kill's dominant term). A construct-free run coalesces
+      # into ONE text node.
+      #
+      # StringScanner probes are byte-indexed while the scan walks
+      # characters, so the byte cursor (+bi+) rides alongside +i+ and each
+      # token advances both (the token's own byte size — O(step), linear
+      # across the line).
+      def tokenize_inline(src)
+        scan = StringScanner.new(src)
+        toks = []
+        i = 0
+        bi = 0
+        size = src.length
+        while i < size
+          ch = src[i]
+          node, step =
+            if ch == "\\" && src[i + 1] && ESCAPABLE.match?(src[i + 1])
+              [Node.new(kind: :text, text: src[i + 1]), 2] # escape (:677-680)
+            elsif ch == "`" && (tok = code_token(src, i))
+              tok
+            elsif ch == "[" && (tok = link_token(src, i))
+              tok
+            elsif (ch == "*" || ch == "_") && (tok = delim_token(src, i))
+              tok
+            elsif ch == "~" && src[i + 1] == "~" && (tok = del_token(scan, bi))
+              tok
+            else
+              # boring-segment fast path: one text node per construct-free run
+              scan.pos = bi
+              if (run = scan.scan(BORING_RUN))
+                [Node.new(kind: :text, text: run), run.length]
+              else
+                [Node.new(kind: :text, text: ch), 1]
+              end
+            end
+          toks << node
+          bi += src[i, step].bytesize
+          i += step
+        end
+        toks
+      end
+
+      # Codespan (marked's code rule): a run of m backticks closes at the
+      # next run of exactly m backticks; content keeps one edge space when
+      # both surround a non-space core. A span stays on its source line
+      # (base convention — soft-break lines render as separate rows). No
+      # closer → the backticks are literal text, one char per scan step.
+      def code_token(src, i)
+        m = 1
+        m += 1 while src[i + m] == "`" # the maximal opener run (no tail slice)
+        j = i + m
+        k = nil
+        pos = j
+        while pos < src.length
+          c = src[pos]
+          break if c == "\n"
+
+          if c == "`"
+            run = 1
+            run += 1 while src[pos + run] == "`"
+            if run == m && src[pos + run] != "`"
+              k = pos
+              break
+            end
+            pos += run
+          else
+            pos += 1
+          end
+        end
+        return nil unless k
+
+        content = src[j...k]
+        return nil if content.empty?
+
+        if content.length >= 2 && content.start_with?(" ") && content.end_with?(" ") && content.match?(/\S/)
+          content = content[1..-2]
+        end
+        [Node.new(kind: :code, text: content), k + m - i]
+      end
+
+      # Link (marked's link rule; rendered at markdown.ts:699-719):
+      # [label](dest) — the label nests balanced brackets (escapes
+      # skipped) and stays on one line; the dest carries balanced parens
+      # with no whitespace, the final unbalanced `)` closing it (R6). No
+      # match → the `[` is literal text, one-char advance.
+      def link_token(src, i)
+        return nil unless src[i] == "["
+
+        j = bracket_close(src, i)
+        return nil unless j
+
+        label = src[(i + 1)...j]
+        return nil if label.empty? || label.include?("\n")
+
+        k = link_dest_end(src, j + 1)
+        return nil unless k
+
+        href = src[(j + 2)...k]
+        return nil if href.empty?
+
+        [Node.new(kind: :link, text: label, href:, children: parse_inline(label)), k + 1 - i]
+      end
+
+      # The matching `]` for the `[` at i — balanced brackets, escapes
+      # skipped — or nil.
+      def bracket_close(src, i)
+        depth = 1
+        j = i + 1
+        while j < src.length
+          c = src[j]
+          if c == "\\"
+            j += 2
+          else
+            depth += 1 if c == "["
+            depth -= 1 if c == "]"
+            break if depth.zero?
+
+            j += 1
+          end
+        end
+        depth.zero? && j < src.length ? j : nil
+      end
+
+      # The index of the `)` that closes a link destination whose `(` sits
+      # at k — balanced parens, escapes skipped, no whitespace (R6) — or
+      # nil when the destination never closes.
+      def link_dest_end(src, k)
+        return nil unless src[k] == "("
+
+        depth = 1
+        k += 1
+        while k < src.length
+          c = src[k]
+          if c == "\\"
+            k += 2
+            next
+          end
+          if c == "("
+            depth += 1
+          elsif c == ")"
+            depth -= 1
+            return k if depth.zero?
+          elsif WHITESPACE.match?(c)
+            return nil
+          end
+          k += 1
+        end
+        nil
+      end
+
+      # A delimiter run: a maximal +*+/+_+ run with the CommonMark
+      # flanking verdicts computed at the run's edges (line start/end
+      # count as whitespace). `*` opens iff left-flanking and closes iff
+      # right-flanking (intraword kept); `_` additionally may open only
+      # when not right-flanking or preceded by punctuation, and may close
+      # only when not left-flanking or followed by punctuation (intraword
+      # disallowed) — the R1-R3 law, spec §"Emphasis and strong emphasis".
+      def delim_token(src, i)
+        ch = src[i]
+        return nil unless ch == "*" || ch == "_"
+
+        count = 1
+        count += 1 while src[i + count] == ch # the maximal same-char run
+        prev = i.zero? ? nil : src[i - 1]
+        nxt = src[i + count] # nil = line end
+        left = left_flanking?(prev, nxt)
+        right = right_flanking?(prev, nxt)
+        can_open = ch == "*" ? left : left && (!right || punct?(prev))
+        can_close = ch == "*" ? right : right && (!left || punct?(nxt))
+        [Node.new(kind: :delim, ch:, count:, orig: count, can_open:, can_close:), count]
+      end
+
+      # left-flanking: not followed by whitespace, and (not followed by
+      # punctuation OR preceded by whitespace/punctuation).
+      def left_flanking?(prev, nxt)
+        !whitespace?(nxt) && (!punct?(nxt) || whitespace?(prev) || punct?(prev))
+      end
+
+      # right-flanking: not preceded by whitespace, and (not preceded by
+      # punctuation OR followed by whitespace/punctuation).
+      def right_flanking?(prev, nxt)
+        !whitespace?(prev) && (!punct?(prev) || whitespace?(nxt) || punct?(nxt))
+      end
+
+      def whitespace?(ch)
+        ch.nil? || WHITESPACE.match?(ch) # nil = line start/end
+      end
+
+      def punct?(ch)
+        !ch.nil? && PUNCT.match?(ch)
+      end
+
+      # The strict-del pair (markdown.ts:9-21) anchored at the scan
+      # position (the pattern is matched against the slice — \A anchors at
+      # the absolute string start in Ruby); no match → nil (the tilde
+      # falls to the text fallback). The caller pre-gates on a literal
+      # `~~` (the I72 guard — a plain `~` never reaches here), so the
+      # probe runs only where the construct can actually open.
+      def del_token(scan, bi)
+        scan.pos = bi
+        m = scan.scan(STRICT_DEL)
+        return nil unless m
+
+        [Node.new(kind: :del, children: parse_inline(scan.captures[1])), m.length]
+      end
+
+      # Inline source → resolved nodes: tokenize, then the CommonMark
+      # emphasis resolution (spec §"Emphasis and strong emphasis").
+      def parse_inline(src)
+        toks = tokenize_inline(src)
+        resolve_emphasis(toks)
+        toks
+      end
+
+      # Emphasis resolution: each delimiter run scans back for the NEAREST
+      # same-char opener that can open (past the per-key openers bottom —
+      # a failed closer never re-scans below where its search stopped);
+      # two stars make strong, one makes em (mixed runs split, remnants
+      # re-close — ***x*** nests em around the strong); the rule of 3
+      # rejects a pair whose original run lengths sum to a multiple of 3
+      # unless both runs are multiples of 3; delimiters that never match
+      # render as their literal characters.
+      #
+      # I72: the resolution runs over a doubly-linked token list with
+      # sentinel ends, so a match is one O(children) unlink + O(1) splice
+      # and the opener stack prunes by truncation — the I68 cure's per-
+      # closer toks.index identity scans and its openers.reject!/
+      # children.any? nested walk are gone (the measured quadratic terms
+      # on delimiter-dense text). The final sequence is written back
+      # through +toks+, which the renderer walks as before.
+      def resolve_emphasis(toks)
+        head = Node.new(kind: :text, text: "") # sentinels: unlinks never touch a list edge
+        tail = Node.new(kind: :text, text: "")
+        prev = head
+        toks.each do |t|
+          prev.next = t
+          t.prev = prev
+          prev = t
+        end
+        prev.next = tail
+        tail.prev = prev
+        openers = [] # unmatched delimiter nodes, in scan order
+        bottoms = {} # [ch, closer_can_open, closer_orig % 3] → search-stop bound
+        tok = head.next
+        while tok && !tok.equal?(tail)
+          if tok.kind == :delim
+            openers << tok
+            close_emphasis(openers, bottoms, tok) if tok.can_close
+          end
+          tok = tok.next
+        end
+        resolved = []
+        tok = head.next
+        while tok && !tok.equal?(tail)
+          resolved << tok
+          tok = tok.next
+        end
+        toks.replace(resolved)
+      end
+
+      # Resolve +tok+ as a potential closer; splices emphasis nodes into
+      # the linked run and prunes +openers+. The closer remnant (a run
+      # only partly consumed) re-closes in the loop until spent or
+      # unmatchable. Every opener above the hit sits strictly between the
+      # two ends — absorbed into the new node's children, rendered
+      # literally (the I68 children.any? containment walk was exactly that
+      # stack segment).
+      def close_emphasis(openers, bottoms, tok)
+        key = [tok.ch, tok.can_open, tok.orig % 3]
+        loop do
+          j = openers.size - 2 # the closer itself is already on the stack
+          hit = nil
+          while j >= 0
+            break if bottoms[key] && openers[j].equal?(bottoms[key])
+
+            hit = openers[j] if openers[j].ch == tok.ch && openers[j].can_open
+            break if hit
+
+            j -= 1
+          end
+          unless hit
+            # I72: the reference openers-bottom law — the bound rides just
+            # below the failed closer (everything below it was proven dead
+            # for this key by this or an earlier same-key walk), and a
+            # closer that can no longer open is dead — off the stack. The
+            # I68 cure's degenerate nil bound re-walked the whole
+            # accumulated stack on every failed closer: the remaining
+            # quadratic term on delimiter-dense text.
+            bottoms[key] = openers.size >= 2 ? openers[-2] : nil
+            openers.pop unless tok.can_open
+            return
+          end
+          return unless rule_of_three_ok?(hit, tok)
+
+          use = hit.count >= 2 && tok.count >= 2 ? 2 : 1
+          children = [] # the run strictly between the two ends, unlinked once
+          mid = hit.next
+          until mid.equal?(tok)
+            children << mid
+            mid = mid.next
+          end
+          node = Node.new(kind: use == 2 ? :strong : :em, children: children)
+          hit.count -= use
+          tok.count -= use
+          node.prev = hit
+          node.next = tok
+          hit.next = node
+          tok.prev = node
+          openers.slice!(j..) # the hit and everything above it (incl. the closer)
+          openers << hit if hit.count.positive?
+          openers << tok if tok.count.positive?
+          if hit.count.zero? # the spent opener leaves the flow — the node takes its slot
+            hit.prev.next = node
+            node.prev = hit.prev
+          end
+          if tok.count.zero? # the spent closer likewise
+            node.next = tok.next
+            tok.next.prev = node
+          end
+          return if tok.count.zero? # spent — the scan resumes after the node
+        end
+      end
+
+      # The rule of 3: when one of the two delimiters can both open and
+      # close, their original run lengths must not sum to a multiple of 3
+      # unless both runs are multiples of 3.
+      def rule_of_three_ok?(opener, closer)
+        either = (opener.can_open && opener.can_close) || (closer.can_open && closer.can_close)
+        return true unless either
+        return true if opener.orig % 3 == 0 && closer.orig % 3 == 0
+
+        (opener.orig + closer.orig) % 3 != 0
+      end
 
       def blocks
         # tabs → 3 spaces (markdown.ts:261)
@@ -138,11 +511,14 @@ module Tart
 
       def code_block(open, lines)
         fence = open[1][0]
+        indent = indent_of(open[0]) # R7: the opening fence's own indent (≤ 3)
         body = []
         while (next_line = lines.shift)
           break if CLOSING_FENCE[fence].match?(next_line)
 
-          body << next_line
+          # R7: marked strips the opening fence's indent from each body
+          # line, bounded by the line's own indent (markdown.ts:526-550).
+          body << (indent.positive? ? next_line.sub(/\A {1,#{indent}}/, "") : next_line)
         end
         [:code, open[2].strip, body.join("\n")]
       end
@@ -247,10 +623,18 @@ module Tart
         rows = []
         items.each_with_index do |item_lines, i|
           marker = ordered ? "#{start + i}. " : "- " # normalized bullets (:775-779)
-          prefix = (base.empty? ? [] : [Span.new(text: base)]) + [Span.new(text: marker, fg: FG[:list_bullet])]
-          continuation = Span.new(text: base + " " * marker.length) # :781-782
+          # R8: a task item's `[x] `/`[ ] ` folds INTO the listBullet-styled
+          # marker span (markdown.ts renderList taskMarker — checked
+          # normalizes to x); the item text loses the marker and the
+          # continuation prefix follows the FULL marker width (:781-782).
+          task = item_lines.first.match(/\A\[([ xX])\] /)
+          marker_text = task ? "#{marker}[#{task[1].downcase}] " : marker
+          lines = item_lines.dup
+          lines[0] = item_lines.first[task[0].length..] if task
+          prefix = (base.empty? ? [] : [Span.new(text: base)]) + [Span.new(text: marker_text, fg: FG[:list_bullet])]
+          continuation = Span.new(text: base + " " * marker_text.length) # :781-782
           first = true
-          parse_blocks(item_lines).each do |inner|
+          parse_blocks(lines).each do |inner|
             case inner[0]
             when :list then rows.concat(list_rows(inner, depth + 1)) # nested: unprefixed (:794-798)
             when :space then next
@@ -271,59 +655,45 @@ module Tart
         [(@width || MAX_HR_WIDTH), MAX_HR_WIDTH].min
       end
 
-      # Inline tokens → spans (markdown.ts:677-733). +fg+/+modifiers+ are the
-      # enclosing style; delimiters nest by recursion.
-      def inline_spans(src, fg = nil, modifiers = [])
+      # Nodes → spans (markdown.ts:677-733 render cases). +fg+/+modifiers+
+      # are the enclosing style; emphasis nests by recursion. A codespan
+      # renders its raw content with the code fg and NO enclosing style
+      # (:695-697). A link renders its label children with the link fg +
+      # underline, then the linkUrl fallback — " (href)" unless the raw
+      # label already is the href (mailto stripped) (:711-719). Unresolved
+      # delimiter runs render their characters literally.
+      def render_nodes(nodes, fg, modifiers)
         spans = []
-        pos = 0
-        while (m = INLINE_SCAN.match(src, pos))
-          pre = src[pos...m.begin(0)]
-          spans << span(pre, fg, modifiers) unless pre.empty?
-          consumed = m.end(0)
-          if m[:escape]
-            spans << span(m[:escape][1..], fg, modifiers)
-          elsif m[:code]
-            spans << Span.new(text: m[:code][1..-2], fg: FG[:code]) # raw, no nesting (:695-697)
-          elsif (body = m[:strong])
-            spans.concat(inline_spans(body[2..-3], fg, modifiers + [:bold])) # :683-687
-          elsif (body = m[:em])
-            inner = body[1..-2]
-            if padded?(inner) # padded delimiters are literal (flanking approximation)
-              # I65 D1: on reject, emit the delimiter AT THE MATCH POSITION
-              # and advance past IT. src[pos]/pos+1 re-emitted the pre-text
-              # the loop top already emitted (minus one char) on every
-              # iteration — the repeated-prefix explosion (new_problems.md,
-              # 2026-10-16). The remainder re-scans as ordinary text.
-              spans << span(src[m.begin(0)], fg, modifiers)
-              consumed = m.begin(0) + 1
-            else
-              spans.concat(inline_spans(inner, fg, modifiers + [:italic])) # :689-693
-            end
-          elsif (body = m[:del])
-            inner = body[2..-3]
-            if strict_strikethrough?(inner)
-              spans.concat(inline_spans(inner, fg, modifiers + [:crossed_out])) # :725-729
-            else # StrictStrikethroughTokenizer (markdown.ts:9-21) rejects it → literal
-              # I65 D1: the same emission cure as the em arm above — the
-              # delimiter character at the match position, scan resumes
-              # at m.begin(0) + 1 (never src[pos]/pos + 1).
-              spans << span(src[m.begin(0)], fg, modifiers)
-              consumed = m.begin(0) + 1
-            end
-          elsif m[:link]
-            text = m[:link][1...m[:link].index("](")]
-            href = m[:link][(m[:link].index("](") + 2)..-2]
-            spans.concat(inline_spans(text, FG[:link], modifiers + [:underlined])) # :701
+        nodes.each do |node|
+          case node.kind
+          when :text
+            spans << span(node.text, fg, modifiers) unless node.text.empty?
+          when :code
+            spans << Span.new(text: node.text, fg: FG[:code]) # raw, no nesting (:695-697)
+          when :link
+            spans.concat(render_nodes(node.children, FG[:link], modifiers + [:underlined])) # :701
             # OSC-8 out of scope: the linkUrl fallback — URL appended in
             # parens unless text already is the href (:711-719).
-            unless text == href || text == href.delete_prefix("mailto:")
-              spans << Span.new(text: " (#{href})", fg: FG[:link_url])
+            unless node.text == node.href || node.text == node.href.delete_prefix("mailto:")
+              spans << Span.new(text: " (#{node.href})", fg: FG[:link_url])
             end
+          when :em
+            spans.concat(render_nodes(node.children, fg, modifiers + [:italic])) # :689-693
+          when :strong
+            spans.concat(render_nodes(node.children, fg, modifiers + [:bold])) # :683-687
+          when :del
+            spans.concat(render_nodes(node.children, fg, modifiers + [:crossed_out])) # :725-729
+          when :delim
+            spans << span(node.ch * node.count, fg, modifiers) unless node.count.zero?
           end
-          pos = consumed
         end
-        spans << span(src[pos..], fg, modifiers) if pos < src.length
         merge_adjacent(spans)
+      end
+
+      # Inline tokens → spans: parse (tokenize + emphasis resolution), then
+      # render with the enclosing style.
+      def inline_spans(src, fg = nil, modifiers = [])
+        render_nodes(parse_inline(src), fg, modifiers)
       end
 
       # Adjacent same-style spans coalesce (one text run per style, as pi's
@@ -332,18 +702,6 @@ module Tart
         spans.chunk_while { |a, b| a.fg == b.fg && a.modifiers == b.modifiers }.map do |group|
           Span.new(text: group.map(&:text).join, fg: group.first.fg, modifiers: group.first.modifiers)
         end
-      end
-
-      # Padded delimiters are literal text (approximation of CommonMark
-      # flanking rules; pi inherits marked's).
-      def padded?(inner)
-        inner.start_with?(" ") || inner.end_with?(" ")
-      end
-
-      # STRICT_STRIKETHROUGH_REGEX (markdown.ts:9): content neither starts
-      # nor ends with whitespace or ~.
-      def strict_strikethrough?(inner)
-        !inner.match?(/\A[\s~]/) && !inner.match?(/[\s~]\z/)
       end
 
       # A row is one display line: spans containing "\n" split rows
