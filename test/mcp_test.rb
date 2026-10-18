@@ -91,6 +91,52 @@ module Tart
       assert Mcp::Client::SUPPORTED_PROTOCOL_VERSIONS.include?("2024-11-05")
     end
 
+    # I73 child-env pin (seam (d), behavioral): the stdio child gets an
+    # explicit scrubbed copy of the parent env — no bundler keys, the belt
+    # strips bundler's RUBYOPT token while the rest rides through, the
+    # child PATH is the scrubbed parent PATH — with the config env merged
+    # on top, config wins. The env-dumping child is the echo-server
+    # fixture pattern (pure Ruby over real pipes, no gems).
+    def test_child_env_stdio_child_gets_the_scrubbed_base_and_config_wins
+      dump = File.join(@dir, "env_dump_child.rb")
+      File.write(dump, <<~RUBY)
+        require "json"
+        warn JSON.generate(ENV.to_h)
+        sleep
+      RUBY
+      saved = %w[BUNDLE_GEMFILE BUNDLER_ORIG_BUNDLE_GEMFILE RUBYOPT BUNDLER_ORIG_RUBYOPT
+                 TART_MCP_TEST_MARKER].to_h { |key| [key, ENV[key]] }
+      transport = nil
+      begin
+        ENV["BUNDLE_GEMFILE"] = "/t/Gemfile"
+        ENV["BUNDLER_ORIG_BUNDLE_GEMFILE"] = ChildEnv::INTENTIONALLY_NIL
+        # Hand-exported poison: NO record covers RUBYOPT (the pre-existing
+        # bundle-exec record is lifted for the pin) — the belt must strip
+        # bundler's token on its own.
+        ENV.delete("BUNDLER_ORIG_RUBYOPT")
+        ENV["RUBYOPT"] = "-r/x/y/bundler/setup -EUTF-8"
+        ENV["TART_MCP_TEST_MARKER"] = "parent-value"
+        chunks = []
+        transport = Mcp::Stdio.new(command: RUBY, args: [dump],
+                                   env: {"TART_MCP_TEST_MARKER" => "config-value"})
+        transport.on_stderr = ->(chunk) { chunks << chunk }
+        transport.start
+        wait_until { !chunks.join.empty? }
+        child = JSON.parse(chunks.join)
+
+        refute child.key?("BUNDLE_GEMFILE"), "the NIL record deleted the bundler key in the stdio child"
+        assert_equal "-EUTF-8", child["RUBYOPT"],
+                     "the belt stripped bundler's token, the user token rode through"
+        assert_equal "config-value", child["TART_MCP_TEST_MARKER"], "the config env wins over the base"
+        assert_equal ChildEnv.scrub(ENV.to_h)["PATH"], child["PATH"],
+                     "the child PATH is the scrubbed parent PATH (the user shell PATH under bundle exec)"
+        assert_empty child.keys.grep(/\ABUNDLER_ORIG_/), "zero ORIG residue in the stdio child"
+      ensure
+        saved.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
+        transport&.close
+      end
+    end
+
     def test_server_method_not_found_surfaces_as_a_failure_typed_by_mcp_error
       client = connected_client
       result = client.send(:request, "resources/list", nil, timeout_ms: nil)

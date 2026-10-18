@@ -2,6 +2,8 @@
 
 require "json"
 
+require_relative "../child_env"
+
 module Tart
   module Mcp
     # The stdio transport (port of pi's packages/mcp/src/transports/stdio.ts):
@@ -116,9 +118,19 @@ module Tart
         stdin_r, @stdin_w = IO.pipe
         @stdout_r, stdout_w = IO.pipe
         @stderr_r, stderr_w = IO.pipe
-        options = {pgroup: true, in: stdin_r, out: stdout_w, err: stderr_w}
+        # I73: the child gets an explicit scrubbed copy of the parent env
+        # (Tart::ChildEnv.scrub — the bundler-export cure) with the config
+        # env merged on top, config wins (the current @env handling,
+        # byte-preserved), spawned EXPLICITLY with unsetenv_others —
+        # pi's letter (stdio.ts:94: node always passes a full env copy;
+        # Ruby's Process.spawn(env, …) merges over inherit, which was the
+        # letter-divergent shape). Observable-identical when tart is
+        # launched clean (the scrub is a no-op there).
+        base = ChildEnv.scrub(ENV.to_h)
+        base.merge!(@env) if @env
+        options = {pgroup: true, in: stdin_r, out: stdout_w, err: stderr_w, unsetenv_others: true}
         options[:chdir] = @cwd if @cwd
-        @pid = Process.spawn(*(@env ? [@env] : []), @command, *@args, **options)
+        @pid = Process.spawn(base, @command, *@args, **options)
         LIVE_GROUPS << @pid
         # The child owns its ends now.
         stdin_r.close

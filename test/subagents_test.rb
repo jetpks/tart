@@ -320,6 +320,36 @@ module Tart
              "the bridge instruction is the prompt tail"
     end
 
+    # I73 child-env pin (seam (c)): the child_env pick source is the
+    # scrubbed parent env — a poisoned source (bundler's record shape)
+    # yields the user's PATH, no bundler keys, and the identity picks
+    # byte-unchanged (the law touches bundler keys only).
+    def test_child_env_poisoned_source_env_yields_the_user_path_and_no_bundler_keys
+      @server.script([{type: :stream, content: "ok"}])
+      poisoned = default_env.dup
+      poisoned["PATH"] = "/bundle/bin:#{poisoned["PATH"]}"
+      poisoned["BUNDLER_ORIG_PATH"] = default_env["PATH"]
+      poisoned["BUNDLE_GEMFILE"] = "/t/Gemfile"
+      poisoned["BUNDLER_ORIG_BUNDLE_GEMFILE"] = ChildEnv::INTENTIONALLY_NIL
+      poisoned["RUBYOPT"] = "-r/x/y/bundler/setup -w"
+      poisoned["BUNDLER_ORIG_RUBYOPT"] = ChildEnv::INTENTIONALLY_NIL
+      manager = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"), env: poisoned,
+                                       identity: "pi", hooks: @hooks)
+      @managers << manager
+      run = manager.spawn_run(agent: "worker", task: "t", async: false, timeout_ms: 0, tool_timeout_ms: 0)
+
+      assert_equal :completed, run[:state], "the child boots and completes on the scrubbed env"
+      _, env = manager.spawn_argv_and_env(run)
+      assert_equal poisoned["BUNDLER_ORIG_PATH"], env["PATH"],
+                   "the PATH pick restored the user's PATH (the bundler prepend is gone)"
+      %w[BUNDLE_GEMFILE RUBYOPT BUNDLER_ORIG_PATH BUNDLER_ORIG_BUNDLE_GEMFILE].each do |key|
+        refute env.key?(key), "#{key} must not reach the child env"
+      end
+      assert_equal "pi", env["TART_IDENTITY"], "the identity bootstrap pick is untouched by the law"
+      assert_equal "test-key", env["PI_API_KEY"], "the identity picks ride unchanged"
+      assert_equal @home, env["HOME"]
+    end
+
     def test_fork_agent_prepends_the_preamble_and_resumes_the_parent_session
       recorder = Agent::Session::Recorder.new(cwd: @cwd, root: File.join(@home, "agent"))
       recorder.append_message(Agent::Message.user("inherited turn"))

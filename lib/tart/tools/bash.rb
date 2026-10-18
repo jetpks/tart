@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative "../child_env"
 require_relative "safe_execute"
 
 module Tart
@@ -130,7 +131,7 @@ module Tart
         cancelled = false
         outcome =
           begin
-            spawn_and_stream(command, output, nil, on_chunk:)
+            spawn_and_stream(command, output, nil, on_chunk:, env: ChildEnv.scrub(ENV.to_h))
           rescue Fast::Completions::CancelledError, Async::Cancel
             cancelled = true
             {exit_code: nil}
@@ -207,10 +208,14 @@ module Tart
       # values never leak, even when a reader nils; the scrub is
       # prefix-scoped (pi deletes only its own five PI_*, so a port nested
       # in a real pi parent still sees the parent's PI_*). Then each truthy
-      # reader value sets <IDENTITY>_<SUFFIX>. run_user never calls this
-      # (pi's user-bash executor passes no env and never scrubs).
+      # reader value sets <IDENTITY>_<SUFFIX>. I73: the copy composes from
+      # Tart::ChildEnv.scrub(ENV.to_h) — pi's getShellEnv is process.env
+      # (shell.ts:138), but pi cannot be bundler-launched; the scrub is the
+      # cure for tart's bundle-exec daily driver and a no-op when clean.
+      # run_user never calls this (the session readers never fire there;
+      # its own scrub is the bundler-keys-only law — see spawn_and_stream).
       def session_env_for_spawn
-        env = ENV.to_h
+        env = ChildEnv.scrub(ENV.to_h)
         SESSION_ENV_SUFFIXES.each { |suffix| env.delete(Identity.env_key(@identity, suffix)) }
         @session_env.each do |suffix, reader|
           value = reader.call
@@ -219,7 +224,7 @@ module Tart
         env
       end
 
-      def spawn_and_stream(command, output, timeout_seconds, on_chunk: nil, env: nil)
+      def spawn_and_stream(command, output, timeout_seconds, on_chunk: nil, env:)
         out_rd, out_wr = IO.pipe
         err_rd, err_wr = IO.pipe
         pid = nil
@@ -227,17 +232,18 @@ module Tart
         timed_out = false
 
         begin
-          if env
-            # The tool path: the composed hash IS the child env —
-            # unsetenv_others makes the scrub real (no inherited copy
-            # bleeds through).
-            pid = Process.spawn(env, "/bin/bash", "-c", command, chdir: @cwd, pgroup: true,
-                                in: File::NULL, out: out_wr, err: out_wr, unsetenv_others: true)
-          else
-            # Plain inheritance: run_user (pi's user-bash executor, no env).
-            pid = Process.spawn("/bin/bash", "-c", command, chdir: @cwd, pgroup: true,
-                                in: File::NULL, out: out_wr, err: out_wr)
-          end
+          # The composed hash IS the child env — unsetenv_others makes the
+          # scrub real (no inherited copy bleeds through). I73: BOTH arms
+          # pass an explicit env now — the tool arm's session_env_for_spawn,
+          # the run_user arm Tart::ChildEnv.scrub(ENV.to_h) (OQ-1, the §5.1
+          # declared mechanism deviation: pi's user-bash executor passes no
+          # env — bash-executor.ts:48-100, node inherits — but pi cannot be
+          # bundler-launched; an explicit scrubbed copy is observably
+          # IDENTICAL to inheritance when tart is clean and is the cure
+          # when it is not, at the exact seam the owner types `!architect …`
+          # into). The bare-inheritance arm is deleted.
+          pid = Process.spawn(env, "/bin/bash", "-c", command, chdir: @cwd, pgroup: true,
+                              in: File::NULL, out: out_wr, err: out_wr, unsetenv_others: true)
           out_wr.close
           err_wr.close
 
