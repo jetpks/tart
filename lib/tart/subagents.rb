@@ -276,6 +276,23 @@ module Tart
               "model must be provider/id (got #{spec.inspect}); valid levels: #{LEVELS.join(", ")}"
       end
 
+      # I78 Law 4 — the registry consult on the dormant catalog: kwarg (pi
+      # resolveRequiredSubagentModelCandidate). catalog nil = parse-only
+      # (byte-identical for every pre-I78 caller); an EMPTY registry never
+      # validates (pi's never-validate-without-a-registry law — a corrupt
+      # models.json must not turn dispatch into a raise); the fallback
+      # (parent) pair is exempt (the inherited model is the session's live
+      # model — provider+id, level ignored); otherwise the explicit spec
+      # is valid iff it resolves through the catalog's exact-match
+      # Config#resolve (the I71-frozen law — NO fuzzy machinery). The
+      # rejection names the RAW requested string verbatim, pi's
+      # interpolation.
+      if catalog && !catalog.model_entries.empty? &&
+         !(fallback.is_a?(Array) && fallback[0] == provider && fallback[1] == model_id) &&
+         catalog.resolve("#{provider}/#{model_id}").nil?
+        raise ArgumentError, "Unknown subagent model '#{spec}' in the active Pi model registry."
+      end
+
       [provider, model_id, suffix || (fallback.is_a?(Array) ? fallback[2] : nil)]
     end
 
