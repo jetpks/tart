@@ -295,7 +295,9 @@ module Tart
       # PI_IDENTITY write was a dead key nothing read).
       sanctioned = %w[PATH HOME TART_IDENTITY PI_API_KEY PI_API_BASE PI_MODEL PI_PROVIDER
                       PI_MODEL_REASONING PI_THINKING_LEVEL PI_CONTEXT_WINDOW PI_TOOL_TIMEOUT_MS
-                      PI_RUN_DEADLINE_MS PI_SUBAGENTS_HOME PI_SUPERVISOR_CHANNEL PI_SUBAGENTS_AGENT]
+                      PI_RUN_DEADLINE_MS PI_SUBAGENTS_HOME PI_SUPERVISOR_CHANNEL PI_SUBAGENTS_AGENT
+                      PI_SESSION_SINK_HOST PI_SESSION_SINK_TOKEN PI_SESSION_SINK_DISABLED
+                      PI_SESSION_SINK_AGENT_NAME PI_SESSION_SINK_PARENT_SESSION_ID]
       assert_empty(env.keys - sanctioned, "spawn env closure violated: #{(env.keys - sanctioned).inspect}")
       assert env.key?("PATH")
       assert env.key?("HOME")
@@ -348,6 +350,46 @@ module Tart
       assert_equal "pi", env["TART_IDENTITY"], "the identity bootstrap pick is untouched by the law"
       assert_equal "test-key", env["PI_API_KEY"], "the identity picks ride unchanged"
       assert_equal @home, env["HOME"]
+    end
+
+    # I74 session-sink child capture (AC4): the five identity-namespaced
+    # sink picks — HOST/TOKEN/DISABLED pass through from the scrubbed
+    # source env, AGENT_NAME is the run label (unconditional),
+    # PARENT_SESSION_ID is the live parent recorder id (nil → omitted).
+    def test_child_env_session_sink_picks_the_five_identity_namespaced_keys
+      @server.script([{type: :stream, content: "ok"}])
+      recorder = Struct.new(:id, :path).new("parent-session-id", "/tmp/parent.jsonl")
+      loop = Struct.new(:recorder).new(recorder)
+      manager = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"),
+                                       env: default_env.merge("PI_SESSION_SINK_HOST" => "http://127.0.0.1:1",
+                                                              "PI_SESSION_SINK_TOKEN" => "tok",
+                                                              "PI_SESSION_SINK_DISABLED" => "0"),
+                                       identity: "pi", hooks: @hooks, agent: loop)
+      @managers << manager
+      run = manager.spawn_run(agent: "worker", task: "t", async: false, timeout_ms: 0, tool_timeout_ms: 0)
+
+      _, env = manager.spawn_argv_and_env(run)
+      assert_equal "http://127.0.0.1:1", env["PI_SESSION_SINK_HOST"]
+      assert_equal "tok", env["PI_SESSION_SINK_TOKEN"]
+      assert_equal "0", env["PI_SESSION_SINK_DISABLED"]
+      assert_equal "worker", env["PI_SESSION_SINK_AGENT_NAME"]
+      assert_equal "parent-session-id", env["PI_SESSION_SINK_PARENT_SESSION_ID"]
+    end
+
+    # The same seam from a clean parent: no sink env, no parent recorder —
+    # every pick except the unconditional label is OMITTED (nil keys
+    # never reach the child; FILE-configured parents need no pick).
+    def test_child_env_session_sink_picks_omitted_when_the_parent_has_none
+      @server.script([{type: :stream, content: "ok"}])
+      manager = new_manager
+      run = manager.spawn_run(agent: "worker", task: "t", async: false, timeout_ms: 0, tool_timeout_ms: 0)
+
+      _, env = manager.spawn_argv_and_env(run)
+      %w[PI_SESSION_SINK_HOST PI_SESSION_SINK_TOKEN PI_SESSION_SINK_DISABLED
+         PI_SESSION_SINK_PARENT_SESSION_ID].each do |key|
+        refute env.key?(key), "#{key} must be omitted when the parent has none"
+      end
+      assert_equal "worker", env["PI_SESSION_SINK_AGENT_NAME"], "the label rides regardless"
     end
 
     def test_fork_agent_prepends_the_preamble_and_resumes_the_parent_session
