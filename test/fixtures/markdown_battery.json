@@ -1,0 +1,1278 @@
+{
+  "provenance": "markdown-parity battery (I68). Oracle: the pinned repos/pi clone @ v1.1.0 (branch oracle-v1.1.0), marked 18.0.11 via packages/tui with pi's StrictStrikethroughTokenizer setup — captured by tmp/i68-spec/capture.js (scratch, spec session 2026-10-17); captures in tmp/i68-spec/oracle.json, base-side comparison ledger in tmp/i68-spec/ledger.txt. Expect rows: the 36 base-green cases are tart's measured base spans (verified equal to the oracle distinctions); the 11 designed-RED cases are frozen from the oracle captures (the post-cure bar). A span is [text, fg, modifiers]; fg null = terminal default; zero-width spans dropped; modifiers compare as a SET; an empty row is a blank line. Rendered with width: 94.",
+  "cases": [
+    {
+      "name": "owner_snake_line",
+      "src": "checking some_var_name and then other_value next",
+      "rows": [
+        [
+          [
+            "checking some_var_name and then other_value next",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "underscore_real_em",
+      "src": "A _real_ emphasis case",
+      "rows": [
+        [
+          [
+            "A ",
+            null,
+            []
+          ],
+          [
+            "real",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            " emphasis case",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "intraword_double_underscore",
+      "src": "foo__bar__baz",
+      "rows": [
+        [
+          [
+            "foo__bar__baz",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "intraword_star_em",
+      "src": "foo*bar*baz",
+      "rows": [
+        [
+          [
+            "foo",
+            null,
+            []
+          ],
+          [
+            "bar",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            "baz",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "intraword_double_star",
+      "src": "foo**bar**baz",
+      "rows": [
+        [
+          [
+            "foo",
+            null,
+            []
+          ],
+          [
+            "bar",
+            null,
+            [
+              "bold"
+            ]
+          ],
+          [
+            "baz",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "em_word_boundaries",
+      "src": "The _quick_ brown fox _jumps_ over",
+      "rows": [
+        [
+          [
+            "The ",
+            null,
+            []
+          ],
+          [
+            "quick",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            " brown fox ",
+            null,
+            []
+          ],
+          [
+            "jumps",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            " over",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "strong_word_boundaries",
+      "src": "The __quick__ brown fox __jumps__ over",
+      "rows": [
+        [
+          [
+            "The ",
+            null,
+            []
+          ],
+          [
+            "quick",
+            null,
+            [
+              "bold"
+            ]
+          ],
+          [
+            " brown fox ",
+            null,
+            []
+          ],
+          [
+            "jumps",
+            null,
+            [
+              "bold"
+            ]
+          ],
+          [
+            " over",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "multi_snake_identifiers",
+      "src": "file_name_2_test.rb and other_name_here too",
+      "rows": [
+        [
+          [
+            "file_name_2_test.rb and other_name_here too",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "em_punct_flank",
+      "src": "(see _note_ below) and (also _this_ one)",
+      "rows": [
+        [
+          [
+            "(see ",
+            null,
+            []
+          ],
+          [
+            "note",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            " below) and (also ",
+            null,
+            []
+          ],
+          [
+            "this",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            " one)",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "em_before_period",
+      "src": "It is _important_. Very.",
+      "rows": [
+        [
+          [
+            "It is ",
+            null,
+            []
+          ],
+          [
+            "important",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            ". Very.",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "star_padded",
+      "src": "* padded * stays literal",
+      "rows": [
+        [
+          [
+            "- ",
+            "light_magenta",
+            []
+          ],
+          [
+            "padded * stays literal",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "underscore_padded",
+      "src": "_ padded _ stays literal",
+      "rows": [
+        [
+          [
+            "_ padded _ stays literal",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "strong_padded",
+      "src": "** padded ** stays literal",
+      "rows": [
+        [
+          [
+            "** padded ** stays literal",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "strong_intraword",
+      "src": "a__bold__b stays literal",
+      "rows": [
+        [
+          [
+            "a__bold__b stays literal",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "underscore_pair_in_parens",
+      "src": "call (x_y) then (p_q) now",
+      "rows": [
+        [
+          [
+            "call (x_y) then (p_q) now",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "triple_delim",
+      "src": "***bold italic***",
+      "rows": [
+        [
+          [
+            "bold italic",
+            null,
+            [
+              "bold",
+              "italic"
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "strong_nested_em_underscore",
+      "src": "**bold _inner_ bold**",
+      "rows": [
+        [
+          [
+            "bold ",
+            null,
+            [
+              "bold"
+            ]
+          ],
+          [
+            "inner",
+            null,
+            [
+              "bold",
+              "italic"
+            ]
+          ],
+          [
+            " bold",
+            null,
+            [
+              "bold"
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "em_nested_strong_star",
+      "src": "*em **inner** em*",
+      "rows": [
+        [
+          [
+            "em ",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            "inner",
+            null,
+            [
+              "bold",
+              "italic"
+            ]
+          ],
+          [
+            " em",
+            null,
+            [
+              "italic"
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "strong_nested_em_star",
+      "src": "**bold *inner* bold**",
+      "rows": [
+        [
+          [
+            "bold ",
+            null,
+            [
+              "bold"
+            ]
+          ],
+          [
+            "inner",
+            null,
+            [
+              "bold",
+              "italic"
+            ]
+          ],
+          [
+            " bold",
+            null,
+            [
+              "bold"
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "escaped_star",
+      "src": "\\*not em\\* literal",
+      "rows": [
+        [
+          [
+            "*not em* literal",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "escaped_underscore",
+      "src": "\\_a\\_ and \\_b\\_ literal",
+      "rows": [
+        [
+          [
+            "_a_ and _b_ literal",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "escaped_backslash_before_letter",
+      "src": "back \\to *em* now",
+      "rows": [
+        [
+          [
+            "back \\to ",
+            null,
+            []
+          ],
+          [
+            "em",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            " now",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "escaped_two_backslashes",
+      "src": "x \\\\ y *em* still",
+      "rows": [
+        [
+          [
+            "x \\ y ",
+            null,
+            []
+          ],
+          [
+            "em",
+            null,
+            [
+              "italic"
+            ]
+          ],
+          [
+            " still",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "code_protect_underscore",
+      "src": "the `a_b_c` identifier stays",
+      "rows": [
+        [
+          [
+            "the ",
+            null,
+            []
+          ],
+          [
+            "a_b_c",
+            "light_magenta",
+            []
+          ],
+          [
+            " identifier stays",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "code_protect_delims",
+      "src": "run `**not bold**` and `*not em*` now",
+      "rows": [
+        [
+          [
+            "run ",
+            null,
+            []
+          ],
+          [
+            "**not bold**",
+            "light_magenta",
+            []
+          ],
+          [
+            " and ",
+            null,
+            []
+          ],
+          [
+            "*not em*",
+            "light_magenta",
+            []
+          ],
+          [
+            " now",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "del_basic",
+      "src": "this is ~~gone~~ now",
+      "rows": [
+        [
+          [
+            "this is ",
+            null,
+            []
+          ],
+          [
+            "gone",
+            null,
+            [
+              "crossed_out"
+            ]
+          ],
+          [
+            " now",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "del_padded",
+      "src": "this is ~~ padded ~~ now",
+      "rows": [
+        [
+          [
+            "this is ~~ padded ~~ now",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "del_adjacent",
+      "src": "~~a~~ and ~~b~~",
+      "rows": [
+        [
+          [
+            "a",
+            null,
+            [
+              "crossed_out"
+            ]
+          ],
+          [
+            " and ",
+            null,
+            []
+          ],
+          [
+            "b",
+            null,
+            [
+              "crossed_out"
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "del_tilde_edge",
+      "src": "a ~~b~ c~~ d",
+      "rows": [
+        [
+          [
+            "a ",
+            null,
+            []
+          ],
+          [
+            "b~ c",
+            null,
+            [
+              "crossed_out"
+            ]
+          ],
+          [
+            " d",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "link_basic",
+      "src": "see [pi](https://pi.dev) docs",
+      "rows": [
+        [
+          [
+            "see ",
+            null,
+            []
+          ],
+          [
+            "pi",
+            "light_blue",
+            [
+              "underlined"
+            ]
+          ],
+          [
+            " (https://pi.dev)",
+            "gray",
+            []
+          ],
+          [
+            " docs",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "link_text_eq_href",
+      "src": "go to [https://pi.dev](https://pi.dev) now",
+      "rows": [
+        [
+          [
+            "go to ",
+            null,
+            []
+          ],
+          [
+            "https://pi.dev",
+            "light_blue",
+            [
+              "underlined"
+            ]
+          ],
+          [
+            " now",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "link_punct_url",
+      "src": "try [search](https://ex.com/p?q=1&x=2#frag) ok",
+      "rows": [
+        [
+          [
+            "try ",
+            null,
+            []
+          ],
+          [
+            "search",
+            "light_blue",
+            [
+              "underlined"
+            ]
+          ],
+          [
+            " (https://ex.com/p?q=1&x=2#frag)",
+            "gray",
+            []
+          ],
+          [
+            " ok",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "link_parens_url",
+      "src": "see [wiki](https://en.wikipedia.org/wiki/Foo_(bar)) here",
+      "rows": [
+        [
+          [
+            "see ",
+            null,
+            []
+          ],
+          [
+            "wiki",
+            "light_blue",
+            [
+              "underlined"
+            ]
+          ],
+          [
+            " (https://en.wikipedia.org/wiki/Foo_(bar))",
+            "gray",
+            []
+          ],
+          [
+            " here",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "link_formatted_text",
+      "src": "the [**bold** link](https://x.dev) here",
+      "rows": [
+        [
+          [
+            "the ",
+            null,
+            []
+          ],
+          [
+            "bold",
+            "light_blue",
+            [
+              "bold",
+              "underlined"
+            ]
+          ],
+          [
+            " link",
+            "light_blue",
+            [
+              "underlined"
+            ]
+          ],
+          [
+            " (https://x.dev)",
+            "gray",
+            []
+          ],
+          [
+            " here",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "link_mailto",
+      "src": "email [foo@bar.com](mailto:foo@bar.com) ok",
+      "rows": [
+        [
+          [
+            "email ",
+            null,
+            []
+          ],
+          [
+            "foo@bar.com",
+            "light_blue",
+            [
+              "underlined"
+            ]
+          ],
+          [
+            " ok",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "heading_inline_bold",
+      "src": "## A **bold** heading",
+      "rows": [
+        [
+          [
+            "A ",
+            "yellow",
+            [
+              "bold"
+            ]
+          ],
+          [
+            "bold",
+            "yellow",
+            [
+              "bold"
+            ]
+          ],
+          [
+            " heading",
+            "yellow",
+            [
+              "bold"
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "heading_inline_code",
+      "src": "#### `code` heading",
+      "rows": [
+        [
+          [
+            "#### ",
+            "yellow",
+            [
+              "bold"
+            ]
+          ],
+          [
+            "code",
+            "light_magenta",
+            []
+          ],
+          [
+            " heading",
+            "yellow",
+            [
+              "bold"
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "heading_six",
+      "src": "###### six deep",
+      "rows": [
+        [
+          [
+            "###### ",
+            "yellow",
+            [
+              "bold"
+            ]
+          ],
+          [
+            "six deep",
+            "yellow",
+            [
+              "bold"
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "hr_underscores",
+      "src": "___",
+      "rows": [
+        [
+          [
+            "────────────────────────────────────────────────────────────────────────────────",
+            "gray",
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "fenced_tilde",
+      "src": "~~~js\nconsole.log(1)\n~~~",
+      "rows": [
+        [
+          [
+            "```js",
+            "gray",
+            []
+          ]
+        ],
+        [
+          [
+            "  ",
+            null,
+            []
+          ],
+          [
+            "console.log(1)",
+            "green",
+            []
+          ]
+        ],
+        [
+          [
+            "```",
+            "gray",
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "fenced_indented",
+      "src": "  ```\n  indented body\n  ```",
+      "rows": [
+        [
+          [
+            "```",
+            "gray",
+            []
+          ]
+        ],
+        [
+          [
+            "  ",
+            null,
+            []
+          ],
+          [
+            "indented body",
+            "green",
+            []
+          ]
+        ],
+        [
+          [
+            "```",
+            "gray",
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "fenced_unclosed",
+      "src": "```\nno closing fence",
+      "rows": [
+        [
+          [
+            "```",
+            "gray",
+            []
+          ]
+        ],
+        [
+          [
+            "  ",
+            null,
+            []
+          ],
+          [
+            "no closing fence",
+            "green",
+            []
+          ]
+        ],
+        [
+          [
+            "```",
+            "gray",
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "list_paren_ordered",
+      "src": "1) alpha\n2) beta",
+      "rows": [
+        [
+          [
+            "1. ",
+            "light_magenta",
+            []
+          ],
+          [
+            "alpha",
+            null,
+            []
+          ]
+        ],
+        [
+          [
+            "2. ",
+            "light_magenta",
+            []
+          ],
+          [
+            "beta",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "list_task",
+      "src": "- [x] done\n- [ ] todo",
+      "rows": [
+        [
+          [
+            "- [x] ",
+            "light_magenta",
+            []
+          ],
+          [
+            "done",
+            null,
+            []
+          ]
+        ],
+        [
+          [
+            "- [ ] ",
+            "light_magenta",
+            []
+          ],
+          [
+            "todo",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "list_nested_ordered_in_unordered",
+      "src": "- a\n  1. one\n  2. two",
+      "rows": [
+        [
+          [
+            "- ",
+            "light_magenta",
+            []
+          ],
+          [
+            "a",
+            null,
+            []
+          ]
+        ],
+        [
+          [
+            "    ",
+            null,
+            []
+          ],
+          [
+            "1. ",
+            "light_magenta",
+            []
+          ],
+          [
+            "one",
+            null,
+            []
+          ]
+        ],
+        [
+          [
+            "    ",
+            null,
+            []
+          ],
+          [
+            "2. ",
+            "light_magenta",
+            []
+          ],
+          [
+            "two",
+            null,
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "list_code_item",
+      "src": "- item\n  ```\n  code\n  ```",
+      "rows": [
+        [
+          [
+            "- ",
+            "light_magenta",
+            []
+          ],
+          [
+            "item",
+            null,
+            []
+          ]
+        ],
+        [
+          [
+            "  ",
+            null,
+            []
+          ],
+          [
+            "```",
+            "gray",
+            []
+          ]
+        ],
+        [
+          [
+            "  ",
+            null,
+            []
+          ],
+          [
+            "  ",
+            null,
+            []
+          ],
+          [
+            "code",
+            "green",
+            []
+          ]
+        ],
+        [
+          [
+            "  ",
+            null,
+            []
+          ],
+          [
+            "```",
+            "gray",
+            []
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "quote_nested",
+      "src": "> a\n> > b",
+      "rows": [
+        [
+          [
+            "│ ",
+            "gray",
+            []
+          ],
+          [
+            "a",
+            "gray",
+            [
+              "italic"
+            ]
+          ]
+        ],
+        [
+          [
+            "│ ",
+            "gray",
+            []
+          ],
+          [
+            "│ ",
+            "gray",
+            [
+              "italic"
+            ]
+          ],
+          [
+            "b",
+            "gray",
+            [
+              "italic"
+            ]
+          ]
+        ]
+      ]
+    },
+    {
+      "name": "quote_list",
+      "src": "> - x\n> - y",
+      "rows": [
+        [
+          [
+            "│ ",
+            "gray",
+            []
+          ],
+          [
+            "- ",
+            "light_magenta",
+            [
+              "italic"
+            ]
+          ],
+          [
+            "x",
+            "gray",
+            [
+              "italic"
+            ]
+          ]
+        ],
+        [
+          [
+            "│ ",
+            "gray",
+            []
+          ],
+          [
+            "- ",
+            "light_magenta",
+            [
+              "italic"
+            ]
+          ],
+          [
+            "y",
+            "gray",
+            [
+              "italic"
+            ]
+          ]
+        ]
+      ]
+    }
+  ]
+}
