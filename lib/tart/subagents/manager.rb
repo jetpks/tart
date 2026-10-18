@@ -9,6 +9,9 @@ require "time"
 require_relative "../agent/session"
 require_relative "../child_env"
 require_relative "../identity"
+# I78 Law 4: the validation seat loads the model catalog from the same
+# staged root the Manager carries (`Models.load(root: @root)`).
+require_relative "../models"
 
 # I74: the session-sink module rides THIS require site — the sink is
 # coupled to the child-capture law (child_env's five picks feed the
@@ -142,8 +145,14 @@ module Tart
         # `model:` > the parent's current pair — the profile rides the
         # SAME resolve_model path (`provider/id[:level]`).
         source = model || spec[:model]
+        # I78 Law 4: an EXPLICIT model (the call arg OR the profile's
+        # `model:`) validates against the registry — the catalog loads
+        # fresh from disk per spawn (the same staged root, hermetic by
+        # construction); the inherited arm (nil source) never loads,
+        # never validates (pi's law — the parent is running on it).
+        catalog = source ? Models.load(root: @root) : nil
         provider, model_id, level =
-          source ? Subagents.resolve_model(source, catalog: nil, fallback: parent_model_pair) : parent_model_pair
+          source ? Subagents.resolve_model(source, catalog: catalog, fallback: parent_model_pair) : parent_model_pair
         # I49 D5: every gate-on child gets the intercom bridge —
         # contact_supervisor appended to its tools and the instruction
         # appended to its prompt (pi applyIntercomBridgeToAgent, mode
@@ -170,6 +179,7 @@ module Tart
         exit_rd, exit_wr = IO.pipe
         record = {
           id:, agent: spec[:name], state: :running, dir:, pid: nil, pgid: nil, async: !!async,
+          owned: true, # I78 Law 3: true exactly when THIS process spawned it
           timed_out: false, started_at: now_ms, tool_call_id:,
           # Port-internal keys (beyond the §2.2 public contract) that
           # #spawn_argv_and_env derives the child harness from:
@@ -284,6 +294,7 @@ module Tart
       def status(id: nil)
         return render_status(reconcile_run(find_run!(id.to_s))) if id
 
+        sweep_home
         list = @mutex.synchronize { @runs.dup }
         list.each { |record| reconcile_run(record) }
         ordered = list.sort_by { |record| [record[:state] == :running ? 0 : 1, -(record[:started_at] || 0)] }
@@ -306,9 +317,11 @@ module Tart
         @mutex.synchronize { @runs.map(&:dup) }
       end
 
-      # Any non-terminal run — the print drain's predicate.
+      # Any non-terminal OWNED run — the print drain's predicate (I78
+      # Law 3: a foreign run adopted from disk never gates the adopter's
+      # drain).
       def outstanding?
-        @mutex.synchronize { @runs.any? { |record| record[:state] == :running } }
+        @mutex.synchronize { @runs.any? { |record| record[:owned] && record[:state] == :running } }
       end
 
       # §5.4 — the print agent-end drain: waits for every outstanding run
@@ -326,7 +339,11 @@ module Tart
       # channel stops LAST (its terminal sweep sees the settled runs).
       def shutdown
         @mutex.synchronize { @shutdown = true }
-        ids = @mutex.synchronize { @runs.select { |record| record[:state] == :running }.map { |record| record[:id] } }
+        # I78 Law 3: the stop ladder arms ONLY owned runs — stopping a
+        # foreign child from teardown would signal another session's run.
+        ids = @mutex.synchronize do
+          @runs.select { |record| record[:owned] && record[:state] == :running }.map { |record| record[:id] }
+        end
         ids.each do |id|
           begin
             stop(id:)
@@ -608,7 +625,7 @@ module Tart
           # callbacks) — safe under this lock. With this, `outstanding? ==
           # false` REALLY implies the notification is queued, as the comment
           # below always claimed.
-          notify_completion(record) if record[:async]
+          notify_completion(record) if record[:owned] && record[:async]
         end
         close_exit_pipe(record)
         record
@@ -617,8 +634,12 @@ module Tart
       # Disk-first reconcile (§2.1/§2.5 — T3): a non-terminal run whose
       # result.json + terminal status.json are BOTH on disk adopts the
       # terminal state even if the watcher never saw it live; an observed
-      # exit settles through the full processor.
+      # exit settles through the full processor. I78 Law 2/3: a NON-OWNED
+      # record routes through the reap seam instead — never settle_run,
+      # never a notification into the adopter's session.
       def reconcile_run(record)
+        return reap_run(record) unless record[:owned]
+
         return record if terminal?(record[:state])
 
         disk = read_json(status_path(record))
@@ -665,9 +686,12 @@ module Tart
 
             # Deadline backstop (arms here too when the §2.2 supervisor
             # thread is absent/disarmed — both-sides T2) + the belt-and-
-            # braces exit sweep.
+            # braces exit sweep. I78 Law 2/3: a non-owned record routes
+            # through the reaper — disk-only convergence, no notification.
             enforce_deadline(record) if deadline_due?(record)
-            settle_run(record) if record[:state] == :running && exited?(record)
+            next unless record[:state] == :running && exited?(record)
+
+            record[:owned] ? settle_run(record) : reap_run(record)
           end
         end
       rescue StandardError
@@ -720,6 +744,161 @@ module Tart
         nil
       end
 
+      # --- the reaper (I78 — pi stale-run-reconciler.js, read-path synchronous) ---
+
+      # Law 1 — the fleet sweep (pi async-status.js :373/:436): the fleet
+      # read reconciles the runs root BEFORE listing. Best-effort
+      # discipline: an unreadable status.json / a non-run dir is skipped,
+      # never fatal; terminal foreign history is NOT adopted (the fleet
+      # must not flood); a NON-TERMINAL unknown dir is adopted via the
+      # existing disk_find (dedupe unchanged) and reaped synchronously,
+      # in-line, once per fleet read. NO new thread — the sweep lives on
+      # the read path only; the watcher stays the one background thread.
+      def sweep_home
+        Dir.children(@home).sort.each do |child|
+          dir = File.join(@home, child)
+          next unless File.directory?(dir)
+
+          disk = read_json(File.join(dir, "status.json"))
+          next unless disk.is_a?(Hash) && disk["state"].is_a?(String)
+          next if TERMINAL_STATES.include?(disk["state"])
+
+          record = disk_find(child)
+          reap_run(record) if record
+        end
+      rescue StandardError
+        nil # a broken runs root never blocks the fleet list
+      end
+
+      # Law 2 — the convergence seam for NON-OWNED records (a foreign run
+      # this process never spawned, adopted from disk). pi's exact order:
+      # (d) already-terminal-on-disk adopts the state, writes nothing;
+      # (a) an existing result.json is AUTHORITATIVE (result-derive —
+      # write ONLY the atomic status flip, the crash-between-writes
+      # recovery); (b) a dead pid (ESRCH on BOTH pid and pgid — the
+      # existing exited? law; EPERM = live, never converged) fabricates
+      # the failed repair, result BEFORE the flip; (c) a live or
+      # unprobeable pid is left byte-identical. Never settle_run — no
+      # notification, no first-stderr-line story: the adopter never
+      # speaks for a run it did not spawn.
+      def reap_run(record)
+        return record if terminal?(record[:state])
+
+        disk = read_json(status_path(record))
+        if disk.is_a?(Hash) && TERMINAL_STATES.include?(disk["state"]) && File.file?(result_path(record))
+          return adopt_terminal_disk(record, disk)
+        end
+
+        if File.file?(result_path(record))
+          result = read_json(result_path(record))
+          # An UNREADABLE result is not authority — fall through to the
+          # pid probe (a live pid is never converged, never fabricated
+          # over; a dead one gets the honest repair).
+          return reap_from_result(record, disk, result) if result.is_a?(Hash)
+        end
+
+        return record unless exited?(record)
+
+        reap_dead_repair(record)
+      end
+
+      # Leg (d): the existing reconcile_run first leg, unchanged — adopt
+      # the terminal disk state, write nothing.
+      def adopt_terminal_disk(record, disk)
+        @mutex.synchronize do
+          record[:state] = disk["state"].to_sym
+          record[:timed_out] = disk["timedOut"] == true
+        end
+        close_exit_pipe(record)
+        record
+      end
+
+      # Leg (a) — pi terminalStatusFromResult: derive the terminal state
+      # from the authoritative result (success → completed; !success &&
+      # timedOut → stopped; else failed) and write ONLY the status flip
+      # (lastUpdate/endedAt now, error from the result's error when
+      # present, timedOut from the result). result.json is NEVER
+      # rewritten on this leg. The flip merges over the on-disk status
+      # (pi's spread) so legacy/unknown fields pass through untouched.
+      def reap_from_result(record, disk, result)
+        state = if result["success"] then "completed"
+                elsif result["timedOut"] == true then "stopped"
+                else "failed"
+                end
+        now = now_ms
+        base = disk.is_a?(Hash) ? disk : base_status(record)
+        payload = base.merge("state" => state, "lastUpdate" => now, "endedAt" => now,
+                             "timedOut" => result["timedOut"] == true)
+        payload["error"] = result["error"] if result["error"]
+        atomic_write_json(status_path(record), payload)
+        @mutex.synchronize do
+          record[:state] = state.to_sym
+          record[:timed_out] = result["timedOut"] == true
+        end
+        record
+      end
+
+      # Leg (b) — pi writeFailedRepair: the dead-pid repair. result.json
+      # FIRST (atomic temp+rename — the frozen watcher-compatible
+      # discipline), THEN the atomic status.json flip to "failed" — a
+      # poller watching status.json observes running → failed. The
+      # message is pi's BYTE-PINNED base + the stderr-tail diagnostics;
+      # nil/legacy status fields (startedAt: null, missing keys) ride
+      # base_status's nil-tolerant shape and never raise; pid stays
+      # recorded verbatim (pi keeps it; a nil pid reads "unknown", pi's
+      # own interpolation fallback).
+      def reap_dead_repair(record)
+        pid = record[:pid] || "unknown"
+        message = "Async runner process #{pid} exited or disappeared before writing a result. " \
+                  "Marked run failed by stale-run reconciliation."
+        diagnostics = stderr_tail_diagnostics(record)
+        message = "#{message}\n\nRunner stderr tail:\n#{diagnostics}" if diagnostics
+
+        result = {"output" => read_output(record), "success" => false, "timedOut" => false, "error" => message}
+        atomic_write_json(result_path(record), result) # BEFORE the flip
+
+        now = now_ms
+        payload = base_status(record).merge(
+          "state" => "failed",
+          "lastUpdate" => now,
+          "endedAt" => now,
+          "timedOut" => false,
+          "error" => message
+        )
+        atomic_write_json(status_path(record), payload)
+        @mutex.synchronize do
+          record[:state] = :failed
+          record[:timed_out] = false
+        end
+        record
+      end
+
+      # pi readRunnerStartupDiagnostics (stale-run-reconciler.js :27-52):
+      # read ≤64KB from the END of runner.stderr.log, take the LAST 30
+      # lines, truncate past 4000 chars to the last 4000 + the marker.
+      # nil when the log is absent/empty/unreadable — diagnostics are
+      # best-effort, never fatal.
+      def stderr_tail_diagnostics(record)
+        path = File.join(record[:dir], "runner.stderr.log")
+        return nil unless File.file?(path)
+
+        size = File.size(path)
+        return nil if size <= 0
+
+        content = File.open(path, "r") do |file|
+          file.seek([0, size - 64 * 1024].max)
+          file.read(64 * 1024)
+        end.to_s.strip
+        return nil if content.empty?
+
+        lines = content.split(/\r?\n/).last(30).join("\n")
+        return "#{lines.chars.last(4000).join}\n[stderr tail truncated]" if lines.length > 4000
+
+        lines
+      rescue StandardError
+        nil
+      end
+
       # --- registry lookup ---
 
       def find_run(id)
@@ -739,7 +918,9 @@ module Tart
 
       # A run unknown to this process's registry but present on disk (the
       # stale-run-reconciler discipline — T3): synthesized from its
-      # status.json and adopted into the registry.
+      # status.json and adopted into the registry. I78 Law 3: the
+      # synthesis carries owned: false — the adopter never speaks for a
+      # run it did not spawn.
       def disk_find(id)
         dir = File.join(@home, id)
         status = read_json(File.join(dir, "status.json"))
@@ -748,7 +929,8 @@ module Tart
         record = {
           id: status["id"].to_s, agent: status["agent"].to_s,
           state: status["state"].to_s.to_sym, dir:, pid: status["pid"], pgid: status["pid"],
-          async: true, timed_out: status["timedOut"] == true, started_at: status["started_at"],
+          async: true, owned: false,
+          timed_out: status["timedOut"] == true, started_at: status["startedAt"],
           tool_call_id: status["toolCallId"], exit_pipe: nil, stopped: false,
           deadline_due: false, signaled: nil
         }
