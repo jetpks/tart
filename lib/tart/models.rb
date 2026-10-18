@@ -5,6 +5,7 @@ require_relative "agent/session"
 require_relative "settings"
 require_relative "schemas/models"
 require_relative "shapes/model"
+require_relative "models/vendored"
 
 module Tart
   module Models
@@ -123,20 +124,75 @@ module Tart
     DEFAULT_ENTRY_CONTEXT_WINDOW = 128_000
     DEFAULT_ENTRY_MAX_TOKENS = 16_384
 
-    # The entry's declared window, else pi's 128_000 definition default
-    # when an entry EXISTS; nil without an entry (the no-entry chain's
-    # signal — no default may leak into an entry-less boot).
+    # The entry's declared window, else the vendored tier's fill (I71 R2 —
+    # the tier slots BETWEEN the declared value and the definition default:
+    # an ENTRY that omits the field + a vendored match ⇒ the vendored
+    # value), else pi's 128_000 definition default when an entry EXISTS;
+    # nil without an entry (the no-entry chain's signal — no default may
+    # leak into an entry-less boot). A user-declared value ALWAYS wins —
+    # the fill-only law.
     def entry_context_window(entry)
       return nil unless entry
-      entry.context_window || DEFAULT_ENTRY_CONTEXT_WINDOW
+      entry.context_window || vendored_integer(entry, "contextWindow") || DEFAULT_ENTRY_CONTEXT_WINDOW
     end
 
-    # The entry's declared cap, else pi's 16_384 definition default when
-    # an entry EXISTS (never the window fallback — the big-declared-window
-    # fallback is the Face-1 400); nil without an entry.
+    # The entry's declared cap, else the vendored tier's fill (same slot —
+    # I71 R2), else pi's 16_384 definition default when an entry EXISTS
+    # (never the window fallback — the big-declared-window fallback is the
+    # Face-1 400); nil without an entry.
     def entry_max_tokens(entry)
       return nil unless entry
-      entry.max_tokens || DEFAULT_ENTRY_MAX_TOKENS
+      entry.max_tokens || vendored_integer(entry, "maxTokens") || DEFAULT_ENTRY_MAX_TOKENS
+    end
+
+    # The vendored tier's integer fill for the entry (I71 R2): the matched
+    # vendored model's fact, or nil (no match / non-integer fact — the
+    # definition default then applies). Read-only: the loaded catalog is
+    # never touched.
+    def vendored_integer(entry, field)
+      value = vendored_facts(entry)&.[](field)
+      value.is_a?(Integer) ? value : nil
+    end
+
+    # The vendored tier's facts for the entry (I71 R2): the matched
+    # vendored model's RAW pi facts hash (the tier's own schema — never
+    # the models.json CatalogContract), nil when the entry matches
+    # nothing. NEVER raises — the never-raise boot law (a missing/corrupt
+    # vendor file is a degraded tier, never a boot error, never a warning).
+    def vendored_facts(entry)
+      Vendored.facts_for_entry(entry)
+    end
+
+    # The entry's compat through the vendored fill (I71 R2): the entry's
+    # declared compat when it carries one, else the matched vendored
+    # compat (built through the existing build_compat six-key pick — the
+    # vendored superset keys are tolerated-and-dropped, the I46 law), else
+    # nil. The fill the boot/switch threading feeds the wire model's
+    # dialect derivation with.
+    def resolved_compat(entry)
+      return nil unless entry
+
+      declared = entry.respond_to?(:compat) ? entry.compat : entry[:compat]
+      declared || vendored_compat(entry)
+    end
+
+    # The vendored tier's compat fill for the entry (I71 R2): the matched
+    # vendored model's compat through build_compat's six-key pick, nil
+    # when the entry matches nothing. NEVER raises.
+    def vendored_compat(entry)
+      facts = vendored_facts(entry)
+      build_compat(facts&.[]("compat")) if facts
+    end
+
+    # The dialect for a catalog ENTRY (I71 R2, the new public seam): the
+    # entry's declared compat, vendored-filled — `dialect_for(entry.compat
+    # || vendored compat)`. The boot/switch threading consults this seam
+    # (the threaded compat is the RESOLVED one, so the wire model's
+    # dialect derivation sees the fill); {dialect_for} itself and the
+    # {wire_model} signature are UNCHANGED — existing direct-call pins
+    # hold.
+    def dialect_for_entry(entry)
+      dialect_for(resolved_compat(entry))
     end
 
     # The wire model (Grounds D7): the catalog facts + the resolved
@@ -239,13 +295,19 @@ module Tart
 
     def build_providers(parsed)
       parsed.fetch("providers").to_h do |key, provider|
-        [key, Shapes::Provider.new(
+        built = Shapes::Provider.new(
           name: provider["name"],
           base_url: provider["baseUrl"],
           api_key: provider["apiKey"],
           api: provider["api"],
           models: (provider["models"] || []).map { |model| build_model(model, provider: key) }
-        )]
+        )
+        # The vendored tier's per-entry baseUrl record (I71 R2 — the match
+        # rule needs the provider BLOCK's baseUrl, which the bare typed
+        # entry doesn't carry): auxiliary lookup state beside the typed
+        # catalog — the catalog bytes are untouched.
+        Vendored.register_entries(built.base_url, built.models)
+        [key, built]
       end
     end
 

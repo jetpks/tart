@@ -40,6 +40,11 @@ require "json"
 #   {type: :slow_stream, content:, chunk_every:} (streams slowly, for interrupts)
 #   {type: :error, status: 400, message: "..."}  (HTTP error the client raises
 #     on — transport/error_middleware.rb maps 400 to BadRequestError)
+#   {type: :models, ids: [...]}                  (I71: the /v1/models listing
+#     shape — {"object":"list","data":[{id:, object:"model"}...]}; answers
+#     ANY request (the listing GET included) with that JSON. Optional
+#     overrides: status: (a non-200 listing reply) and raw: (a malformed
+#     body served verbatim).)
 # Every captured request body is pushed to +requests+ (a Queue) for
 # assertions (e.g. schema gating against the actual payload); the full
 # per-request wire entry (method, path, notable headers, body) goes to
@@ -157,7 +162,9 @@ class MockLLMServer
     @requests << parsed_body unless parsed_body.nil?
 
     spec = @script.shift || {type: :message, content: ""}
-    if spec[:type] == :error
+    if spec[:type] == :models
+      respond_models(io, spec)
+    elsif spec[:type] == :error
       respond_error(io, spec)
     elsif entry[:streaming]
       respond_stream(io, spec)
@@ -180,6 +187,16 @@ class MockLLMServer
     payload[:usage] = {prompt_tokens: 10, completion_tokens: 5, total_tokens: 15} unless @suppress_usage
     out = JSON.generate(payload)
     io.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n" \
+      "Content-Length: #{out.bytesize}\r\n\r\n#{out}")
+  end
+
+  # The I71 listing reply: the OpenAI-compatible /v1/models shape, or the
+  # spec's overrides (status:/raw:) — the models_listing pins speak it.
+  def respond_models(io, spec)
+    out = spec[:raw] || JSON.generate({object: "list",
+      data: Array(spec[:ids]).map { |id| {id:, object: "model"} }})
+    status = spec[:status] || 200
+    io.write("HTTP/1.1 #{status} Status\r\nContent-Type: application/json\r\nConnection: close\r\n" \
       "Content-Length: #{out.bytesize}\r\n\r\n#{out}")
   end
 

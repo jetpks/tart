@@ -3248,6 +3248,133 @@ module Tart
       end
     end
 
+    # --- the live /v1/models listing merge (I71 R4/AC3) ---
+
+    # A staged LOAD-PATH catalog whose zai block declares NO baseUrl and
+    # NO apiKey: the vendored tier matches through the KEY arm (rule b),
+    # and the menu fetch falls back per-field to the threaded endpoint
+    # (the mock) — one staging serves the merge, the dedup, and the
+    # enrichment pins.
+    def stage_live_list_catalog
+      File.write(File.join(@dir, "models.json"), JSON.generate({"default" => "zai/glm-5.3",
+        "providers" => {"zai" => {"name" => "Z.AI", "models" => [
+          {"id" => "glm-5.3", "name" => "Mine", "reasoning" => true}]}}}))
+      Models.load(root: @dir)
+    end
+
+    def live_menu_ids(chat)
+      menu = chat.instance_variable_get(:@menu)
+      menu ? menu.instance_variable_get(:@filtered).map { |item| item[:id] } : []
+    end
+
+    def live_item(chat, id)
+      menu = chat.instance_variable_get(:@menu)
+      menu&.instance_variable_get(:@filtered)&.find { |item| item[:id] == id }
+    end
+
+    def test_live_list_menu_merges_the_listed_ids_with_vendored_enrichment
+      server = MockLLMServer.new.start
+      server.script([{type: :models, ids: ["glm-5.2", "glm-5.3", "glm-4.7"]}])
+      with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
+        endpoint: {api_key: "k", api_base: server.url},
+        footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
+        chat.open_model_menu
+        wait_until { live_menu_ids(chat).include?("glm-5.2") }
+
+        assert_includes live_menu_ids(chat), "glm-4.7", "every listed id merges in"
+        assert_equal 1, live_menu_ids(chat).count("glm-5.3"), "the user entry is NOT duplicated"
+
+        merged = live_item(chat, "glm-5.3")
+        assert_equal "Mine", merged.fetch(:name), "the USER entry wins the provider+id collision"
+        assert merged.fetch(:entry).is_a?(Shapes::Model), "the user entry rides verbatim"
+
+        live = live_item(chat, "glm-5.2").fetch(:entry)
+        assert_equal "GLM-5.2", live.name, "the vendored name fills the bare live entry"
+        assert_equal true, live.reasoning, "the vendored reasoning fills"
+        assert_equal "high", live.thinking_level_map.fetch(:high), "the vendored map fills"
+        assert_equal "zai", live.compat.thinking_format, "the vendored compat fills (six-key pick)"
+        assert_nil live.context_window, "the window stays nil — the entry-fact seams resolve it"
+      end
+    ensure
+      server.stop
+    end
+
+    def test_live_list_selecting_a_live_entry_threads_the_vendored_facts
+      server = MockLLMServer.new.start
+      server.script([{type: :models, ids: ["glm-5.2"]}])
+      with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
+        endpoint: {api_key: "k", api_base: server.url},
+        footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
+        switched = []
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil,
+                                                           max_tokens: nil, model_reasoning: nil,
+                                                           thinking_level_map: nil, compat: nil|
+            switched << {model_id:, provider:, max_tokens:, model_reasoning:, thinking_level_map:, compat:}
+          end
+          agent.define_singleton_method(:set_thinking_level) do |_level| end
+        end
+
+        chat.open_model_menu
+        wait_until { live_menu_ids(chat).include?("glm-5.2") }
+        "glm-5.2".each_char { |char| chat.on_event(TUI.key_event(char)) }
+        chat.on_event(TUI.key_event("enter"))
+
+        vendored = Models::Vendored.facts_for("zai", nil, "glm-5.2")
+        assert_equal [{model_id: "glm-5.2", provider: "zai", max_tokens: vendored.fetch("maxTokens"),
+                       model_reasoning: true, thinking_level_map: vendored.fetch("thinkingLevelMap").transform_keys(&:to_sym),
+                       compat: Models.build_compat(vendored.fetch("compat"))}],
+          switched,
+          "selecting a live entry rides apply_model_selection UNCHANGED — the vendored facts " \
+          "thread exactly like a catalog entry's (the cap via entry_max_tokens, the map/compat filled)"
+      end
+    ensure
+      server.stop
+    end
+
+    def test_live_list_failure_row_renders_once_without_a_crash_and_single_attempt
+      server = MockLLMServer.new.start
+      server.script([{type: :models, raw: "{not json"}])
+      with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
+        endpoint: {api_key: "k", api_base: server.url},
+        footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat, session|
+        chat.open_model_menu
+        wait_until do
+          draw(chat, session)
+          session.buffer_content.any? { |row| row.include?("(live listing unavailable)") }
+        end
+        assert_equal 1, server.request_count, "the failed fetch is ONE attempt — no retries"
+        assert_equal ["glm-5.3"], live_menu_ids(chat), "the menu keeps the user entries"
+        assert_equal 1, session.buffer_content.count { |row| row.include?("(live listing unavailable)") },
+          "exactly ONE muted failure row after the list"
+
+        # The menu stays functional: enter still selects the user entry.
+        chat.on_event(TUI.key_event("enter"))
+        refute chat.menu_open?, "no crash — the failure never raises into the surface"
+      end
+    ensure
+      server.stop
+    end
+
+    def test_live_list_never_fires_at_boot_or_on_the_direct_switch_path
+      server = MockLLMServer.new.start
+      with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
+        endpoint: {api_key: "k", api_base: server.url},
+        footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
+        # Boot (construction + footer facts): zero requests — pinned in
+        # models_listing_test too; here: the DIRECT-SWITCH path.
+        chat.switch_model(provider: "zai", id: "glm-5.3", name: "Mine", reasoning: true,
+          context_window: 100_000, max_tokens: nil, thinking_level_map: nil)
+        assert_equal 0, server.request_count, "the /model <ref> direct switch never fetches"
+
+        chat.open_model_menu("glm") # the seeded open fires ONE fetch, same as the plain one
+        wait_until { server.request_count == 1 }
+        assert_equal 1, server.request_count, "ONE fetch per (seeded) menu open"
+      end
+    ensure
+      server.stop
+    end
+
     # The footer's pwd line renders the dim token (pi footer.ts:282 —
     # theme.fg("dim", pwd); the line-level fg was silently dropped by the
     # span-array path — the default-fg pwd/branch defect).
@@ -5809,13 +5936,14 @@ module Tart
     # kernel: injectable (the I38 animation-window pins record animate
     # calls; default IdleKernel unchanged).
     def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false,
-      models: nil, settings_root: nil, clock: nil, kernel: nil, identity: nil)
+      models: nil, settings_root: nil, clock: nil, kernel: nil, identity: nil, endpoint: nil)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
         kernel ||= IdleKernel.new
         kwargs = {session:, kernel:, footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
           models:, settings_root: settings_root || @dir}
         kwargs[:identity] = identity if identity # the I69 move seam (pi-face header pins opt in explicitly)
         kwargs[:clock] = clock if clock # the spinner's fake-time seam (pi's 80ms dwell pinned, zero sleeps)
+        kwargs[:endpoint] = endpoint if endpoint # the I71 R5 live-listing fallback tier (nil = no listing)
         chat = Render::Chat.new(**kwargs)
         yield(chat, session, kernel)
       end

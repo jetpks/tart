@@ -225,6 +225,71 @@ module Tart
       refute menu.handle(TUI.key_event("enter")), "the menu closed"
     end
 
+    # --- the live-listing merge (I71 R4): refresh + the failure row ---
+
+    def test_model_menu_refresh_preserves_the_query_and_clamps_the_selection
+      menu = model_menu
+      "air".each_char { |char| menu.handle(TUI.key_event(char)) }
+      assert_equal ["glm-5-air"], filtered_values(menu), "the query filters pre-refresh"
+
+      # The listed merge rebuilds the items with the CURRENT query — a
+      # non-empty query re-filters to the top row (the existing
+      # edit-query rule).
+      merged = MODEL_ENTRIES + [{provider: "zai", id: "glm-5.2", name: "GLM-5.2",
+        reasoning: true, context_window: nil, max_tokens: nil}]
+      menu.refresh(entries: merged)
+
+      assert_equal menu.instance_variable_get(:@query), "air", "the query is preserved"
+      assert_equal ["glm-5-air"], filtered_values(menu), "the filter re-ran on the merged list"
+      assert_equal 0, menu.selected, "a query re-filters to the top row (the existing rule)"
+
+      # An empty query rides the EXISTING edit-query rule verbatim (the
+      # [@selected, size-1].max form — byte-copied from edit_query, the
+      # frozen "clamped to the restored list" behavior).
+      menu2 = model_menu
+      menu2.handle(TUI.key_event("down")) # selection moves off row 0
+      menu2.refresh(entries: merged)
+      assert_equal ["glm-5-air", "glm-5.3", "glm-5.2"], filtered_values(menu2),
+        "the merged list restored (the current-first/default-second sort re-derived)"
+      assert_equal 2, menu2.selected, "the frozen empty-query rule: [selected, size-1].max"
+
+      # The ✓/· markers and the sort re-derive around the stored refs —
+      # row shape UNCHANGED (no new glyphs).
+      text = rows(menu2).join("\n")
+      assert_includes text, "glm-5-air [zai]"
+      assert_includes text, "  Model Name: GLM-5.2"
+
+      # And the in-range bound holds when the refreshed list SHRINKS
+      # (edit_query never sees a shrinking restore; the live merge can).
+      menu2.refresh(entries: [MODEL_ENTRIES.first])
+      assert_equal 0, menu2.selected, "clamped in range on the shrunken list"
+    end
+
+    def test_model_menu_refresh_failure_row_shape_and_clearing
+      menu = model_menu
+
+      refute_includes rows(menu).join("\n"), "(live listing unavailable)",
+        "absent before the fetch settles"
+
+      menu.listing_failed!
+      text = rows(menu).join("\n")
+      assert_includes text, "  (live listing unavailable)", "the ONE muted failure row"
+      assert_equal 1, rows(menu).count { |row| row.include?("(live listing unavailable)") },
+        "exactly one failure row"
+      failure_row = rows(menu).find { |row| row.include?("(live listing unavailable)") }
+      assert_equal Theme[:muted], failure_row_spans(menu).find { |s| s.content.include?("unavailable") }&.style&.fg,
+        "the failure row renders muted"
+
+      # A landed refresh (success) clears the flag.
+      menu.refresh(entries: MODEL_ENTRIES)
+      refute_includes rows(menu).join("\n"), "(live listing unavailable)",
+        "the failure row is absent on success"
+    end
+
+    def failure_row_spans(menu)
+      menu.lines(80).flat_map { |line| line.spans }
+    end
+
     def test_model_menu_no_matching_models_row
       menu = model_menu([])
       assert_includes rows(menu).join("\n"), "No matching models"

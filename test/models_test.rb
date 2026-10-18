@@ -553,5 +553,134 @@ module Tart
       # loaded entry still carries the raw nil.
       assert_nil windowless.max_tokens, "no catalog-load defaulting (Shapes::Model#to_h stays DECLARED)"
     end
+
+    # --- the vendored pi catalogue tier (I71 R2) — the fill-only law, the
+    # frozen match rule, the hermetic inertness ---
+
+    ZAI_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+
+    def test_vendored_baseurl_match_fills_the_gap_entry
+      write_models(JSON.generate({"providers" => {"zai" => {"name" => "Z.AI", "baseUrl" => ZAI_BASE_URL,
+        "apiKey" => "k", "models" => [{"id" => "glm-5.3", "reasoning" => true}]}}}))
+      entry = load_models.model_entries.first
+
+      assert_equal 1_000_000, Models.entry_context_window(entry),
+        "the vendored contextWindow fills the omitted field"
+      assert_equal 131_072, Models.entry_max_tokens(entry),
+        "the vendored maxTokens fills the capless entry"
+      assert_equal "glm-5.3", load_models.model_entries.first.name,
+        "the vendored tier is read-only: the loaded entry's name stays the declared id fallback"
+    end
+
+    def test_vendored_fills_only_omitted_fields_declared_values_win
+      write_models(JSON.generate({"providers" => {"zai" => {"name" => "Z.AI", "baseUrl" => ZAI_BASE_URL,
+        "apiKey" => "k", "models" => [{"id" => "glm-5.3", "name" => "Mine", "reasoning" => true,
+        "contextWindow" => 200_000, "maxTokens" => 8_192,
+        "thinkingLevelMap" => {"low" => "mine"},
+        "compat" => {"thinkingFormat" => "openai"}}]}}}))
+      entry = load_models.model_entries.first
+
+      assert_equal 200_000, Models.entry_context_window(entry), "the declared window ALWAYS wins"
+      assert_equal 8_192, Models.entry_max_tokens(entry), "the declared cap ALWAYS wins"
+      assert_equal ({low: "mine"}), Settings.thinking_facts(entry, model_id: entry.id).thinking_level_map,
+        "the declared map ALWAYS wins"
+      assert_equal :openai, Models.dialect_for_entry(entry).thinking_format,
+        "the declared non-zai compat ALWAYS wins (and rides the DEFAULT dialect)"
+    end
+
+    def test_vendored_match_is_baseurl_exact_case_and_trailing_slash_tolerant
+      write_models(JSON.generate({"providers" => {"zai" => {"name" => "Z.AI",
+        "baseUrl" => "HTTPS://API.Z.AI/API/CODING/PAAS/V4/", "apiKey" => "k",
+        "models" => [{"id" => "GLM-5.3"}]}}}))
+      entry = load_models.model_entries.first
+
+      assert_equal 1_000_000, Models.entry_context_window(entry),
+        "case-insensitive baseUrl compare, one trailing slash stripped both sides, id compare case-insensitive"
+    end
+
+    def test_vendored_key_arms_only_without_a_declared_baseurl
+      # (b): the block declares NO baseUrl and its KEY equals the vendored name.
+      write_models(JSON.generate({"providers" => {"ZAI" => {"name" => "Z.AI", "apiKey" => "k",
+        "models" => [{"id" => "glm-5.3"}]}}}))
+      assert_equal 1_000_000, Models.entry_context_window(load_models.model_entries.first),
+        "the KEY arm matches case-insensitively (no baseUrl declared)"
+
+      # The hermetic-suite inertness law: a zai-KEYED block WITH a baseUrl
+      # that matches no vendored provider matches NOTHING — no bare-id
+      # cross-provider fallback.
+      write_models(JSON.generate({"providers" => {"zai" => {"name" => "Z.AI",
+        "baseUrl" => "http://localhost:1/v1", "apiKey" => "k",
+        "models" => [{"id" => "glm-5.3"}]}}}))
+      entry = load_models.model_entries.first
+      assert_equal Models::DEFAULT_ENTRY_CONTEXT_WINDOW, Models.entry_context_window(entry)
+      assert_equal Models::DEFAULT_ENTRY_MAX_TOKENS, Models.entry_max_tokens(entry)
+      assert_nil Models.resolved_compat(entry), "no match ⇒ no vendored compat"
+    end
+
+    def test_vendored_no_match_is_inert_and_no_entry_stays_nil
+      write_models(CATALOG) # glm @ https://example.test/v1 — matches nothing vendored
+      declared, windowless = load_models.model_entries
+
+      assert_equal Models::DEFAULT_ENTRY_CONTEXT_WINDOW, Models.entry_context_window(windowless)
+      assert_equal Models::DEFAULT_ENTRY_MAX_TOKENS, Models.entry_max_tokens(windowless)
+      assert_nil Models.entry_context_window(nil), "nil entry ⇒ nil, unchanged"
+      assert_nil Models.entry_max_tokens(nil), "nil entry ⇒ nil, unchanged"
+      assert Models::DEFAULT_DIALECT.equal?(Models.dialect_for_entry(windowless)),
+        "no match ⇒ the default dialect instance"
+    end
+
+    def test_vendored_dialect_for_entry_arms_both_ways
+      write_models(JSON.generate({"providers" => {
+        "zai" => {"name" => "Z.AI", "baseUrl" => ZAI_BASE_URL, "apiKey" => "k",
+          "models" => [{"id" => "glm-5.3"}]},
+        "openrouter" => {"name" => "OR", "baseUrl" => "https://openrouter.ai/api/v1", "apiKey" => "k",
+          "models" => [{"id" => "z-ai/glm-5.3"}]}}}))
+      zai, openrouter = load_models.model_entries
+
+      d = Models.dialect_for_entry(zai)
+      assert_equal :zai, d.thinking_format, "the vendored zai thinkingFormat builds the zai dialect"
+      assert_equal "max_tokens", d.max_tokens_field
+      assert_equal false, d.supports_developer_role
+      assert_equal true, d.supports_reasoning_effort
+      assert_equal true, d.zai_tool_stream
+      refute Models::DEFAULT_DIALECT.equal?(d)
+
+      # The I46/I64 boundary: the vendored openrouter thinkingFormat is NOT
+      # zai — the DEFAULT dialect, the superset keys tolerated-and-dropped.
+      plain = Models.dialect_for_entry(openrouter)
+      assert Models::DEFAULT_DIALECT.equal?(plain),
+        "the vendored openrouter compat rides the DEFAULT dialect (no vocabulary extension)"
+    end
+
+    def test_vendored_owner_catalog_shape_is_a_merge_noop
+      # The owner's live models.json shape: every entry FULLY specified —
+      # every seam reads the declared value, the vendored tier never fires.
+      owner = {"default" => "openrouter/z-ai/glm-5.3", "providers" => {
+        "zai" => {"name" => "Z.AI", "baseUrl" => ZAI_BASE_URL, "apiKey" => "k", "models" => [
+          {"id" => "glm-5.3", "reasoning" => true, "contextWindow" => 1_000_000, "maxTokens" => 131_072,
+           "thinkingLevelMap" => {"off" => nil, "low" => "low", "high" => "high", "max" => "max"},
+           "compat" => {"supportsStore" => false, "supportsDeveloperRole" => false,
+                        "supportsReasoningEffort" => true, "maxTokensField" => "max_tokens",
+                        "thinkingFormat" => "zai", "supportsStrictMode" => true, "zaiToolStream" => true}}]}}}
+      write_models(JSON.generate(owner))
+      entry = load_models.model_entries.first
+
+      assert_equal 1_000_000, Models.entry_context_window(entry)
+      assert_equal 131_072, Models.entry_max_tokens(entry)
+      assert_equal :zai, Models.dialect_for_entry(entry).thinking_format
+      assert_equal 131_072, Models.entry_max_tokens(entry), "declared cap — no vendored fill"
+    end
+
+    def test_vendored_loaded_catalog_bytes_stay_stable
+      write_models(JSON.generate({"providers" => {"zai" => {"name" => "Z.AI", "baseUrl" => ZAI_BASE_URL,
+        "apiKey" => "k", "models" => [{"id" => "glm-5.3"}]}}}))
+      entry = load_models.model_entries.first
+
+      assert_equal({id: "glm-5.3", name: "glm-5.3", reasoning: false, context_window: nil,
+                    max_tokens: nil, thinking_level_map: nil, compat: nil, provider: "zai"},
+        entry.to_h,
+        "the fill lives at the fact seams ONLY — Shapes::Model#to_h stays DECLARED")
+      assert_nil entry.max_tokens, "no merge-at-load"
+    end
   end
 end
