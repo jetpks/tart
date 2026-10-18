@@ -117,14 +117,30 @@ module Tart
               @work_task&.stop
               supervisor&.stop
               @poller = poller
-              poller&.stop
+              begin
+                poller&.stop
+              rescue PollerLingerError => e
+                # I75: on the signal path the poller is wedged inside one
+                # native call (Grounds F4) and is ABANDONED — the linger raise
+                # must not mask the signal routing or it would skip the flush
+                # tail (F5's mask). Off the signal path it still surfaces
+                # (I02: a missed join must surface).
+                raise unless contain_signal_path_error(e)
+              end
             end
           end
         ensure
           Signal.trap("INT", previous_trap)
         end
 
-        raise @work_error if @work_error
+        if @work_error
+          # I75: on the signal path a draw/frame error (the dead tty's
+          # Errno::EIO class, Grounds F8) is contained — logged, never
+          # re-raised — or it would skip the flush tail exactly like the
+          # unrouted-signal unwind did (F5). Off the signal path it raises
+          # exactly as before (the standing surface).
+          raise @work_error unless contain_signal_path_error(@work_error)
+        end
         self
       end
 
@@ -211,6 +227,18 @@ module Tart
       #   poller thread polls this every frame.
       def stop_requested?
         @stop_mutex.synchronize { @stop }
+      end
+
+      # The signal-path containment seam (I75): on the signal path (the
+      # TUI.run bracket's SignalGuard has a recorded exit code) a teardown
+      # error is CONTAINED — logged, one line, never re-raised, never
+      # masking the recorded exit code — and this returns true. Off the
+      # signal path it returns false and the caller re-raises (the standing
+      # I02 surface is untouched).
+      def contain_signal_path_error(error)
+        return false unless signal_exit_pending?
+        warn "tart: contained after signal: #{error.class}: #{error.message.to_s[0, 160]}"
+        true
       end
 
       # Cancels the in-flight work (the work task, else the {#async} tasks)
@@ -347,6 +375,14 @@ module Tart
         @stop_mutex.synchronize { @stop = true }
       end
 
+      # @return [Boolean] whether a signal exit is pending on this run's
+      #   SignalGuard (nil-safe: a kernel run without a TUI.run bracket —
+      #   unit/bench contexts — has no guard and no signal path).
+      def signal_exit_pending?
+        guard = defined?(Tart::TUI::SignalGuard) ? Tart::TUI::SignalGuard.active : nil
+        guard&.signal_exit_pending? || false
+      end
+
       def draw_frame
         return unless @dirty || animating?
         @dirty = false
@@ -357,8 +393,15 @@ module Tart
       end
 
       # Installs the SIGINT trap net; returns the previous handler so run's
-      # teardown can restore it.
+      # teardown can restore it. I75 ADDITIVE (the routing law): the active
+      # SignalGuard (a TUI.run bracket armed it) wires its HUP/TERM routing
+      # onto this loop's sentinel queue — the same push the INT net does
+      # (trap-context push is the proven pattern; the signal's EINTR itself
+      # wakes the parked scheduler). The guard owns the HUP/TERM traps and
+      # their restore; SIGINT stays this loop's one authority, untouched.
       def install_trap_net
+        guard = defined?(Tart::TUI::SignalGuard) ? Tart::TUI::SignalGuard.active : nil
+        guard&.route(-> { @events << STOP })
         Signal.trap("INT") { @events << INTERRUPT }
       end
 

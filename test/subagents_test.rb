@@ -122,7 +122,7 @@ module Tart
     end
 
     def test_unknown_agent_names_the_three
-      manager = new_manager
+      manager = new_manager(root: File.join(@home, ".tart"))
       error = assert_raises(ArgumentError) { manager.spawn_run(agent: "scout", task: "x", async: true) }
       # I49 re-pin: the unknown-agent raise lives in Profiles.resolve now —
       # the merged-table listing (builtins + discovered) + the closest-match
