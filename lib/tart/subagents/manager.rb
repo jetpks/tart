@@ -37,8 +37,9 @@ module Tart
     # stop-requests/, steer-log.jsonl}, sessions/}`. status.json is
     # written atomically (temp+rename — pi control-channel's idiom) at
     # spawn and at every transition; result.json is written BEFORE the
-    # terminal status flip; the task text is NEVER recorded (taskChars
-    # only — pi's redaction). Process.detach owns every child reap (no
+    # terminal status flip; status.task carries the RAW spawn task
+    # verbatim (I81 Law 3 — taskChars the raw char count; the I79 box
+    # never renders a task row). Process.detach owns every child reap (no
     # waitpid anywhere here — no early reap, no zombie); a run settles
     # only on observed exit (EOF on the child-held sentinel fd, or ESRCH
     # on both pid and pgid), and status reads reconcile from disk so a
@@ -86,6 +87,9 @@ module Tart
                          "through completion notifications or subagent({ action: \"status\", id: \"...\" }).".freeze
 
       attr_reader :cwd, :home, :identity, :root
+      # I81 Law 2 — this session's own depth facts (read at construction;
+      # the spawn check + the child env picks ride them).
+      attr_reader :subagent_depth, :subagent_max_depth
       # The parent-side supervisor channel (I49): register() constructs and
       # arms it; #shutdown stops it; the `subagent` tool's reply/pending
       # actions read it (a bare Manager — tests — carries nil, and the
@@ -118,6 +122,12 @@ module Tart
         @identity = identity
         @root = root
         @hooks = hooks
+        # I81 Law 2 — the depth ladder, read ONCE at construction from
+        # this session's env (pi resolveCurrentSubagentDepth /
+        # resolveCurrentMaxSubagentDepth): own depth (absent/invalid → 0)
+        # and max (absent/invalid → the default 2).
+        @subagent_depth = Subagents.resolve_subagent_depth(env: @env, identity: @identity)
+        @subagent_max_depth = Subagents.resolve_subagent_max_depth(env: @env, identity: @identity)
         @kernel = kernel
         @agent = agent
         @arm_deadline_supervisor = arm_deadline_supervisor
@@ -146,6 +156,16 @@ module Tart
       # settled state.
       def spawn_run(agent:, task:, async:, model: nil, timeout_ms: nil, tool_timeout_ms: nil,
                     tool_call_id: nil, parent_session: nil)
+        # I81 Law 2 — the depth check FIRST (pi checkSubagentDepth,
+        # subagent-executor.js:6983-6993): before ANY disk resolution, a
+        # session at its own max cannot spawn — the raise rides the
+        # existing raise→{error:} tool-result path (the unknown-agent
+        # precedent).
+        if Subagents.subagent_depth_blocked?(depth: @subagent_depth, max: @subagent_max_depth)
+          raise ArgumentError, Subagents.nested_subagent_blocked_message(depth: @subagent_depth,
+                                                                        max: @subagent_max_depth)
+        end
+
         # I49: the merged table (builtins < user < project profiles),
         # resolved fresh from disk EVERY spawn (no cache); raises the
         # unknown-agent ArgumentError (the retired unknown_agent_message's
@@ -200,7 +220,10 @@ module Tart
           owned: true, # I78 Law 3: true exactly when THIS process spawned it
           timed_out: false, started_at: spawned_at, tool_call_id:,
           # Port-internal keys (beyond the §2.2 public contract) that
-          # #spawn_argv_and_env derives the child harness from:
+          # #spawn_argv_and_env derives the child harness from. I81 Law 3:
+          # `task` carries the RAW spawn task verbatim (the fork preamble
+          # is excluded — it lives on task_text) for the status write.
+          task: task.to_s,
           task_chars: task.to_s.length, tools: spec[:tools], provider:, model_id:, level:,
           timeout_ms: deadline, tool_timeout_ms: tool_deadline, parent_session: parent_session.to_s,
           fork: forked, task_text:, exit_pipe: exit_rd, stopped: false, deadline_due: false, signaled: nil,
@@ -390,12 +413,18 @@ module Tart
       # CLOSED (spawned with unsetenv_others — OQ-7): the parent's
       # PATH/HOME, the identity + resolved model facts, the child knobs
       # (timeouts, the runs root), nil keys omitted, NO subagents gate
-      # row (children never nest), NO MCP config.
+      # row (the child's gate resolves ON from the settings default —
+      # the I70 flip), NO MCP config. I81 Law 2: the env adds the
+      # nested-grant depth picks (see child_env).
       def spawn_argv_and_env(run)
         argv = [RbConfig.ruby, bin_tart_path, "-p", run[:task_text],
                 "--tools", Array(run[:tools]).join(","),
                 "--system-prompt-file", File.join(run[:dir], "system-prompt.md"),
-                "--session-root", File.join(run[:dir], "sessions"),
+                # I81 Law 3 — the transcript path cure (argv-side ONLY;
+                # agent/session.rb's <root>/sessions composition is
+                # hard-frozen): the run dir ITSELF, so the Recorder lands
+                # the transcript at <run-dir>/sessions/<cwd-slug>/….
+                "--session-root", run[:dir],
                 "--steer-inbox", steer_requests_dir(run[:dir])]
         argv += ["--resume", run[:parent_session]] if run[:fork]
         [argv, child_env(run)]
@@ -467,6 +496,13 @@ module Tart
         # never inert in a real child.
         env[key.("SUPERVISOR_CHANNEL")] = File.join(run[:dir], "control")
         env[key.("SUBAGENTS_AGENT")] = run[:agent]
+        # I81 Law 2 — the nested-grant depth picks, written ALWAYS (the
+        # closed pick list grows EXACTLY these two keys; the nil-omission
+        # rules don't apply): the child's own depth is the parent's + 1
+        # and it inherits the parent's max (pi resolveChildDepth /
+        # resolveChildMaxSubagentDepth — types.js:196-201).
+        env[key.("SUBAGENTS_DEPTH")] = (@subagent_depth + 1).to_s
+        env[key.("SUBAGENTS_MAX_DEPTH")] = @subagent_max_depth.to_s
         # I74 — the session-sink child capture (AC4): the pi extension's
         # known boundary (foreground subagent children never load ambient
         # extensions) closed natively — the child IS a full tart boot, and
@@ -1150,7 +1186,12 @@ module Tart
         payload = {
           "id" => record[:id],
           "agent" => record[:agent],
-          "task" => nil, # the task text is NEVER recorded (taskChars only)
+          # I81 Law 3 — the raw task text verbatim (the run's own launch
+          # artifact, pi async-execution.js:1254 analog; the fork
+          # preamble is excluded — it rides task_text only). The I79 box
+          # still renders NO task row; legacy task:null dirs stay
+          # tolerated (adoption reads disk, never rewrites it).
+          "task" => record[:task],
           "taskChars" => record[:task_chars],
           "mode" => "single",
           "state" => record[:state].to_s,

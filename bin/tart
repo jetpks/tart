@@ -460,6 +460,16 @@ module Tart
           subagents_manager.endpoint =
             endpoint_facts(models, Models.resolve_boot_model(models, settings, identity:),
               identity:, resolved:)
+          # I81 Law 1 — the profile diagnostics surface (OQ-2): one
+          # command_line row per profile diagnostic, the skills/prompts
+          # idiom below ("#{d.path}: #{d.message}"). A fresh READ-ONLY
+          # discover — per-spawn resolution stays uncached; the boot call
+          # is an extra scan. Warn-and-drop files LOAD (this row is their
+          # only interactive surface); malformed-file warnings were dark
+          # before this row existed (declared).
+          Subagents::Profiles.discover(cwd: workdir).diagnostics.each do |d|
+            surface.command_line("#{d.path}: #{d.message}")
+          end
         end
         tools = build_tools(workdir, settings, mcp_servers:,
           identity:, session_env: session_env_readers(surface), hooks:)

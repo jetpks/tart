@@ -35,10 +35,18 @@ module Tart
         # wins the same-name collision (Spec §1 precedence project > user).
         [[File.join(root, "agents"), :user], [File.expand_path(PROJECT_DIR, cwd), :project]].each do |dir, source|
           each_profile_file(dir) do |path|
-            spec, error = build_profile(path, source)
+            spec, error, dropped = build_profile(path, source)
             if error
               diagnostics << Skills::Diagnostic.new(type: "warning", message: error, path: path)
               next
+            end
+            # I81 Law 1 — the warn-and-drop diagnostic: ONE per affected
+            # file, only when unknown names were dropped; the file itself
+            # LOADS (pi's loadout parity).
+            unless dropped.empty?
+              diagnostics << Skills::Diagnostic.new(
+                type: "warning", path: path,
+                message: Schemas::Subagents::ProfileFields.unknown_tools_dropped_message(dropped))
             end
             profiles[spec[:name]] = spec
           end
@@ -139,41 +147,59 @@ module Tart
       # file stem (pi: the runtime name is the frontmatter's); context maps
       # to the builtin table's SYMBOLS (:fresh/:fork — the Manager's fork
       # check reads spec[:context] == :fork).
+      # One file → [spec Hash, nil error, dropped names] on success or
+      # [nil, error-message, []] on skip (the caller renders the warning
+      # diagnostics). I81 Law 1: the unknown-tools drop rides the SUCCESS
+      # path — the spec loads with the kept tools and the dropped list is
+      # returned for the diagnostic. The frontmatter name wins over the
+      # file stem (pi: the runtime name is the frontmatter's); context
+      # maps to the builtin table's SYMBOLS (:fresh/:fork — the Manager's
+      # fork check reads spec[:context] == :fork).
       def build_profile(path, source)
         frontmatter, body = Skills.parse_frontmatter(File.read(path))
-        return [nil, "invalid YAML frontmatter"] unless frontmatter.is_a?(Hash)
+        return [nil, "invalid YAML frontmatter", []] unless frontmatter.is_a?(Hash)
 
         contract = Schemas::Subagents::PROFILE_CONTRACT.call(frontmatter)
         unless contract.success?
           return [nil, contract.errors.to_a.map { |error| error.respond_to?(:text) ? error.text : error.to_s }
-                         .join("; ")]
+                         .join("; "), []]
         end
-        return [nil, "system prompt body is empty"] if body.to_s.strip.empty?
+        return [nil, "system prompt body is empty", []] if body.to_s.strip.empty?
 
         name = frontmatter["name"] || File.basename(path, ".md")
-        [spec_hash(name, frontmatter, body, source), nil]
+        spec, dropped = spec_hash(name, frontmatter, body, source)
+        [spec, nil, dropped]
       rescue StandardError => e
-        [nil, e.message]
+        [nil, e.message, []]
       end
 
+      # I81 Law 1: the spec's tools = the KNOWN entries in declaration
+      # order (unknown names dropped at build, never rejected); returns
+      # [spec, dropped] — the dropped list feeds the warn-and-drop
+      # diagnostic.
       def spec_hash(name, frontmatter, body, source)
-        tools = tools_list(frontmatter["tools"])
-        {
-          name:, description: frontmatter["description"] || "", tools:,
+        kept, dropped = tools_list(frontmatter["tools"])
+        spec = {
+          name:, description: frontmatter["description"] || "", tools: kept,
           thinking: frontmatter["thinking"],
           context: frontmatter["context"] == "fork" ? :fork : :fresh,
           system_prompt: body, model: frontmatter["model"], source:
         }
+        [spec, dropped]
       end
 
       # Shape already validated by the contract; an omitted tools line
       # means the full builtin seven (Spec §2 — an explicit list preserves
-      # its order, the I41 wire-order rule).
+      # its order, the I41 wire-order rule). I81 Law 1 — the drop seat:
+      # unknown names are DROPPED (kept entries in declaration order);
+      # an explicit list that drops to EMPTY means zero tools (OQ-3).
+      # Returns [kept, dropped].
       def tools_list(value)
-        return Tools::ALL if value.nil?
+        return [Tools::ALL, []] if value.nil?
 
         list = value.is_a?(String) ? value.split(",") : Array(value)
-        list.map(&:strip).reject(&:empty?)
+        names = list.map(&:strip).reject(&:empty?)
+        names.partition { |name| Schemas::Subagents::ProfileFields::TOOLS_UNIVERSE.include?(name) }
       end
     end
   end

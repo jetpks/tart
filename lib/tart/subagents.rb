@@ -257,6 +257,50 @@ module Tart
         File.join(Agent::Session.default_root, "subagents")
     end
 
+    # --- I81 Law 2 — the nested-grant depth law (pi-subagents 0.79.1
+    # --- shared/types.js:134-201, verbatim semantics; this module is the
+    # --- port's types.js analog) ---
+
+    # pi DEFAULT_SUBAGENT_MAX_DEPTH (types.js:134).
+    DEFAULT_MAX_SUBAGENT_DEPTH = 2
+
+    module_function
+
+    # A session's OWN depth (resolveCurrentSubagentDepth): the
+    # <IDENTITY>_SUBAGENTS_DEPTH env — a non-negative integer; absent or
+    # invalid → 0 (the top level).
+    def resolve_subagent_depth(env:, identity: Identity::DEFAULT)
+      normalize_non_negative_integer(env[Identity.env_key(identity, "SUBAGENTS_DEPTH")]) || 0
+    end
+
+    # A session's max depth (resolveCurrentMaxSubagentDepth): the
+    # <IDENTITY>_SUBAGENTS_MAX_DEPTH env — a non-negative integer; absent
+    # or invalid → the default 2.
+    def resolve_subagent_max_depth(env:, identity: Identity::DEFAULT)
+      normalize_non_negative_integer(env[Identity.env_key(identity, "SUBAGENTS_MAX_DEPTH")]) ||
+        DEFAULT_MAX_SUBAGENT_DEPTH
+    end
+
+    # pi checkSubagentDepth (types.js:188-195): blocked when depth >= max.
+    def subagent_depth_blocked?(depth:, max:)
+      depth >= max
+    end
+
+    # pi's blocked-spawn bytes VERBATIM (subagent-executor.js:6983-6993)
+    # — the raise the Manager's spawn_run carries through the existing
+    # {error:} tool-result path.
+    def nested_subagent_blocked_message(depth:, max:)
+      "Nested subagent call blocked (depth=#{depth}, max=#{max}). You are running at the maximum subagent nesting depth. " \
+        "Complete your current task directly without delegating to further subagents."
+    end
+
+    # pi normalizeNonNegativeInteger (types.js:177-183): number-or-string
+    # → integer ≥ 0, else nil (the callers apply their own fallback).
+    def normalize_non_negative_integer(value)
+      parsed = value.is_a?(Integer) ? value : Integer(value.to_s, 10) rescue nil
+      parsed.is_a?(Integer) && parsed >= 0 ? parsed : nil
+    end
+
     # The model routing (Grounds §6): `spec` is "provider/id" or
     # "provider/id:level" (the `:level` suffix overrides thinking — the
     # owner's vocabulary). Resolution order: call > agent default (none

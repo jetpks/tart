@@ -248,13 +248,14 @@ module Tart
       sessions = Dir.glob(File.join(run[:dir], "sessions", "**", "*.jsonl"))
       assert_equal 1, sessions.size, "the child session records under the run dir"
 
-      # status.json: the lifecycle + the task redaction (taskChars only).
+      # status.json: the lifecycle + the raw task verbatim (I81 Law 3 —
+      # the declared re-pin of the taskChars-only redaction).
       status = JSON.parse(File.read(File.join(run[:dir], "status.json")))
       assert_equal "completed", status["state"]
       assert_equal "single", status["mode"]
       assert_equal false, status["timedOut"]
       assert_equal 14, status["taskChars"]
-      refute status["task"].to_s.include?("answer one"), "the task text is NEVER recorded"
+      assert_equal "say answer one", status["task"], "the RAW task rides verbatim (fork preamble excluded)"
       assert_equal result_path(run)[:path], status["outputFile"]
 
       # The §7 status lines, disk-first.
@@ -287,7 +288,11 @@ module Tart
       assert argv[argv.index("--tools") + 1].end_with?(",contact_supervisor"),
              "the intercom tool is the argv tools tail"
       assert_equal File.join(run[:dir], "system-prompt.md"), argv[argv.index("--system-prompt-file") + 1]
-      assert_equal File.join(run[:dir], "sessions"), argv[argv.index("--session-root") + 1]
+      # I81 Law 3 re-pin (the declared re-pin): the argv passes the run
+      # dir ITSELF — the frozen Recorder composition (session.rb:78-80,
+      # hard-frozen) joins sessions/ exactly once, so the transcript
+      # lands <run-dir>/sessions/<cwd-slug>/<ts>_<id>.jsonl.
+      assert_equal run[:dir], argv[argv.index("--session-root") + 1]
       assert_equal File.join(run[:dir], "control", "steer-requests"), argv[argv.index("--steer-inbox") + 1]
       refute_includes argv, "--resume", "a :fresh agent never resumes"
 
@@ -303,11 +308,17 @@ module Tart
       # exactly these three locale keys into the closed env — the floor
       # overrides a present non-UTF-8 LC_ALL or sets LC_CTYPE; LANG only
       # ever rides the pass-through picks. NOTHING else is sanctioned.
+      # I81 nested-grant-hygiene (Law 2, the declared re-pin of THIS
+      # pin): the depth ladder introduces exactly TWO more keys, written
+      # ALWAYS — <ID>_SUBAGENTS_DEPTH = own depth + 1 and
+      # <ID>_SUBAGENTS_MAX_DEPTH = own max (the closed pick list grows
+      # exactly those two; the nil-omission rules don't apply).
       sanctioned = %w[PATH HOME TART_IDENTITY PI_API_KEY PI_API_BASE PI_MODEL PI_PROVIDER
                       PI_MODEL_REASONING PI_THINKING_LEVEL PI_CONTEXT_WINDOW PI_TOOL_TIMEOUT_MS
                       PI_RUN_DEADLINE_MS PI_SUBAGENTS_HOME PI_SUPERVISOR_CHANNEL PI_SUBAGENTS_AGENT
                       PI_SESSION_SINK_HOST PI_SESSION_SINK_TOKEN PI_SESSION_SINK_DISABLED
                       PI_SESSION_SINK_AGENT_NAME PI_SESSION_SINK_PARENT_SESSION_ID
+                      PI_SUBAGENTS_DEPTH PI_SUBAGENTS_MAX_DEPTH
                       LANG LC_ALL LC_CTYPE]
       assert_empty(env.keys - sanctioned, "spawn env closure violated: #{(env.keys - sanctioned).inspect}")
       assert env.key?("PATH")
@@ -322,6 +333,10 @@ module Tart
       # always creates it), the agent label feeds the surfaced ask.
       assert_equal File.join(run[:dir], "control"), env["PI_SUPERVISOR_CHANNEL"]
       assert_equal "worker", env["PI_SUBAGENTS_AGENT"]
+      # I81 Law 2: the depth picks are unconditional — a top-level parent
+      # (no depth env) hands the child depth 1 and the default max 2.
+      assert_equal "1", env["PI_SUBAGENTS_DEPTH"]
+      assert_equal "2", env["PI_SUBAGENTS_MAX_DEPTH"]
       # The channel dirs exist on disk from the spawn's mkdir.
       assert File.directory?(File.join(run[:dir], "control", "supervisor-requests"))
       assert File.directory?(File.join(run[:dir], "control", "supervisor-replies"))
@@ -331,6 +346,154 @@ module Tart
       assert_includes prompt_file, "You are `worker`"
       assert prompt_file.end_with?(Subagents::Supervisor::BRIDGE_INSTRUCTION),
              "the bridge instruction is the prompt tail"
+    end
+
+    # --- I81 Law 2: the nested grant (subagent selectable, depth-bounded) ---
+
+    def test_nested_grant_registry_accepts_subagent_without_building_or_raising
+      assert_equal %w[subagent], Tools::Registry::SELECTABLE_SUBAGENT,
+                   "the acceptance vocabulary is the pinnable named constant"
+
+      # No raise on a `subagent` selection; with no registered instance
+      # the loadout drops it silently (pi loadout parity — pinned no-raise).
+      loadout = Tools::Registry.build(selected: %w[read subagent], cwd: @cwd)
+      assert_equal %w[read], loadout.keys
+
+      # The registered-tools merge (I47, unchanged) supplies the instance
+      # LAST on the wire.
+      hooks = Hooks.new
+      manager = Subagents.register(hooks:, cwd: @cwd, env: default_env,
+                                   home: File.join(@home, "subagents"))
+      @managers << manager
+      merged = Tools::Registry.build(selected: %w[read subagent], cwd: @cwd, hooks: hooks)
+      assert_equal %w[read subagent], merged.keys, "the registered merge supplies subagent LAST"
+
+      # Unknown names OUTSIDE the acceptance vocabulary still raise (the
+      # tools_test.rb:114 rm_rf pin survives; this is the sibling seam).
+      assert_raises(ArgumentError) { Tools::Registry.build(selected: %w[read rm_rf], cwd: @cwd) }
+    end
+
+    def test_nested_depth_env_picks_land_in_spawn_argv_and_env
+      @server.script([{type: :stream, content: "one"}, {type: :stream, content: "two"},
+                      {type: :stream, content: "three"}])
+
+      # Defaults: a top-level parent (no depth env) hands the child 1 / 2.
+      manager = new_manager
+      run = manager.spawn_run(agent: "worker", task: "t", async: false, timeout_ms: 0, tool_timeout_ms: 0)
+      _, env = manager.spawn_argv_and_env(run)
+      assert_equal "1", env["PI_SUBAGENTS_DEPTH"], "own depth 0 → child depth 1"
+      assert_equal "2", env["PI_SUBAGENTS_MAX_DEPTH"], "own max (the default 2) inherits"
+
+      # A mid-tree parent: own depth 1 → child 2; an explicit max passes
+      # through verbatim (the operator-override inheritance, types.js:184).
+      deep = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"),
+                                    env: default_env.merge("PI_SUBAGENTS_DEPTH" => "1",
+                                                           "PI_SUBAGENTS_MAX_DEPTH" => "3"),
+                                    identity: "pi", hooks: @hooks)
+      @managers << deep
+      deep_run = deep.spawn_run(agent: "worker", task: "t", async: false, timeout_ms: 0, tool_timeout_ms: 0)
+      _, deep_env = deep.spawn_argv_and_env(deep_run)
+      assert_equal "2", deep_env["PI_SUBAGENTS_DEPTH"]
+      assert_equal "3", deep_env["PI_SUBAGENTS_MAX_DEPTH"]
+
+      # Invalid values fall back (the non-negative-integer law): depth →
+      # 0 (child 1), max → the default 2.
+      invalid = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"),
+                                       env: default_env.merge("PI_SUBAGENTS_DEPTH" => "oops",
+                                                              "PI_SUBAGENTS_MAX_DEPTH" => "-1"),
+                                       identity: "pi", hooks: @hooks)
+      @managers << invalid
+      invalid_run = invalid.spawn_run(agent: "worker", task: "t", async: false,
+                                      timeout_ms: 0, tool_timeout_ms: 0)
+      _, invalid_env = invalid.spawn_argv_and_env(invalid_run)
+      assert_equal "1", invalid_env["PI_SUBAGENTS_DEPTH"], "invalid depth → 0 → child 1"
+      assert_equal "2", invalid_env["PI_SUBAGENTS_MAX_DEPTH"], "invalid max → the default 2"
+    end
+
+    def test_depth_cap_blocks_spawn_with_pi_bytes_verbatim
+      assert_equal 2, Subagents::DEFAULT_MAX_SUBAGENT_DEPTH, "pi DEFAULT_SUBAGENT_MAX_DEPTH"
+      capped = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"),
+                                      env: default_env.merge("PI_SUBAGENTS_DEPTH" => "2",
+                                                             "PI_SUBAGENTS_MAX_DEPTH" => "2"),
+                                      identity: "pi", hooks: @hooks)
+      @managers << capped
+      error = assert_raises(ArgumentError) { capped.spawn_run(agent: "worker", task: "t", async: true) }
+      assert_equal "Nested subagent call blocked (depth=2, max=2). You are running at the maximum subagent nesting depth. " \
+                     "Complete your current task directly without delegating to further subagents.",
+                   error.message, "pi subagent-executor.js:6983-6993 bytes EXACT"
+      assert_empty Dir.children(capped.home), "the check fires FIRST — no run dir before any disk resolution"
+
+      # depth 3 >= max 2 also blocks; the bytes name the session's facts.
+      over = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"),
+                                    env: default_env.merge("PI_SUBAGENTS_DEPTH" => "3",
+                                                           "PI_SUBAGENTS_MAX_DEPTH" => "2"),
+                                    identity: "pi", hooks: @hooks)
+      @managers << over
+      error3 = assert_raises(ArgumentError) { over.spawn_run(agent: "worker", task: "t", async: true) }
+      assert_includes error3.message, "(depth=3, max=2)"
+      assert_empty Dir.children(over.home)
+    end
+
+    # --- I81 Law 3: the forensics law (single-sessions transcript + the task on disk) ---
+
+    def test_forensic_single_sessions_transcript_and_status_task_verbatim
+      @server.script([{type: :stream, content: "forensic answer"}])
+      manager = new_manager
+      run = manager.spawn_run(agent: "worker", task: "forensic task bytes", async: false,
+                              timeout_ms: 0, tool_timeout_ms: 0)
+
+      argv, = manager.spawn_argv_and_env(run)
+      assert_equal run[:dir], argv[argv.index("--session-root") + 1], "the argv passes the run dir itself"
+
+      status = JSON.parse(File.read(File.join(run[:dir], "status.json")))
+      assert_equal "forensic task bytes", status["task"], "the RAW task verbatim (fork preamble excluded)"
+      assert_equal "forensic task bytes".length, status["taskChars"], "taskChars is the raw CHARACTER count"
+      assert_equal File.join(run[:dir], "sessions"), status["sessionRoot"],
+                   "sessionRoot is the transcript's container"
+
+      sessions = Dir.glob(File.join(run[:dir], "sessions", "**", "*.jsonl"))
+      assert_equal 1, sessions.size, "exactly one transcript under the run dir"
+      relative = sessions.first.delete_prefix("#{run[:dir]}/").split("/")
+      assert_equal "sessions", relative.first
+      assert_equal 3, relative.length,
+                   "exactly ONE sessions path segment (no doubled dir): #{relative.inspect}"
+      assert_equal status["sessionRoot"], File.dirname(File.dirname(sessions.first)),
+                   "the transcript sits directly under the status sessionRoot"
+    end
+
+    def test_forensic_legacy_doubled_path_and_task_null_adopt_without_raising
+      manager = new_manager
+      id = "01legacy00-0000-7000-8000-000000000001"
+      dir = File.join(manager.home, id)
+      # The pre-I81 doubled layout (the live specimen shape): the
+      # Recorder's composition over an argv that ALREADY pointed at the
+      # sessions dir — sessions/sessions/<slug>/<file>.jsonl.
+      slug = "--#{File.expand_path(@cwd).sub(%r{\A/}, "").gsub(%r{[/\\:]}, "-")}--"
+      doubled = File.join(dir, "sessions", "sessions", slug)
+      FileUtils.mkdir_p([doubled, File.join(dir, "control", "steer-requests"),
+                         File.join(dir, "control", "stop-requests")])
+      transcript = File.join(doubled, "2026-10-18T07-44-19-606Z_#{id}.jsonl")
+      File.write(transcript, "{\"type\":\"session_start\"}\n")
+      pid = Process.spawn("sleep", "0.05")
+      Process.detach(pid)
+      sleep 0.5
+      File.write(File.join(dir, "status.json"), JSON.generate(
+        {"id" => id, "agent" => "worker", "task" => nil, "taskChars" => 5, "mode" => "single",
+         "state" => "running", "pid" => pid, "cwd" => @cwd, "asyncDir" => dir,
+         "sessionRoot" => File.join(dir, "sessions"), "startedAt" => nil, "lastUpdate" => nil,
+         "toolCallId" => nil}))
+
+      # The fleet read reconciles the legacy dir — dead pid → the failed
+      # repair — WITHOUT raising, and the on-disk legacy task:null stays
+      # (adoption never rewrites it).
+      lines = manager.status(id: nil)
+      assert_includes lines, "- #{id} | failed | single | worker", "the legacy dir adopts"
+      status = JSON.parse(File.read(File.join(dir, "status.json")))
+      assert_equal "failed", status["state"]
+      assert_nil status["task"], "the legacy nil task survives adoption byte-identical"
+      # The manager's transcript glob (sessions/**/*.jsonl — the same
+      # shape) still matches the doubled layout: legacy dirs keep adopting.
+      assert_equal [transcript], Dir.glob(File.join(dir, "sessions", "**", "*.jsonl"))
     end
 
     # I73 child-env pin (seam (c)): the child_env pick source is the
