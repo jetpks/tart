@@ -1093,5 +1093,65 @@ module Tart
       assert_ps_clean(run[:pid])
       puts "[i48-e2e] leg E4: default-on home, stop lands stopped/timedOut false, no zombies"
     end
+
+    # *****************************************************************
+    # I80 child-encoding-hygiene, lane core. Every byte above is the
+    # judged instrument — UNTOUCHED; this leg is the lane's append. It
+    # reuses leg A's EXACT machinery (staged HOME, the closed locale-less
+    # tart_env — ALREADY the defect environment, no new staging,
+    # MockLLMServer, the foreground subagent call) with a Diátaxis-grade
+    # non-ASCII task AND child answer. At base the locale-blind
+    # read_output swallowed the byte-exact child answer to "" and the run
+    # settled failed with the JSON.generate BINARY warning recorded as the
+    # error (the devstral-docs failure class, probe B). The three laws
+    # (child locale + boot UTF-8 + the byte-hygienic readers) make the
+    # whole child boundary byte-exact.
+    # *****************************************************************
+
+    ENC_PROMPT = "I80 encoding e2e: delegate the Diátaxis note — résumé ✓ (á é ü)"
+    ENC_CHILD_TASK = "I80 encoding child task: write the Diátaxis note — résumé ✓ (á é ü)"
+    ENC_CHILD_ANSWER = "I80 encoding answer: Diátaxis — résumé ✓ (á é ü) OK"
+    ENC_FINAL = "I80 encoding parent final: the child answered byte-exact"
+
+    def test_encoding_e2e_non_ascii_round_trip
+      stage_subagents_home
+      stage_home
+      @server.script([
+        {type: :stream, tool_calls: [{id: "c1", name: "subagent",
+                                      arguments: {agent: "worker", task: ENC_CHILD_TASK, async: false}}]},
+        {type: :stream, content: ENC_CHILD_ANSWER},
+        {type: :stream, content: ENC_FINAL}
+      ])
+
+      stdout, stderr, status = tart_sub(ENC_PROMPT)
+      assert_equal 0, status.exitstatus, "the parent exits 0 (stderr: #{stderr})"
+      assert_equal ENC_FINAL, stdout.chomp, "the parent's final stdout is byte-exact"
+      assert_empty stderr, "the parent's own stderr carries ZERO lines (the boot law's leg)"
+
+      drain_captures
+      child_req = child_requests(ENC_CHILD_TASK).first
+      assert child_req, "the child's wire request was captured"
+      child_user = child_req["messages"].select { |m| m["role"] == "user" }.last
+      assert_equal ENC_CHILD_TASK, child_user["content"],
+        "the child wire request carries the task BYTE-EXACT"
+
+      run_dir = the_only_run_dir
+      stderr_log = File.read(File.join(run_dir, "runner.stderr.log"))
+      refute stderr_log.include?("passed as BINARY"),
+        "runner.stderr.log carries ZERO 'passed as BINARY' lines: #{stderr_log[0, 200].inspect}"
+
+      sj = status_json(run_dir)
+      assert_equal "completed", sj["state"]
+      assert_equal ENC_CHILD_TASK.length, sj["taskChars"],
+        "taskChars is the task's CHARACTER count (the task text itself is never recorded)"
+      refute sj["task"].to_s.include?(ENC_CHILD_TASK), "the task text is never recorded (pi redacts)"
+
+      rj = result_json(run_dir)
+      assert_equal true, rj["success"]
+      assert_equal ENC_CHILD_ANSWER, rj["output"],
+        "result.json output equals the child answer BYTE-EXACT"
+      puts "[i48-e2e] encoding leg: exit 0, task + answer rode the boundary byte-exact, " \
+           "run #{File.basename(run_dir)} completed"
+    end
   end
 end
