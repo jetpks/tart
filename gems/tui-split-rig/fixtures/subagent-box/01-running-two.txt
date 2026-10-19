@@ -1,0 +1,5 @@
+ ⠏ Async agents · background
+ ├─ ⠇ worker [fresh] · 30.0s
+ │     ⎿  active 30s ago
+ └─ ⠇ reviewer [fresh] · 30.0s
+       ⎿  active 30s ago
