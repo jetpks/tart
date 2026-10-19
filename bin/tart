@@ -33,6 +33,7 @@ end
 require "optparse"
 require_relative "../lib/tart"
 require_relative "../lib/tart/session_sink"
+require_relative "../lib/tart/utf8_boot"
 
 module Tart
   module Executable
@@ -227,6 +228,12 @@ module Tart
     end
 
     def run(argv)
+      # I80 encoding hygiene — Law 2, the boot UTF-8 law, ONCE per process
+      # before any parse or IO: a locale-less direct boot (no LANG/LC_* in
+      # the env) arrives with BINARY-tagged non-ASCII ARGV and US-ASCII
+      # text reads — every wire round then warns "UTF-8 string passed as
+      # BINARY" (the devstral-docs failure class).
+      Tart::UTF8Boot.enforce!(argv: argv)
       # Once per process, before any reactor runs (print mode runs a reactor
       # too): the first in-reactor IO draws async's IO::Buffer experimental
       # warning onto the terminal.

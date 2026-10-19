@@ -298,11 +298,17 @@ module Tart
       # rides the LITERAL bootstrap key TART_IDENTITY (the child's
       # resolve_identity reads only that literal; the old namespaced
       # PI_IDENTITY write was a dead key nothing read).
+      # I80 child-encoding-hygiene (seat ruling 2026-10-18, the I77
+      # ruling-#2 DECLARED re-pin pattern): Law 1's UTF-8 floor introduces
+      # exactly these three locale keys into the closed env — the floor
+      # overrides a present non-UTF-8 LC_ALL or sets LC_CTYPE; LANG only
+      # ever rides the pass-through picks. NOTHING else is sanctioned.
       sanctioned = %w[PATH HOME TART_IDENTITY PI_API_KEY PI_API_BASE PI_MODEL PI_PROVIDER
                       PI_MODEL_REASONING PI_THINKING_LEVEL PI_CONTEXT_WINDOW PI_TOOL_TIMEOUT_MS
                       PI_RUN_DEADLINE_MS PI_SUBAGENTS_HOME PI_SUPERVISOR_CHANNEL PI_SUBAGENTS_AGENT
                       PI_SESSION_SINK_HOST PI_SESSION_SINK_TOKEN PI_SESSION_SINK_DISABLED
-                      PI_SESSION_SINK_AGENT_NAME PI_SESSION_SINK_PARENT_SESSION_ID]
+                      PI_SESSION_SINK_AGENT_NAME PI_SESSION_SINK_PARENT_SESSION_ID
+                      LANG LC_ALL LC_CTYPE]
       assert_empty(env.keys - sanctioned, "spawn env closure violated: #{(env.keys - sanctioned).inspect}")
       assert env.key?("PATH")
       assert env.key?("HOME")

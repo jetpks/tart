@@ -73,6 +73,14 @@ module Tart
 
       TERMINAL_STATES = %w[completed failed stopped].freeze
 
+      # I80 encoding hygiene — Law 1's floor value (the owner's measured
+      # machine locale): set as LC_ALL (overriding a present non-UTF-8
+      # value, which would mask LC_CTYPE) or LC_CTYPE (masking a non-UTF-8
+      # LANG) whenever the child's effective charset key is not UTF-8 —
+      # MRI's default_external follows LC_ALL > LC_CTYPE > LANG, and a
+      # locale-less child boots US-ASCII (the devstral-docs failure class).
+      UTF8_LOCALE = "en_US.UTF-8".freeze
+
       # pi fleet-view.js:391, byte-exact — the empty-fleet status line.
       FLEET_EMPTY_LINE = "No active subagent fleet. Background runs that already finished are available " \
                          "through completion notifications or subagent({ action: \"status\", id: \"...\" }).".freeze
@@ -480,6 +488,32 @@ module Tart
         env[key.("SESSION_SINK_AGENT_NAME")] = run[:agent]
         parent_id = parent_session_id
         env[key.("SESSION_SINK_PARENT_SESSION_ID")] = parent_id if parent_id
+        # I80 encoding hygiene — Law 1, the child locale law. pi-subagents
+        # passes the FULL parent env to its children
+        # (async-execution.js:503); this closed pick list (the I73/I48 OQ-7
+        # design) was the ONE child-spawn arm that dropped LANG/LC_*, so a
+        # locale-less parent chain booted the child runner with
+        # Encoding.default_external = US-ASCII and every non-ASCII byte
+        # crossing the boundary mangled. The pick list grows ONLY these
+        # keys (the CLOSED-env design stays; the I73 scrub above strips
+        # bundler keys only — locale keys pass through it untouched).
+        source.each do |locale_key, locale_value|
+          next unless locale_key == "LANG" || locale_key.match?(/\ALC_/)
+          next if locale_value.nil? || locale_value.empty?
+
+          env[locale_key] = locale_value
+        end
+        # The UTF-8 floor (the declared BRIEF §5.1 mechanism deviation —
+        # pi never needed it, node is UTF-8-native): MRI/setlocale charset
+        # precedence is LC_ALL > LC_CTYPE > LANG, so when the effective
+        # charset key is absent or non-UTF-8, a present LC_ALL is itself
+        # overridden (it would mask LC_CTYPE), else LC_CTYPE is set (it
+        # masks a non-UTF-8 LANG, which stays untouched). LANG is never
+        # invented.
+        effective = env["LC_ALL"] || env["LC_CTYPE"] || env["LANG"]
+        unless effective&.match?(/UTF-?8\z/i)
+          env[env.key?("LC_ALL") ? "LC_ALL" : "LC_CTYPE"] = UTF8_LOCALE
+        end
         env
       end
 
@@ -1158,9 +1192,18 @@ module Tart
         File.join(dir, "control", "stop-requests")
       end
 
+      # I80 encoding hygiene — Law 3, the byte-hygienic artifact readers
+      # (the port's own established idiom: output_accumulator.rb:41,
+      # read.rb:85 — binread + force_encoding(UTF_8) + scrub): a
+      # locale-blind text-mode read of the child's byte-exact non-ASCII
+      # output tags it US-ASCII with invalid bytes and String#sub then
+      # RAISES, whose rescue swallowed the answer to "" and settled the
+      # run failed (the exact devstral-docs failure class). Byte-identical
+      # for valid UTF-8 (scrub is identity there), never-raise for
+      # arbitrary child bytes.
       def read_output(record)
         path = File.join(record[:dir], "runner.stdout.log")
-        File.file?(path) ? File.read(path).sub(/\n\z/, "") : ""
+        File.file?(path) ? File.binread(path).force_encoding(Encoding::UTF_8).scrub.sub(/\n\z/, "") : ""
       rescue StandardError
         ""
       end
@@ -1169,7 +1212,7 @@ module Tart
         path = File.join(record[:dir], "runner.stderr.log")
         return nil unless File.file?(path)
 
-        File.foreach(path) do |line|
+        File.binread(path).force_encoding(Encoding::UTF_8).scrub.each_line do |line|
           stripped = line.strip
           return stripped unless stripped.empty?
         end
