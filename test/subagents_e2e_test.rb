@@ -136,7 +136,10 @@ module Tart
       sj = status_json(run_dir)
       assert_equal "completed", sj["state"]
       assert_equal false, sj.fetch("timedOut", nil), "a completed run never sets timedOut"
-      refute sj["task"].to_s.include?(A_CHILD_TASK), "the task text is never recorded (pi redacts)"
+      # I81 Law 3 re-pin (declared in the lane prompt as a behavior-
+      # contradicting pin inside the touch set): the RAW task now rides
+      # status.json verbatim.
+      assert_equal A_CHILD_TASK, sj["task"], "the spawn's raw task is on disk verbatim"
       rj = result_json(run_dir)
       assert_equal true, rj["success"]
       assert_equal A_CHILD_ANSWER, rj["output"].to_s.strip
@@ -1143,8 +1146,10 @@ module Tart
       sj = status_json(run_dir)
       assert_equal "completed", sj["state"]
       assert_equal ENC_CHILD_TASK.length, sj["taskChars"],
-        "taskChars is the task's CHARACTER count (the task text itself is never recorded)"
-      refute sj["task"].to_s.include?(ENC_CHILD_TASK), "the task text is never recorded (pi redacts)"
+        "taskChars is the task's CHARACTER count"
+      # I81 Law 3 re-pin (declared in the lane prompt as a behavior-
+      # contradicting pin inside the touch set): the raw task rides verbatim.
+      assert_equal ENC_CHILD_TASK, sj["task"], "the spawn's raw task is on disk byte-exact"
 
       rj = result_json(run_dir)
       assert_equal true, rj["success"]
@@ -1152,6 +1157,126 @@ module Tart
         "result.json output equals the child answer BYTE-EXACT"
       puts "[i48-e2e] encoding leg: exit 0, task + answer rode the boundary byte-exact, " \
            "run #{File.basename(run_dir)} completed"
+    end
+
+    # *****************************************************************
+    # I81 agent-loading-forensics, lane core. Every byte above is the
+    # judged instrument — UNTOUCHED except the two DECLARED Law-3 re-pins
+    # above (leg A's and the encoding leg's task-null refutes, both
+    # inside this touch-set file); this leg is the lane's append. THREE
+    # process generations on the leg-A machinery (staged HOME + a staged
+    # agents dir, MockLLMServer, real `bin/tart -p` subprocesses): the
+    # parent's model calls `subagent` on a CUSTOM coordinator agent whose
+    # `tools:` carry `subagent` AND an unknown entry (`bg_wait` — the
+    # live 07:40Z specimen name); the child's captured wire proves the
+    # Law-1 drop (bg_wait absent, subagent declared LAST) and the Law-2
+    # grant (the child spawns the grandchild); the grandchild's output
+    # rides back through the chain; the Law-3 forensics run live on BOTH
+    # run dirs (single-sessions transcripts, raw task text on disk).
+    # *****************************************************************
+
+    N_PROMPT = "e2e nested leg: delegate through the coordinator"
+    N_CHILD_TASK = "e2e nested child task: the coordinator delegates the check"
+    N_GRANDCHILD_TASK = "e2e nested grandchild task: report the leg-N answer"
+    N_GRANDCHILD_ANSWER = "leg N grandchild answer: two levels deep"
+    N_CHILD_ANSWER = "leg N child answer: the grandchild reported"
+    N_FINAL = "leg N parent final: the chain answered"
+
+    def test_nested_e2e_three_generations_custom_coordinator
+      stage_subagents_home
+      stage_home
+      # The staged USER-tier agents dir (the parent AND the child resolve
+      # profiles from the same staged HOME's default agent root).
+      agents_dir = File.join(@home, ".tart", "agents")
+      FileUtils.mkdir_p(agents_dir)
+      File.write(File.join(agents_dir, "coordinator.md"), <<~MD)
+        ---
+        description: e2e nested coordinator (custom agent)
+        tools: read, bash, bg_wait, subagent
+        ---
+
+        You are the e2e nested coordinator. Delegate the leg-N check to the worker.
+      MD
+
+      # Script slots consumed in ARRIVAL order; every generation blocks
+      # on the next (foreground spawns), so the order is deterministic:
+      # parent spawn turn → child spawn turn → grandchild turn → child
+      # tool-result turn → parent tool-result turn.
+      @server.script([
+        {type: :stream, tool_calls: [{id: "c1", name: "subagent",
+                                      arguments: {agent: "coordinator", task: N_CHILD_TASK, async: false}}]},
+        {type: :stream, tool_calls: [{id: "c2", name: "subagent",
+                                      arguments: {agent: "worker", task: N_GRANDCHILD_TASK, async: false}}]},
+        {type: :stream, content: N_GRANDCHILD_ANSWER},
+        {type: :stream, content: N_CHILD_ANSWER},
+        {type: :stream, content: N_FINAL}
+      ])
+
+      stdout, stderr, status = tart_sub(N_PROMPT)
+      assert_equal 0, status.exitstatus, "the parent exits 0 (stderr: #{stderr})"
+      assert_equal N_FINAL, stdout.strip, "the parent's final stdout is the chain's answer"
+
+      drain_captures
+      assert_equal 5, @captures.size,
+        "parent spawn, child spawn, grandchild, child tool-result, parent tool-result " \
+        "(captured: #{@captures.size})"
+
+      # Law 1 + Law 2 on the child's captured wire: the custom
+      # coordinator's spec tools after the drop (read, bash) + the bridge
+      # union (contact_supervisor) + the registered merge (subagent LAST);
+      # the unknown bg_wait is ABSENT.
+      child_req = child_requests(N_CHILD_TASK).first
+      assert child_req, "the child's spawn request was captured"
+      assert_equal %w[read bash contact_supervisor subagent],
+        child_req["tools"].to_a.map { |t| t.dig("function", "name") },
+        "the dropped unknown name is absent; subagent is declared LAST (the merge order)"
+
+      # The grandchild: the child's model spawned the builtin worker.
+      grand_req = child_requests(N_GRANDCHILD_TASK).first
+      assert grand_req, "the grandchild's request was captured"
+      assert_equal %w[read grep find ls bash edit write contact_supervisor subagent],
+        grand_req["tools"].to_a.map { |t| t.dig("function", "name") },
+        "the grandchild (the builtin worker) also declares subagent LAST (the depth-1 grant)"
+
+      # The chain: the grandchild's output rode the child's tool result;
+      # the child's output rode the parent's tool result.
+      child_replay = child_requests(N_CHILD_TASK).last
+      assert_includes tool_message(child_replay, "c2"), N_GRANDCHILD_ANSWER,
+        "the grandchild's output is the child's tool result"
+      parent_req2 = @captures.find do |r|
+        r["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "c1" }
+      end
+      assert parent_req2, "the parent's tool-result turn was captured"
+      assert_equal N_CHILD_ANSWER, tool_message(parent_req2, "c1").strip,
+        "the child's output is the parent's tool result (verbatim, §7)"
+
+      # TWO run dirs under the staged home (the child + the grandchild).
+      runs = Dir.children(@subagents_home).sort.map do |child|
+        [child, status_json(File.join(@subagents_home, child))]
+      end
+      assert_equal 2, runs.size, "the child and grandchild runs both landed under the staged home"
+      child_run = runs.find { |_d, sj| sj["task"] == N_CHILD_TASK }
+      grand_run = runs.find { |_d, sj| sj["task"] == N_GRANDCHILD_TASK }
+      assert child_run, "the child run's status carries the raw spawn task (Law 3)"
+      assert grand_run, "the grandchild run's status carries the raw spawn task (Law 3)"
+      assert_equal N_GRANDCHILD_ANSWER, result_json(File.join(@subagents_home, grand_run[0]))["output"].to_s.strip
+      assert_equal N_CHILD_ANSWER, result_json(File.join(@subagents_home, child_run[0]))["output"].to_s.strip
+
+      # Law 3 LIVE on both generations: single-sessions transcripts and
+      # the status sessionRoot = the transcript's container.
+      [child_run, grand_run].each do |(name, sj)|
+        run_dir = File.join(@subagents_home, name)
+        sessions = Dir.glob(File.join(run_dir, "sessions", "**", "*.jsonl"))
+        assert_equal 1, sessions.size, "#{name}: exactly one transcript"
+        relative = sessions.first.delete_prefix("#{run_dir}/").split("/")
+        assert_equal "sessions", relative.first
+        assert_equal 3, relative.length, "#{name}: exactly ONE sessions segment (#{relative.inspect})"
+        assert_equal File.join(run_dir, "sessions"), sj["sessionRoot"],
+          "#{name}: sessionRoot is the transcript's container"
+        assert_equal "completed", sj["state"]
+      end
+      puts "[i48-e2e] nested leg: exit 0, three generations (parent → coordinator → worker → grandchild), " \
+           "drop + grant on the child wire, runs #{child_run[0]} + #{grand_run[0]} completed"
     end
   end
 end

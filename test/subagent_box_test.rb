@@ -302,7 +302,10 @@ module Tart
          toolCallId].each do |key|
         assert status.key?(key), "existing key #{key} survives"
       end
-      assert_equal nil, status["task"], "the task text is NEVER recorded"
+      # I81 Law 3 re-pin (the declared re-pin): the raw task rides
+      # status.json verbatim; the I79 box still renders NO task row
+      # (the box laws are untouched — this pin is the payload's).
+      assert_equal "additive facts", status["task"]
     end
 
     def test_fork_spawn_records_the_fork_context
