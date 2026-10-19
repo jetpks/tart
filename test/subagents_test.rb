@@ -30,6 +30,11 @@ module Tart
     end
 
     def teardown
+      # I79 fix pass: Subagents.register records the module-level
+      # current_manager slot; without this reset a leaked manager arms the
+      # Chat box ticks in whichever test class runs next (order-dependent
+      # — the exact idiom test/subagent_box_test.rb teardown uses).
+      Subagents.current_manager = nil
       @managers.each(&:shutdown)
       @server.stop
       FileUtils.rm_rf(@home)

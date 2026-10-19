@@ -1,0 +1,5 @@
+ ◖SPIN◗ Async agents · background
+ ├─ ◖SPIN◗ worker [fresh] · ◖DUR◗
+ │     ⎿  no activity for ◖DUR◗
+ └─ ◖SPIN◗ reviewer [fresh] · ◖DUR◗
+       ⎿  active ◖DUR◗ ago

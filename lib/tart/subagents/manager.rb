@@ -9,6 +9,9 @@ require "time"
 require_relative "../agent/session"
 require_relative "../child_env"
 require_relative "../identity"
+# The box seam's retention/observation-key law lives with the renderer
+# (Law 1's frozen constants); the sweep diffs through it (Law 2).
+require_relative "../render/subagent_box"
 # I78 Law 4: the validation seat loads the model catalog from the same
 # staged root the Manager carries (`Models.load(root: @root)`).
 require_relative "../models"
@@ -177,15 +180,26 @@ module Tart
         File.write(File.join(dir, "system-prompt.md"), spec[:system_prompt])
 
         exit_rd, exit_wr = IO.pipe
+        # Law 3 — the additive box facts, recorded at spawn (the I71/I78
+        # resolution seat): `model` is the resolved provider/id string,
+        # `context` is pi's badge law ("fork" when the spawn resumes the
+        # parent session, else "fresh"). Plus the box snapshot's flip
+        # facts (ended_at/error/last_update — nil until a settle/reap).
+        spawned_model = provider && model_id ? "#{provider}/#{model_id}" : nil
+        spawned_at = now_ms
         record = {
           id:, agent: spec[:name], state: :running, dir:, pid: nil, pgid: nil, async: !!async,
           owned: true, # I78 Law 3: true exactly when THIS process spawned it
-          timed_out: false, started_at: now_ms, tool_call_id:,
+          timed_out: false, started_at: spawned_at, tool_call_id:,
           # Port-internal keys (beyond the §2.2 public contract) that
           # #spawn_argv_and_env derives the child harness from:
           task_chars: task.to_s.length, tools: spec[:tools], provider:, model_id:, level:,
           timeout_ms: deadline, tool_timeout_ms: tool_deadline, parent_session: parent_session.to_s,
-          fork: forked, task_text:, exit_pipe: exit_rd, stopped: false, deadline_due: false, signaled: nil
+          fork: forked, task_text:, exit_pipe: exit_rd, stopped: false, deadline_due: false, signaled: nil,
+          # The I79 box seam's snapshot facts (nil-tolerant; historical dirs
+          # adopted from disk without them render no badge/model).
+          model: spawned_model, context: forked ? "fork" : "fresh",
+          last_update: spawned_at, ended_at: nil, error: nil
         }
         write_status(record)
 
@@ -616,6 +630,11 @@ module Tart
 
           record[:state] = state
           record[:timed_out] = timed_out
+          # Law 3 — the box snapshot's flip facts, recorded at the settle.
+          now = now_ms
+          record[:last_update] = now
+          record[:ended_at] = now
+          record[:error] = error_line
           # JUDGE FIX (post-merge, recorded in the verdict): the notification
           # must queue INSIDE this mutex — the state flip above was observable
           # before send_next_turn ran, so `drain`'s outstanding? poll could
@@ -628,6 +647,7 @@ module Tart
           notify_completion(record) if record[:owned] && record[:async]
         end
         close_exit_pipe(record)
+        kick_box_draw
         record
       end
 
@@ -648,6 +668,7 @@ module Tart
             record[:state] = disk["state"].to_sym
             record[:timed_out] = disk["timedOut"] == true
           end
+          adopt_box_facts(record, disk)
           close_exit_pipe(record)
         elsif exited?(record)
           settle_run(record)
@@ -809,7 +830,24 @@ module Tart
           record[:state] = disk["state"].to_sym
           record[:timed_out] = disk["timedOut"] == true
         end
+        adopt_box_facts(record, disk)
         close_exit_pipe(record)
+        kick_box_draw
+        record
+      end
+
+      # Law 3 — pass the disk status's additive box facts onto the record
+      # (nil/legacy tolerance: absent keys leave the record's values — a
+      # historical dir without the fields renders no badge/model, never
+      # raises). Read-path only; the on-disk vocabulary is untouched.
+      def adopt_box_facts(record, disk)
+        @mutex.synchronize do
+          record[:model] = disk["model"] if disk["model"]
+          record[:context] = disk["context"] if disk["context"]
+          record[:last_update] = disk["lastUpdate"] if disk["lastUpdate"]
+          record[:ended_at] = disk["endedAt"] if disk["endedAt"]
+          record[:error] = disk["error"] if disk["error"]
+        end
         record
       end
 
@@ -834,7 +872,11 @@ module Tart
         @mutex.synchronize do
           record[:state] = state.to_sym
           record[:timed_out] = result["timedOut"] == true
+          record[:last_update] = now
+          record[:ended_at] = now
+          record[:error] = result["error"]
         end
+        kick_box_draw
         record
       end
 
@@ -869,7 +911,11 @@ module Tart
         @mutex.synchronize do
           record[:state] = :failed
           record[:timed_out] = false
+          record[:last_update] = now
+          record[:ended_at] = now
+          record[:error] = message
         end
+        kick_box_draw
         record
       end
 
@@ -932,7 +978,11 @@ module Tart
           async: true, owned: false,
           timed_out: status["timedOut"] == true, started_at: status["startedAt"],
           tool_call_id: status["toolCallId"], exit_pipe: nil, stopped: false,
-          deadline_due: false, signaled: nil
+          deadline_due: false, signaled: nil,
+          # Law 3 — the additive box facts ride the synthesis (nil-tolerant:
+          # a historical dir without them renders no badge/model).
+          model: status["model"], context: status["context"],
+          last_update: status["lastUpdate"], ended_at: status["endedAt"], error: status["error"]
         }
         @mutex.synchronize do
           existing = @runs.find { |candidate| candidate[:id] == record[:id] }
@@ -975,6 +1025,69 @@ module Tart
         loop
       end
 
+      # --- the box snapshot (I79 Law 3) ---
+
+      # The Law-3 seam is PUBLIC: the Chat surface's per-frame read and the
+      # chat sweep task's ≤5s call. The §7 status rendering below stays
+      # private (the `private` marker resumes after this section).
+      public
+
+      # The box-facing snapshot (Law 3 — the Chat surface's per-frame read):
+      # a mutex-guarded, allocation-bounded array of plain row hashes over
+      # the in-memory records. Reads never block the render frame beyond
+      # this lock (the worst case is one watcher tick stale). Zero runs →
+      # the frozen empty rows without touching the supervisor channel — the
+      # absent box allocates nothing.
+      def box_snapshot
+        rows = nil
+        @mutex.synchronize do
+          next rows = [] if @runs.empty?
+
+          rows = @runs.map do |record|
+            { id: record[:id], agent: record[:agent], state: record[:state].to_s,
+              started_at: record[:started_at], last_update: record[:last_update],
+              ended_at: record[:ended_at], model: record[:model], context: record[:context],
+              dir: record[:dir], error: record[:error] }
+          end
+        end
+        attention_ids = @supervisor_channel&.pending&.filter_map { |request| request[:run_id] }
+        rows.each { |row| row[:attention] = !!(attention_ids&.include?(row[:id])) }
+        { rows: rows }
+      end
+
+      # The box's ≤5s sweep (Law 2 — pi DEFAULT_LIVENESS_INTERVAL_MS): the
+      # I78 fleet sweep adopts non-terminal foreign dirs, the reaper's
+      # result-derive/dead-pid legs reconcile the known records. Returns
+      # whether any box-observable fact changed (the caller requests the
+      # draw through the kernel bridge).
+      def box_sweep
+        before = box_observation_key
+        sweep_home
+        records = @mutex.synchronize { @runs.dup }
+        records.each { |record| reconcile_run(record) if record[:state] == :running }
+        box_observation_key != before
+      end
+
+      # The observation key the sweep diffs (no glyph-frame bucket — the
+      # sweep never draws for animation frames): the visible rows' facts.
+      def box_observation_key
+        now = now_ms
+        Render::SubagentBox.stable_key(Render::SubagentBox.visible(box_snapshot.fetch(:rows), now))
+      end
+
+      # The box draw kick (Law 2 — the existing kernel bridge): a state
+      # transition pushes one synthetic event; the pushed block executes on
+      # the reactor (Chat#on_agent_event dereferences `event[:type]` — the
+      # I48 wake-bridge pattern) and the event itself marks the frame dirty
+      # (Loop#process). No-op without the bridge (print boots/tests).
+      def kick_box_draw
+        @kernel&.async {}
+      rescue StandardError
+        nil # a dead bridge never blocks the watcher's settle path
+      end
+
+      private
+
       # --- status rendering (§7) ---
 
       def render_status(record)
@@ -1015,6 +1128,11 @@ module Tart
           "lastUpdate" => now_ms,
           "toolCallId" => record[:tool_call_id]
         }
+        # Law 3 — the additive box fields, recorded at spawn: key-present
+        # only when the record carries them, so historical/legacy shapes
+        # stay byte-unchanged and the nil/legacy tolerance holds.
+        payload["model"] = record[:model] if record[:model]
+        payload["context"] = record[:context] if record[:context]
         payload["timeoutMs"] = record[:timeout_ms] if record[:timeout_ms]
         payload["toolTimeoutMs"] = record[:tool_timeout_ms] if record[:tool_timeout_ms]
         payload

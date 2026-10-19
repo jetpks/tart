@@ -1,0 +1,4 @@
+ async subagent · background
+ ■ worker [fresh] · ◖DUR◗
+   ✗ Step 1/1: worker [fresh] · failed (mock/mock-1) · ◖DUR◗
+     error: staged stop: the ladder fired

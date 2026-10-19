@@ -210,6 +210,15 @@ module Tart
 
     module_function
 
+    class << self
+      # Law 3 — the register slot: the ONE bin/tart-untouched reach from
+      # the boot wiring to the Chat surface (bin/tart is hard-frozen; the
+      # surface is built before register runs). {register} records the
+      # Manager here; print boots and tests never set it — nil renders no
+      # box.
+      attr_accessor :current_manager
+    end
+
     # The boot wiring's single entry (called ONLY when the resolved
     # settings gate is on — OQ-1): builds the {Manager}, constructs and
     # ARMS the {SupervisorChannel} (I49 — the same kernel/agent objects as
@@ -235,6 +244,7 @@ module Tart
       channel.start
       manager.supervisor_channel = channel
       hooks.register_tool(Tools::Subagent.new(manager:))
+      self.current_manager = manager
       manager
     end
 

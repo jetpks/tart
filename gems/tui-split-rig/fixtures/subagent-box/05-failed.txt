@@ -1,0 +1,4 @@
+ async subagent · background
+ ✗ reviewer [fresh] · 35.5s
+   ✗ Step 1/1: reviewer [fresh] · failed (mock/mock-1) · 35.5s
+     error: staged failure: the wire died

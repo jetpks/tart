@@ -1,0 +1,4 @@
+ async subagent · background
+ ✗ reviewer [fresh] · ◖DUR◗
+   ✗ Step 1/1: reviewer [fresh] · failed (mock/mock-1) · ◖DUR◗
+     error: staged failure: the wire died

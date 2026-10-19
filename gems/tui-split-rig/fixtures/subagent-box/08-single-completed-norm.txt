@@ -1,0 +1,2 @@
+ async subagent · background
+   ✓ worker [fresh] · complete (mock/mock-1) · ◖DUR◗

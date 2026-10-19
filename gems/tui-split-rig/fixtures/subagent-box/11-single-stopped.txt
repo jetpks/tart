@@ -1,0 +1,4 @@
+ async subagent · background
+ ■ worker [fresh] · 10.5s
+   ✗ Step 1/1: worker [fresh] · failed (mock/mock-1) · 10.5s
+     error: staged stop: the ladder fired
