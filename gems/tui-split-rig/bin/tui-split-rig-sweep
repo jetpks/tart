@@ -1,0 +1,295 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# tui-split-rig-sweep — the parity-battery fan-out (I83). A NEW sibling of
+# the frozen tui-split-rig CLI (whose run/diff verbs stay byte-frozen): it
+# fans the scenario battery across concurrent `tui-split-rig run` CHILD
+# PROCESSES (one per scenario — the I27 per-Runner tmux-token scoping makes
+# concurrent rig processes safe on the shared tmux server, so the fan-out
+# needs no threads and no lib/ changes), then aggregates the per-scenario
+# exit codes with max.
+#
+#   tui-split-rig-sweep [--jobs N] [--out ROOT] [--only NAMES] [--probes]
+#                       [--runs N] [--app both|pi|tart] [--tart-dir PATH]
+#                       [--pi-bin PATH] [--list]
+#
+# The frozen laws (architecture/I83-rig-sweep-parallel.md, Specification):
+#   1. Default set = every scenarios/s*.yml sorted by filename (19 today,
+#      s1_tart included — it matches the glob); --probes ADDS the
+#      probe_*.yml files (opt-in, they are not parity gates); --only
+#      restricts to exact extensionless basenames — an unknown NAME is
+#      refused loudly (exit 2, named); an entry ending in ".yml" is a
+#      direct scenario PATH reference whose existence is NOT pre-checked —
+#      the child's own Scenario.load refusal surfaces through the fan-out
+#      as exit 2 (the loud, aggregated missing-yml signal). --list prints
+#      the plan (name, resolved yml path, assigned out dir) + the jobs
+#      count and runs NOTHING (exit 0).
+#   2. Each scenario is ONE subprocess
+#      …/bin/tui-split-rig run <yml> --out <dir>, with --runs/--app/
+#      --tart-dir/--pi-bin forwarded verbatim when provided (the rig's own
+#      defaults otherwise). At most --jobs N children in flight (default
+#      8); the rest queue.
+#   3. Per-scenario out dir: <ROOT>/sw-<nn> (1-based zero-padded ordinal
+#      in the sorted sweep set), ROOT defaulting to the tart repo root;
+#      each dir is rm -rf'd before its spawn (idempotent re-sweeps). Under
+#      the default root the assigned path is sw-<nn> — 5 chars from the
+#      repo root, inside the measured <= 20-char green geometry window for
+#      the wrap scenarios (s9/s16; red starts at 22). All paths resolve
+#      from this script's own __dir__ — invocation works from any cwd.
+#   4. The sweep exit code = MAX over per-scenario exit codes: 0 only if
+#      every scenario exited 0; any 2 => 2; else any 1 => 1. Every code
+#      surfaces in the printed table — none swallowed. At today's base the
+#      full battery aggregates to 2 (s13's standing leak-era shape) — the
+#      honest signal, not a wrapper defect.
+#   5. Report at <ROOT>/sweep-report.json:
+#      {set, jobs, scenarios: [{name, path, out_dir, exit_code, wall_ms}],
+#      aggregate_exit_code, wall_ms} + the printed table + a final
+#      "sweep: <aggregate> (N scenarios, <wall>s, jobs <J>)" line.
+#   6. Children get the six HERDR_* keys scrubbed (the standing gate
+#      discipline — a sweep from a herdr-attached shell runs gate-shaped).
+#   7. SIGINT/SIGTERM => KILL all in-flight children, reap their orphans
+#      (the runner's teardown is inline, not ensure-wrapped — an
+#      interrupted child cannot clean up behind itself, so the sweep kills
+#      the pane apps by their staged out-dir path and drops the child's
+#      token-scoped sessions), bounded, exit 2.
+#   8. Sweep-own failures (bad flags, unknown --only name, unspawnable
+#      child) exit 2 — the rig family's 0/1/2 vocabulary.
+#
+# Stdlib only — runs without Bundler.
+
+require "fileutils"
+require "json"
+require "open3"
+require "optparse"
+
+RIG_BIN = File.expand_path("tui-split-rig", __dir__)
+SCENARIOS_DIR = File.expand_path("../scenarios", __dir__)
+REPO_ROOT = File.expand_path("../../..", __dir__) # gems/tui-split-rig/bin -> the tart repo root
+HERDR_KEYS = %w[
+  HERDR_ENV HERDR_TAB_ID HERDR_SOCKET_PATH
+  HERDR_BIN_PATH HERDR_WORKSPACE_ID HERDR_PANE_ID
+].freeze
+
+# The trap-visible in-flight set (Law 7). The spawn loop registers each
+# child here BEFORE its pid can be awaited; the trap reads it.
+IN_FLIGHT = {}
+
+def monotonic
+  Process.clock_gettime(Process::CLOCK_MONOTONIC)
+end
+
+def rig_failure(message)
+  warn "tui-split-rig-sweep: #{message}"
+  exit 2
+end
+
+def usage_line
+  "usage: tui-split-rig-sweep [--jobs N] [--out ROOT] [--only NAMES] [--probes] " \
+    "[--runs N] [--app both|pi|tart] [--tart-dir PATH] [--pi-bin PATH] [--list]"
+end
+
+# Law 7: signal guards go up FIRST — an INT during option parsing must
+# still exit 2, not die on an unhandled Interrupt.
+def install_signal_guards
+  # Trap handlers are invoked WITH the signal number — a zero-arity handler
+  # raises inside the trap context and the sweep would sail through an INT
+  # (measured on ruby 4.0.7).
+  shutdown = lambda do |_signo|
+    pids = IN_FLIGHT.keys
+    pids.each { |pid| Process.kill("KILL", pid) rescue nil }
+    entries = IN_FLIGHT.values
+    sleep 0.5 # a just-spawned child's tmux new-session gets a beat to land
+    entries.each { |entry| reap_orphans(entry) }
+    warn "tui-split-rig-sweep: interrupted — #{pids.size} in-flight child(ren) KILLed, " \
+         "their panes/sessions reaped, exiting 2"
+    exit!(2)
+  end
+  Signal.trap("INT", shutdown)
+  Signal.trap("TERM", shutdown)
+end
+
+# An interrupted child cannot run the runner's own teardown (it is inline,
+# not ensure-wrapped), so the sweep reaps the orphan pane apps and sessions:
+# the staged app command lines embed the run's unique out dir (tart even
+# survives SIGHUP spinning — the runner's own kill -9 reason), and the child's
+# sessions are token-scoped tui-split-rig-<token>-<app>-<scenario>-r<n>-<hex>.
+def reap_orphans(entry)
+  system("pkill", "-9", "-f", entry.fetch(:out_dir))
+  Open3.capture2("tmux", "ls", err: IO::NULL)[0].to_s.each_line do |line|
+    session = line.split(":").first.to_s
+    next unless session.start_with?("tui-split-rig-") && session.include?("-#{entry.fetch(:name)}-r")
+
+    system("tmux", "kill-session", "-t", session)
+  end
+rescue StandardError
+  nil
+end
+
+def parse_options(argv)
+  options = {jobs: 8, out: nil, only: nil, probes: false, runs: nil,
+             app: nil, tart_dir: nil, pi_bin: nil, list: false}
+  parser = OptionParser.new do |p|
+    p.on("--jobs N", Integer, "max concurrent children (default 8)") { |n| options[:jobs] = n }
+    p.on("--out ROOT", "root for the sw-NN out dirs + the report (default: the tart repo root)") { |v| options[:out] = v }
+    p.on("--only NAMES", "comma list of exact scenario basenames (or .yml paths)") { |v| options[:only] = v }
+    p.on("--probes", "ADD the probe_*.yml scenarios to the default set") { options[:probes] = true }
+    p.on("--runs N", Integer, "runs per scenario (forwarded verbatim)") { |n| options[:runs] = n }
+    p.on("--app NAME", %w[both pi tart], "which app(s) (forwarded verbatim)") { |a| options[:app] = a }
+    p.on("--tart-dir PATH", "tart checkout (forwarded verbatim)") { |v| options[:tart_dir] = v }
+    p.on("--pi-bin PATH", "oracle pi binary (forwarded verbatim)") { |v| options[:pi_bin] = v }
+    p.on("--list", "print the plan and run NOTHING") { options[:list] = true }
+  end
+  parser.parse!(argv)
+  rig_failure("unexpected arguments: #{argv.join(' ')}\n#{usage_line}") unless argv.empty?
+  rig_failure("--jobs must be a positive integer (got #{options[:jobs].inspect})") unless options[:jobs].is_a?(Integer) && options[:jobs] >= 1
+  options
+rescue OptionParser::ParseError => e
+  rig_failure("#{e.message}\n#{usage_line}")
+end
+
+def scenario_entries(paths)
+  paths.map { |path| {name: File.basename(path, ".yml"), path: File.expand_path(path)} }
+end
+
+def discover_set(probes)
+  entries = scenario_entries(Dir.glob(File.join(SCENARIOS_DIR, "s*.yml")).sort)
+  entries += scenario_entries(Dir.glob(File.join(SCENARIOS_DIR, "probe_*.yml")).sort) if probes
+  entries
+end
+
+def select_entries(universe, only)
+  universe_names = universe.map { |e| e[:name] }
+  only.split(",").map do |raw|
+    entry = raw.strip
+    # ".yml" entries are PATH references (battery names are extensionless):
+    # existence is deliberately NOT pre-checked — an unspawnable scenario
+    # surfaces as the child's own exit 2 through the fan-out (Law 8).
+    next {name: File.basename(entry, ".yml"), path: File.expand_path(entry)} if entry.end_with?(".yml")
+
+    hit = universe.find { |e| e[:name] == entry }
+    rig_failure("unknown --only scenario: #{entry} (known: #{universe_names.join(', ')})") unless hit
+    hit
+  end.uniq { |e| e[:name] }
+end
+
+def assign_out_dirs(entries, root)
+  entries.each_with_index.map do |entry, i|
+    nn = format("%02d", i + 1)
+    entry.merge(index: i, out_dir: File.join(root, "sw-#{nn}"))
+  end
+end
+
+def print_plan(assigned, jobs)
+  puts "jobs #{jobs}"
+  assigned.each do |e|
+    puts format("sw-%02d %s %s %s", e[:index] + 1, e[:name], e[:path], e[:out_dir])
+  end
+end
+
+# Law 6: the six HERDR_* keys never reach a child (the standing gate
+# discipline — a sweep from a herdr-attached shell runs gate-shaped).
+# nil values DELETE the keys from the inherited environment (Process.spawn's
+# first-hash arg only MERGES — a full-env copy could not scrub anything).
+def child_env
+  HERDR_KEYS.to_h { |key| [key, nil] }
+end
+
+def child_argv(entry, options)
+  argv = [RIG_BIN, "run", entry[:path], "--out", entry[:out_dir]]
+  argv += ["--runs", options[:runs].to_s] if options[:runs]
+  argv += ["--app", options[:app]] if options[:app]
+  argv += ["--tart-dir", options[:tart_dir]] if options[:tart_dir]
+  argv += ["--pi-bin", options[:pi_bin]] if options[:pi_bin]
+  argv
+end
+
+def spawn_child(entry, options)
+  FileUtils.rm_rf(entry[:out_dir]) # Law 3: idempotent re-sweeps
+  log = File.open("#{entry[:out_dir]}.log", "w")
+  pid =
+    begin
+      Process.spawn(child_env, *child_argv(entry, options), out: log, err: log)
+    rescue SystemCallError => e
+      rig_failure("cannot spawn the rig child for #{entry[:name]}: #{e.class}: #{e.message}")
+    ensure
+      log.close
+    end
+  IN_FLIGHT[pid] = entry
+  {entry: entry, spawned_at: monotonic, pid: pid}
+end
+
+def wait_for_child
+  Process.wait2
+rescue Errno::ECHILD
+  rig_failure("child bookkeeping lost (ECHILD with in-flight children)")
+end
+
+def run_sweep(assigned, options, root)
+  FileUtils.mkdir_p(root)
+  sweep_t0 = monotonic
+  results = Array.new(assigned.size)
+  in_flight = {}
+  queue = assigned.dup
+  until queue.empty? && in_flight.empty?
+    while in_flight.size < options[:jobs] && !queue.empty?
+      job = spawn_child(queue.shift, options)
+      in_flight[job.fetch(:pid)] = job
+    end
+    next if in_flight.empty?
+
+    pid, status = wait_for_child
+    job = in_flight.delete(pid)
+    IN_FLIGHT.delete(pid)
+    next unless job
+
+    entry = job.fetch(:entry)
+    # A signalled child has no exit status — that is a rig failure (2).
+    code = status.exited? ? status.exitstatus : 2
+    results[entry[:index]] = {
+      "name" => entry[:name], "path" => entry[:path], "out_dir" => entry[:out_dir],
+      "exit_code" => code, "wall_ms" => ((monotonic - job.fetch(:spawned_at)) * 1000).round
+    }
+  end
+  wall_ms = ((monotonic - sweep_t0) * 1000).round
+  aggregate = results.map { |r| r.fetch("exit_code") }.max
+
+  assigned.each do |e|
+    r = results[e[:index]]
+    puts format("sw-%02d %-30s ec=%d wall=%5dms out=%s", e[:index] + 1, e[:name],
+                r.fetch("exit_code"), r.fetch("wall_ms"), r.fetch("out_dir"))
+  end
+  File.write(File.join(root, "sweep-report.json"), JSON.pretty_generate(
+    "set" => assigned.map { |e| e[:name] },
+    "jobs" => options[:jobs],
+    "scenarios" => results,
+    "aggregate_exit_code" => aggregate,
+    "wall_ms" => wall_ms
+  ) + "\n")
+  puts format("sweep: %d (%d scenarios, %.1fs, jobs %d)", aggregate, results.size,
+              wall_ms / 1000.0, options[:jobs])
+  aggregate
+end
+
+def main(argv)
+  install_signal_guards
+  options = parse_options(argv)
+  universe = discover_set(options[:probes])
+  entries = options[:only] ? select_entries(universe, options[:only]) : universe
+  rig_failure("no scenarios selected (scenarios dir: #{SCENARIOS_DIR})") if entries.empty?
+  # Deterministic sweep order (Law 3's ordinals ride it) — reap order would
+  # make the report non-deterministic under fan-out.
+  root = root_for(options)
+  assigned = assign_out_dirs(entries.sort_by { |e| e[:name] }, root)
+  if options[:list]
+    print_plan(assigned, options.fetch(:jobs))
+    exit(0)
+  end
+
+  exit(run_sweep(assigned, options, root))
+end
+
+def root_for(options)
+  options[:out] ? File.expand_path(options[:out]) : REPO_ROOT
+end
+
+main(ARGV)
