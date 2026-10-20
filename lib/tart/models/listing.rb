@@ -80,8 +80,16 @@ module Tart
             response = client.get("/models", headers: {"Authorization" => "Bearer #{api_key}",
                                                        "Accept" => "application/json"})
             begin
-              body = response.status == 200 ? response.read : nil
-              body ? parse_ids(body) : nil
+              # ALWAYS release the response body before closing the client:
+              # an UNREAD non-200 body leaves the connection a busy pool
+              # resource, and `client.close` below blocks in the pool's
+              # unbounded wait_until_free (async-pool controller.rb:145)
+              # until the outer with_timeout fires — the measured ~6 s
+              # teardown stall (timeout + JOIN_MARGIN). Reading the body
+              # drains it and frees the connection, so the close returns
+              # immediately on every status; only a 200 body is parsed.
+              body = response.read
+              body && response.status == 200 ? parse_ids(body) : nil
             ensure
               client.close
             end
