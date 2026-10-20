@@ -184,7 +184,7 @@ module TuiSplitRig
       staged = boot_session(app, mock, n, stage)
       session = staged[:session]
 
-      boot = settle(session, "boot")
+      boot = settle(session, "boot", require_content: true)
       alive = session_exists?(session)
       # The scenario's resize knob (the s16 instrument, I56): after the boot
       # settle, BEFORE the paste/prompt block — resize-window moves a
@@ -658,13 +658,26 @@ module TuiSplitRig
       Open3.capture2("tmux", "capture-pane", "-e", "-p", "-t", session, err: IO::NULL)[0].to_s
     end
 
-    def settle(session, label)
+    # The boot settle's require_content arm (I83, escape-hatch — disclosed
+    # in the Builder Report): 3 IDENTICAL captures also settle a BLANK
+    # pre-first-render screen — under a ≥13-way simultaneous boot storm
+    # (the sweep-crosstalk shape) the app's first render can exceed the
+    # ~750 ms quiet window, the boot then "settles" on emptiness (measured:
+    # failing tarts boot_settle_ms ≈ 783-791 vs 1323-1345 when the banner
+    # rendered during settle), the prompt is sent before the app arms its
+    # input reader, and the app discards the pending pty input —
+    # completed=false, rig exit 2. A blank capture is never a valid
+    # boot-settled state (both apps render a banner/motd first); the reply
+    # and post-settle settles keep the exact byte-frozen semantics
+    # (require_content defaults false — a dead pane's empty capture still
+    # settles them).
+    def settle(session, label, require_content: false)
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       last = nil
       same = 0
       loop do
         current = capture(session)
-        same = current == last ? same + 1 : 0
+        same = current == last && (!require_content || !current.strip.empty?) ? same + 1 : 0
         last = current
         elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
         return {label:, ms: (elapsed * 1000).round, timed_out: false} if same >= QUIET_POLLS
