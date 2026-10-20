@@ -476,7 +476,8 @@ module Tart
       File.write(transcript, "{\"type\":\"session_start\"}\n")
       pid = Process.spawn("sleep", "0.05")
       Process.detach(pid)
-      sleep 0.5
+      # Poll the sleeper's exit (and reap) instead of a fixed 0.5 s window.
+      wait_until { !system("ps -p #{pid} >/dev/null 2>&1") }
       File.write(File.join(dir, "status.json"), JSON.generate(
         {"id" => id, "agent" => "worker", "task" => nil, "taskChars" => 5, "mode" => "single",
          "state" => "running", "pid" => pid, "cwd" => @cwd, "asyncDir" => dir,
@@ -673,15 +674,17 @@ module Tart
     end
 
     def test_steer_receipts_and_the_correlated_consumption_log
-      # A 200-char slow stream ≈ 20s (the mock pauses 0.1s per char) — a
-      # wide, deterministic steer window.
+      # A 20-char slow stream ≈ 2 s (the mock pauses 0.1s per char) — the
+      # minimum that still outlasts the steer action by ≥3× margin.
       @server.script([
-        {type: :slow_stream, content: "x" * 120, chunk_every: 0.3},
+        {type: :slow_stream, content: "x" * 20, chunk_every: 0.3},
         {type: :stream, content: "steered answer"}
       ])
       manager = new_manager
       run = manager.spawn_run(agent: "worker", task: "steer me", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      sleep 0.5 # the child is mid-stream (the boundary is ~12s away)
+      # The child is mid-stream — its first captured request is the marker
+      # (boot-time tolerant: the poll waits out the real child boot).
+      wait_until { @server.request_count >= 1 }
 
       # The request file format — the follow_up write waits in the inbox
       # while the child streams (no boundary until the stream ends).
@@ -718,7 +721,7 @@ module Tart
     end
 
     def test_steer_receipt_vocabulary
-      @server.script([{type: :slow_stream, content: "x" * 120, chunk_every: 0.3}, {type: :stream, content: "done"}])
+      @server.script([{type: :slow_stream, content: "x" * 20, chunk_every: 0.3}, {type: :stream, content: "done"}])
       manager = new_manager
       run = manager.spawn_run(agent: "worker", task: "t", async: true, timeout_ms: 0, tool_timeout_ms: 0)
 
@@ -750,7 +753,7 @@ module Tart
       @server.script([{type: :slow_stream, content: "s" * 200, chunk_every: 0.5}, {type: :stream, content: "never"}])
       manager = new_manager
       run = manager.spawn_run(agent: "worker", task: "stop target", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      sleep 0.4
+      wait_until { manager.runs.first[:state] == :running } # the child is in flight
       assert_equal :running, manager.runs.first[:state]
 
       receipt = manager.stop(id: run[:id])
@@ -763,7 +766,8 @@ module Tart
       status = JSON.parse(File.read(File.join(settled[:dir], "status.json")))
       assert_equal "stopped", status["state"]
       assert_equal false, status["timedOut"]
-      sleep 0.5
+      # Poll the zombie's absence instead of a fixed 0.5 s window.
+      wait_until { `ps -o stat= -p #{settled[:pid]} 2>/dev/null`.strip.empty? }
       assert_empty `ps -o stat= -p #{settled[:pid]} 2>/dev/null`.strip,
                    "no zombie — Process.detach owns the reap"
     end

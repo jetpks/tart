@@ -70,6 +70,24 @@ module Tart
       assert_equal 1, @server.request_count
     end
 
+    # The teardown-bounded close (I82 Law 1): the non-200 failure path
+    # releases the response body before `client.close`, so the fetch
+    # returns PROMPTLY — the base tree stalls ~6.0 s here (timeout 5 +
+    # JOIN_MARGIN 1) because the unread body leaves the connection a busy
+    # pool resource and the close blocks in the pool's unbounded drain
+    # wait. Same wire bytes, one attempt, nil — just a fast nil.
+    def test_non_200_failure_path_returns_promptly
+      @server.script([{type: :models, ids: [], status: 500}])
+
+      t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      result = Models::Listing.fetch(base_url: @server.url, api_key: "k", timeout: 1)
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+
+      assert_nil result, "non-200 ⇒ nil, nothing raised"
+      assert_operator elapsed, :<, 2.5,
+        "the failure path must not ride the pool-drain stall (base ~6.0 s); elapsed=#{elapsed.round(3)}s"
+    end
+
     def test_data_less_body_returns_nil
       @server.script([{type: :models, raw: JSON.generate({object: "list"})}])
 
