@@ -1,0 +1,5 @@
+ async subagent · background
+   ◖SPIN◗ reviewer [fresh] · running (mock/mock-1)
+     ⎿  thinking…
+     Press ctrl+o for live detail
+     output: ◖PATH◗

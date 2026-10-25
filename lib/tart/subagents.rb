@@ -210,6 +210,15 @@ module Tart
 
     module_function
 
+    class << self
+      # Law 3 — the register slot: the ONE bin/tart-untouched reach from
+      # the boot wiring to the Chat surface (bin/tart is hard-frozen; the
+      # surface is built before register runs). {register} records the
+      # Manager here; print boots and tests never set it — nil renders no
+      # box.
+      attr_accessor :current_manager
+    end
+
     # The boot wiring's single entry (called ONLY when the resolved
     # settings gate is on — OQ-1): builds the {Manager}, constructs and
     # ARMS the {SupervisorChannel} (I49 — the same kernel/agent objects as
@@ -235,6 +244,7 @@ module Tart
       channel.start
       manager.supervisor_channel = channel
       hooks.register_tool(Tools::Subagent.new(manager:))
+      self.current_manager = manager
       manager
     end
 
@@ -245,6 +255,50 @@ module Tart
     def home(env: ENV, identity: Identity::DEFAULT)
       env[Identity.env_key(identity, "SUBAGENTS_HOME")] ||
         File.join(Agent::Session.default_root, "subagents")
+    end
+
+    # --- I81 Law 2 — the nested-grant depth law (pi-subagents 0.79.1
+    # --- shared/types.js:134-201, verbatim semantics; this module is the
+    # --- port's types.js analog) ---
+
+    # pi DEFAULT_SUBAGENT_MAX_DEPTH (types.js:134).
+    DEFAULT_MAX_SUBAGENT_DEPTH = 2
+
+    module_function
+
+    # A session's OWN depth (resolveCurrentSubagentDepth): the
+    # <IDENTITY>_SUBAGENTS_DEPTH env — a non-negative integer; absent or
+    # invalid → 0 (the top level).
+    def resolve_subagent_depth(env:, identity: Identity::DEFAULT)
+      normalize_non_negative_integer(env[Identity.env_key(identity, "SUBAGENTS_DEPTH")]) || 0
+    end
+
+    # A session's max depth (resolveCurrentMaxSubagentDepth): the
+    # <IDENTITY>_SUBAGENTS_MAX_DEPTH env — a non-negative integer; absent
+    # or invalid → the default 2.
+    def resolve_subagent_max_depth(env:, identity: Identity::DEFAULT)
+      normalize_non_negative_integer(env[Identity.env_key(identity, "SUBAGENTS_MAX_DEPTH")]) ||
+        DEFAULT_MAX_SUBAGENT_DEPTH
+    end
+
+    # pi checkSubagentDepth (types.js:188-195): blocked when depth >= max.
+    def subagent_depth_blocked?(depth:, max:)
+      depth >= max
+    end
+
+    # pi's blocked-spawn bytes VERBATIM (subagent-executor.js:6983-6993)
+    # — the raise the Manager's spawn_run carries through the existing
+    # {error:} tool-result path.
+    def nested_subagent_blocked_message(depth:, max:)
+      "Nested subagent call blocked (depth=#{depth}, max=#{max}). You are running at the maximum subagent nesting depth. " \
+        "Complete your current task directly without delegating to further subagents."
+    end
+
+    # pi normalizeNonNegativeInteger (types.js:177-183): number-or-string
+    # → integer ≥ 0, else nil (the callers apply their own fallback).
+    def normalize_non_negative_integer(value)
+      parsed = value.is_a?(Integer) ? value : Integer(value.to_s, 10) rescue nil
+      parsed.is_a?(Integer) && parsed >= 0 ? parsed : nil
     end
 
     # The model routing (Grounds §6): `spec` is "provider/id" or
@@ -274,6 +328,23 @@ module Tart
       if provider.empty? || model_id.empty?
         raise ArgumentError,
               "model must be provider/id (got #{spec.inspect}); valid levels: #{LEVELS.join(", ")}"
+      end
+
+      # I78 Law 4 — the registry consult on the dormant catalog: kwarg (pi
+      # resolveRequiredSubagentModelCandidate). catalog nil = parse-only
+      # (byte-identical for every pre-I78 caller); an EMPTY registry never
+      # validates (pi's never-validate-without-a-registry law — a corrupt
+      # models.json must not turn dispatch into a raise); the fallback
+      # (parent) pair is exempt (the inherited model is the session's live
+      # model — provider+id, level ignored); otherwise the explicit spec
+      # is valid iff it resolves through the catalog's exact-match
+      # Config#resolve (the I71-frozen law — NO fuzzy machinery). The
+      # rejection names the RAW requested string verbatim, pi's
+      # interpolation.
+      if catalog && !catalog.model_entries.empty? &&
+         !(fallback.is_a?(Array) && fallback[0] == provider && fallback[1] == model_id) &&
+         catalog.resolve("#{provider}/#{model_id}").nil?
+        raise ArgumentError, "Unknown subagent model '#{spec}' in the active Pi model registry."
       end
 
       [provider, model_id, suffix || (fallback.is_a?(Array) ? fallback[2] : nil)]

@@ -26,14 +26,26 @@ module Tart
         NAME_MESSAGE = "must be a safe file name using only letters, numbers, dots, underscores, and hyphens.".freeze
 
         # The tool universe (Spec §2): the seven builtins + the intercom
-        # tool. The pinned unknown-tool failure names this set sorted.
-        TOOLS_UNIVERSE = %w[read edit write bash find grep ls contact_supervisor].freeze
+        # tool. I81 Law 1 widens it by EXACTLY one name — `subagent` (the
+        # nested-grant law's contract leg); `rm_rf` etc. stay unknown (the
+        # tools_test.rb:114 pin survives). The retired unknown-tool REJECT
+        # is gone (pi never validates names at load — agents.js:739-741
+        # shape only); the warn-and-drop diagnostic in profiles.rb names
+        # this set sorted.
+        TOOLS_UNIVERSE = %w[read edit write bash find grep ls contact_supervisor subagent].freeze
 
         # pi's comma form (a string splits on ","; an array passes through).
+        # I81 Law 1: the contract's tools rule validates SHAPE ONLY — a
+        # structurally invalid value still fails (today's bytes); unknown
+        # NAMES are dropped at profile build (pi's loadout parity), never
+        # rejected here.
         TOOLS_SHAPE_MESSAGE = "tools must be a comma-separated string or an array of strings"
 
-        def self.unknown_tool_message(name)
-          "unknown tool #{name} (valid tools: #{TOOLS_UNIVERSE.sort.join(", ")})"
+        # I81 Law 1 — the warn-and-drop diagnostic text (pi has no warn
+        # analog; the port-own vocabulary). ONE per affected file; <names>
+        # is the dropped entries in declaration order, comma+space joined.
+        def self.unknown_tools_dropped_message(names)
+          "unknown tool(s) #{names.join(", ")} — dropped (valid tools: #{TOOLS_UNIVERSE.sort.join(", ")})"
         end
 
         def self.thinking_message
@@ -65,16 +77,12 @@ module Tart
         rule(:tools) do
           next if value.nil?
 
+          # I81 Law 1: SHAPE ONLY (pi agents.js:739-741 — names never
+          # validate at load). Unknown names flow to the profile build,
+          # which drops them and emits the warn-and-drop diagnostic.
           list = value.is_a?(String) ? value.split(",") : value
           unless list.is_a?(Array) && list.all? { |item| item.is_a?(String) }
             key.failure(ProfileFields::TOOLS_SHAPE_MESSAGE)
-            next
-          end
-
-          list.map(&:strip).reject(&:empty?).each do |name|
-            next if ProfileFields::TOOLS_UNIVERSE.include?(name)
-
-            key.failure(ProfileFields.unknown_tool_message(name))
           end
         end
 

@@ -673,12 +673,14 @@ module Tart
     # loop_test; ctrl+c is app.clear. The kernel's trap net keeps the
     # interrupted?-or-stop contract for real signals.)
     def test_kernel_interrupt_cancels_in_flight_turn
-      @server.script([{type: :slow_stream, content: "x" * 40}])
+      @server.script([{type: :slow_stream, content: "x" * 12}])
       agent, events = agent_on_kernel
 
       kernel = Core::Loop.new(session: ScriptedSession.new)
       th = Thread.new do
-        sleep 0.3 # the turn is streaming (40 chars × 0.1 s pauses)
+        # the turn is streaming — the captured request is the mid-stream
+        # marker (12 chars × 0.1 s pauses ≈ 1.2 s of stream remain)
+        wait_until { @server.request_count >= 1 }
         Process.kill("INT", Process.pid)
       end
       kernel.run { agent.run("long stream") }
@@ -740,11 +742,11 @@ module Tart
 
     # AC2 (the interrupt gate): an interrupt during a live stream ABORTS the
     # in-flight request (the Async::Cancel lands in the streaming HTTP read
-    # — probe3 ARM1; the full scripted stream would run ≈ 4 s) and emits NO
+    # — probe3 ARM1; the full scripted stream would run ≈ 1.2 s) and emits NO
     # error terminal: interrupted? true, last_error nil, agent_end carries
     # interrupted: true and no :error key, no message_end with error: true.
     def test_interrupt_mid_stream_aborts_request_no_error_terminal
-      @server.script([{type: :slow_stream, content: "x" * 40}])
+      @server.script([{type: :slow_stream, content: "x" * 12}])
       agent, events = agent_on_kernel
 
       wall = nil
@@ -758,7 +760,7 @@ module Tart
           end
         end
         root.async do
-          sleep 0.3 # mid-stream (40 chars × 0.1 s pauses)
+          wait_until { @server.request_count >= 1 } # mid-stream
           turn.stop
         end
         begin
@@ -768,7 +770,7 @@ module Tart
         end
       end
 
-      assert_operator wall, :<, 2.0, "the request ABORTED (the full stream runs ≈ 4 s); wall=#{wall.round(2)}s"
+      assert_operator wall, :<, 2.0, "the request ABORTED (the full stream runs ≈ 1.2 s); wall=#{wall.round(2)}s"
       assert agent.interrupted?
       assert_nil agent.last_error
       end_event = events.find { |e| e[:type] == :agent_end }
@@ -785,7 +787,7 @@ module Tart
     # ARM2); de-bridged, the unwind consumes it (the Cancel arm) — the NEXT
     # run on the same chat makes a FRESH request and completes.
     def test_run_after_an_interrupt_makes_a_fresh_request
-      @server.script([{type: :slow_stream, content: "x" * 40}])
+      @server.script([{type: :slow_stream, content: "x" * 12}])
       agent, = agent_on_kernel
 
       Async do |root|
@@ -797,7 +799,7 @@ module Tart
           end
         end
         root.async do
-          sleep 0.3 # mid-stream
+          wait_until { @server.request_count >= 1 } # mid-stream
           turn.stop
         end
         begin
@@ -837,7 +839,9 @@ module Tart
           end
         end
         root.async do
-          sleep 0.1 # ~0.1 s into the 0.5 s batch
+          # ~the first tool's start — the interrupt lands inside the 0.5 s
+          # sleep batch (the abort-fast property pins the remaining span)
+          wait_until { stamped_events(stamped, :tool_execution_start).any? }
           cancel_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           turn.stop
         end
@@ -876,7 +880,12 @@ module Tart
 
       entries = Agent::Session.load_entries(recorder.path)
       assistants = entries.select { |entry| entry.dig("message", "role") == "assistant" }
-      frozen = {"role" => "assistant", "tool_calls" => {}, "finish_reason" => "stop",
+      # I77 RE-PIN (AMENDMENT 2026-10-18T19:56Z, escalation-seat ruling): the
+      # identity law projects the running model identity on every MODEL-BEARING
+      # assistant — this mock chat's pair rides immediately after tool_calls;
+      # the model-less/failure/user/tool shapes stay untouched.
+      frozen = {"role" => "assistant", "tool_calls" => {}, "provider" => "mock",
+                "model" => "tart-test-model", "finish_reason" => "stop",
                 "input_tokens" => 10, "output_tokens" => 5, "cache_write_tokens" => 0}
       assert_equal frozen.merge("content" => "the frozen reply"),
         assistants[0]["message"],
@@ -1598,7 +1607,7 @@ module Tart
 
       # The Async::Cancel arm: the interrupt's trace stays empty (the D3
       # conversion re-raises; run()'s rescue owns the bookkeeping).
-      @server.script([{type: :slow_stream, content: "x" * 40}])
+      @server.script([{type: :slow_stream, content: "x" * 12}])
       interruptee, interrupt_events = agent_on_kernel
       Async do |root|
         turn = root.async do
@@ -1609,7 +1618,7 @@ module Tart
           end
         end
         root.async do
-          sleep 0.3 # mid-stream
+          wait_until { @server.request_count >= 1 } # mid-stream
           turn.stop
         end
         begin
@@ -1791,14 +1800,16 @@ module Tart
       inbox = File.join(@dir, "control", "steer-requests")
       FileUtils.mkdir_p(inbox)
       @server.script([
-        {type: :slow_stream, content: "x" * 80, chunk_every: 0.1},
+        {type: :slow_stream, content: "x" * 12, chunk_every: 0.1},
         {type: :message, content: "steered reply"},
       ])
       agent, = agent_on_kernel(steer_inbox: inbox)
       thread = run_in_background(agent, "start the work")
 
-      # Mid-stream: the request file lands while the turn runs.
-      sleep 0.4
+      # Mid-stream: the request file lands while the turn runs — the
+      # captured request is the marker (12 chars × 0.1 s pauses of stream
+      # remain, ≥3× the write+consume action).
+      wait_until { @server.request_count >= 1 }
       request_id = "req-#{object_id}"
       File.write(File.join(inbox, "0001700000000000-#{request_id}.json"),
                  JSON.generate({"type" => "steer", "id" => request_id, "ts" => 1_700_000_000_000,
@@ -1822,11 +1833,12 @@ module Tart
     def test_stop_file_interrupts_the_run_at_the_boundary
       stop_dir = File.join(@dir, "control", "stop-requests")
       FileUtils.mkdir_p(stop_dir)
-      @server.script([{type: :slow_stream, content: "x" * 80, chunk_every: 0.1}])
+      @server.script([{type: :slow_stream, content: "x" * 12, chunk_every: 0.1}])
       agent, events = agent_on_kernel(steer_inbox: File.join(@dir, "control", "steer-requests"))
       thread = run_in_background(agent, "long stream")
 
-      sleep 0.4
+      # mid-stream (the captured request is the marker)
+      wait_until { @server.request_count >= 1 }
       File.write(File.join(stop_dir, "0001700000000000-stop.json"),
                  JSON.generate({"type" => "stop", "ts" => 1_700_000_000_000}))
       join_run(thread)
@@ -1842,13 +1854,14 @@ module Tart
       inbox = File.join(@dir, "control", "steer-requests")
       FileUtils.mkdir_p(inbox)
       @server.script([
-        {type: :slow_stream, content: "x" * 80, chunk_every: 0.1},
+        {type: :slow_stream, content: "x" * 12, chunk_every: 0.1},
         {type: :message, content: "steered reply"},
       ])
       agent, = agent_on_kernel(steer_inbox: inbox)
       thread = run_in_background(agent, "start the work")
 
-      sleep 0.4
+      # mid-stream (the captured request is the marker)
+      wait_until { @server.request_count >= 1 }
       File.write(File.join(inbox, "0001700000000001-garbage.json"), "{not json")
       File.write(File.join(inbox, "0001700000000002-ok.json"),
                  JSON.generate({"type" => "steer", "id" => "req-ok", "ts" => 1_700_000_000_002,
@@ -1902,10 +1915,10 @@ module Tart
 
     # A wake landing mid-run no-ops (race-safe: one Loop one fiber).
     def test_wake_noops_while_a_run_is_in_flight
-      @server.script([{type: :slow_stream, content: "x" * 40, chunk_every: 0.1}])
+      @server.script([{type: :slow_stream, content: "x" * 12, chunk_every: 0.1}])
       agent, = agent_on_kernel
       thread = run_in_background(agent, "long stream")
-      sleep 0.3
+      wait_until { agent.running? } # the run is in flight (mid-stream)
       assert agent.running?, "the run is in flight"
 
       result = nil

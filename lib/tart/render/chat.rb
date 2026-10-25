@@ -16,9 +16,13 @@ require_relative "picker"
 require_relative "model_menu"
 require_relative "selection"
 require_relative "viewport"
+require_relative "subagent_box"
 require_relative "slash_source"
 require_relative "transcript"
 require_relative "../models"
+# Law 3 — the box's data seam: the Chat surface reaches the boot-wired
+# Manager through {Subagents.current_manager} (bin/tart is hard-frozen).
+require_relative "../subagents"
 require_relative "../shapes/model"
 require_relative "../shapes/session"
 
@@ -70,6 +74,23 @@ module Tart
       # widgets/pending/status containers — itemized cuts, as ever):
       # transcript + spacer(1) + editor + footer.
       DOCK_SPACER_ROWS = 1
+
+      # I79 Law 2 — the subagent box's cadences (pi's own constants): the
+      # ≤5s fleet sweep (async-job-tracker.js:22
+      # DEFAULT_LIVENESS_INTERVAL_MS = 5000 — a fixed-rate POLL that draws
+      # only on observable change, never a fixed-rate render) and the 1s
+      # glyph animation tick (types.js:132 WIDGET_ANIMATION_INTERVAL_MS,
+      # armed only while a visible row runs).
+      BOX_SWEEP_INTERVAL_SECONDS = 5.0
+      BOX_GLYPH_INTERVAL_SECONDS = 1.0
+
+      # The absent box's widget (zero rows, constraint 0) — a shared
+      # immutable Paragraph so the absent path allocates nothing per frame
+      # (Law 2, the BP floors).
+      NO_BOX_WIDGET = TUI.paragraph(text: [], wrap: false)
+
+      # The absent box's rows (shared frozen array — no allocation).
+      NO_BOX_ROWS = [].freeze
 
       # Smallest editor area: top border, one input row, bottom border (pi
       # chat-viewport.ts:33 editor minSize 3).
@@ -303,6 +324,16 @@ module Tart
         # first status-kind start re-anchors it ({restart_spinner!}).
         @clock = clock
         @spinner_started_at = nil
+        # I79 Law 2 — the box's render-key cache ([key, rows]) and its tick
+        # handles: the row set rebuilds only on an observable snapshot
+        # change, a 1s glyph frame boundary, or a width change; the sweep
+        # task arms once per Manager; the glyph tick arms while any visible
+        # row runs. @box_sweep_task/@box_glyph_tick are reactor-task
+        # handles; nil = not armed.
+        @box_cache = nil
+        @box_sweep_task = nil
+        @box_glyph_tick = nil
+        @box_running = false
         # The footer state machine (I24 wave 4): the branch cache and the
         # usage accounting (pi footer-data-provider.ts + footer.ts), fed
         # the launcher facts per frame from {@footer_data}.
@@ -473,6 +504,7 @@ module Tart
         # event queue (the I02 static-loop property). The retired
         # re-arm rendered 60 frames/s where pi renders on request ≈ 22/s
         # on the identical stream (Grounds §2 — the burn).
+        arm_box_ticks
         widget
       end
 
@@ -1389,7 +1421,16 @@ module Tart
       # pending block — pi's document-area shrink: the TRANSCRIPT yields,
       # the editor/footer never move).
       def transcript_area_rows(height = screen_height)
-        [height - editor_area_rows(height) - FOOTER_ROWS - dock_spacer_rows(height) - pending_rows, 1].max
+        [height - editor_area_rows(height) - FOOTER_ROWS - dock_spacer_rows(height) - pending_rows -
+         box_row_count, 1].max
+      end
+
+      # The box's row count for the transcript-area math (the transcript
+      # yields to the box exactly like it yields to the pending block —
+      # pi's document-area shrink; the editor/footer never move). Zero
+      # without a Manager — the cached read makes the repeat call free.
+      def box_row_count
+        Subagents.current_manager ? subagent_box_rows.size : 0
       end
 
       # --- mouse: wheel scroll + transcript selection (items 6/10, pi
@@ -1608,11 +1649,17 @@ module Tart
         transcript_rows = transcript_area_rows(height)
         spacer_rows = dock_spacer_rows(height)
         pending = pending_rows
+        # I79 Law 2 — the box's widgetsAbove slot (pi chat-viewport.ts:29-34
+        # — the container renders between pendingMessages and the editor): a
+        # separate layout child, zero rows when no run is visible, so the
+        # absent frame composes byte-identically to the base layout.
+        box_rows = subagent_box_rows
         TUI.layout(
           children: [
             transcript_widget(transcript_rows),
             dock_spacer_widget,
             pending_widget(pending),
+            box_widget(box_rows),
             picker_or_menu_widget || editor_widget,
             footer_widget,
           ],
@@ -1620,6 +1667,7 @@ module Tart
             TUI.constraint_min(transcript_rows),
             TUI.constraint_length(spacer_rows),
             TUI.constraint_length(pending),
+            TUI.constraint_length(box_rows.size),
             TUI.constraint_length(editor_rows),
             TUI.constraint_length(FOOTER_ROWS),
           ]
@@ -1651,6 +1699,93 @@ module Tart
       # the editor (AC2).
       def dock_spacer_widget
         TUI.paragraph(text: [Panel.blank_line], wrap: false)
+      end
+
+      # --- the subagent status box (I79 Law 2) ---
+
+      # @return the box's widget for one frame: the render-key-cached rows
+      #   as a Paragraph, or the shared absent widget (zero rows, zero
+      #   allocation) when no run is visible.
+      def box_widget(rows)
+        return NO_BOX_WIDGET if rows.empty?
+
+        TUI.paragraph(text: rows, wrap: false)
+      end
+
+      # The box's cached row set (Law 2): rebuilt only when the snapshot's
+      # observable key changes, a 1s glyph frame boundary passes while a
+      # row runs, or the width changes — streaming, scrolling, resize and
+      # mounted pickers never drop or duplicate the box. The cache rides
+      # the surface mutex (the render frame's context).
+      def subagent_box_rows
+        manager = Subagents.current_manager
+        @box_running = false
+        return NO_BOX_ROWS unless manager
+
+        rows = manager.box_snapshot.fetch(:rows)
+        # The absent-box short-circuit (Law 2): no visible run → the shared
+        # frozen rows, no key computation, no allocation — the sweep tick's
+        # changed-detection carries the reappearance paint.
+        return NO_BOX_ROWS if rows.empty?
+
+        # The box's clock is WALL time in ms (pi Date.now — the record
+        # facts startedAt/lastUpdate/endedAt are wall-clock; the retention
+        # window and the elapsed/age spans must compare like against like).
+        # The 1s glyph frame bucket derives from the same clock (pi's
+        # WIDGET_ANIMATION_INTERVAL_MS: the frame advances on TIME).
+        now = (Time.now.to_f * 1000).to_i
+        @box_running = rows.any? { |row| row[:state] == "running" }
+        key = [SubagentBox.render_key(rows, now), viewport_width]
+        cache = @box_cache
+        return cache[1] if cache && cache[0] == key
+
+        lines = SubagentBox.render(rows:, now:, frame: (now / 1000), width: viewport_width,
+                                   main_level: thinking_level || "off")
+        @box_cache = [key, lines]
+        lines
+      end
+
+      # The box's tick arms/cancels (reactor context — render_frame): the
+      # ≤5s sweep task arms once per Manager (pi's liveness interval — the
+      # adoption path for foreign/staged dirs, drawing only on observable
+      # change); the 1s glyph tick arms while any visible row runs and
+      # cancels with the last one (I58 — the armed state paints frame 0
+      # itself; the tick only paces the paints).
+      def arm_box_ticks
+        manager = Subagents.current_manager
+        if manager && @box_sweep_task.nil?
+          @box_sweep_task = @kernel.async { box_sweep_loop(manager) }
+        end
+        if @box_running
+          @box_glyph_tick ||= @kernel.tick(BOX_GLYPH_INTERVAL_SECONDS)
+        elsif @box_glyph_tick
+          task = @box_glyph_tick
+          @box_glyph_tick = nil
+          task&.stop
+        end
+      end
+
+      # The sweep loop (a reactor task): the Manager's I78 fleet sweep at
+      # the ≤5s cadence; a stale cache requests exactly one draw. The
+      # staleness predicate is the cache key vs the fresh snapshot — the
+      # retirement drop and every reconcile-mutation between frames paint
+      # through this (nothing renders without the request, the I58
+      # discipline).
+      def box_sweep_loop(manager)
+        loop do
+          sleep BOX_SWEEP_INTERVAL_SECONDS
+          break unless Subagents.current_manager.equal?(manager)
+
+          manager.box_sweep
+          @kernel.request_draw if box_cache_stale?(manager)
+        end
+      end
+
+      def box_cache_stale?(manager)
+        rows = manager.box_snapshot.fetch(:rows)
+        now = (Time.now.to_f * 1000).to_i
+        fresh = [SubagentBox.render_key(rows, now), viewport_width]
+        @box_cache ? @box_cache[0] != fresh : rows.any?
       end
 
       # The pending block's row count (pi updatePendingMessagesDisplay

@@ -9,6 +9,12 @@ require "time"
 require_relative "../agent/session"
 require_relative "../child_env"
 require_relative "../identity"
+# The box seam's retention/observation-key law lives with the renderer
+# (Law 1's frozen constants); the sweep diffs through it (Law 2).
+require_relative "../render/subagent_box"
+# I78 Law 4: the validation seat loads the model catalog from the same
+# staged root the Manager carries (`Models.load(root: @root)`).
+require_relative "../models"
 
 # I74: the session-sink module rides THIS require site — the sink is
 # coupled to the child-capture law (child_env's five picks feed the
@@ -31,8 +37,9 @@ module Tart
     # stop-requests/, steer-log.jsonl}, sessions/}`. status.json is
     # written atomically (temp+rename — pi control-channel's idiom) at
     # spawn and at every transition; result.json is written BEFORE the
-    # terminal status flip; the task text is NEVER recorded (taskChars
-    # only — pi's redaction). Process.detach owns every child reap (no
+    # terminal status flip; status.task carries the RAW spawn task
+    # verbatim (I81 Law 3 — taskChars the raw char count; the I79 box
+    # never renders a task row). Process.detach owns every child reap (no
     # waitpid anywhere here — no early reap, no zombie); a run settles
     # only on observed exit (EOF on the child-held sentinel fd, or ESRCH
     # on both pid and pgid), and status reads reconcile from disk so a
@@ -67,11 +74,22 @@ module Tart
 
       TERMINAL_STATES = %w[completed failed stopped].freeze
 
+      # I80 encoding hygiene — Law 1's floor value (the owner's measured
+      # machine locale): set as LC_ALL (overriding a present non-UTF-8
+      # value, which would mask LC_CTYPE) or LC_CTYPE (masking a non-UTF-8
+      # LANG) whenever the child's effective charset key is not UTF-8 —
+      # MRI's default_external follows LC_ALL > LC_CTYPE > LANG, and a
+      # locale-less child boots US-ASCII (the devstral-docs failure class).
+      UTF8_LOCALE = "en_US.UTF-8".freeze
+
       # pi fleet-view.js:391, byte-exact — the empty-fleet status line.
       FLEET_EMPTY_LINE = "No active subagent fleet. Background runs that already finished are available " \
                          "through completion notifications or subagent({ action: \"status\", id: \"...\" }).".freeze
 
       attr_reader :cwd, :home, :identity, :root
+      # I81 Law 2 — this session's own depth facts (read at construction;
+      # the spawn check + the child env picks ride them).
+      attr_reader :subagent_depth, :subagent_max_depth
       # The parent-side supervisor channel (I49): register() constructs and
       # arms it; #shutdown stops it; the `subagent` tool's reply/pending
       # actions read it (a bare Manager — tests — carries nil, and the
@@ -104,6 +122,12 @@ module Tart
         @identity = identity
         @root = root
         @hooks = hooks
+        # I81 Law 2 — the depth ladder, read ONCE at construction from
+        # this session's env (pi resolveCurrentSubagentDepth /
+        # resolveCurrentMaxSubagentDepth): own depth (absent/invalid → 0)
+        # and max (absent/invalid → the default 2).
+        @subagent_depth = Subagents.resolve_subagent_depth(env: @env, identity: @identity)
+        @subagent_max_depth = Subagents.resolve_subagent_max_depth(env: @env, identity: @identity)
         @kernel = kernel
         @agent = agent
         @arm_deadline_supervisor = arm_deadline_supervisor
@@ -132,6 +156,16 @@ module Tart
       # settled state.
       def spawn_run(agent:, task:, async:, model: nil, timeout_ms: nil, tool_timeout_ms: nil,
                     tool_call_id: nil, parent_session: nil)
+        # I81 Law 2 — the depth check FIRST (pi checkSubagentDepth,
+        # subagent-executor.js:6983-6993): before ANY disk resolution, a
+        # session at its own max cannot spawn — the raise rides the
+        # existing raise→{error:} tool-result path (the unknown-agent
+        # precedent).
+        if Subagents.subagent_depth_blocked?(depth: @subagent_depth, max: @subagent_max_depth)
+          raise ArgumentError, Subagents.nested_subagent_blocked_message(depth: @subagent_depth,
+                                                                        max: @subagent_max_depth)
+        end
+
         # I49: the merged table (builtins < user < project profiles),
         # resolved fresh from disk EVERY spawn (no cache); raises the
         # unknown-agent ArgumentError (the retired unknown_agent_message's
@@ -142,8 +176,14 @@ module Tart
         # `model:` > the parent's current pair — the profile rides the
         # SAME resolve_model path (`provider/id[:level]`).
         source = model || spec[:model]
+        # I78 Law 4: an EXPLICIT model (the call arg OR the profile's
+        # `model:`) validates against the registry — the catalog loads
+        # fresh from disk per spawn (the same staged root, hermetic by
+        # construction); the inherited arm (nil source) never loads,
+        # never validates (pi's law — the parent is running on it).
+        catalog = source ? Models.load(root: @root) : nil
         provider, model_id, level =
-          source ? Subagents.resolve_model(source, catalog: nil, fallback: parent_model_pair) : parent_model_pair
+          source ? Subagents.resolve_model(source, catalog: catalog, fallback: parent_model_pair) : parent_model_pair
         # I49 D5: every gate-on child gets the intercom bridge —
         # contact_supervisor appended to its tools and the instruction
         # appended to its prompt (pi applyIntercomBridgeToAgent, mode
@@ -168,14 +208,29 @@ module Tart
         File.write(File.join(dir, "system-prompt.md"), spec[:system_prompt])
 
         exit_rd, exit_wr = IO.pipe
+        # Law 3 — the additive box facts, recorded at spawn (the I71/I78
+        # resolution seat): `model` is the resolved provider/id string,
+        # `context` is pi's badge law ("fork" when the spawn resumes the
+        # parent session, else "fresh"). Plus the box snapshot's flip
+        # facts (ended_at/error/last_update — nil until a settle/reap).
+        spawned_model = provider && model_id ? "#{provider}/#{model_id}" : nil
+        spawned_at = now_ms
         record = {
           id:, agent: spec[:name], state: :running, dir:, pid: nil, pgid: nil, async: !!async,
-          timed_out: false, started_at: now_ms, tool_call_id:,
+          owned: true, # I78 Law 3: true exactly when THIS process spawned it
+          timed_out: false, started_at: spawned_at, tool_call_id:,
           # Port-internal keys (beyond the §2.2 public contract) that
-          # #spawn_argv_and_env derives the child harness from:
+          # #spawn_argv_and_env derives the child harness from. I81 Law 3:
+          # `task` carries the RAW spawn task verbatim (the fork preamble
+          # is excluded — it lives on task_text) for the status write.
+          task: task.to_s,
           task_chars: task.to_s.length, tools: spec[:tools], provider:, model_id:, level:,
           timeout_ms: deadline, tool_timeout_ms: tool_deadline, parent_session: parent_session.to_s,
-          fork: forked, task_text:, exit_pipe: exit_rd, stopped: false, deadline_due: false, signaled: nil
+          fork: forked, task_text:, exit_pipe: exit_rd, stopped: false, deadline_due: false, signaled: nil,
+          # The I79 box seam's snapshot facts (nil-tolerant; historical dirs
+          # adopted from disk without them render no badge/model).
+          model: spawned_model, context: forked ? "fork" : "fresh",
+          last_update: spawned_at, ended_at: nil, error: nil
         }
         write_status(record)
 
@@ -284,6 +339,7 @@ module Tart
       def status(id: nil)
         return render_status(reconcile_run(find_run!(id.to_s))) if id
 
+        sweep_home
         list = @mutex.synchronize { @runs.dup }
         list.each { |record| reconcile_run(record) }
         ordered = list.sort_by { |record| [record[:state] == :running ? 0 : 1, -(record[:started_at] || 0)] }
@@ -306,9 +362,11 @@ module Tart
         @mutex.synchronize { @runs.map(&:dup) }
       end
 
-      # Any non-terminal run — the print drain's predicate.
+      # Any non-terminal OWNED run — the print drain's predicate (I78
+      # Law 3: a foreign run adopted from disk never gates the adopter's
+      # drain).
       def outstanding?
-        @mutex.synchronize { @runs.any? { |record| record[:state] == :running } }
+        @mutex.synchronize { @runs.any? { |record| record[:owned] && record[:state] == :running } }
       end
 
       # §5.4 — the print agent-end drain: waits for every outstanding run
@@ -326,7 +384,11 @@ module Tart
       # channel stops LAST (its terminal sweep sees the settled runs).
       def shutdown
         @mutex.synchronize { @shutdown = true }
-        ids = @mutex.synchronize { @runs.select { |record| record[:state] == :running }.map { |record| record[:id] } }
+        # I78 Law 3: the stop ladder arms ONLY owned runs — stopping a
+        # foreign child from teardown would signal another session's run.
+        ids = @mutex.synchronize do
+          @runs.select { |record| record[:owned] && record[:state] == :running }.map { |record| record[:id] }
+        end
         ids.each do |id|
           begin
             stop(id:)
@@ -351,12 +413,18 @@ module Tart
       # CLOSED (spawned with unsetenv_others — OQ-7): the parent's
       # PATH/HOME, the identity + resolved model facts, the child knobs
       # (timeouts, the runs root), nil keys omitted, NO subagents gate
-      # row (children never nest), NO MCP config.
+      # row (the child's gate resolves ON from the settings default —
+      # the I70 flip), NO MCP config. I81 Law 2: the env adds the
+      # nested-grant depth picks (see child_env).
       def spawn_argv_and_env(run)
         argv = [RbConfig.ruby, bin_tart_path, "-p", run[:task_text],
                 "--tools", Array(run[:tools]).join(","),
                 "--system-prompt-file", File.join(run[:dir], "system-prompt.md"),
-                "--session-root", File.join(run[:dir], "sessions"),
+                # I81 Law 3 — the transcript path cure (argv-side ONLY;
+                # agent/session.rb's <root>/sessions composition is
+                # hard-frozen): the run dir ITSELF, so the Recorder lands
+                # the transcript at <run-dir>/sessions/<cwd-slug>/….
+                "--session-root", run[:dir],
                 "--steer-inbox", steer_requests_dir(run[:dir])]
         argv += ["--resume", run[:parent_session]] if run[:fork]
         [argv, child_env(run)]
@@ -428,6 +496,13 @@ module Tart
         # never inert in a real child.
         env[key.("SUPERVISOR_CHANNEL")] = File.join(run[:dir], "control")
         env[key.("SUBAGENTS_AGENT")] = run[:agent]
+        # I81 Law 2 — the nested-grant depth picks, written ALWAYS (the
+        # closed pick list grows EXACTLY these two keys; the nil-omission
+        # rules don't apply): the child's own depth is the parent's + 1
+        # and it inherits the parent's max (pi resolveChildDepth /
+        # resolveChildMaxSubagentDepth — types.js:196-201).
+        env[key.("SUBAGENTS_DEPTH")] = (@subagent_depth + 1).to_s
+        env[key.("SUBAGENTS_MAX_DEPTH")] = @subagent_max_depth.to_s
         # I74 — the session-sink child capture (AC4): the pi extension's
         # known boundary (foreground subagent children never load ambient
         # extensions) closed natively — the child IS a full tart boot, and
@@ -449,6 +524,32 @@ module Tart
         env[key.("SESSION_SINK_AGENT_NAME")] = run[:agent]
         parent_id = parent_session_id
         env[key.("SESSION_SINK_PARENT_SESSION_ID")] = parent_id if parent_id
+        # I80 encoding hygiene — Law 1, the child locale law. pi-subagents
+        # passes the FULL parent env to its children
+        # (async-execution.js:503); this closed pick list (the I73/I48 OQ-7
+        # design) was the ONE child-spawn arm that dropped LANG/LC_*, so a
+        # locale-less parent chain booted the child runner with
+        # Encoding.default_external = US-ASCII and every non-ASCII byte
+        # crossing the boundary mangled. The pick list grows ONLY these
+        # keys (the CLOSED-env design stays; the I73 scrub above strips
+        # bundler keys only — locale keys pass through it untouched).
+        source.each do |locale_key, locale_value|
+          next unless locale_key == "LANG" || locale_key.match?(/\ALC_/)
+          next if locale_value.nil? || locale_value.empty?
+
+          env[locale_key] = locale_value
+        end
+        # The UTF-8 floor (the declared BRIEF §5.1 mechanism deviation —
+        # pi never needed it, node is UTF-8-native): MRI/setlocale charset
+        # precedence is LC_ALL > LC_CTYPE > LANG, so when the effective
+        # charset key is absent or non-UTF-8, a present LC_ALL is itself
+        # overridden (it would mask LC_CTYPE), else LC_CTYPE is set (it
+        # masks a non-UTF-8 LANG, which stays untouched). LANG is never
+        # invented.
+        effective = env["LC_ALL"] || env["LC_CTYPE"] || env["LANG"]
+        unless effective&.match?(/UTF-?8\z/i)
+          env[env.key?("LC_ALL") ? "LC_ALL" : "LC_CTYPE"] = UTF8_LOCALE
+        end
         env
       end
 
@@ -599,6 +700,11 @@ module Tart
 
           record[:state] = state
           record[:timed_out] = timed_out
+          # Law 3 — the box snapshot's flip facts, recorded at the settle.
+          now = now_ms
+          record[:last_update] = now
+          record[:ended_at] = now
+          record[:error] = error_line
           # JUDGE FIX (post-merge, recorded in the verdict): the notification
           # must queue INSIDE this mutex — the state flip above was observable
           # before send_next_turn ran, so `drain`'s outstanding? poll could
@@ -608,17 +714,22 @@ module Tart
           # callbacks) — safe under this lock. With this, `outstanding? ==
           # false` REALLY implies the notification is queued, as the comment
           # below always claimed.
-          notify_completion(record) if record[:async]
+          notify_completion(record) if record[:owned] && record[:async]
         end
         close_exit_pipe(record)
+        kick_box_draw
         record
       end
 
       # Disk-first reconcile (§2.1/§2.5 — T3): a non-terminal run whose
       # result.json + terminal status.json are BOTH on disk adopts the
       # terminal state even if the watcher never saw it live; an observed
-      # exit settles through the full processor.
+      # exit settles through the full processor. I78 Law 2/3: a NON-OWNED
+      # record routes through the reap seam instead — never settle_run,
+      # never a notification into the adopter's session.
       def reconcile_run(record)
+        return reap_run(record) unless record[:owned]
+
         return record if terminal?(record[:state])
 
         disk = read_json(status_path(record))
@@ -627,6 +738,7 @@ module Tart
             record[:state] = disk["state"].to_sym
             record[:timed_out] = disk["timedOut"] == true
           end
+          adopt_box_facts(record, disk)
           close_exit_pipe(record)
         elsif exited?(record)
           settle_run(record)
@@ -665,9 +777,12 @@ module Tart
 
             # Deadline backstop (arms here too when the §2.2 supervisor
             # thread is absent/disarmed — both-sides T2) + the belt-and-
-            # braces exit sweep.
+            # braces exit sweep. I78 Law 2/3: a non-owned record routes
+            # through the reaper — disk-only convergence, no notification.
             enforce_deadline(record) if deadline_due?(record)
-            settle_run(record) if record[:state] == :running && exited?(record)
+            next unless record[:state] == :running && exited?(record)
+
+            record[:owned] ? settle_run(record) : reap_run(record)
           end
         end
       rescue StandardError
@@ -720,6 +835,186 @@ module Tart
         nil
       end
 
+      # --- the reaper (I78 — pi stale-run-reconciler.js, read-path synchronous) ---
+
+      # Law 1 — the fleet sweep (pi async-status.js :373/:436): the fleet
+      # read reconciles the runs root BEFORE listing. Best-effort
+      # discipline: an unreadable status.json / a non-run dir is skipped,
+      # never fatal; terminal foreign history is NOT adopted (the fleet
+      # must not flood); a NON-TERMINAL unknown dir is adopted via the
+      # existing disk_find (dedupe unchanged) and reaped synchronously,
+      # in-line, once per fleet read. NO new thread — the sweep lives on
+      # the read path only; the watcher stays the one background thread.
+      def sweep_home
+        Dir.children(@home).sort.each do |child|
+          dir = File.join(@home, child)
+          next unless File.directory?(dir)
+
+          disk = read_json(File.join(dir, "status.json"))
+          next unless disk.is_a?(Hash) && disk["state"].is_a?(String)
+          next if TERMINAL_STATES.include?(disk["state"])
+
+          record = disk_find(child)
+          reap_run(record) if record
+        end
+      rescue StandardError
+        nil # a broken runs root never blocks the fleet list
+      end
+
+      # Law 2 — the convergence seam for NON-OWNED records (a foreign run
+      # this process never spawned, adopted from disk). pi's exact order:
+      # (d) already-terminal-on-disk adopts the state, writes nothing;
+      # (a) an existing result.json is AUTHORITATIVE (result-derive —
+      # write ONLY the atomic status flip, the crash-between-writes
+      # recovery); (b) a dead pid (ESRCH on BOTH pid and pgid — the
+      # existing exited? law; EPERM = live, never converged) fabricates
+      # the failed repair, result BEFORE the flip; (c) a live or
+      # unprobeable pid is left byte-identical. Never settle_run — no
+      # notification, no first-stderr-line story: the adopter never
+      # speaks for a run it did not spawn.
+      def reap_run(record)
+        return record if terminal?(record[:state])
+
+        disk = read_json(status_path(record))
+        if disk.is_a?(Hash) && TERMINAL_STATES.include?(disk["state"]) && File.file?(result_path(record))
+          return adopt_terminal_disk(record, disk)
+        end
+
+        if File.file?(result_path(record))
+          result = read_json(result_path(record))
+          # An UNREADABLE result is not authority — fall through to the
+          # pid probe (a live pid is never converged, never fabricated
+          # over; a dead one gets the honest repair).
+          return reap_from_result(record, disk, result) if result.is_a?(Hash)
+        end
+
+        return record unless exited?(record)
+
+        reap_dead_repair(record)
+      end
+
+      # Leg (d): the existing reconcile_run first leg, unchanged — adopt
+      # the terminal disk state, write nothing.
+      def adopt_terminal_disk(record, disk)
+        @mutex.synchronize do
+          record[:state] = disk["state"].to_sym
+          record[:timed_out] = disk["timedOut"] == true
+        end
+        adopt_box_facts(record, disk)
+        close_exit_pipe(record)
+        kick_box_draw
+        record
+      end
+
+      # Law 3 — pass the disk status's additive box facts onto the record
+      # (nil/legacy tolerance: absent keys leave the record's values — a
+      # historical dir without the fields renders no badge/model, never
+      # raises). Read-path only; the on-disk vocabulary is untouched.
+      def adopt_box_facts(record, disk)
+        @mutex.synchronize do
+          record[:model] = disk["model"] if disk["model"]
+          record[:context] = disk["context"] if disk["context"]
+          record[:last_update] = disk["lastUpdate"] if disk["lastUpdate"]
+          record[:ended_at] = disk["endedAt"] if disk["endedAt"]
+          record[:error] = disk["error"] if disk["error"]
+        end
+        record
+      end
+
+      # Leg (a) — pi terminalStatusFromResult: derive the terminal state
+      # from the authoritative result (success → completed; !success &&
+      # timedOut → stopped; else failed) and write ONLY the status flip
+      # (lastUpdate/endedAt now, error from the result's error when
+      # present, timedOut from the result). result.json is NEVER
+      # rewritten on this leg. The flip merges over the on-disk status
+      # (pi's spread) so legacy/unknown fields pass through untouched.
+      def reap_from_result(record, disk, result)
+        state = if result["success"] then "completed"
+                elsif result["timedOut"] == true then "stopped"
+                else "failed"
+                end
+        now = now_ms
+        base = disk.is_a?(Hash) ? disk : base_status(record)
+        payload = base.merge("state" => state, "lastUpdate" => now, "endedAt" => now,
+                             "timedOut" => result["timedOut"] == true)
+        payload["error"] = result["error"] if result["error"]
+        atomic_write_json(status_path(record), payload)
+        @mutex.synchronize do
+          record[:state] = state.to_sym
+          record[:timed_out] = result["timedOut"] == true
+          record[:last_update] = now
+          record[:ended_at] = now
+          record[:error] = result["error"]
+        end
+        kick_box_draw
+        record
+      end
+
+      # Leg (b) — pi writeFailedRepair: the dead-pid repair. result.json
+      # FIRST (atomic temp+rename — the frozen watcher-compatible
+      # discipline), THEN the atomic status.json flip to "failed" — a
+      # poller watching status.json observes running → failed. The
+      # message is pi's BYTE-PINNED base + the stderr-tail diagnostics;
+      # nil/legacy status fields (startedAt: null, missing keys) ride
+      # base_status's nil-tolerant shape and never raise; pid stays
+      # recorded verbatim (pi keeps it; a nil pid reads "unknown", pi's
+      # own interpolation fallback).
+      def reap_dead_repair(record)
+        pid = record[:pid] || "unknown"
+        message = "Async runner process #{pid} exited or disappeared before writing a result. " \
+                  "Marked run failed by stale-run reconciliation."
+        diagnostics = stderr_tail_diagnostics(record)
+        message = "#{message}\n\nRunner stderr tail:\n#{diagnostics}" if diagnostics
+
+        result = {"output" => read_output(record), "success" => false, "timedOut" => false, "error" => message}
+        atomic_write_json(result_path(record), result) # BEFORE the flip
+
+        now = now_ms
+        payload = base_status(record).merge(
+          "state" => "failed",
+          "lastUpdate" => now,
+          "endedAt" => now,
+          "timedOut" => false,
+          "error" => message
+        )
+        atomic_write_json(status_path(record), payload)
+        @mutex.synchronize do
+          record[:state] = :failed
+          record[:timed_out] = false
+          record[:last_update] = now
+          record[:ended_at] = now
+          record[:error] = message
+        end
+        kick_box_draw
+        record
+      end
+
+      # pi readRunnerStartupDiagnostics (stale-run-reconciler.js :27-52):
+      # read ≤64KB from the END of runner.stderr.log, take the LAST 30
+      # lines, truncate past 4000 chars to the last 4000 + the marker.
+      # nil when the log is absent/empty/unreadable — diagnostics are
+      # best-effort, never fatal.
+      def stderr_tail_diagnostics(record)
+        path = File.join(record[:dir], "runner.stderr.log")
+        return nil unless File.file?(path)
+
+        size = File.size(path)
+        return nil if size <= 0
+
+        content = File.open(path, "r") do |file|
+          file.seek([0, size - 64 * 1024].max)
+          file.read(64 * 1024)
+        end.to_s.strip
+        return nil if content.empty?
+
+        lines = content.split(/\r?\n/).last(30).join("\n")
+        return "#{lines.chars.last(4000).join}\n[stderr tail truncated]" if lines.length > 4000
+
+        lines
+      rescue StandardError
+        nil
+      end
+
       # --- registry lookup ---
 
       def find_run(id)
@@ -739,7 +1034,9 @@ module Tart
 
       # A run unknown to this process's registry but present on disk (the
       # stale-run-reconciler discipline — T3): synthesized from its
-      # status.json and adopted into the registry.
+      # status.json and adopted into the registry. I78 Law 3: the
+      # synthesis carries owned: false — the adopter never speaks for a
+      # run it did not spawn.
       def disk_find(id)
         dir = File.join(@home, id)
         status = read_json(File.join(dir, "status.json"))
@@ -748,9 +1045,14 @@ module Tart
         record = {
           id: status["id"].to_s, agent: status["agent"].to_s,
           state: status["state"].to_s.to_sym, dir:, pid: status["pid"], pgid: status["pid"],
-          async: true, timed_out: status["timedOut"] == true, started_at: status["started_at"],
+          async: true, owned: false,
+          timed_out: status["timedOut"] == true, started_at: status["startedAt"],
           tool_call_id: status["toolCallId"], exit_pipe: nil, stopped: false,
-          deadline_due: false, signaled: nil
+          deadline_due: false, signaled: nil,
+          # Law 3 — the additive box facts ride the synthesis (nil-tolerant:
+          # a historical dir without them renders no badge/model).
+          model: status["model"], context: status["context"],
+          last_update: status["lastUpdate"], ended_at: status["endedAt"], error: status["error"]
         }
         @mutex.synchronize do
           existing = @runs.find { |candidate| candidate[:id] == record[:id] }
@@ -793,6 +1095,69 @@ module Tart
         loop
       end
 
+      # --- the box snapshot (I79 Law 3) ---
+
+      # The Law-3 seam is PUBLIC: the Chat surface's per-frame read and the
+      # chat sweep task's ≤5s call. The §7 status rendering below stays
+      # private (the `private` marker resumes after this section).
+      public
+
+      # The box-facing snapshot (Law 3 — the Chat surface's per-frame read):
+      # a mutex-guarded, allocation-bounded array of plain row hashes over
+      # the in-memory records. Reads never block the render frame beyond
+      # this lock (the worst case is one watcher tick stale). Zero runs →
+      # the frozen empty rows without touching the supervisor channel — the
+      # absent box allocates nothing.
+      def box_snapshot
+        rows = nil
+        @mutex.synchronize do
+          next rows = [] if @runs.empty?
+
+          rows = @runs.map do |record|
+            { id: record[:id], agent: record[:agent], state: record[:state].to_s,
+              started_at: record[:started_at], last_update: record[:last_update],
+              ended_at: record[:ended_at], model: record[:model], context: record[:context],
+              dir: record[:dir], error: record[:error] }
+          end
+        end
+        attention_ids = @supervisor_channel&.pending&.filter_map { |request| request[:run_id] }
+        rows.each { |row| row[:attention] = !!(attention_ids&.include?(row[:id])) }
+        { rows: rows }
+      end
+
+      # The box's ≤5s sweep (Law 2 — pi DEFAULT_LIVENESS_INTERVAL_MS): the
+      # I78 fleet sweep adopts non-terminal foreign dirs, the reaper's
+      # result-derive/dead-pid legs reconcile the known records. Returns
+      # whether any box-observable fact changed (the caller requests the
+      # draw through the kernel bridge).
+      def box_sweep
+        before = box_observation_key
+        sweep_home
+        records = @mutex.synchronize { @runs.dup }
+        records.each { |record| reconcile_run(record) if record[:state] == :running }
+        box_observation_key != before
+      end
+
+      # The observation key the sweep diffs (no glyph-frame bucket — the
+      # sweep never draws for animation frames): the visible rows' facts.
+      def box_observation_key
+        now = now_ms
+        Render::SubagentBox.stable_key(Render::SubagentBox.visible(box_snapshot.fetch(:rows), now))
+      end
+
+      # The box draw kick (Law 2 — the existing kernel bridge): a state
+      # transition pushes one synthetic event; the pushed block executes on
+      # the reactor (Chat#on_agent_event dereferences `event[:type]` — the
+      # I48 wake-bridge pattern) and the event itself marks the frame dirty
+      # (Loop#process). No-op without the bridge (print boots/tests).
+      def kick_box_draw
+        @kernel&.async {}
+      rescue StandardError
+        nil # a dead bridge never blocks the watcher's settle path
+      end
+
+      private
+
       # --- status rendering (§7) ---
 
       def render_status(record)
@@ -821,7 +1186,12 @@ module Tart
         payload = {
           "id" => record[:id],
           "agent" => record[:agent],
-          "task" => nil, # the task text is NEVER recorded (taskChars only)
+          # I81 Law 3 — the raw task text verbatim (the run's own launch
+          # artifact, pi async-execution.js:1254 analog; the fork
+          # preamble is excluded — it rides task_text only). The I79 box
+          # still renders NO task row; legacy task:null dirs stay
+          # tolerated (adoption reads disk, never rewrites it).
+          "task" => record[:task],
           "taskChars" => record[:task_chars],
           "mode" => "single",
           "state" => record[:state].to_s,
@@ -833,6 +1203,11 @@ module Tart
           "lastUpdate" => now_ms,
           "toolCallId" => record[:tool_call_id]
         }
+        # Law 3 — the additive box fields, recorded at spawn: key-present
+        # only when the record carries them, so historical/legacy shapes
+        # stay byte-unchanged and the nil/legacy tolerance holds.
+        payload["model"] = record[:model] if record[:model]
+        payload["context"] = record[:context] if record[:context]
         payload["timeoutMs"] = record[:timeout_ms] if record[:timeout_ms]
         payload["toolTimeoutMs"] = record[:tool_timeout_ms] if record[:tool_timeout_ms]
         payload
@@ -858,9 +1233,18 @@ module Tart
         File.join(dir, "control", "stop-requests")
       end
 
+      # I80 encoding hygiene — Law 3, the byte-hygienic artifact readers
+      # (the port's own established idiom: output_accumulator.rb:41,
+      # read.rb:85 — binread + force_encoding(UTF_8) + scrub): a
+      # locale-blind text-mode read of the child's byte-exact non-ASCII
+      # output tags it US-ASCII with invalid bytes and String#sub then
+      # RAISES, whose rescue swallowed the answer to "" and settled the
+      # run failed (the exact devstral-docs failure class). Byte-identical
+      # for valid UTF-8 (scrub is identity there), never-raise for
+      # arbitrary child bytes.
       def read_output(record)
         path = File.join(record[:dir], "runner.stdout.log")
-        File.file?(path) ? File.read(path).sub(/\n\z/, "") : ""
+        File.file?(path) ? File.binread(path).force_encoding(Encoding::UTF_8).scrub.sub(/\n\z/, "") : ""
       rescue StandardError
         ""
       end
@@ -869,7 +1253,7 @@ module Tart
         path = File.join(record[:dir], "runner.stderr.log")
         return nil unless File.file?(path)
 
-        File.foreach(path) do |line|
+        File.binread(path).force_encoding(Encoding::UTF_8).scrub.each_line do |line|
           stripped = line.strip
           return stripped unless stripped.empty?
         end

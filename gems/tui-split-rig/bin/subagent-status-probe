@@ -1,0 +1,394 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# subagent-status-probe — the I79 live oracle-parity gate (AC1's live leg).
+#
+# Boots tart DIRECTLY in tmux (the subagents-motd-probe shape — NOT through
+# TuiSplitRig::Runner): a staged HOME whose runs root (<HOME>/.tart/subagents)
+# carries staged status.json dirs in the PORT's schema with the SAME staged
+# facts as the oracle captures (agents worker/reviewer, model "mock/mock-1",
+# context "fresh", startedAt/lastUpdate with the fixed +30s delta, live sleep
+# pids), a staged sandbox cwd, a CLOSED pane env staging only the mock model
+# facts (no request is made by the boot), the DEFAULT identity, HERDR vars
+# scrubbed. The box's ≤5s sweep adopts the staged dirs through the I78 fleet
+# sweep; the states are driven on disk:
+#
+#   - attention: the supervisor-ask file <home>/<run>/control/
+#     supervisor-requests/<id>.json — the channel's 250ms tick registers it,
+#     the box's snapshot reads the pending registry keyed by run id.
+#   - terminal transitions: the port's in-dir result.json — the I78 reaper's
+#     result-derive leg flips the run (success → completed; failure →
+#     failed; success:false + timedOut → stopped) through the box's reads.
+#
+# Eight frozen states (the oracle captures' sequence): boot A drives the
+# multi/six (01 running-two, 02 attention, 03 completed-with-output, 04
+# running-one after the 10s retention drop, 05 failed, 06 empty), boots B/C
+# drive the single terminal arms (08 single-completed, 11 single-stopped).
+# The box region is extracted per state (plain + -e), the FROZEN
+# normalization classes applied (◖SPIN◗ the ten frames + ●, ◖DUR◗ every
+# elapsed/age token incl. the word "now", ◖PATH◗ the output row's path —
+# the ~-contraction collapses into the class), and compared against
+# gems/tui-split-rig/fixtures/subagent-box/ (plain bytes exact; the styled
+# side at the parsed-SGR-run level — the tmux capture-pane -e model where
+# attribute state carries across newlines and resets land at default-attr
+# cell boundaries, the same instrument the fixtures were captured with).
+#
+# Prints SUBAGENT_STATUS_OK and exits 0; any mismatch prints the failing
+# state + the first differing row and exits 1. Stdlib only — runs without
+# Bundler. Zero network, zero live API (the mock endpoint is a dead port;
+# the attention state's one wake turn fails against it hermetically).
+#
+#   subagent-status-probe [--out DIR]
+
+require "fileutils"
+require "open3"
+require "optparse"
+require "shellwords"
+require "json"
+
+options = {out: "tmp/subagent-status-probe-#{Time.now.to_i}"}
+parser = OptionParser.new do |p|
+  p.on("--out DIR", "output directory (default tmp/subagent-status-probe-<ts>)") { |d| options[:out] = d }
+end
+parser.parse!(ARGV)
+
+# HERDR discipline (this repo's sessions run inside herdr panes): the
+# probe's OWN process env must not leak the owner's pane coordinates.
+ENV.keys.grep(/\AHERDR_/).each { |key| ENV.delete(key) }
+
+fail_probe = lambda do |message|
+  puts "SUBAGENT_STATUS_FAIL: #{message}"
+  exit 1
+end
+
+repo = File.expand_path("../..", File.expand_path("..", __dir__))
+fixtures = File.join(repo, "gems", "tui-split-rig", "fixtures", "subagent-box")
+fail_probe.call("the frozen fixture dir is missing: #{fixtures}") unless File.directory?(fixtures)
+bundle = Open3.capture2("sh", "-c", "command -v bundle")[0].to_s.strip
+fail_probe.call("bundle binary not found on PATH") if bundle.empty?
+
+# The frozen normalization classes (tmp/i79-spec/oracle/extract.rb, verbatim).
+SPIN = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏●]/
+normalize_line = lambda do |line|
+  out = line.gsub(SPIN, "◖SPIN◗")
+  out = out.gsub(/output: \S.*\z/, "output: ◖PATH◗")
+  out = out.gsub(/(\d+)m(\d+)s\b/, "◖DUR◗")
+  out = out.gsub(/(\d+(?:\.\d+)?)s\b/, "◖DUR◗")
+  out = out.gsub(/(\d+)ms\b/, "◖DUR◗")
+  out = out.gsub(/\bnow\b/, "◖DUR◗")
+  out
+end
+
+# The stateful SGR parser (tmux capture-pane -e's model): attribute state
+# carries across newlines; SGR 0/empty reset everything, 39 resets fg, 1
+# bolds, 38;2;r;g;b sets fg. Runs are [text, {fg:, bold:}].
+parse_styled = lambda do |lines|
+  fg = nil
+  bold = false
+  lines.map do |line|
+    runs = []
+    buf = +""
+    pos = 0
+    while (match = /\e\[([0-9;]*)m/.match(line, pos))
+      buf << line[pos...match.begin(0)]
+      runs << [normalize_line.call(buf), {fg: fg, bold: bold}] unless buf.empty?
+      buf = +""
+      codes = match[1].split(";", -1)
+      i = 0
+      while i < codes.size
+        case codes[i]
+        when "", "0"
+          fg = nil
+          bold = false
+        when "39"
+          fg = nil
+        when "1"
+          bold = true
+        when "38"
+          if codes[i + 1] == "2"
+            fg = "38;2;#{codes[i + 2]};#{codes[i + 3]};#{codes[i + 4]}"
+            i += 4
+          end
+        end
+        i += 1
+      end
+      pos = match.end(0)
+    end
+    buf << line[pos..] if pos < line.length
+    runs << [normalize_line.call(buf), {fg: fg, bold: bold}] unless buf.empty?
+    runs
+  end
+end
+
+# --- one boot: the staged home + the tmux pane + the capture helpers ---
+
+boot_box = lambda do |stage|
+  home = File.join(stage, "home")
+  sandbox = File.join(stage, "sandbox")
+  runs_root = File.join(home, ".tart", "subagents")
+  FileUtils.mkdir_p([home, sandbox, runs_root])
+  stderr_log = File.join(stage, "tart.stderr")
+  staged = {
+    "HOME" => home,
+    "PATH" => "#{File.dirname(bundle)}:#{ENV.fetch('PATH', '')}",
+    "BUNDLE_FROZEN" => "true",
+    "TERM" => "xterm-256color",
+    "COLORTERM" => "truecolor",
+    "TART_MODEL" => "mock-1",
+    "TART_API_KEY" => "mock-key",
+    "TART_API_BASE" => "http://127.0.0.1:9/v1"
+  }
+  # The CLOSED pane env: scrub the parent's PI_*/TART_*/HERDR_*/BUNDLE_*/
+  # BUNDLER_*/RUBYOPT/RUBYLIB keys not staged above — no owner state may
+  # leak into the boot (the runner's env_flags discipline).
+  scrub = (ENV.keys.grep(/\A(?:PI|TART|HERDR|BUNDLE|BUNDLER)_/) + %w[RUBYOPT RUBYLIB]) - staged.keys
+  flags = [*scrub.flat_map { |key| ["-u", key] },
+           *staged.map { |key, value| "#{key}=#{Shellwords.escape(value)}" }].join(" ")
+  command = "cd #{Shellwords.escape(repo)} && exec env #{flags} #{Shellwords.escape(bundle)} exec bin/tart " \
+            "#{Shellwords.escape(sandbox)} 2>#{Shellwords.escape(stderr_log)}"
+  token = format("%04x%04x", rand(65_536), rand(65_536))
+  session = "subagent-status-#{token}"
+  system("tmux", "kill-session", "-t", session, out: IO::NULL, err: IO::NULL) if
+    system("tmux", "has-session", "-t", session, out: IO::NULL, err: IO::NULL)
+  system("tmux", "new-session", "-d", "-x", "120", "-y", "40", "-c", sandbox, "-s", session, command) or
+    fail_probe.call("tmux new-session failed")
+  [session, home, runs_root, stderr_log]
+end
+
+capture = lambda do |session, styled|
+  Open3.capture2("tmux", "capture-pane", styled ? "-e" : "-p", "-p", "-t", session, err: IO::NULL)[0].to_s
+end
+
+session_alive = lambda do |session|
+  system("tmux", "has-session", "-t", session, out: IO::NULL, err: IO::NULL)
+end
+
+descendants = lambda do |pid|
+  out = Open3.capture2("pgrep", "-P", pid.to_s)[0].to_s
+  out.split.flat_map { |child| [child.to_i, *descendants.call(child.to_i)] }
+rescue StandardError
+  []
+end
+
+teardown = lambda do |session|
+  return unless session_alive.call(session)
+
+  pid_line, = Open3.capture2("tmux", "list-panes", "-t", session, "-F", '#{pane_pid}', err: IO::NULL)
+  pids = pid_line.to_s.strip.split.map(&:to_i).flat_map { |pid| [pid, *descendants.call(pid)] }
+  pids.each { |pid| Process.kill("KILL", pid) rescue nil }
+  sleep 0.2 unless pids.empty?
+  system("tmux", "kill-session", "-t", session, out: IO::NULL, err: IO::NULL)
+end
+
+POLL = 0.25
+CAP = 45.0
+
+wait_plain = lambda do |session, marker, present|
+  started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  loop do
+    plain = capture.call(session, false)
+    has = plain.include?(marker)
+    return true if present == has
+
+    fail_probe.call("the pane died waiting for #{marker.inspect} (#{present ? "present" : "absent"})") unless
+      session_alive.call(session)
+    if Process.clock_gettime(Process::CLOCK_MONOTONIC) - started > CAP
+      fail_probe.call("timeout waiting for #{marker.inspect} to be #{present ? "present" : "absent"}:\n" +
+                      capture.call(session, false))
+    end
+    sleep POLL
+  end
+end
+
+# A fixed settle past the last draw (the 1s glyph tick keeps the pane
+# redrawing while a row runs — the capture needs to land between frames;
+# draws take milliseconds, a 1.6s dwell is ample).
+settle = -> { sleep 1.6 }
+
+# The box-region extraction (the reference extractor's shape): the head is
+# the first pane line carrying the box's title; the region runs to the
+# editor's top border; the styled slice rides the same indices. No head →
+# the box is absent ("(box absent)", the extractor's convention).
+extract = lambda do |session|
+  plain = capture.call(session, false)
+  styled = capture.call(session, true)
+  head = plain.lines.index { |l| l.include?("Async agents · background") || l.include?("async subagent · background") }
+  return [[], [], nil] if head.nil?
+
+  box = plain.lines[head..]
+  box = box.take_while { |l| !l.start_with?("─") }
+  box.pop while box.any? && box.last.strip.empty?
+  sbox = styled.lines[head, box.size] || []
+  [box.map(&:chomp), sbox.map(&:chomp), plain]
+end
+
+assert_state = lambda do |state, session, out_dir|
+  box, sbox, _plain = extract.call(session)
+  want_plain = File.readlines(File.join(fixtures, "#{state}-norm.txt"), chomp: true)
+  got_plain = box.empty? ? ["(box absent)"] : box.map { |l| normalize_line.call(l) }
+  if got_plain != want_plain
+    diff_i = (0...[got_plain.size, want_plain.size].max).find { |i| got_plain[i] != want_plain[i] }
+    fail_probe.call("state #{state}: plain bytes differ at row #{diff_i}\n" \
+                    "got:  #{got_plain[diff_i].inspect}\n" \
+                    "want: #{want_plain[diff_i].inspect}\nfull got:\n#{got_plain.join("\n")}")
+  end
+  want_styled = parse_styled.call(File.readlines(File.join(fixtures, "#{state}-styled-norm.txt"), chomp: true))
+  got_styled = parse_styled.call(sbox.empty? ? ["(box absent)"] : sbox)
+  if got_styled != want_styled
+    diff_i = (0...[got_styled.size, want_styled.size].max).find { |i| got_styled[i] != want_styled[i] }
+    fail_probe.call("state #{state}: styled runs differ at row #{diff_i}\n" \
+                    "got:  #{got_styled[diff_i].inspect}\n" \
+                    "want: #{want_styled[diff_i].inspect}")
+  end
+  File.write(File.join(out_dir, "#{state}-got.txt"), box.join("\n") + "\n") unless box.empty?
+  puts "state #{state}: OK"
+end
+
+# The staged run dir in the PORT's schema (base_status's shape + the
+# additive model/context fields), with the oracle captures' fixed deltas:
+# lastUpdate = startedAt + 30_000, live sleep pid.
+BOOT_T = (Time.now.to_f * 1000).to_i
+stage_run = lambda do |runs_root, id, agent, model:, context:|
+  dir = File.join(runs_root, id)
+  FileUtils.mkdir_p([dir, File.join(dir, "control", "steer-requests"),
+                     File.join(dir, "control", "stop-requests"),
+                     File.join(dir, "control", "supervisor-requests"),
+                     File.join(dir, "control", "supervisor-replies"),
+                     File.join(dir, "sessions")])
+  pid = Process.spawn("sleep", "600")
+  Process.detach(pid)
+  status = {"id" => id, "agent" => agent, "task" => nil, "taskChars" => nil, "mode" => "single",
+            "state" => "running", "pid" => pid, "cwd" => File.dirname(runs_root),
+            "asyncDir" => dir, "sessionRoot" => File.join(dir, "sessions"),
+            "startedAt" => BOOT_T, "lastUpdate" => BOOT_T + 30_000, "toolCallId" => nil,
+            "model" => model, "context" => context}
+  File.write(File.join(dir, "status.json"), JSON.generate(status))
+  [dir, pid]
+end
+
+write_result = lambda do |dir, payload|
+  File.write(File.join(dir, "result.json"), JSON.generate(payload))
+end
+
+$staged_pids = []
+$staged_dirs = []
+stage = lambda do |runs_root, id, agent|
+  dir, pid = stage_run.call(runs_root, id, agent, model: "mock/mock-1", context: "fresh")
+  $staged_pids << pid
+  $staged_dirs << dir
+  dir
+end
+
+# --- boot A: the multi/six states (01, 02, 03, 04, 05, 06) ---
+
+stage_a = File.expand_path("boot-a", options[:out])
+FileUtils.mkdir_p(stage_a)
+session_a, home_a, runs_a, stderr_a = boot_box.call(stage_a)
+
+begin
+  # The boot's chat surface first (the motd probe's marker), then the
+  # box: the ≤5s sweep adopts the staged dirs through the I78 fleet sweep.
+  wait_plain.call(session_a, "ctrl+c interrupt/quit", true)
+  worker_a = stage.call(runs_a, "a1worker-0000-0000-0000-000000000001", "worker")
+  reviewer_a = stage.call(runs_a, "a2reviewer-0000-0000-0000-000000000002", "reviewer")
+  # The runs must be staged BEFORE the first sweep window closes; the box
+  # appears within ~5s of the frame loop's first frame.
+  wait_plain.call(session_a, "Async agents · background", true)
+  settle.call
+  assert_state.call("01-running-two", session_a, stage_a)
+
+  # attention: the supervisor ask for the worker run (the channel's 250ms
+  # tick registers it; the wake turn fails hermetically against the dead
+  # mock endpoint — no API spend).
+  File.write(File.join(worker_a, "control", "supervisor-requests", "ask-1.json"),
+             JSON.generate({"type" => "subagent.supervisor.request", "id" => "ask-1",
+                            "runId" => File.basename(worker_a), "agent" => "worker",
+                            "reason" => "need_decision", "message" => "staged ask: which way?",
+                            "expectsReply" => true, "createdAt" => BOOT_T}))
+  wait_plain.call(session_a, "no activity for", true)
+  settle.call
+  assert_state.call("02-attention", session_a, stage_a)
+
+  # completed-with-output: the worker's in-dir result lands; the I78
+  # reaper's result-derive leg flips the run through the box's reads; the
+  # ✓ row holds beside the still-running reviewer.
+  write_result.call(worker_a, {"output" => "The staged result: fixed output line one.",
+                               "success" => true, "timedOut" => false})
+  wait_plain.call(session_a, "✓ worker", true)
+  settle.call
+  assert_state.call("03-completed-with-output", session_a, stage_a)
+
+  # running-one: the ✓ row retires 10s after its flip (the retention law);
+  # the reviewer's single form remains.
+  wait_plain.call(session_a, "✓ worker", false)
+  wait_plain.call(session_a, "async subagent · background", true)
+  settle.call
+  assert_state.call("04-running-one", session_a, stage_a)
+
+  # failed: the reviewer's result carries success:false + the staged error.
+  write_result.call(reviewer_a, {"output" => "", "success" => false, "timedOut" => false,
+                                 "error" => "staged failure: the wire died"})
+  wait_plain.call(session_a, "✗ reviewer", true)
+  settle.call
+  assert_state.call("05-failed", session_a, stage_a)
+
+  # empty: the ✗ row retires too — the box disappears entirely.
+  wait_plain.call(session_a, "✗ reviewer", false)
+  wait_plain.call(session_a, "Async agents · background", false)
+  wait_plain.call(session_a, "async subagent · background", false)
+  settle.call
+  assert_state.call("06-empty", session_a, stage_a)
+ensure
+  teardown.call(session_a) if defined?(session_a)
+end
+
+# --- boot B: the single-completed arm (08) ---
+
+stage_b = File.expand_path("boot-b", options[:out])
+FileUtils.mkdir_p(stage_b)
+session_b, _home_b, runs_b, = boot_box.call(stage_b)
+begin
+  wait_plain.call(session_b, "ctrl+c interrupt/quit", true)
+  stage.call(runs_b, "b1worker-0000-0000-0000-000000000003", "worker")
+  wait_plain.call(session_b, "async subagent · background", true)
+  write_result.call(Dir.children(runs_b).map { |c| File.join(runs_b, c) }.find { |d| File.file?(File.join(d, "status.json")) },
+                    {"output" => "done", "success" => true, "timedOut" => false})
+  wait_plain.call(session_b, "✓ worker", true)
+  settle.call
+  assert_state.call("08-single-completed", session_b, stage_b)
+ensure
+  teardown.call(session_b) if defined?(session_b)
+end
+
+# --- boot C: the single-stopped arm (11 — the escalation terminal) ---
+
+stage_c = File.expand_path("boot-c", options[:out])
+FileUtils.mkdir_p(stage_c)
+session_c, _home_c, runs_c, = boot_box.call(stage_c)
+begin
+  wait_plain.call(session_c, "ctrl+c interrupt/quit", true)
+  stopped_dir = stage.call(runs_c, "c1worker-0000-0000-0000-000000000004", "worker")
+  wait_plain.call(session_c, "async subagent · background", true)
+  # success:false + timedOut:true → the reaper derives the stopped state
+  # (pi's readResultRepairData state law); the failed child renders the
+  # step state + the error row.
+  write_result.call(stopped_dir, {"output" => "", "success" => false, "timedOut" => true,
+                                  "error" => "staged stop: the ladder fired"})
+  wait_plain.call(session_c, "■ worker", true)
+  settle.call
+  assert_state.call("11-single-stopped", session_c, stage_c)
+ensure
+  teardown.call(session_c) if defined?(session_c)
+end
+
+# The pane stderr logs must carry no crash (the boot-defect class).
+[stderr_a].each do |log|
+  next unless File.exist?(log)
+
+  text = File.read(log)
+  fail_probe.call("the boot crashed — stderr:\n#{text}") if text.match?(/NoMethodError|subagent_box/)
+end
+
+$staged_pids.each { |pid| Process.kill("KILL", pid) rescue nil }
+puts "SUBAGENT_STATUS_OK"
+exit 0

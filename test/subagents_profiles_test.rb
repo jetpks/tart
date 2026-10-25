@@ -123,11 +123,66 @@ module Tart
       spec = Subagents::Profiles.resolve("array", cwd: @cwd, root: @root, env: ENV)
       assert_equal %w[grep read], spec[:tools], "the array form passes through in order"
 
+      # I81 Law 1 re-pin (the declared re-pin of the retired reject): an
+      # unknown name no longer rejects the file — it is DROPPED and the
+      # file loads with exactly ONE warn-and-drop diagnostic.
       write_profile("user", "unknown.md", tools: "read, sabotage", body: "Body.")
+      spec = Subagents::Profiles.resolve("unknown", cwd: @cwd, root: @root, env: ENV)
+      assert_equal %w[read], spec[:tools], "the unknown name is dropped, the known one kept"
       diagnostic = Subagents::Profiles.discover(cwd: @cwd, root: @root, env: ENV).diagnostics
                           .find { |d| d.path.end_with?("unknown.md") }
-      assert_equal "unknown tool sabotage (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, write)",
+      assert_equal "unknown tool(s) sabotage — dropped (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, subagent, write)",
                    diagnostic.message
+
+      # A structurally invalid tools value still warns+skips the file
+      # (today's bytes — the contract's SHAPE rule, pi agents.js:739-741).
+      write_profile("user", "badshape.md", raw: "---\nname: badshape\ntools: 5\n---\n\nBody.\n")
+      result = Subagents::Profiles.discover(cwd: @cwd, root: @root, env: ENV)
+      shape = result.diagnostics.find { |d| d.path.end_with?("badshape.md") }
+      assert_equal "tools must be a comma-separated string or an array of strings", shape.message
+      assert_empty result.profiles.map { |s| s[:name] } & %w[badshape]
+    end
+
+    def test_dropped_unknown_names_keep_known_entries_in_declaration_order
+      # The live coordinator shape (the 07:40Z specimen): unknown entries
+      # between known ones; subagent is KNOWN post-widening.
+      write_profile("user", "coordinator.md", tools: "read, bg_wait, grep, web_search, subagent", body: "Body.")
+
+      spec = Subagents::Profiles.resolve("coordinator", cwd: @cwd, root: @root, env: ENV)
+      assert_equal %w[read grep subagent], spec[:tools],
+                   "known entries keep declaration order; subagent is a known name"
+
+      diagnostics = Subagents::Profiles.discover(cwd: @cwd, root: @root, env: ENV).diagnostics
+      dropped = diagnostics.find { |d| d.path.end_with?("coordinator.md") }
+      refute_nil dropped
+      assert_equal "warning", dropped.type
+      assert_equal "unknown tool(s) bg_wait, web_search — dropped (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, subagent, write)",
+                   dropped.message
+      assert_equal 1, diagnostics.size, "exactly ONE diagnostic for the file"
+    end
+
+    def test_dropped_all_unknown_tools_load_with_zero_tools_and_the_diagnostic
+      # OQ-3: an explicit list that drops to EMPTY is meaningful — the
+      # agent loads with ZERO tools plus the warning (pi's loadout makes
+      # it so); the builtin-seven default applies ONLY to an omitted line.
+      write_profile("user", "ghost.md", tools: "bg_wait", body: "Body.")
+
+      result = Subagents::Profiles.discover(cwd: @cwd, root: @root, env: ENV)
+      spec = result.profiles.find { |s| s[:name] == "ghost" }
+      assert spec, "an all-unknown list still LOADS"
+      assert_empty spec[:tools], "zero tools"
+      assert_equal 1, result.diagnostics.size
+      assert_equal "unknown tool(s) bg_wait — dropped (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, subagent, write)",
+                   result.diagnostics.first.message
+    end
+
+    def test_dropped_nothing_when_every_declared_tool_is_known
+      write_profile("user", "clean.md", tools: "subagent, contact_supervisor, read", body: "Body.")
+
+      spec = Subagents::Profiles.resolve("clean", cwd: @cwd, root: @root, env: ENV)
+      assert_equal %w[subagent contact_supervisor read], spec[:tools]
+      assert_empty Subagents::Profiles.discover(cwd: @cwd, root: @root, env: ENV).diagnostics,
+                   "a file with zero dropped names emits nothing"
     end
 
     def test_model_validated_by_resolve_model_semantics_verbatim

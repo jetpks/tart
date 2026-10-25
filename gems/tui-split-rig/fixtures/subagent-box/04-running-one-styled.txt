@@ -1,0 +1,5 @@
+ [1m[38;2;222;224;225masync subagent[0m [38;2;126;136;142m· background[39m
+   [38;2;108;118;123m⠙[39m [1mreviewer[0m[38;2;126;136;142m [fresh][39m [38;2;126;136;142m·[39m [38;2;108;118;123mrunning[38;2;126;136;142m (mock/mock-1)[39m
+     [38;2;126;136;142m⎿  thinking…[39m
+     [38;2;167;152;215mPress ctrl+o for live detail[39m
+     [38;2;126;136;142moutput: /Users/eric/architect/spaces/20261009-pi-port/tmp/i79-spec/oracle/cap/psub/async-subagent-runs/c7c2e6f3-e…

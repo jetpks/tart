@@ -45,6 +45,16 @@ require "json"
 #     ANY request (the listing GET included) with that JSON. Optional
 #     overrides: status: (a non-200 listing reply) and raw: (a malformed
 #     body served verbatim).)
+#   Optional per entry: +match:+ — a Proc/lambda over the PARSED request
+#     body (I87 Law 2, strictly additive). An entry carrying a truthy
+#     +match:+ is served to the first captured request whose body satisfies
+#     the predicate, REGARDLESS of arrival order (the deterministic-order
+#     cure for the subagents-e2e drain legs: the child's slow boot must not
+#     flip which request takes which scripted response). Entries without
+#     +match:+ keep the blind arrival-order shift; a +match:+ entry whose
+#     predicate never fires parks until its request arrives or the script
+#     is exhausted (then the same {type: :message, content: ""} fallback
+#     as an empty script). +rearm!+ restores match: entries like any other.
 # Every captured request body is pushed to +requests+ (a Queue) for
 # assertions (e.g. schema gating against the actual payload); the full
 # per-request wire entry (method, path, notable headers, body) goes to
@@ -61,6 +71,10 @@ class MockLLMServer
     @template = []
     @accept_thread = nil
     @suppress_usage = false
+    # serve() runs on a per-connection thread; take_spec's scan+delete must
+    # not interleave for concurrent requests (two requests matching the
+    # SAME entry must serve that entry exactly once, in one piece).
+    @script_mutex = Mutex.new
   end
 
   # The Case-3 compaction instrument (I29): every response is served
@@ -161,7 +175,7 @@ class MockLLMServer
     @request_logs << entry
     @requests << parsed_body unless parsed_body.nil?
 
-    spec = @script.shift || {type: :message, content: ""}
+    spec = take_spec(parsed_body)
     if spec[:type] == :models
       respond_models(io, spec)
     elsif spec[:type] == :error
@@ -178,6 +192,20 @@ class MockLLMServer
     nil
   ensure
     io.close rescue nil
+  end
+
+  # The scripted-response selector (I87 Law 2): content-addressable when
+  # the entry declares +match:+, arrival-order otherwise — byte-identical
+  # semantics for every pre-I87 caller (entries without +match:+ keep the
+  # blind shift, in order; the exhausted fallback is unchanged).
+  def take_spec(parsed_body)
+    @script_mutex.synchronize do
+      index = @script.index { |entry| entry[:match] && entry[:match].call(parsed_body) }
+      return @script.delete_at(index) if index
+      index = @script.index { |entry| !entry[:match] }
+      return @script.delete_at(index) if index
+      {type: :message, content: ""}
+    end
   end
 
   def respond_message(io, spec)

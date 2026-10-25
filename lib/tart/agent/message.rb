@@ -35,7 +35,10 @@ module Tart
     # "cache_write_tokens"} — the token keys follow the recorded nil/0
     # conventions (unreported input/output drop, cache_write persists as a
     # reported zero, cache_read/thinking omit when zero) and
-    # thinking/thinking_signature ride when present.
+    # thinking/thinking_signature ride when present. I77 adds the running
+    # model identity to ASSISTANT messages — `provider`/`model`, present-
+    # only (nil-gated, additive: every pre-I77 byte shape is unchanged) —
+    # pi's own per-assistant pair, closing the recorded-forensics gap.
     class Message
       ROLES = %i[user assistant system tool].freeze
 
@@ -185,8 +188,20 @@ module Tart
       # nil/0 conventions below reproduce the recorded parser defaults
       # (unreported prompt/completion drop; cache_write persists as the
       # reported zero it defaults to; cache_read/thinking omit at zero).
+      #
+      # I77 — the running model identity rides present-only immediately
+      # after +tool_calls+: pi records the same `provider`/`model` pair on
+      # every assistant message (live proof, the spike's E5 capture), and
+      # the 06:58Z session's forensics gap (no model identity anywhere in
+      # the file) is the recorded cost of dropping it. Nil-gated and
+      # additive: the fixture seeds carry no model, so every existing
+      # recorded byte shape (model-less assistants, the error_failure
+      # assistant, replayed bodies) is byte-identical, and +from_seed_hash+
+      # (declared-fields only) stays model-inert on replay.
       def assistant_to_h
         out = {role: "assistant", content:, tool_calls: tool_calls.to_h { |id, call| [id, call_to_h(call)] }}
+        out[:provider] = provider if provider
+        out[:model] = model if model
         out[:thinking] = thinking.text if thinking&.text
         out[:thinking_signature] = thinking.signature if thinking&.signature
         out[:finish_reason] = finish_reason if finish_reason

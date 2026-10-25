@@ -26,6 +26,15 @@ module Tart
         "contact_supervisor" => "Tart::Tools::ContactSupervisor"
       }.freeze
 
+      # I81 Law 2 — the nested-grant acceptance vocabulary: names the
+      # registry ACCEPTS in a selected list but NEVER builds (no
+      # TOOL_CLASSES entry, no constructor). Today exactly `subagent` —
+      # the hooks registered-tools merge (below) supplies the instance,
+      # LAST on the wire (the I47 merge order); a selected `subagent`
+      # with no registered instance drops from the loadout silently (pi
+      # loadout parity, agent-session.ts:1575-1582).
+      SELECTABLE_SUBAGENT = %w[subagent].freeze
+
       # Classes whose write boundary accepts the §5 toggle (registry.rb doc).
       WRITE_BOUNDARY_CLASSES = %w[
         Tart::Tools::Edit
@@ -60,15 +69,20 @@ module Tart
       def build(selected:, cwd:, strip_trailing_whitespace: false, mcp_servers: nil,
                 identity: Identity::DEFAULT, session_env: {}, hooks: nil)
         selected.each do |name|
-          raise ArgumentError, "Unknown tool: #{name}" unless TOOL_CLASSES.key?(name)
+          raise ArgumentError, "Unknown tool: #{name}" unless TOOL_CLASSES.key?(name) || SELECTABLE_SUBAGENT.include?(name)
         end
 
         # Selected-order keys (the I41 fix — Hash#slice kept TOOL_CLASSES'
         # receiver order, diverging from the resolved list pi declares).
-        builtins = selected.to_h do |name|
+        # I81 Law 2: a selectable-but-unbuilt name (subagent) never
+        # instantiates here — it joins the loadout ONLY through the
+        # registered-tools merge below.
+        builtins = selected.filter_map do |name|
+          next if SELECTABLE_SUBAGENT.include?(name)
+
           [name, build_tool(TOOL_CLASSES.fetch(name), cwd:,
                             strip_trailing_whitespace:, identity:, session_env:)]
-        end
+        end.to_h
         loadout = mcp_servers ? builtins.merge(Mcp.tools_for(mcp_servers)) : builtins
         return loadout unless hooks
 

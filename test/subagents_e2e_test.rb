@@ -136,7 +136,10 @@ module Tart
       sj = status_json(run_dir)
       assert_equal "completed", sj["state"]
       assert_equal false, sj.fetch("timedOut", nil), "a completed run never sets timedOut"
-      refute sj["task"].to_s.include?(A_CHILD_TASK), "the task text is never recorded (pi redacts)"
+      # I81 Law 3 re-pin (declared in the lane prompt as a behavior-
+      # contradicting pin inside the touch set): the RAW task now rides
+      # status.json verbatim.
+      assert_equal A_CHILD_TASK, sj["task"], "the spawn's raw task is on disk verbatim"
       rj = result_json(run_dir)
       assert_equal true, rj["success"]
       assert_equal A_CHILD_ANSWER, rj["output"].to_s.strip
@@ -154,16 +157,24 @@ module Tart
     def test_leg_b_async_delegation_and_print_drain
       stage_subagents_home
       stage_home
-      # Script order: the parent's tool-result turn is issued ~instantly
-      # after the start message, while the child still owes a ~350ms
-      # interpreter boot (Grounds §4 probe B) — so the child's request
-      # arrives LAST and gets the slow stream. The margin is two orders of
-      # magnitude; a flipped order fails loud on the stdout pin below.
+      # I87 Law 2 (kill the arrival-order bet): each response routes by
+      # REQUEST CONTENT, not arrival order — the parent's tool-result turn
+      # is identified by the c1 tool message, the child's first request by
+      # the delegated task text, the parent's opening turn by the leg
+      # prompt. At base the script shifted blindly and bet the child's
+      # ~350ms interpreter boot loses to the parent's instant tool-result
+      # turn; under sustained 8-way load the boot starves, the order
+      # flips, and the stdout pin inverts (the measured class-(f) firing).
+      # Every response below is byte-identical to the old order-shifted
+      # script; only the ROUTING is deterministic now.
       @server.script([
         {type: :stream, tool_calls: [{id: "c1", name: "subagent",
-                                      arguments: {agent: "worker", task: B_CHILD_TASK, async: true}}]},
-        {type: :stream, content: B_FINAL},
-        {type: :slow_stream, content: B_CHILD_SLOW, chunk_every: 0.05}
+                                      arguments: {agent: "worker", task: B_CHILD_TASK, async: true}}],
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(B_PROMPT) } }},
+        {type: :stream, content: B_FINAL,
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "c1" } }},
+        {type: :slow_stream, content: B_CHILD_SLOW, chunk_every: 0.05,
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(B_CHILD_TASK) } }}
       ])
 
       stdout, stderr, status = tart_sub(B_PROMPT)
@@ -984,14 +995,20 @@ module Tart
     def test_default_on_e2_async_detached_notify_and_print_drain
       stage_subagents_home
       assert_no_staged_settings
-      # The leg-B script-order bet: the parent's tool-result turn is issued
-      # ~instantly after the start message, so the child's request arrives
-      # LAST and takes the slow stream.
+      # I87 Law 2 (kill the arrival-order bet — the leg-B shape): responses
+      # route by REQUEST CONTENT (see test_leg_b above), so the child's
+      # slow boot can never flip which request takes which response. The
+      # firing class-(f) inversion (the stdout pin carrying the child's
+      # answer) is impossible by construction now; every assertion below
+      # is unchanged.
       @server.script([
         {type: :stream, tool_calls: [{id: "c1", name: "subagent",
-                                      arguments: {agent: "worker", task: B_CHILD_TASK, async: true}}]},
-        {type: :stream, content: B_FINAL},
-        {type: :slow_stream, content: B_CHILD_SLOW, chunk_every: 0.05}
+                                      arguments: {agent: "worker", task: B_CHILD_TASK, async: true}}],
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(B_PROMPT) } }},
+        {type: :stream, content: B_FINAL,
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "c1" } }},
+        {type: :slow_stream, content: B_CHILD_SLOW, chunk_every: 0.05,
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(B_CHILD_TASK) } }}
       ])
 
       stdout, stderr, status = tart_sub(B_PROMPT)
@@ -1092,6 +1109,188 @@ module Tart
       assert_equal false, sj.fetch("timedOut", nil), "a user stop never sets timedOut"
       assert_ps_clean(run[:pid])
       puts "[i48-e2e] leg E4: default-on home, stop lands stopped/timedOut false, no zombies"
+    end
+
+    # *****************************************************************
+    # I80 child-encoding-hygiene, lane core. Every byte above is the
+    # judged instrument — UNTOUCHED; this leg is the lane's append. It
+    # reuses leg A's EXACT machinery (staged HOME, the closed locale-less
+    # tart_env — ALREADY the defect environment, no new staging,
+    # MockLLMServer, the foreground subagent call) with a Diátaxis-grade
+    # non-ASCII task AND child answer. At base the locale-blind
+    # read_output swallowed the byte-exact child answer to "" and the run
+    # settled failed with the JSON.generate BINARY warning recorded as the
+    # error (the devstral-docs failure class, probe B). The three laws
+    # (child locale + boot UTF-8 + the byte-hygienic readers) make the
+    # whole child boundary byte-exact.
+    # *****************************************************************
+
+    ENC_PROMPT = "I80 encoding e2e: delegate the Diátaxis note — résumé ✓ (á é ü)"
+    ENC_CHILD_TASK = "I80 encoding child task: write the Diátaxis note — résumé ✓ (á é ü)"
+    ENC_CHILD_ANSWER = "I80 encoding answer: Diátaxis — résumé ✓ (á é ü) OK"
+    ENC_FINAL = "I80 encoding parent final: the child answered byte-exact"
+
+    def test_encoding_e2e_non_ascii_round_trip
+      stage_subagents_home
+      stage_home
+      @server.script([
+        {type: :stream, tool_calls: [{id: "c1", name: "subagent",
+                                      arguments: {agent: "worker", task: ENC_CHILD_TASK, async: false}}]},
+        {type: :stream, content: ENC_CHILD_ANSWER},
+        {type: :stream, content: ENC_FINAL}
+      ])
+
+      stdout, stderr, status = tart_sub(ENC_PROMPT)
+      assert_equal 0, status.exitstatus, "the parent exits 0 (stderr: #{stderr})"
+      assert_equal ENC_FINAL, stdout.chomp, "the parent's final stdout is byte-exact"
+      assert_empty stderr, "the parent's own stderr carries ZERO lines (the boot law's leg)"
+
+      drain_captures
+      child_req = child_requests(ENC_CHILD_TASK).first
+      assert child_req, "the child's wire request was captured"
+      child_user = child_req["messages"].select { |m| m["role"] == "user" }.last
+      assert_equal ENC_CHILD_TASK, child_user["content"],
+        "the child wire request carries the task BYTE-EXACT"
+
+      run_dir = the_only_run_dir
+      stderr_log = File.read(File.join(run_dir, "runner.stderr.log"))
+      refute stderr_log.include?("passed as BINARY"),
+        "runner.stderr.log carries ZERO 'passed as BINARY' lines: #{stderr_log[0, 200].inspect}"
+
+      sj = status_json(run_dir)
+      assert_equal "completed", sj["state"]
+      assert_equal ENC_CHILD_TASK.length, sj["taskChars"],
+        "taskChars is the task's CHARACTER count"
+      # I81 Law 3 re-pin (declared in the lane prompt as a behavior-
+      # contradicting pin inside the touch set): the raw task rides verbatim.
+      assert_equal ENC_CHILD_TASK, sj["task"], "the spawn's raw task is on disk byte-exact"
+
+      rj = result_json(run_dir)
+      assert_equal true, rj["success"]
+      assert_equal ENC_CHILD_ANSWER, rj["output"],
+        "result.json output equals the child answer BYTE-EXACT"
+      puts "[i48-e2e] encoding leg: exit 0, task + answer rode the boundary byte-exact, " \
+           "run #{File.basename(run_dir)} completed"
+    end
+
+    # *****************************************************************
+    # I81 agent-loading-forensics, lane core. Every byte above is the
+    # judged instrument — UNTOUCHED except the two DECLARED Law-3 re-pins
+    # above (leg A's and the encoding leg's task-null refutes, both
+    # inside this touch-set file); this leg is the lane's append. THREE
+    # process generations on the leg-A machinery (staged HOME + a staged
+    # agents dir, MockLLMServer, real `bin/tart -p` subprocesses): the
+    # parent's model calls `subagent` on a CUSTOM coordinator agent whose
+    # `tools:` carry `subagent` AND an unknown entry (`bg_wait` — the
+    # live 07:40Z specimen name); the child's captured wire proves the
+    # Law-1 drop (bg_wait absent, subagent declared LAST) and the Law-2
+    # grant (the child spawns the grandchild); the grandchild's output
+    # rides back through the chain; the Law-3 forensics run live on BOTH
+    # run dirs (single-sessions transcripts, raw task text on disk).
+    # *****************************************************************
+
+    N_PROMPT = "e2e nested leg: delegate through the coordinator"
+    N_CHILD_TASK = "e2e nested child task: the coordinator delegates the check"
+    N_GRANDCHILD_TASK = "e2e nested grandchild task: report the leg-N answer"
+    N_GRANDCHILD_ANSWER = "leg N grandchild answer: two levels deep"
+    N_CHILD_ANSWER = "leg N child answer: the grandchild reported"
+    N_FINAL = "leg N parent final: the chain answered"
+
+    def test_nested_e2e_three_generations_custom_coordinator
+      stage_subagents_home
+      stage_home
+      # The staged USER-tier agents dir (the parent AND the child resolve
+      # profiles from the same staged HOME's default agent root).
+      agents_dir = File.join(@home, ".tart", "agents")
+      FileUtils.mkdir_p(agents_dir)
+      File.write(File.join(agents_dir, "coordinator.md"), <<~MD)
+        ---
+        description: e2e nested coordinator (custom agent)
+        tools: read, bash, bg_wait, subagent
+        ---
+
+        You are the e2e nested coordinator. Delegate the leg-N check to the worker.
+      MD
+
+      # Script slots consumed in ARRIVAL order; every generation blocks
+      # on the next (foreground spawns), so the order is deterministic:
+      # parent spawn turn → child spawn turn → grandchild turn → child
+      # tool-result turn → parent tool-result turn.
+      @server.script([
+        {type: :stream, tool_calls: [{id: "c1", name: "subagent",
+                                      arguments: {agent: "coordinator", task: N_CHILD_TASK, async: false}}]},
+        {type: :stream, tool_calls: [{id: "c2", name: "subagent",
+                                      arguments: {agent: "worker", task: N_GRANDCHILD_TASK, async: false}}]},
+        {type: :stream, content: N_GRANDCHILD_ANSWER},
+        {type: :stream, content: N_CHILD_ANSWER},
+        {type: :stream, content: N_FINAL}
+      ])
+
+      stdout, stderr, status = tart_sub(N_PROMPT)
+      assert_equal 0, status.exitstatus, "the parent exits 0 (stderr: #{stderr})"
+      assert_equal N_FINAL, stdout.strip, "the parent's final stdout is the chain's answer"
+
+      drain_captures
+      assert_equal 5, @captures.size,
+        "parent spawn, child spawn, grandchild, child tool-result, parent tool-result " \
+        "(captured: #{@captures.size})"
+
+      # Law 1 + Law 2 on the child's captured wire: the custom
+      # coordinator's spec tools after the drop (read, bash) + the bridge
+      # union (contact_supervisor) + the registered merge (subagent LAST);
+      # the unknown bg_wait is ABSENT.
+      child_req = child_requests(N_CHILD_TASK).first
+      assert child_req, "the child's spawn request was captured"
+      assert_equal %w[read bash contact_supervisor subagent],
+        child_req["tools"].to_a.map { |t| t.dig("function", "name") },
+        "the dropped unknown name is absent; subagent is declared LAST (the merge order)"
+
+      # The grandchild: the child's model spawned the builtin worker.
+      grand_req = child_requests(N_GRANDCHILD_TASK).first
+      assert grand_req, "the grandchild's request was captured"
+      assert_equal %w[read grep find ls bash edit write contact_supervisor subagent],
+        grand_req["tools"].to_a.map { |t| t.dig("function", "name") },
+        "the grandchild (the builtin worker) also declares subagent LAST (the depth-1 grant)"
+
+      # The chain: the grandchild's output rode the child's tool result;
+      # the child's output rode the parent's tool result.
+      child_replay = child_requests(N_CHILD_TASK).last
+      assert_includes tool_message(child_replay, "c2"), N_GRANDCHILD_ANSWER,
+        "the grandchild's output is the child's tool result"
+      parent_req2 = @captures.find do |r|
+        r["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "c1" }
+      end
+      assert parent_req2, "the parent's tool-result turn was captured"
+      assert_equal N_CHILD_ANSWER, tool_message(parent_req2, "c1").strip,
+        "the child's output is the parent's tool result (verbatim, §7)"
+
+      # TWO run dirs under the staged home (the child + the grandchild).
+      runs = Dir.children(@subagents_home).sort.map do |child|
+        [child, status_json(File.join(@subagents_home, child))]
+      end
+      assert_equal 2, runs.size, "the child and grandchild runs both landed under the staged home"
+      child_run = runs.find { |_d, sj| sj["task"] == N_CHILD_TASK }
+      grand_run = runs.find { |_d, sj| sj["task"] == N_GRANDCHILD_TASK }
+      assert child_run, "the child run's status carries the raw spawn task (Law 3)"
+      assert grand_run, "the grandchild run's status carries the raw spawn task (Law 3)"
+      assert_equal N_GRANDCHILD_ANSWER, result_json(File.join(@subagents_home, grand_run[0]))["output"].to_s.strip
+      assert_equal N_CHILD_ANSWER, result_json(File.join(@subagents_home, child_run[0]))["output"].to_s.strip
+
+      # Law 3 LIVE on both generations: single-sessions transcripts and
+      # the status sessionRoot = the transcript's container.
+      [child_run, grand_run].each do |(name, sj)|
+        run_dir = File.join(@subagents_home, name)
+        sessions = Dir.glob(File.join(run_dir, "sessions", "**", "*.jsonl"))
+        assert_equal 1, sessions.size, "#{name}: exactly one transcript"
+        relative = sessions.first.delete_prefix("#{run_dir}/").split("/")
+        assert_equal "sessions", relative.first
+        assert_equal 3, relative.length, "#{name}: exactly ONE sessions segment (#{relative.inspect})"
+        assert_equal File.join(run_dir, "sessions"), sj["sessionRoot"],
+          "#{name}: sessionRoot is the transcript's container"
+        assert_equal "completed", sj["state"]
+      end
+      puts "[i48-e2e] nested leg: exit 0, three generations (parent → coordinator → worker → grandchild), " \
+           "drop + grant on the child wire, runs #{child_run[0]} + #{grand_run[0]} completed"
     end
   end
 end

@@ -50,6 +50,16 @@ task "models:vendor:refresh" do
 end
 
 
+# I84: the parallel test path (arch Law 2) — ADDITIVE ONLY. `rake test` and
+# its :test task below stay byte-stable and REMAIN the canonical gate; this
+# task shells to the stdlib-only runner (test/support/parallel_runner.rb),
+# whose verdict must match the serial one. Jobs: TART_TEST_JOBS, default 8.
+desc "Run the full suite across parallel minitest workers (TART_TEST_JOBS env, default 8; rake test stays the canonical gate)"
+task "test:par" do
+  ruby "test/support/parallel_runner.rb"
+end
+
+
 Rake::TestTask.new(:test) do |t|
   t.libs << "test"
   t.libs << "lib"

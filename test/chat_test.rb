@@ -1607,19 +1607,47 @@ module Tart
 
     def test_kernel_interrupt_during_streaming_cancels_and_leaves_render_coherent
       @server = MockLLMServer.new.start
-      @server.script([{type: :slow_stream, content: "x" * 40}])
+      # I87 Law 1 (unmask the drop): 80 chars ≈ 8 s at the frozen 0.1 s/char
+      # pace — the stream must OUTLAST the 5 s wait_until deadline so a
+      # dropped interrupt can never mask as a natural end (at 40 chars ≈ 4 s
+      # it could). On the interrupt path the stream is cancelled
+      # immediately, so the extra length costs nothing on green runs.
+      @server.script([{type: :slow_stream, content: "x" * 80}])
       kernel, chat, session = chat_with_server
 
       scenario = Thread.new do
-        type(session, "long stream")
-        wait_until { chat.busy? }
-        # Backlog C: the interrupt is ESCAPE (pi app.interrupt — the
-        # editor's onEscape → interrupt_work!); ctrl+c is the editor's
-        # clear/exit (the loop is not the decider — the loop_test pin).
-        session.push_event(TUI.key_event("esc"))
-        wait_until { !chat.busy? }
-        wait_until { chat.transcript_lines.join.include?("interrupted") }
-        kernel.stop!
+        # The anti-wedge belt (I82 Law 4): `kernel.stop!` rides an `ensure`
+        # so EVERY exit path — including a `wait_until` deadline raise —
+        # stops the kernel. Without the belt a missed timing window leaves
+        # `kernel.run` looping forever and the suite WEDGES instead of
+        # failing; with it the deadline raise surfaces through `join` as a
+        # loud red. (The escape twin below has carried the belt since I82;
+        # the I87 belt audit closes this gap.)
+        begin
+          type(session, "long stream")
+          wait_until { chat.busy? }
+          # I87 Law 1 (order the handshake): ESC only after the kernel's
+          # work task is live AND the stream is demonstrably in flight —
+          # the mock server captured the request AND three content chunks
+          # have rendered. Measured mechanism (I87 forensics): interrupt_work!
+          # finds live tasks either way, but Task#stop's delivery into a
+          # fiber parked BEFORE its first socket read can silently fail on
+          # this stack (Scheduler#raise returns, the Cancel never lands, the
+          # run stays busy forever — the firing record); past the first
+          # rendered chunks the fiber parks at the SSE read, the state where
+          # cancellation delivery is the designed mechanism. The silent
+          # no-delivery window is closed BY CONSTRUCTION, not by timing.
+          wait_until { captured.any? { |req| req["messages"].select { |m| m["role"] == "user" }.last["content"] == "long stream" } }
+          wait_until { widget_lines_with_spans(session.drawn.last).map { |l| l.spans.map(&:content).join }.join.include?("xxx") }
+          # Backlog C: the interrupt is ESCAPE (pi app.interrupt — the
+          # editor's onEscape → interrupt_work!); ctrl+c is the editor's
+          # clear/exit (the loop is not the decider — the loop_test pin).
+          session.push_event(TUI.key_event("esc"))
+          wait_until { !chat.busy? }
+          wait_until { chat.transcript_lines.join.include?("interrupted") }
+        ensure
+          kernel.stop!
+        end
       end
       kernel.run
       scenario.join
@@ -3663,7 +3691,12 @@ module Tart
         # IdleKernel#stop no-ops; the tool's checkpoint flag does the cancel.
         Async do |root|
           root.async { workers.each { |block| root.async { block.call } } }
-          sleep 0.3 # the command is running
+          # The in-flight observable for a SILENT command (no chunks to
+          # poll): the spawned child process — run_user is inside its
+          # output-drain wait once the child exists, so the escape lands
+          # inside the tool's cooperative waits (the checkpoint belt),
+          # never before the queued exec block has even started.
+          wait_until { bash_child_in_flight?("sleep 5") }
           chat.on_event(TUI.key_event("esc"))
         end
         draw(chat, session)
@@ -3841,6 +3874,17 @@ module Tart
       lines.map { |line| line.spans.map(&:content).join }
     end
 
+    # The in-flight observable for a silent user-bash command: the command's
+    # spawned child process (pgroup spawn ⇒ /bin/bash -c <command> is a
+    # direct child of THIS test process). run_user is inside its
+    # output-drain wait once the child exists.
+    def bash_child_in_flight?(command)
+      `ps -eo ppid=,command=`.lines.any? do |line|
+        ppid, cmd = line.strip.split(" ", 2)
+        ppid == Process.pid.to_s && cmd.to_s.include?(command)
+      end
+    end
+
     # The live loader row's spans (nil when no running block is on screen).
     def loader_row_spans(chat)
       chat.display_lines.map(&:spans).find { |spans| spans.map(&:content).join.include?("Running...") }
@@ -3856,7 +3900,10 @@ module Tart
       with_chat(width: 60, screen_height: 24) do |chat, session|
         send_message(chat, "!printf 'alpha\\n'; sleep 0.5; printf 'beta\\n'")
         reactor = run_user_bash_task(chat)
-        sleep 0.2 # the first chunk has landed; the second has not
+        # The first chunk lands ~instantly and the second follows 0.5 s later
+        # (the scripted in-command sleep), so a poll on the rendered live row
+        # ends strictly between them — no fixed window to miss under load.
+        wait_until { row_texts(chat.display_lines).any? { |row| row == " alpha" } }
         draw(chat, session)
 
         rows = row_texts(chat.display_lines)
@@ -3909,7 +3956,9 @@ module Tart
       with_chat(width: 60, screen_height: 24) do |chat, session|
         send_message(chat, "!printf 'par'; sleep 0.3; printf 'tial\\r\\nline2'; sleep 0.3; printf 'tail'")
         reactor = run_user_bash_task(chat)
-        sleep 0.45 # chunks 1-2 have landed ("par" + "tial\nline2")
+        # chunks 1-2 land at ~0.3 s and the tail follows 0.3 s later — poll
+        # the joined row instead of guessing the window.
+        wait_until { row_texts(chat.display_lines).any? { |row| row == " line2" } }
         draw(chat, session)
 
         rows = row_texts(chat.display_lines)
@@ -3931,7 +3980,8 @@ module Tart
       with_chat(width: 60, screen_height: 24) do |chat, session|
         send_message(chat, "!printf 'x\\ry'; sleep 0.4; printf ' end'")
         reactor = run_user_bash_task(chat)
-        sleep 0.15
+        # the joined CR-only row lands ~instantly; " end" follows 0.4 s later
+        wait_until { row_texts(chat.display_lines).any? { |row| row == " xy" } }
         draw(chat, session)
 
         rows = row_texts(chat.display_lines)
@@ -3984,7 +4034,10 @@ module Tart
         # IdleKernel#stop no-ops; the tool's checkpoint flag does the cancel.
         Async do |root|
           root.async { workers.each { |block| root.async { block.call } } }
-          sleep 0.3
+          # The landed " kept" chunk proves run_user is inside its
+          # streaming wait — the escape then cancels mid-run and the
+          # partial output is kept.
+          wait_until { row_texts(chat.display_lines).any? { |row| row == " kept" } }
           draw(chat, session)
           assert chat.user_bash_streaming?, "the run is mid-flight"
 
@@ -4017,7 +4070,7 @@ module Tart
       with_chat(width: 60, screen_height: 24, clock:, kernel:) do |chat, session|
         send_message(chat, "!sleep 2")
         reactor = run_user_bash_task(chat)
-        sleep 0.2
+        wait_until { chat.user_bash_streaming? } # the run is in flight
 
         refute chat.busy?, "@busy stays false — a bash run is no agent turn"
         draw(chat, session)
@@ -4057,7 +4110,7 @@ module Tart
       with_chat(width: 60, screen_height: 24, clock:) do |chat, session|
         send_message(chat, "!sleep 2")
         reactor = run_user_bash_task(chat)
-        sleep 0.2
+        wait_until { chat.user_bash_streaming? } # the first run is in flight
         draw(chat, session)
         assert_equal "⠋", loader_row_spans(chat)[1].content
         reactor.join(5)
@@ -4067,7 +4120,7 @@ module Tart
         t += Render::Chat::SPINNER_INTERVAL_SECONDS
         send_message(chat, "!sleep 2")
         reactor = run_user_bash_task(chat)
-        sleep 0.2
+        wait_until { chat.user_bash_streaming? } # the second run is in flight
         draw(chat, session)
         assert_equal "⠋", loader_row_spans(chat)[1].content,
           "the anchor resets at each run start (pi: one Loader per component)"
@@ -4084,7 +4137,7 @@ module Tart
       with_chat(width: 60, screen_height: 24) do |chat, session|
         send_message(chat, "!!sleep 2")
         reactor = run_user_bash_task(chat)
-        sleep 0.2
+        wait_until { chat.user_bash_streaming? } # the run is mid-flight
         draw(chat, session)
 
         buffer = session.buffer_content
@@ -4106,7 +4159,9 @@ module Tart
       with_chat(width: 60, screen_height: 24) do |chat, session|
         send_message(chat, "!seq 1 25; sleep 2")
         reactor = run_user_bash_task(chat)
-        sleep 0.2 # seq has printed all 25 lines; the run is mid-flight
+        # seq prints instantly and the run then holds ~2 s — poll the tail
+        # row instead of guessing the window.
+        wait_until { row_texts(chat.display_lines).any? { |row| row == " 25" } }
         draw(chat, session)
 
         rows = row_texts(chat.display_lines)
@@ -5747,19 +5802,42 @@ module Tart
     # existing interrupt path (Task#stop — the ctrl+c mechanism).
     def test_escape_interrupts_a_streaming_run_through_the_kernel_path
       @server = MockLLMServer.new.start
-      @server.script([{type: :slow_stream, content: "x" * 40}])
+      # I87 Law 1 (unmask the drop): 80 chars ≈ 8 s at the frozen 0.1 s/char
+      # pace — outlasts the 5 s wait_until deadline, so a dropped interrupt
+      # is ALWAYS a loud red, never a masked natural end (the base-40-char
+      # ≈ 4 s stream could still green a dropped interrupt serially). The
+      # interrupt path cancels the stream immediately: no green-run cost.
+      @server.script([{type: :slow_stream, content: "x" * 80}])
       kernel, chat, session = chat_with_server
 
       scenario = Thread.new do
-        type(session, "long stream")
-        wait_until { chat.busy? }
-        session.push_event(TUI.key_event("esc"))
-        wait_until { !chat.busy? }
-        wait_until { chat.transcript_lines.join.include?("interrupted") }
-        @agent_interrupted = chat.agent.interrupted?
-        type(session, "still there") # the loop must still be alive to submit
-        wait_until { captured.any? { |req| req["messages"].select { |m| m["role"] == "user" }.last["content"] == "still there" } }
-        kernel.stop!
+        # The anti-wedge belt (I82 Law 4): `kernel.stop!` rides an `ensure`
+        # so EVERY exit path — including a `wait_until` deadline raise —
+        # stops the kernel. Without the belt a missed timing window leaves
+        # `kernel.run` looping forever and the suite WEDGES instead of
+        # failing; with it the deadline raise surfaces through `join` as a
+        # loud red.
+        begin
+          type(session, "long stream")
+          wait_until { chat.busy? }
+          # I87 Law 1 (order the handshake — see the kernel_interrupt twin
+          # above for the measured mechanism): ESC only after the mock
+          # server captured the request AND three content chunks rendered —
+          # the work task is live and the fiber is parked at the SSE read,
+          # where Task#stop's cancellation delivery is the designed
+          # mechanism. Closes the pre-IO silent-no-delivery window by
+          # construction.
+          wait_until { captured.any? { |req| req["messages"].select { |m| m["role"] == "user" }.last["content"] == "long stream" } }
+          wait_until { widget_lines_with_spans(session.drawn.last).map { |l| l.spans.map(&:content).join }.join.include?("xxx") }
+          session.push_event(TUI.key_event("esc"))
+          wait_until { !chat.busy? }
+          wait_until { chat.transcript_lines.join.include?("interrupted") }
+          @agent_interrupted = chat.agent.interrupted?
+          type(session, "still there") # the loop must still be alive to submit
+          wait_until { captured.any? { |req| req["messages"].select { |m| m["role"] == "user" }.last["content"] == "still there" } }
+        ensure
+          kernel.stop!
+        end
       end
       kernel.run
       scenario.join
