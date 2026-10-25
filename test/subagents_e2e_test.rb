@@ -157,16 +157,24 @@ module Tart
     def test_leg_b_async_delegation_and_print_drain
       stage_subagents_home
       stage_home
-      # Script order: the parent's tool-result turn is issued ~instantly
-      # after the start message, while the child still owes a ~350ms
-      # interpreter boot (Grounds §4 probe B) — so the child's request
-      # arrives LAST and gets the slow stream. The margin is two orders of
-      # magnitude; a flipped order fails loud on the stdout pin below.
+      # I87 Law 2 (kill the arrival-order bet): each response routes by
+      # REQUEST CONTENT, not arrival order — the parent's tool-result turn
+      # is identified by the c1 tool message, the child's first request by
+      # the delegated task text, the parent's opening turn by the leg
+      # prompt. At base the script shifted blindly and bet the child's
+      # ~350ms interpreter boot loses to the parent's instant tool-result
+      # turn; under sustained 8-way load the boot starves, the order
+      # flips, and the stdout pin inverts (the measured class-(f) firing).
+      # Every response below is byte-identical to the old order-shifted
+      # script; only the ROUTING is deterministic now.
       @server.script([
         {type: :stream, tool_calls: [{id: "c1", name: "subagent",
-                                      arguments: {agent: "worker", task: B_CHILD_TASK, async: true}}]},
-        {type: :stream, content: B_FINAL},
-        {type: :slow_stream, content: B_CHILD_SLOW, chunk_every: 0.05}
+                                      arguments: {agent: "worker", task: B_CHILD_TASK, async: true}}],
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(B_PROMPT) } }},
+        {type: :stream, content: B_FINAL,
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "c1" } }},
+        {type: :slow_stream, content: B_CHILD_SLOW, chunk_every: 0.05,
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(B_CHILD_TASK) } }}
       ])
 
       stdout, stderr, status = tart_sub(B_PROMPT)
@@ -987,14 +995,20 @@ module Tart
     def test_default_on_e2_async_detached_notify_and_print_drain
       stage_subagents_home
       assert_no_staged_settings
-      # The leg-B script-order bet: the parent's tool-result turn is issued
-      # ~instantly after the start message, so the child's request arrives
-      # LAST and takes the slow stream.
+      # I87 Law 2 (kill the arrival-order bet — the leg-B shape): responses
+      # route by REQUEST CONTENT (see test_leg_b above), so the child's
+      # slow boot can never flip which request takes which response. The
+      # firing class-(f) inversion (the stdout pin carrying the child's
+      # answer) is impossible by construction now; every assertion below
+      # is unchanged.
       @server.script([
         {type: :stream, tool_calls: [{id: "c1", name: "subagent",
-                                      arguments: {agent: "worker", task: B_CHILD_TASK, async: true}}]},
-        {type: :stream, content: B_FINAL},
-        {type: :slow_stream, content: B_CHILD_SLOW, chunk_every: 0.05}
+                                      arguments: {agent: "worker", task: B_CHILD_TASK, async: true}}],
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(B_PROMPT) } }},
+        {type: :stream, content: B_FINAL,
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "c1" } }},
+        {type: :slow_stream, content: B_CHILD_SLOW, chunk_every: 0.05,
+         match: ->(req) { req["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(B_CHILD_TASK) } }}
       ])
 
       stdout, stderr, status = tart_sub(B_PROMPT)

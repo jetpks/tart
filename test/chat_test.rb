@@ -1607,19 +1607,47 @@ module Tart
 
     def test_kernel_interrupt_during_streaming_cancels_and_leaves_render_coherent
       @server = MockLLMServer.new.start
-      @server.script([{type: :slow_stream, content: "x" * 40}])
+      # I87 Law 1 (unmask the drop): 80 chars ≈ 8 s at the frozen 0.1 s/char
+      # pace — the stream must OUTLAST the 5 s wait_until deadline so a
+      # dropped interrupt can never mask as a natural end (at 40 chars ≈ 4 s
+      # it could). On the interrupt path the stream is cancelled
+      # immediately, so the extra length costs nothing on green runs.
+      @server.script([{type: :slow_stream, content: "x" * 80}])
       kernel, chat, session = chat_with_server
 
       scenario = Thread.new do
-        type(session, "long stream")
-        wait_until { chat.busy? }
-        # Backlog C: the interrupt is ESCAPE (pi app.interrupt — the
-        # editor's onEscape → interrupt_work!); ctrl+c is the editor's
-        # clear/exit (the loop is not the decider — the loop_test pin).
-        session.push_event(TUI.key_event("esc"))
-        wait_until { !chat.busy? }
-        wait_until { chat.transcript_lines.join.include?("interrupted") }
-        kernel.stop!
+        # The anti-wedge belt (I82 Law 4): `kernel.stop!` rides an `ensure`
+        # so EVERY exit path — including a `wait_until` deadline raise —
+        # stops the kernel. Without the belt a missed timing window leaves
+        # `kernel.run` looping forever and the suite WEDGES instead of
+        # failing; with it the deadline raise surfaces through `join` as a
+        # loud red. (The escape twin below has carried the belt since I82;
+        # the I87 belt audit closes this gap.)
+        begin
+          type(session, "long stream")
+          wait_until { chat.busy? }
+          # I87 Law 1 (order the handshake): ESC only after the kernel's
+          # work task is live AND the stream is demonstrably in flight —
+          # the mock server captured the request AND three content chunks
+          # have rendered. Measured mechanism (I87 forensics): interrupt_work!
+          # finds live tasks either way, but Task#stop's delivery into a
+          # fiber parked BEFORE its first socket read can silently fail on
+          # this stack (Scheduler#raise returns, the Cancel never lands, the
+          # run stays busy forever — the firing record); past the first
+          # rendered chunks the fiber parks at the SSE read, the state where
+          # cancellation delivery is the designed mechanism. The silent
+          # no-delivery window is closed BY CONSTRUCTION, not by timing.
+          wait_until { captured.any? { |req| req["messages"].select { |m| m["role"] == "user" }.last["content"] == "long stream" } }
+          wait_until { widget_lines_with_spans(session.drawn.last).map { |l| l.spans.map(&:content).join }.join.include?("xxx") }
+          # Backlog C: the interrupt is ESCAPE (pi app.interrupt — the
+          # editor's onEscape → interrupt_work!); ctrl+c is the editor's
+          # clear/exit (the loop is not the decider — the loop_test pin).
+          session.push_event(TUI.key_event("esc"))
+          wait_until { !chat.busy? }
+          wait_until { chat.transcript_lines.join.include?("interrupted") }
+        ensure
+          kernel.stop!
+        end
       end
       kernel.run
       scenario.join
@@ -5774,7 +5802,12 @@ module Tart
     # existing interrupt path (Task#stop — the ctrl+c mechanism).
     def test_escape_interrupts_a_streaming_run_through_the_kernel_path
       @server = MockLLMServer.new.start
-      @server.script([{type: :slow_stream, content: "x" * 40}])
+      # I87 Law 1 (unmask the drop): 80 chars ≈ 8 s at the frozen 0.1 s/char
+      # pace — outlasts the 5 s wait_until deadline, so a dropped interrupt
+      # is ALWAYS a loud red, never a masked natural end (the base-40-char
+      # ≈ 4 s stream could still green a dropped interrupt serially). The
+      # interrupt path cancels the stream immediately: no green-run cost.
+      @server.script([{type: :slow_stream, content: "x" * 80}])
       kernel, chat, session = chat_with_server
 
       scenario = Thread.new do
@@ -5787,6 +5820,15 @@ module Tart
         begin
           type(session, "long stream")
           wait_until { chat.busy? }
+          # I87 Law 1 (order the handshake — see the kernel_interrupt twin
+          # above for the measured mechanism): ESC only after the mock
+          # server captured the request AND three content chunks rendered —
+          # the work task is live and the fiber is parked at the SSE read,
+          # where Task#stop's cancellation delivery is the designed
+          # mechanism. Closes the pre-IO silent-no-delivery window by
+          # construction.
+          wait_until { captured.any? { |req| req["messages"].select { |m| m["role"] == "user" }.last["content"] == "long stream" } }
+          wait_until { widget_lines_with_spans(session.drawn.last).map { |l| l.spans.map(&:content).join }.join.include?("xxx") }
           session.push_event(TUI.key_event("esc"))
           wait_until { !chat.busy? }
           wait_until { chat.transcript_lines.join.include?("interrupted") }
