@@ -167,7 +167,11 @@ module Tart
         while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
           files = Dir.glob(File.join(ctrl2, "supervisor-requests", "*.json"))
           if (file = files.first)
-            payload = JSON.parse(File.read(file))
+            begin
+              payload = JSON.parse(File.read(file))
+            rescue Errno::ENOENT
+              next # the child unlinked its own request between the glob and the read — the poll loop's next tick retries
+            end
             seen << payload
             Subagents::Supervisor.atomic_write_json(
               File.join(ctrl2, "supervisor-replies", "#{payload['id']}.json"),
@@ -220,7 +224,11 @@ module Tart
         100.times do
           files = Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }
           if (file = files.first)
-            id = JSON.parse(File.read(File.join(ctrl, "supervisor-requests", file)))["id"]
+            begin
+              id = JSON.parse(File.read(File.join(ctrl, "supervisor-requests", file)))["id"]
+            rescue Errno::ENOENT
+              next # the child unlinked its consumed request between the Dir.children snapshot and the read — the poll loop's next tick retries
+            end
             sleep 0.1
             Subagents::Supervisor.atomic_write_json(
               File.join(ctrl, "supervisor-replies", "#{id}.json"),
@@ -649,6 +657,76 @@ module Tart
       assert_equal Subagents::WORKFLOW_TEMPLATES.map(&:name), untouched.map(&:name)
     end
 
+    # --- the TOCTOU pins (I88): the cured helpers tolerate a request file
+    # vanishing between the glob and the read — deterministic staging (a
+    # Dir.glob stub that unlinks the staged file before returning its
+    # path), never a timing bet ---
+
+    def test_toctou_request_path_tolerates_a_vanish_between_glob_and_read
+      run = fake_run("worker")
+      rid = stage_request(run, reason: "progress_update", message: "TOCTOU-VANISH", expects_reply: false)
+      stub_glob_unlinking_first(File.join(requests_dir(run), "#{rid}.json"))
+
+      assert_equal File.join(requests_dir(run), "missing.json"),
+                   request_path(run, "TOCTOU-VANISH"),
+                   "the vanished file is not the marker; the missing-marker fallback answers"
+    ensure
+      restore_glob
+    end
+
+    def test_toctou_read_single_request_flunks_honestly_on_a_vanish
+      run = fake_run("worker")
+      rid = stage_request(run, reason: "need_decision", message: "TOCTOU-GONE")
+      stub_glob_unlinking_first(File.join(requests_dir(run), "#{rid}.json"))
+
+      error = assert_raises(Minitest::Assertion) { read_single_request(run) }
+      assert_includes error.message, "vanished between the glob and the read",
+                      "the vanish fails as the honest named flunk, never a raw Errno::ENOENT escape"
+    ensure
+      restore_glob
+    end
+
+    def test_toctou_found_marker_is_still_found
+      run = fake_run("worker")
+      stage_request(run, reason: "need_decision", message: "TOCTOU-FIRST")
+      rid = stage_request(run, reason: "need_decision", message: "TOCTOU-TARGET")
+      stage_request(run, reason: "need_decision", message: "TOCTOU-LAST")
+
+      want = File.join(requests_dir(run), "#{rid}.json")
+      assert_equal want, request_path(run, "TOCTOU-TARGET")
+      assert_equal want, request_file(run, "TOCTOU-TARGET")
+    end
+
+    def test_toctou_missing_marker_fallback_is_unchanged
+      run = fake_run("worker")
+      assert_equal File.join(requests_dir(run), "missing.json"), request_path(run, "TOCTOU-ABSENT")
+      assert_nil request_file(run, "TOCTOU-ABSENT")
+
+      stage_request(run, reason: "need_decision", message: "TOCTOU-OTHER")
+      assert_equal File.join(requests_dir(run), "missing.json"), request_path(run, "TOCTOU-ABSENT")
+      assert_nil request_file(run, "TOCTOU-ABSENT")
+    end
+
+    # Deterministic TOCTOU staging: the Dir.glob stub unlinks the staged
+    # file BEFORE returning its path — the consumer's unlink lands exactly
+    # inside the helper's glob->read window. Single-threaded in these pins
+    # (no channel is started), so no other code globs under the stub; the
+    # caller restores through +restore_glob+ in its ensure.
+    def stub_glob_unlinking_first(path)
+      Dir.singleton_class.send(:alias_method, :toctou_unstubbed_glob, :glob)
+      Dir.singleton_class.send(:define_method, :glob) do |*_args|
+        File.unlink(path) if File.exist?(path)
+        [path]
+      end
+    end
+
+    def restore_glob
+      return unless Dir.singleton_class.method_defined?(:toctou_unstubbed_glob)
+
+      Dir.singleton_class.send(:alias_method, :glob, :toctou_unstubbed_glob)
+      Dir.singleton_class.send(:remove_method, :toctou_unstubbed_glob)
+    end
+
     # --- helpers ---
 
     def new_manager(**opts)
@@ -709,8 +787,8 @@ module Tart
     def request_path(run, message)
       file = Dir.glob(File.join(requests_dir(run), "*.json")).find do |path|
         JSON.parse(File.read(path))["message"] == message
-      rescue JSON::ParserError
-        false
+      rescue JSON::ParserError, Errno::ENOENT
+        false # a vanished file is not the marker — gone IS the awaited consumed state
       end
       file || File.join(requests_dir(run), "missing.json")
     end
@@ -720,6 +798,8 @@ module Tart
       files = Dir.glob(File.join(dir, "*.json"))
       flunk "expected exactly one request file, got #{files.inspect}" if files.size != 1
       JSON.parse(File.read(files.first))
+    rescue Errno::ENOENT
+      flunk "the single request file vanished between the glob and the read (the channel consumed it mid-read): #{files.first.inspect}"
     end
 
     def wait_for_request_file(run, message)
@@ -733,8 +813,8 @@ module Tart
     def request_file(run, message)
       Dir.glob(File.join(requests_dir(run), "*.json")).find do |path|
         JSON.parse(File.read(path))["message"] == message
-      rescue JSON::ParserError
-        false
+      rescue JSON::ParserError, Errno::ENOENT
+        false # a vanished file is not the marker — the child may consume its own ask mid-poll
       end
     end
 
