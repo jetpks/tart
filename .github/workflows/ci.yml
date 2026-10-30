@@ -20,7 +20,14 @@ jobs:
       # spawned child; children then resolve gems from the ruby's DEFAULT
       # paths. Vendored gems (vendor/bundle) are invisible to that lookup
       # and starve every child that boots tart code on a clean runner.
+      #
+      # TERM/COLORTERM: rendering + theme tests resolve truecolor hexes;
+      # without an explicit truecolor-capable TERM the runner's default
+      # degrades every color to a 256-palette index and the parity
+      # assertions see 102 instead of "#7e888e".
       MISE_RUBY_VERSION: ${{ matrix.ruby }}
+      TERM: xterm-256color
+      COLORTERM: truecolor
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4   # installs the mise.toml tools (fd) + the matrix ruby

@@ -1,5 +1,7 @@
 # CI + dev tools. Ruby version comes from MISE_RUBY_VERSION (the CI matrix)
-# or your local mise default — intentionally not pinned here. fd is required
-# by the find tool (PATH lookup only, no auto-download: tools/find.rb).
+# or your local mise default — intentionally not pinned here. fd + ripgrep are
+# required by the find/grep tools (PATH lookup only, no auto-download:
+# tools/find.rb, tools/grep.rb).
 [tools]
 fd = "latest"
+ripgrep = "latest"
