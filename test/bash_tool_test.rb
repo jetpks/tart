@@ -485,9 +485,16 @@ module Tart
     # remain (the marker appears in /proc pgrep -f output only while the
     # command's process group lives).
     def assert_no_probe(marker)
+      # Linux pgrep -f matches the invoking `sh -c` wrapper of this very
+      # backtick (the marker rides in the wrapper's argv; BSD pgrep on macOS
+      # does not) — so every poll would "find" the wrapper and flunk.
+      # Bracket the first character: the pattern [t]art-probe… cannot match
+      # the wrapper's literal "[t]art-probe…" argv, but still matches the
+      # real probe's plain command line.
+      pattern = marker.sub(/\A(.)/, "[\1]")
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
       while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        output = `pgrep -fl #{marker} 2>/dev/null`
+        output = `pgrep -fl #{pattern} 2>/dev/null`
         return if output.strip.empty?
 
         sleep 0.1
