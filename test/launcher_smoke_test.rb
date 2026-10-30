@@ -110,8 +110,14 @@ module Tart
       chat = Agent::Chat.new(
         client: Fast::Completions::Client.new(base_url: "http://localhost:1/v1", api_key: "k"),
         model_id: "assumed-mapless-reasoner", provider_key: "openai")
+      # Pin the boot pair: legacy shape resolves it from env > models.json >
+      # settings, so the clamp outcome otherwise rides whatever model the
+      # HOST resolves (a dev box with PI_MODEL set clamps; a clean runner
+      # resolves the catalogue default, which carries a full xhigh map and
+      # does not).
+      boot = Shapes::ModelRef.new(provider: "openai", id: "assumed-mapless-reasoner")
 
-      data = Executable.footer_data("/somewhere", settings, chat: chat, identity: "pi")
+      data = Executable.footer_data("/somewhere", settings, boot:, chat:, identity: "pi")
       assert_equal "high", data[:thinking_level],
         "the boot level clamps through the map-less rule (no known map for the id)"
       assert_equal "xhigh", data[:default_thinking_level], "the badge source stays unclamped"
@@ -259,7 +265,8 @@ module Tart
       server = MockLLMServer.new.start
       server.script([{type: :message, content: "wired"}])
       home = Dir.mktmpdir("tart-prompt-home-")
-      stdout, stderr, status = Open3.capture3(smoke_env(home, server),
+      pi_bin = stage_pi_install(home)
+      stdout, stderr, status = Open3.capture3(smoke_env(home, server).merge("PATH" => "#{pi_bin}:#{ENV.fetch('PATH', '')}"),
         RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "hello",
         chdir: REPO_ROOT)
 
@@ -338,6 +345,23 @@ module Tart
     ensure
       server.stop
       FileUtils.rm_rf(home)
+    end
+
+    # A self-contained pi install for the <docs> walk (pi_docs_paths:
+    # realpath the pi on PATH, up to the package.json carrying the pi
+    # package name). Real runners have no pi installed — the prompt would
+    # omit <docs> and the test would be host-coupled.
+    def stage_pi_install(home)
+      install = File.join(home, "pi-install")
+      FileUtils.mkpath(File.join(install, "bin"))
+      FileUtils.mkpath(File.join(install, "docs"))
+      FileUtils.mkpath(File.join(install, "examples"))
+      File.write(File.join(install, "bin", "pi"), "#!/bin/sh\nexit 0\n")
+      File.chmod(0o755, File.join(install, "bin", "pi"))
+      File.write(File.join(install, "package.json"),
+        JSON.generate("name" => Agent::SystemPrompt::PI_PACKAGE))
+      File.write(File.join(install, "README.md"), "staged pi readme\n")
+      File.join(install, "bin")
     end
 
     def smoke_env(home, server)

@@ -246,6 +246,11 @@ module Tart
       {
         "PATH" => ENV.fetch("PATH", nil),
         "HOME" => @home,
+        # The child boots tart itself (bin/tart runs Bundler.setup beside
+        # its Gemfile): pass the bundle location through so vendored CI gems
+        # (BUNDLE_PATH=vendor/bundle) resolve — unset locally, where bundler's
+        # default path already carries them.
+        "BUNDLE_PATH" => ENV.fetch("BUNDLE_PATH", nil),
         # I69 move: the e2e legs test the PI_-parity opt-in — stage the
         # identity EXPLICITLY so the (now tart) default never rides.
         "TART_IDENTITY" => "pi",

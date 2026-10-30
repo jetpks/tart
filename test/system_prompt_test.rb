@@ -119,16 +119,25 @@ module Tart
     end
 
     # The <docs> resolver reproduces pi's getPackageDir walk (config.ts
-    # :443-457): realpath the pi on PATH, up to the package.json — on the
-    # parity target this lands byte-identical on the capture's paths.
+    # :443-457): realpath the pi on PATH, up to the package.json. Pinned
+    # captures of one dev box's absolute paths are not portable — resolve
+    # the local install and assert the walk lands on IT; skip where pi
+    # is simply not installed (CI runners).
     def test_pi_docs_paths_resolve_pis_install
+      pi = `sh -c 'command -v pi' 2>/dev/null`.strip
+      skip "pi is not installed on this host" if pi.empty?
+
       docs = Agent::SystemPrompt.pi_docs_paths
-      assert_equal "/Users/eric/.local/share/mise/installs/node/24.18.0/lib/node_modules/@earendil-works/pi-coding-agent/README.md", docs[0],
-        "pi's realpath'd install (the capture's paths)"
+      install_dir = File.dirname(File.realpath(pi))
+      until File.exist?(File.join(install_dir, "package.json")) || install_dir == "/"
+        install_dir = File.dirname(install_dir)
+      end
+      assert_equal File.join(install_dir, "README.md"), docs[0],
+        "pi's realpath'd install (resolved from the local pi on PATH)"
       assert File.file?(docs[0]) && File.directory?(docs[1]) && File.directory?(docs[2])
       # pi's package layout: the walk bottoms at the package.json that
       # carries the package name.
-      assert_equal "@earendil-works/pi-coding-agent", JSON.parse(File.read(File.join(File.dirname(docs[0]), "package.json")))["name"]
+      assert_equal "@earendil-works/pi-coding-agent", JSON.parse(File.read(File.join(install_dir, "package.json")))["name"]
     end
 
     # --- the identity templating (I32 AC1/AC2) ---
