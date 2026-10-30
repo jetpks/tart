@@ -15,18 +15,14 @@ jobs:
         # the dev version; mise resolves each to its latest patch.
         ruby: ["3.4", "4.0"]
     env:
-      BUNDLE_PATH: vendor/bundle
+      # NOTE: deliberately NO BUNDLE_PATH / vendor-bundle caching here.
+      # tart's I73 child-env law scrubs bundler's exported env from every
+      # spawned child; children then resolve gems from the ruby's DEFAULT
+      # paths. Vendored gems (vendor/bundle) are invisible to that lookup
+      # and starve every child that boots tart code on a clean runner.
       MISE_RUBY_VERSION: ${{ matrix.ruby }}
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
-      - uses: actions/cache@v6
-        with:
-          path: vendor/bundle
-          key: bundle-ruby-${{ matrix.ruby }}-${{ hashFiles('Gemfile.lock') }}
-          restore-keys: bundle-ruby-${{ matrix.ruby }}-
-      # Scoped suite — deliberately not the Rakefile's full test task:
-      # its FileList also pulls gems/tui-split-rig/test/**, which needs a
-      # local pinned pi clone that GitHub runners do not have.
+      - uses: jdx/mise-action@v4   # installs the mise.toml tools (fd) + the matrix ruby
       - run: bundle install
       - run: bundle exec ruby -Ilib -Itest -e 'Dir["test/**/*_test.rb"].sort.each { |f| require File.expand_path(f) }'

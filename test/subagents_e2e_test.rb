@@ -403,6 +403,9 @@ module Tart
       {
         "PATH" => ENV.fetch("PATH", nil),
         "HOME" => @home,
+        # See e2e_session_test's tart_env: the child boots tart itself and
+        # needs BUNDLE_PATH to resolve vendored CI gems.
+        "BUNDLE_PATH" => ENV.fetch("BUNDLE_PATH", nil),
         # I69 move: the parent boots stage the PI_-parity opt-in
         # EXPLICITLY (the (now tart) default never rides these pins).
         "TART_IDENTITY" => "pi",

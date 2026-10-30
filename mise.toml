@@ -1,0 +1,5 @@
+# CI + dev tools. Ruby version comes from MISE_RUBY_VERSION (the CI matrix)
+# or your local mise default — intentionally not pinned here. fd is required
+# by the find tool (PATH lookup only, no auto-download: tools/find.rb).
+[tools]
+fd = "latest"
