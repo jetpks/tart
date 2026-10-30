@@ -12,6 +12,13 @@ require "json"
 # minitest on the load path. The historical nesting is preserved as a
 # constant alias below; existing suite callers are unaffected.
 #
+# I04 sender hygiene: serve() sets TCP_NODELAY on every accepted
+# socket (a flushed chunk leaves as its own TCP segment; see the
+# block at the top of serve). Every response already declares
+# `Connection: close` — tart SHIPPED that form (the fast-llm fork of
+# this file predates it and I04-ported it back); this iteration
+# asserts that presence here, it does not add it.
+#
 # Parity-rig extensions (I02), backward compatible:
 # - +request_logs+ / +captured_request_logs+: per-request entries
 #   {method:, path:, headers:, body:} (the rig evidences which URL path and
@@ -151,6 +158,17 @@ class MockLLMServer
   NOTABLE_HEADERS = %w[authorization content-type accept user-agent].freeze
 
   def serve(io)
+    # I04 sender hygiene: disable Nagle on the accepted socket so each
+    # flushed SSE chunk leaves as its own TCP segment. The client side
+    # already disables Nagle (io-endpoint wrapper.rb `buffered: false`
+    # default); the rescue set is that file's prior art (darwin raises
+    # EINVAL on a not-yet-formed connection; some platforms lack the
+    # option — serve anyway).
+    begin
+      io.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+    rescue Errno::EINVAL, Errno::EOPNOTSUPP, Errno::ENOPROTOOPT
+      nil
+    end
     request_line = io.gets
     # A connection that sends no request line (empty TCP connect, prober,
     # port scan) consumes nothing: no script shift, no log entry, no response
