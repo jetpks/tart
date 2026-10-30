@@ -14,7 +14,7 @@ Gem::Specification.new do |spec|
     "deadline-paced frame rendering. All ratatui_ruby calls are confined to the TUI interface module."
   spec.homepage = "https://github.com/jetpks/tart"
   spec.license = "MIT"
-  spec.required_ruby_version = ">= 3.3"
+  spec.required_ruby_version = ">= 3.4"
 
   spec.metadata["homepage_uri"] = spec.homepage
 
