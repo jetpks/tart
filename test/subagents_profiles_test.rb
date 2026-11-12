@@ -131,7 +131,7 @@ module Tart
       assert_equal %w[read], spec[:tools], "the unknown name is dropped, the known one kept"
       diagnostic = Subagents::Profiles.discover(cwd: @cwd, root: @root, env: ENV).diagnostics
                           .find { |d| d.path.end_with?("unknown.md") }
-      assert_equal "unknown tool(s) sabotage — dropped (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, subagent, write)",
+      assert_equal "unknown tool(s) sabotage — dropped (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, subagent, web_fetch, web_search, write)",
                    diagnostic.message
 
       # A structurally invalid tools value still warns+skips the file
@@ -146,7 +146,7 @@ module Tart
     def test_dropped_unknown_names_keep_known_entries_in_declaration_order
       # The live coordinator shape (the 07:40Z specimen): unknown entries
       # between known ones; subagent is KNOWN post-widening.
-      write_profile("user", "coordinator.md", tools: "read, bg_wait, grep, web_search, subagent", body: "Body.")
+      write_profile("user", "coordinator.md", tools: "read, bg_wait, grep, warp_drive, subagent", body: "Body.")
 
       spec = Subagents::Profiles.resolve("coordinator", cwd: @cwd, root: @root, env: ENV)
       assert_equal %w[read grep subagent], spec[:tools],
@@ -156,9 +156,21 @@ module Tart
       dropped = diagnostics.find { |d| d.path.end_with?("coordinator.md") }
       refute_nil dropped
       assert_equal "warning", dropped.type
-      assert_equal "unknown tool(s) bg_wait, web_search — dropped (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, subagent, write)",
+      assert_equal "unknown tool(s) bg_wait, warp_drive — dropped (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, subagent, web_fetch, web_search, write)",
                    dropped.message
       assert_equal 1, diagnostics.size, "exactly ONE diagnostic for the file"
+    end
+
+    # I01: TOOLS_UNIVERSE accepts the web tools — a quest-shaped profile
+    # (no bash) validates clean and keeps its loadout.
+    def test_a_profile_naming_the_web_tools_keeps_them
+      write_profile("user", "quest.md",
+        tools: "read, edit, write, find, grep, ls, web_search, web_fetch, subagent", body: "Quest body.")
+
+      table = Subagents::Profiles.resolve_table(cwd: @cwd, root: @root, env: ENV)
+
+      assert_equal %w[edit find grep ls read subagent web_fetch web_search write],
+        table.fetch("quest").fetch(:tools).sort
     end
 
     def test_dropped_all_unknown_tools_load_with_zero_tools_and_the_diagnostic
@@ -172,7 +184,7 @@ module Tart
       assert spec, "an all-unknown list still LOADS"
       assert_empty spec[:tools], "zero tools"
       assert_equal 1, result.diagnostics.size
-      assert_equal "unknown tool(s) bg_wait — dropped (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, subagent, write)",
+      assert_equal "unknown tool(s) bg_wait — dropped (valid tools: bash, contact_supervisor, edit, find, grep, ls, read, subagent, web_fetch, web_search, write)",
                    result.diagnostics.first.message
     end
 

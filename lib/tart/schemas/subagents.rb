@@ -32,7 +32,7 @@ module Tart
         # is gone (pi never validates names at load — agents.js:739-741
         # shape only); the warn-and-drop diagnostic in profiles.rb names
         # this set sorted.
-        TOOLS_UNIVERSE = %w[read edit write bash find grep ls contact_supervisor subagent].freeze
+        TOOLS_UNIVERSE = %w[read edit write bash find grep ls contact_supervisor subagent web_search web_fetch].freeze
 
         # pi's comma form (a string splits on ","; an array passes through).
         # I81 Law 1: the contract's tools rule validates SHAPE ONLY — a

@@ -25,9 +25,11 @@ module Tart
     module Tools
       # pi bash.ts:29-37 resolveTimeoutMs / edit.ts:138 — the two pinned
       # in-tool strings (byte-exact, pi's own).
+      # The pinned URL rule text (web_fetch — the tool's own voice).
+      PINNED_URL_MESSAGE = "Invalid URL: must be an http(s) URL"
       PINNED_TIMEOUT_MESSAGE = "Invalid timeout: must be a finite number of seconds"
       PINNED_EDITS_MESSAGE = "Edit tool input is invalid. edits must contain at least one replacement."
-      PINNED_TEXTS = [PINNED_TIMEOUT_MESSAGE, PINNED_EDITS_MESSAGE].freeze
+      PINNED_TEXTS = [PINNED_TIMEOUT_MESSAGE, PINNED_EDITS_MESSAGE, PINNED_URL_MESSAGE].freeze
 
       # pi's edit items speak camelCase on the wire (string keys arrive
       # untouched inside the array — the executor seam symbolizes top-level keys
@@ -136,6 +138,36 @@ module Tart
         end
       end
 
+      class WebSearch < Dry::Validation::Contract
+        json do
+          config.validate_keys = false
+          required(:query).value(:string)
+          # D2: the wire schema declares "number" and models send integral
+          # floats — the house numeric precedent (read/bash offset/limit)
+          # accepts integer-or-float; the tool floors floats to the request
+          # integer before clamping.
+          optional(:numResults).maybe([:integer, :float])
+          optional(:includeText).maybe(:bool)
+        end
+      end
+
+      class WebFetch < Dry::Validation::Contract
+        json do
+          config.validate_keys = false
+          required(:url).value(:string)
+          optional(:save).maybe(:bool)
+          optional(:savePath).maybe(:string)
+        end
+
+        # The pinned scheme rule (the tool's own voice): an http(s) URL or
+        # the exact string — checked before any URI parsing or request.
+        rule(:url) do
+          next if value.nil?
+
+          key.failure(PINNED_URL_MESSAGE) unless value.match?(%r{\Ahttps?://}i)
+        end
+      end
+
       # Instantiated once at module load (the pattern contract), keyed by
       # the wire name the tools report through pi_name.
       CONTRACTS = {
@@ -145,7 +177,9 @@ module Tart
         "write" => Write.new,
         "ls" => Ls.new,
         "grep" => Grep.new,
-        "find" => Find.new
+        "find" => Find.new,
+        "web_search" => WebSearch.new,
+        "web_fetch" => WebFetch.new
       }.freeze
 
       module_function
