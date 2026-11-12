@@ -78,6 +78,9 @@ module Tart
           end
           optional(:modelReasoning).maybe(included_in?: [true, false, "true", "false"])
           optional(:defaultTools).maybe(:array) { each(:string) }
+          # I01 D1: the Exa endpoint override the web tools resolve through
+          # Settings.load (user/project tier or the DEFAULTS base).
+          optional(:exaApiBase).maybe(:string)
         end.freeze
       end
 

@@ -494,6 +494,22 @@ module Tart
       assert_equal %w[grep read], Settings.selected_tools({"defaultTools" => ["grep", "+read", "-bash"]})
     end
 
+    # I01: the web tools ride the defaultTools semantics like any name.
+    def test_web_tools_select_through_default_tools_both_forms
+      assert_equal %w[read bash edit write web_search web_fetch],
+        Settings.selected_tools({"defaultTools" => ["+web_search", "+web_fetch"]})
+      assert_equal %w[web_search read],
+        Settings.selected_tools({"defaultTools" => ["web_search", "+read"]})
+    end
+
+    def test_exa_api_base_defaults_and_overrides_per_tier
+      assert_equal "https://api.exa.ai", Settings::DEFAULTS.fetch("exaApiBase")
+      assert_equal "https://api.exa.ai", load_settings.settings.fetch("exaApiBase")
+
+      write_settings(@user_path, '{"exaApiBase": "https://exa-proxy.test"}')
+      assert_equal "https://exa-proxy.test", load_settings.settings.fetch("exaApiBase")
+    end
+
     def test_project_modifiers_compose_onto_the_user_selection
       write_settings(@user_path, '{"defaultTools": ["read", "bash"]}')
       write_settings(@project_path, '{"defaultTools": ["+grep", "-read"]}')
