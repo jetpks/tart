@@ -110,6 +110,15 @@ module Tart
         "modifier-resolved lists declare in resolved order too"
     end
 
+    # I01: the web tools register like any built-in — selectable, ordered.
+    def test_registry_builds_the_web_tools_when_selected
+      tools = Tools::Registry.build(selected: %w[web_search web_fetch], cwd: @dir)
+
+      assert_equal %w[web_search web_fetch], tools.keys, "selected order is the wire order"
+      assert tools.fetch("web_search").is_a?(Tools::WebSearch)
+      assert tools.fetch("web_fetch").is_a?(Tools::WebFetch)
+    end
+
     def test_registry_rejects_unknown_tools
       assert_raises(ArgumentError) { Tools::Registry.build(selected: %w[rm_rf], cwd: @dir) }
     end

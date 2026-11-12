@@ -59,6 +59,10 @@ module Tart
       # ZERO observable change for every existing config (no tool, no
       # injection, no MOTD row). The env tier reads <IDENTITY>_MEMORY.
       "memory" => false,
+      # The Exa API base for the web tools (BRIEF §3): key via env
+      # (EXA_API_KEY, launcher-injected), endpoint via settings — user or
+      # project tier both work (the tools resolve it per call).
+      "exaApiBase" => "https://api.exa.ai",
       # The native subagents module's gate (I48 — OQ-1; I70 default-on
       # ruling, owner 2026-10-17): DEFAULT ON — the crash cure and the flip
       # land together (the MOTD prompt-scope package tier). The opt-out is

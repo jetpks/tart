@@ -23,7 +23,9 @@ module Tart
         "find" => "Tart::Tools::Find",
         "grep" => "Tart::Tools::Grep",
         "ls" => "Tart::Tools::Ls",
-        "contact_supervisor" => "Tart::Tools::ContactSupervisor"
+        "contact_supervisor" => "Tart::Tools::ContactSupervisor",
+        "web_search" => "Tart::Tools::WebSearch",
+        "web_fetch" => "Tart::Tools::WebFetch"
       }.freeze
 
       # I81 Law 2 — the nested-grant acceptance vocabulary: names the
