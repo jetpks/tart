@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.2 (2026-11-14)
+
+Patch release off main since 0.2.1.
+
+### Fixed
+
+- **A tool call omitting a required argument no longer kills the session (#19, #20).** The `ArgumentError: missing keyword:` raised at the `SafeExecute#call` binding — before the in-body rescue could run — is now caught at the boundary and returned to the model as the canonical validation `{error:}` (`…: is missing`, the I43 seam's wrapper): the session continues and the model self-corrects. Unknown keywords and contract-less tool names get one minted wrapper in the same vocabulary; the rescue never re-raises. The green path and the present-invalid path are byte-unchanged.
+
+### Added
+
+- **Native architect-loop driver mode (#18, default-off).** `Tart::ArchitectLoop` + the `architect_loop` / `architect_compact` tools and the `/loop` command, ported from pi's `architect-loop.ts` onto the I47 Hooks seam: a tart session can drive a space-architect loop itself (spawn role children woken through the real KernelBridge path, ground from `architect looplog`). `architect dispatch` stays as the fallback. Includes the builder guard on the `tool_call` channel and compaction playbook carry.
+
+### Internal
+
+- Test suite 1547 → 1580 runs, 0 failures / 0 errors.
+
 ## 0.2.1 (2026-11-14)
 
 Patch release off main since 0.2.0.
