@@ -364,8 +364,8 @@ module Tart
         return unless @kernel
 
         @kernel.async { loop_for_wake&.wake }
-      rescue StandardError
-        nil
+      rescue StandardError => e
+        warn "subagents: supervisor wake failed: #{e.message}"
       end
 
       def loop_for_wake
