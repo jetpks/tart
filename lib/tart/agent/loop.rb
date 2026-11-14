@@ -6,6 +6,9 @@ require_relative "../herdr"
 require_relative "../memory"
 require_relative "../models"
 require_relative "../settings"
+# The I95 driver-mode module rides this file's load (the I74 D1 precedent —
+# the seam file the module's own compaction threading already touches).
+require_relative "../architect_loop"
 require_relative "chat"
 require_relative "session"
 require_relative "status"
@@ -148,6 +151,12 @@ module Tart
         @queues_mutex = Mutex.new
         @steer_inbox = steer_inbox
         @wake_opening = false
+        # The scheduled-manual compaction slot (I95 — architect_compact's
+        # seam): (flag, payload) because a PLAIN compaction's payload is
+        # legitimately nil. Single slot — a second request replaces the
+        # first; drained at the post-run compaction point on the reactor.
+        @manual_compaction_pending = false
+        @pending_manual_compaction = nil
         @in_run = false
         @last_error = nil
         @interrupted = false
@@ -387,9 +396,24 @@ module Tart
       # whether a compaction happened — false when there is nothing to
       # compact (pi raises "Nothing to compact (session too small)"); pi
       # aborts a running turn first — the port dispatches /compact only when
-      # idle.
-      def compact
-        run_compaction(reason: :manual)
+      # idle. I95: +custom_instructions+ threads pi's compaction carry (the
+      # architect_compact arm when called inline is the direct seam; the
+      # mid-turn tool surface schedules through {request_manual_compaction}
+      # instead — compact never runs on a tool worker).
+      def compact(custom_instructions: nil)
+        run_compaction(reason: :manual, custom_instructions:)
+      end
+
+      # The scheduled-manual request (I95 — the sanctioned no-abort
+      # re-expression of pi's ctx.compact abort-the-turn scheduling,
+      # Grounds OQ 1): records a pending request drained at the EXISTING
+      # post-run compaction point (the turn's tool result returns, the run
+      # ends, the compaction lands, the in-flight child's wake resumes the
+      # session). Single slot: a second call replaces the first.
+      def request_manual_compaction(custom_instructions: nil)
+        @manual_compaction_pending = true
+        @pending_manual_compaction = custom_instructions
+        nil
       end
 
       # The !-prefix bash execution record (pi recordBashResult
@@ -493,7 +517,11 @@ module Tart
             # pi _handlePostAgentRun checks compaction after EVERY
             # completed turn, queued steering or not (agent-session.ts:
             # 1861-1885); the run then continues with the queued messages.
-            run_threshold_compaction(message)
+            # I95: a scheduled-manual request drains FIRST (one compaction
+            # per post-run point — the threshold check is skipped behind a
+            # just-run compaction, whose smaller history would not
+            # trigger it anyway).
+            run_threshold_compaction(message) unless run_pending_manual_compaction
             pending = steering_messages
             if pending.empty?
               emit(type: :turn_end, message:)
@@ -557,6 +585,17 @@ module Tart
         run_compaction(reason: :threshold)
       end
 
+      # The I95 scheduled-manual drain at the post-run compaction point:
+      # pending → run_compaction(reason: :manual) with the carried custom
+      # instructions, then clear. Returns whether it ran (the caller skips
+      # the threshold check behind it).
+      def run_pending_manual_compaction
+        return false unless @manual_compaction_pending
+
+        @manual_compaction_pending = false
+        run_compaction(reason: :manual, custom_instructions: @pending_manual_compaction)
+      end
+
       def threshold_exceeded?(message)
         window = resolved_context_window
         return false unless window.is_a?(Integer) && window.positive?
@@ -589,8 +628,9 @@ module Tart
       # history: prepare → summarize (the standalone one-shot call) →
       # replace the history with [summary message, kept tail] → record the
       # compaction entry → emit the compaction event. Returns whether a
-      # compaction happened.
-      def run_compaction(reason:)
+      # compaction happened. I95: +custom_instructions+ threads the carry
+      # into the summarization prompt (nil everywhere = today's bytes).
+      def run_compaction(reason:, custom_instructions: nil)
         preparation = Compaction.prepare(@chat.messages, @compaction_settings, tools: @chat.tools)
         return false unless preparation
 
@@ -600,7 +640,7 @@ module Tart
         # reasons) — the surface's "Compacting context..." border status
         # keys off it; the completed-compaction event below clears it.
         emit(type: :compaction_start, reason:)
-        summarized = summarize(preparation)
+        summarized = summarize(preparation, custom_instructions:)
         return false unless summarized
 
         lists = Compaction.compute_file_lists(
@@ -660,9 +700,9 @@ module Tart
       # (compaction aborted) when the call fails. The full reply Message is
       # returned — its usage is pi's CompactionResult.usage (compaction.ts
       # :1085).
-      def summarize(preparation)
+      def summarize(preparation, custom_instructions: nil)
         prompt = Compaction.summarization_prompt(preparation.messages_to_summarize,
-          previous_summary: preparation.previous_summary)
+          previous_summary: preparation.previous_summary, custom_instructions:)
         summary_chat = @chat.summary_chat(instructions: Compaction::SUMMARIZATION_SYSTEM_PROMPT,
           max_output_tokens: summarization_max_tokens)
         summary_chat.add_message(Message.user(prompt))

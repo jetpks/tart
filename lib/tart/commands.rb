@@ -219,9 +219,10 @@ module Tart
       # agent-session.ts:2764-2765) — since I54 the SURFACE carries that
       # letter: Render::Chat#busy_command_arm interrupts the in-flight run
       # and re-dispatches /compact through the idle path at :agent_end, so
-      # this Handler still only ever compacts an IDLE agent; custom
-      # instructions are unsupported by the port's compaction seam
-      # (recorded reduction).
+      # this Handler still only ever compacts an IDLE agent; since I95 the
+      # compaction seam carries custom instructions (compact
+      # (custom_instructions:) — the architect_compact scheduling arm) and
+      # this recorded reduction is retired.
       def dispatch_compact
         if @agent.call.compact
           @output.call("✓ context compacted")
