@@ -445,14 +445,19 @@ module Tart
     # pi generateSummaryWithUsage's prompt assembly (compaction.ts:695-701):
     # <conversation>-wrapped serialization, optional <previous-summary>, then
     # the update prompt when a previous summary exists, else the initial one.
-    def summarization_prompt(messages, previous_summary: nil)
+    # I95: +custom_instructions+ threads pi's carry (compaction.ts:719-720 —
+    # `basePrompt = basePrompt + "\\n\\nAdditional focus: " + customInstructions`,
+    # guarded by pi's truthiness so nil AND empty stay today's bytes); the
+    # focus rides the BASE prompt (appended after it, inside the final
+    # promptText's tail) — pi's driver playbook keep-essentials arm.
+    def summarization_prompt(messages, previous_summary: nil, custom_instructions: nil)
       prompt = "<conversation>\n#{serialize_conversation(messages)}\n</conversation>\n\n"
-      if previous_summary
-        prompt += "<previous-summary>\n#{previous_summary}\n</previous-summary>\n\n"
-        prompt + UPDATE_SUMMARIZATION_PROMPT
-      else
-        prompt + SUMMARIZATION_PROMPT
-      end
+      prompt += "<previous-summary>\n#{previous_summary}\n</previous-summary>\n\n" if previous_summary
+      base = previous_summary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT
+      # pi's carry (compaction.ts:719-720): the focus rides the BASE prompt's
+      # tail. pi's truthiness guard kept: nil AND empty leave today's bytes.
+      base += "\n\nAdditional focus: #{custom_instructions}" if custom_instructions && !custom_instructions.empty?
+      prompt + base
     end
 
     # ==========================================================================
