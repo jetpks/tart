@@ -101,6 +101,14 @@ module Tart
       # window. A test seam shortens it ({@flash_seconds}).
       FLASH_SECONDS = 1.0
 
+      # The interrupt-delivery belt's frozen production default, in seconds
+      # (I90 Law 4). Calibration (I90 Grounds): honest esc→delivery p-max is
+      # 22 ms under 8-way steal, so 10.0 s is ~450× the observed worst; and
+      # 10.0 strictly exceeds the suite's 5 s wait_until — the no-mask
+      # ordering (Law 5): a dropped interrupt reds at the wait_until FIRST,
+      # the belt can only make a failure louder, never greener.
+      INTERRUPT_DELIVERY_DEADLINE_S = 10.0
+
       # pi status-indicator.ts:85-95 — the compaction-start border labels,
       # minus the cancel hint (deviation: ctrl+c aborts the whole run in the
       # port, not just the compaction — BRIEF §5.1, itemized).
@@ -310,6 +318,17 @@ module Tart
         # surface arms kernel.interrupt_work! and re-dispatches the stored
         # command through the idle path at :agent_end.
         @pending_after_interrupt = nil
+        # The interrupt-delivery belt (I90): armed flag, the watchdog task
+        # handle, its ABSOLUTE deadline (monotonic clock), and the monotonic
+        # arm count. Reactor-serial state — every write happens on a kernel
+        # reactor fiber (the two interrupt dispatch arms, the :agent_end
+        # arm, the render-path guard); the belt never reads through @mutex
+        # (the I79 discipline). The deadline seam stays unset → the frozen
+        # default applies.
+        @interrupt_belt_armed = false
+        @interrupt_belt_task = nil
+        @interrupt_belt_deadline_at = nil
+        @interrupt_belt_arms = 0
         # The RUNNING user-bash block's render state (I38 — pi's
         # BashExecutionComponent): the command/excluded, the accumulated
         # chunk text (the appendOutput join IS this string buffer), and
@@ -381,6 +400,25 @@ module Tart
       # the same test-seam shape: tests inject 0 instead of sleeping
       # real seconds.
       attr_writer :flash_seconds
+
+      # The interrupt-delivery belt's deadline seam (I90 Law 4 — the
+      # flash_seconds= precedent): tests inject a short deadline instead of
+      # sleeping real seconds. nil or unset ⇒ the frozen
+      # {INTERRUPT_DELIVERY_DEADLINE_S} default.
+      attr_writer :interrupt_delivery_deadline
+
+      # The belt's armed-state readback (I90 test seam). Plain ivar read:
+      # writes are reactor-serial and the value is a boolean, so a read
+      # from a test thread cannot tear (MRI GVL).
+      def interrupt_belt_armed?
+        @interrupt_belt_armed
+      end
+
+      # The monotonic arm count (I90 test seam — the I58 stats readback
+      # precedent): increments once per arm, never reset.
+      def interrupt_belt_arms
+        @interrupt_belt_arms
+      end
 
       # @return [Boolean] whether an agent run is in flight.
       def busy?
@@ -483,6 +521,9 @@ module Tart
       end
 
       def render_frame
+        # The belt's expiry guard (I90) — before any compose work; the
+        # escalation's scrollback line then paints in THIS frame.
+        escalate_expired_interrupt_belt
         widget = nil
         @mutex.synchronize do
           enqueue_motd if @motd_pending
@@ -687,6 +728,9 @@ module Tart
             @footer.mark_usage_stale
           when :agent_end
             @busy = false
+            # I90 belt disarm — ANY agent_end (interrupted, error, natural)
+            # is delivery evidence: the watchdog stops, zero residue.
+            disarm_interrupt_delivery_belt
             @compaction_reason = nil
             # The tick cancels with the run (I58) — unless a user-bash
             # stream keeps it alive. Direct ivar read: this arm HOLDS the
@@ -1018,6 +1062,7 @@ module Tart
             @autocomplete.cancel
           elsif busy?
             @kernel.interrupt_work!
+            arm_interrupt_delivery_belt
           elsif @user_bash.running?
             @user_bash.cancel
           elsif @editor.bash_mode?
@@ -1208,8 +1253,118 @@ module Tart
 
         @pending_after_interrupt = text
         @kernel.interrupt_work!
+        arm_interrupt_delivery_belt
         @kernel.request_draw
         true
+      end
+
+      # --- The interrupt-delivery belt (I90) ------------------------------
+      # After a surface-dispatched interrupt (the ESC abort :1020, the
+      # busy /compact-/new abort-first above), the belt requires DELIVERY
+      # EVIDENCE — the run actually ending, observed as ANY :agent_end at
+      # this sink — within a bounded deadline; on miss it escalates loudly
+      # and recoverably (the error scrollback line + the stderr warn +
+      # kernel.stop!). The I87 class-(a) defect this converts: a real-user
+      # ESC in the pre-IO window can leave interrupt_work! returned with
+      # the cancel never delivered (the io-event ready-queue machinery,
+      # I89 NOT CLEAN) — agent_end never fires, busy? sticks forever,
+      # silently. The belt never retries the interrupt and never touches
+      # the session record; it makes the failure loud, once.
+      # MECHANISM (the I90 tick-seam ruling, amending Law 1's spelling):
+      # the watchdog rides the I58 tick seam — a kernel-spawned,
+      # @tasks-registered, teardown-safe reactor task whose fiber-sleep
+      # timer lives in the untouched Loop#tick — and the Law-3 escalation
+      # body executes on the tick-woken render frame (§escalate_expired_
+      # interrupt_belt). The byte-frozen I54 double records kernel#async
+      # blocks and asserts none after an abort-first dispatch, so a direct
+      # @kernel.async spawn is unsatisfiable at arm site 2; the tick seam
+      # is the frozen sanctioned surface timer both the real kernel and
+      # the double already speak.
+
+      # Law 1 — the idempotent arm. Reactor context (both dispatch sites
+      # run on the kernel reactor fiber). Already-armed with a LIVE
+      # watchdog ⇒ ONE watchdog lives and the ORIGINAL (absolute) deadline
+      # stands: a re-dispatch never re-arms, never moves the deadline. A
+      # SWEPT watchdog (interrupt_work!'s blanket @tasks sweep stops the
+      # tick task — the sweep is byte-untouched and hits every reactor
+      # task) is revived by the next dispatch: re-ticking the REMAINING
+      # time only, arms never re-incremented. No dispatch while armed ⇒
+      # the guard still fires on the flag alone (the busy spinner's I58
+      # render cadence keeps frames flowing — graceful degradation).
+      def arm_interrupt_delivery_belt
+        return if @interrupt_belt_armed && live_interrupt_belt_watchdog?
+
+        unless @interrupt_belt_armed
+          @interrupt_belt_armed = true
+          @interrupt_belt_arms += 1
+          @interrupt_belt_deadline_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + delivery_deadline
+        end
+        # The remaining time to the ABSOLUTE deadline — a swept-and-revived
+        # watchdog re-anchors on it, never extending the original deadline.
+        # The 1 ms floor keeps a past-due revival from hot-looping the tick
+        # (Loop#tick skips non-positive waits); the guard's absolute check
+        # is the expiry authority regardless.
+        remaining = [@interrupt_belt_deadline_at - Process.clock_gettime(Process::CLOCK_MONOTONIC), 0.001].max
+        @interrupt_belt_task = @kernel.tick(remaining)
+      end
+
+      # Law 3 — the escalation guard, evaluated at the top of every render
+      # ({render_frame}; the render path runs on the kernel reactor's root
+      # fiber). The belt's own tick wakes the frame loop AT the deadline;
+      # while armed the busy spinner's I58 cadence keeps frames flowing
+      # even if the belt's own tick was swept (graceful degradation — the
+      # guard never depends on the belt's own tick being alive). Reactor-
+      # serial with no await between the check and the flag-clear: the
+      # escalation is exactly-once.
+      def escalate_expired_interrupt_belt
+        return unless @interrupt_belt_armed && @interrupt_belt_deadline_at
+        return if Process.clock_gettime(Process::CLOCK_MONOTONIC) < @interrupt_belt_deadline_at
+
+        # The once-only gate: flag-clear precedes every further act.
+        @interrupt_belt_armed = false
+        task = @interrupt_belt_task
+        @interrupt_belt_task = nil
+        @interrupt_belt_deadline_at = nil
+        # Law 3's teardown gate: the process is already exiting — SILENT
+        # disarm (no line, no warn, no double-stop), zero residue.
+        if @kernel.stop_requested?
+          task&.stop
+          return
+        end
+
+        @transcript_state.enqueue_scrollback("interrupt delivery failed — run aborted", fg: Theme[:error])
+        warn "tart: interrupt delivery failed — run aborted (kernel stopped)"
+        @kernel.request_draw
+        @kernel.stop!
+      end
+
+      # Law 2 — the disarm: ANY :agent_end is delivery evidence. Stops the
+      # watchdog and clears the flag; no transcript bytes, no pending task,
+      # no state carried into the next run (the arm counter stays — it is
+      # monotonic). Duck-typed stop: the real Loop#tick task and the test
+      # double's tick handle both answer #stop (one code path — no test
+      # detection). Reactor context (the :agent_end arm runs on the
+      # agent's kernel task fiber); the stop takes no surface lock, so
+      # calling it under @mutex cannot deadlock (the I79 discipline — the
+      # belt itself never reads through @mutex).
+      def disarm_interrupt_delivery_belt
+        @interrupt_belt_armed = false
+        @interrupt_belt_task&.stop
+        @interrupt_belt_task = nil
+        @interrupt_belt_deadline_at = nil
+      end
+
+      # Whether the belt's watchdog task is still alive (the revival
+      # gate's readback). #stopped? is the duck-typed liveness probe both
+      # the real tick task and the double's handle answer.
+      def live_interrupt_belt_watchdog?
+        @interrupt_belt_task && !@interrupt_belt_task.stopped?
+      end
+
+      # The belt's effective deadline (I90 Law 4): the injected seam value
+      # or the frozen production default.
+      def delivery_deadline
+        @interrupt_delivery_deadline || INTERRUPT_DELIVERY_DEADLINE_S
       end
 
       # app.message.followUp's submit (I54 — pi handleFollowUp,
