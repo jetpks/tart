@@ -471,6 +471,17 @@ module Tart
             surface.command_line("#{d.path}: #{d.message}")
           end
         end
+        # The architect-loop gate (I95 — A-Law 1): the memory gate's idiom —
+        # the settings row "architect_loop" or the <IDENTITY>_ARCHITECT_LOOP
+        # env tier, spellings "1"/"true", DEFAULT OFF. Registered BEFORE
+        # build_tools so the two tools merge into the loadout (the subagents
+        # pattern); INTERACTIVE boot ONLY — driver mode is the launching
+        # session's concept, the print boot never registers. NO MOTD row:
+        # tools + a command, like subagents — not an extension-module row.
+        if architect_loop_enabled?(settings, identity)
+          ArchitectLoop.register(hooks:, cwd: workdir, identity:, agent: -> { surface.agent },
+            output: ->(text) { surface.command_line(text) })
+        end
         tools = build_tools(workdir, settings, mcp_servers:,
           identity:, session_env: session_env_readers(surface), hooks:)
         prompt = system_prompt(workdir, settings, skills.skills, identity, context_files:,
@@ -651,6 +662,17 @@ module Tart
     def subagents_enabled?(settings, identity)
       resolved = Settings.resolve_setting("subagents", settings, identity:)
       resolved == true || resolved == "true" || resolved == "1"
+    end
+
+    # The architect-loop gate (I95 — A-Law 1): the memory gate's idiom —
+    # the settings row "architect_loop" or the <IDENTITY>_ARCHITECT_LOOP
+    # env tier, spellings "1"/"true", DEFAULT OFF. The row arithmetic
+    # (env > file > default-off) lives in the module's enabled? — the
+    # Settings RESOLUTION_ENV/DEFAULTS registries sit outside this lane's
+    # frozen touch set, so the helper reads through the module (its pins
+    # carry the ladder); itemized in the lane report.
+    def architect_loop_enabled?(settings, identity)
+      ArchitectLoop.enabled?(settings, identity:)
     end
 
     # --tools A,B,C (I48 §5.2): the comma list; empty/absent = nil (the
