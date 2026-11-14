@@ -42,6 +42,32 @@ module Tart
         normalized = arguments.transform_keys(&:to_sym)
         normalized[:tool_call] = tool_call if tool_call && execute_accepts_tool_call?
         execute(**normalized)
+      rescue ArgumentError => e
+        # I96 (jetpks/tart#19): a provider shape that cannot bind — a missing
+        # required keyword, or an unknown one — raises HERE, before execute's
+        # in-body safe_execute rescue and validate_input ever run, and the
+        # escape killed the whole session. Consult the I43 seam first (S2) on
+        # the raw symbolized arguments minus the +tool_call+ duck: a failure
+        # IS the result — dry's canonical `…: is missing` wrapper with the
+        # pinned-rule precedence intact. When validation passes (the pure
+        # unknown-keyword class) or the name has no registered contract (the
+        # KeyError belted away — memory, subagent, contact_supervisor,
+        # architect_loop, architect_compact), ONE minted wrapper speaks the
+        # binding error as its single failure line, rendered by the seam's
+        # own pretty_arguments (S3). Never re-raises; the green path and the
+        # present-invalid path (in-body validation on the BOUND kwargs) stay
+        # byte-unchanged — pre-dispatch validation was REJECTED (D1): it
+        # would re-route those frozen bytes and leave unknown keys crashing.
+        received = normalized.reject { |key, _value| key == :tool_call }
+        consulted =
+          begin
+            Schemas::Tools.validate(self.class.pi_name, received)
+          rescue KeyError
+            nil # a contract-less name: the belt speaks for the seam
+          end
+        consulted ||
+          {error: "Validation failed for tool \"#{self.class.pi_name}\":\n  - #{e.message}\n\n" \
+                  "Received arguments:\n#{Schemas::Tools.pretty_arguments(received)}"}
       end
 
       private
