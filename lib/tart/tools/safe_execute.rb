@@ -65,8 +65,14 @@ module Tart
         yield
       rescue Fast::Completions::CancelledError
         raise
+        # I94 E5: ArgumentError stays byte-exact (pi's deliberate
+        # contract-raise idiom — every golden error case); every other
+        # StandardError is an internal defect and carries the class + first
+        # backtrace line, so the model sees WHAT broke and WHERE.
       rescue StandardError => e
-        {error: e.message}
+        site = e.backtrace&.first
+        message = e.is_a?(ArgumentError) ? e.message : "#{e.class}: #{e.message}#{" (at #{site})" if site}"
+        {error: message}
       end
     end
   end

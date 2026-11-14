@@ -7,6 +7,7 @@ require_relative "tools/subagent"
 require_relative "subagents/manager"
 require_relative "subagents/profiles"
 require_relative "subagents/supervisor"
+require_relative "subagents/wake_bridge"
 require_relative "subagents/workflows"
 
 module Tart

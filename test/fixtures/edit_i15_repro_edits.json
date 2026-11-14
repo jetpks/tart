@@ -1,0 +1,21 @@
+{
+ "path": "architecture/ARCHITECT.md",
+ "edits": [
+  {
+   "newText": "- Last iteration: I01-web-tools \u2014 **CONTINUE** (all 6 ACs PASS cold); landed on jetpks/tart main via PR #13 (a8fd712).\n- Next action: I02 hermit-kb frozen at `d644fdee`, builder dispatched; when it settles: verify \u2192 evidence \u2192 judge cold.",
+   "oldText": "- Last iteration: I01-web-tools \u2014 **CONTINUE** (all 6 ACs PASS cold); merged to `project/knowledge-builder` a96e33a2, awaiting human PR push.\n- Next action: human pushes the tart PR (block in `build/land/`), then `architect sync tart`, then `architect new hermit-kb` (ENTRY 2)."
+  },
+  {
+   "newText": "| 01 | web-tools | done | 4f16560a | project/knowledge-builder (a96e33a2) | continue | I01-web-tools.md |\n| 02 | hermit-kb | in-flight | d644fdee | (local repo, integration at land time) | pending | I02-hermit-kb.md |",
+   "oldText": "| 01 | web-tools | done | 4f16560a | project/knowledge-builder (a96e33a2) | continue | I01-web-tools.md |"
+  },
+  {
+   "newText": "## Open items for the human / architect\n\n- **Human**: optional \u2014 give `repos/hermit-kb` a GitHub remote + push whenever desired (loop mechanics resolve by path; local provisions fine).\n- **Architect (I02 landing time)**: install launcher + rendered profile at space root; seed `.tart/{settings,models}.json` from repo templates; decide relay service form (LaunchAgent vs driver-started) on port 9293 \u2014 all outside the loop, per plan follow-up 2.\n- **ENTRY 3 spec must read**: tart subagent children spawn with a closed env pick list WITHOUT `EXA_API_KEY` (I02 digest) \u2014 if quest subagents must search, a tart fix is new-iteration material. Tart TUI `!cmd` bash escape exists \u2014 the OS no-bash backstop is load-bearing, not decorative.\n- Watch for the `exaApiBase` env-tier need (I01 judge ruling 2: add via new iteration, never amend).",
+   "oldText": "## Open items for the human / architect\n\n- **Human**: push the tart PR \u2014 paste-and-run block + PR body in `build/land/`. After it lands on main: `architect sync tart`.\n- **Architect (ENTRY 2 landing time)**: install launcher + seatbelt into space root; seed `.tart/settings.json` + `.tart/models.json` from repo templates (plan follow-up 2).\n- Watch for the `exaApiBase` env-tier need at ENTRY 2 (judge ruling 2: add via new iteration, never amend I01).\n- Keep `draft/web-tools-t01probe` until sync fast-forwards past the PR (provenance record); delete after."
+  },
+  {
+   "newText": "| 2026-11-12 | I01 verdict CONTINUE; lane core integrated (a96e33a2), gates all PASS cold | Judge judgment `tmp/t01-judge/verdict.md` (transcribed to I01 Verdict section, commit fecf6a27) |\n| 2026-11-12 | **BRIEF \u00a72.2 amendment (architect ratification)**: second egress door = localhost Exa relay (`exa-relay`, 127.0.0.1:9293, trusted-world, hardcoded `api.exa.ai` destination); no DNS in the sandbox at all | macOS seatbelt cannot scope a network door to one hostname (live-tested: hostname/IP/CIDR literals refuse to compile, DNS via mDNSResponder socket is unscopable); relay is the only form keeping every frozen \u00a72.2 denial property. Spec asked 3\u00d7 (supervisor notifications lost, tart bug) then froze the recommended option \u2014 ratified here, after the fact, before any build on it |\n| 2026-11-12 | I02 denial suite fails LOUDLY when `EXA_API_KEY` unset (no silent e2e skip) | e2e pillar must be falsifiable; key verified present in driver/operator env (inherited by builder + judge shells) |",
+   "oldText": "| 2026-11-12 | I01 verdict CONTINUE; lane core integrated (a96e33a2), gates all PASS cold | Judge judgment `tmp/t01-judge/verdict.md` (transcribed to I01 Verdict section, commit fecf6a27) |"
+  }
+ ]
+}
