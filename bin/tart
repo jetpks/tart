@@ -455,7 +455,7 @@ module Tart
         # outside the [Extensions] list).
         if subagents_enabled?(settings, identity)
           subagents_manager = Subagents.register(hooks:,
-            kernel: Subagents::KernelBridge.new(->(block) { TUI.push_event(block) }),
+            kernel: Subagents.wake_bridge(session),
             agent: -> { surface.agent }, cwd: workdir, env: ENV, identity:)
           subagents_manager.endpoint =
             endpoint_facts(models, Models.resolve_boot_model(models, settings, identity:),
