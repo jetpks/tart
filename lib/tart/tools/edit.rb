@@ -226,13 +226,31 @@ module Tart
 
             final_content = bom[:bom] + EditDiff.restore_line_endings(result[:new_content], original_ending)
             final_content = EditDiff.strip_trailing_whitespace(final_content) if @strip_trailing_whitespace
+
+            # I94 E1/E2: display metadata (the diff + unified patch) is
+            # generated BEFORE the write and inside its own guard — the
+            # reported result is structurally independent of it (issue #15:
+            # a metadata crash used to become the tool's error result while
+            # the file already carried the edits). Cancellation always
+            # propagates; any other failure warns and degrades to no
+            # details (the pre-I57 header-only success render is the
+            # supported shape — no placeholder patch is invented).
+            metadata = nil
+            begin
+              diff_result = EditDiff.generate_diff_string(result[:base_content], result[:new_content])
+              patch = EditDiff.generate_unified_patch(path, result[:base_content], result[:new_content])
+              metadata = {diff: diff_result[:diff], patch:,
+                          first_changed_line: diff_result[:first_changed_line]}
+            rescue Fast::Completions::CancelledError
+              raise
+            rescue StandardError => e
+              warn "edit: display metadata generation failed: #{e.class}: #{e.message}"
+            end
+
             File.binwrite(absolute_path, final_content)
             check_cancelled
 
-            diff_result = EditDiff.generate_diff_string(result[:base_content], result[:new_content])
-            patch = EditDiff.generate_unified_patch(path, result[:base_content], result[:new_content])
-            @details = {diff: diff_result[:diff], patch:,
-                        first_changed_line: diff_result[:first_changed_line]}
+            @details = metadata
             "Successfully replaced #{edits.length} block(s) in #{path}."
           end
         end

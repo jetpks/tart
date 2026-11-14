@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "diff/lcs"
-require "diff/lcs/hunk"
 
 module Tart
   module Tools
@@ -327,32 +326,141 @@ module Tart
         "--- #{path}\n+++ #{path}\n#{hunks}"
       end
 
-      # The diff-lcs ldiff recipe: build hunks, merging overlapping ones, in
-      # unified format. Lines follow File.readlines semantics (no trailing
-      # empty element for a final newline).
+      # The unified hunks behind generate_unified_patch (I94 E3 — ONE diff
+      # recipe): derived from the line_diff_parts engine (the jsdiff-style
+      # sdiff path that survives issue #15) instead of the Diff::LCS.diff +
+      # Diff::LCS::Hunk recipe, whose #unshift merging drove
+      # Hunk#unified_diff into `undefined method '[]=' for nil` on every
+      # multi-change shape and whose hunks concatenated without a newline
+      # separator once they stopped crashing.
+      #
+      # Change runs (one removed run + its added run, line-paired the way
+      # jsdiff pairs them) are grouped into hunks whose context windows
+      # overlap or touch — the unchanged gap between consecutive runs is
+      # ≤ 2×context_lines — and each group emits `@@ -o,oc +n,nc @@`
+      # followed by ` `/`-`/`+` lines. Zero-count ranges carry the line
+      # number BEFORE the change (the unified-diff convention: `-0,0` for
+      # an insertion at the top of the file, `+0,0` for a full deletion).
+      # Every hunk ends with a newline (git apply rejects a patch whose
+      # final line lacks one), so the hunks join by concatenation.
       def self.build_hunks(old_content, new_content, context_lines)
-        old_lines = old_content.split("\n")
-        new_lines = new_content.split("\n")
-        lcs_diff = Diff::LCS.diff(old_lines, new_lines)
-        return "" if lcs_diff.empty?
+        runs = patch_change_runs(old_content, new_content)
+        return "" if runs.empty?
 
-        output = +""
-        old_hunk = nil
-        file_length_difference = 0
-        lcs_diff.each do |piece|
-          hunk = Diff::LCS::Hunk.new(old_lines, new_lines, piece, context_lines, file_length_difference)
-          file_length_difference = hunk.file_length_difference
-          if old_hunk && !hunk.overlaps?(old_hunk)
-            output << old_hunk.diff(:unified)
-            old_hunk = hunk
-          elsif old_hunk
-            old_hunk.unshift(hunk)
+        groups = []
+        runs.each do |run|
+          if groups.any? && run[:old_start] - run_old_end(groups.last[:runs].last) - 1 <= context_lines * 2
+            groups.last[:runs] << run
           else
-            old_hunk = hunk
+            groups << {runs: [run]}
           end
         end
-        output << old_hunk.diff(:unified, true)
-        output
+
+        groups.map { |group| hunk_string(group[:runs], context_lines) }.join
+      end
+
+      # A run's last old line (0 when the run carries no old lines — a pure
+      # insertion), the grouper's merge-gap measure.
+      def self.run_old_end(run)
+        removed = run[:removed].length
+        removed.zero? ? run[:old_start] - 1 : run[:old_start] + removed - 1
+      end
+
+      # The change runs a patch needs, from ONE walk of line_diff_parts:
+      # each run carries the removed/added lines (line-paired, jsdiff
+      # form), its 1-based cursor positions in both files, and the full
+      # common runs before (pre) and after (post) it, so the grouper can
+      # slice context and merge touching windows without re-walking. A
+      # common part closes the open run (runs stay line-paired; the
+      # merge_change_runs form keeps consecutive removed/added parts as
+      # ONE region).
+      def self.patch_change_runs(old_content, new_content)
+        runs = []
+        commons = []
+        open = nil
+        old_line = 1
+        new_line = 1
+
+        line_diff_parts(old_content, new_content).each do |part|
+          lines = part_lines(part[:value])
+          if part[:removed] || part[:added]
+            if open.nil?
+              open = {old_start: old_line, new_start: new_line, pre: commons, removed: [], added: []}
+              commons = []
+            end
+            if part[:removed]
+              open[:removed] += lines
+              old_line += lines.length
+            else
+              open[:added] += lines
+              new_line += lines.length
+            end
+          else
+            unless open.nil?
+              open[:post] = lines # the maximal common run right after this change
+              runs << open
+              open = nil
+              commons = lines # the gap stays available as the next run's pre
+            else
+              commons += lines
+            end
+            old_line += lines.length
+            new_line += lines.length
+          end
+        end
+
+        unless open.nil?
+          open[:post] = commons
+          runs << open
+        end
+        runs
+      end
+
+      # One hunk's bytes: header + context/changed lines. Between merged
+      # runs the full gap shows as context (the merge condition guarantees
+      # gap ≤ 2×context_lines); the head and tail show at most
+      # context_lines.
+      def self.hunk_string(runs, context_lines)
+        first = runs.first
+        head = first[:pre].last(context_lines)
+        tail = runs.last[:post].first(context_lines)
+
+        body = head.map { |line| " #{line}" }
+        old_count = head.length
+        new_count = head.length
+        runs.each_with_index do |run, i|
+          body += run[:removed].map { |line| "-#{line}" }
+          body += run[:added].map { |line| "+#{line}" }
+          old_count += run[:removed].length
+          new_count += run[:added].length
+          next if i == runs.length - 1
+
+          gap = runs[i + 1][:pre] # == run[:post], the full unchanged run between
+          body += gap.map { |line| " #{line}" }
+          old_count += gap.length
+          new_count += gap.length
+        end
+        body += tail.map { |line| " #{line}" }
+        old_count += tail.length
+        new_count += tail.length
+
+        old_first = first[:old_start] - head.length
+        new_first = first[:new_start] - head.length
+        # An empty range carries the line number BEFORE the hunk (the
+        # unified-diff convention; 0 when the change sits at the boundary).
+        old_first -= 1 if old_count.zero?
+        new_first -= 1 if new_count.zero?
+
+        "@@ -#{old_first},#{old_count} +#{new_first},#{new_count} @@\n#{body.join("\n")}\n"
+      end
+
+      # A part value's lines (the generate_diff_string idiom): split with
+      # trailing empties kept, then drop the artifact tail element a final
+      # newline opens.
+      def self.part_lines(value)
+        lines = value.split("\n", -1)
+        lines.pop if lines.last == ""
+        lines
       end
 
       # Group line changes into jsdiff-style parts (runs of
