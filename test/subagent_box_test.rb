@@ -279,7 +279,8 @@ module Tart
       manager.instance_variable_set(:@kernel, bridge)
       dir = File.join(manager.home, "01adopted-0000")
       FileUtils.mkdir_p(dir)
-      write_status(dir, "running", pid: live_pid, model: "mock/mock-1", context: "fresh")
+      write_status(dir, "running", pid: live_pid, model: "mock/mock-1", context: "fresh",
+                   session_id: manager.session_owner_id)
       manager.status(id: nil) # the sweep adopts
       result = {"output" => "done", "success" => true, "timedOut" => false}
       File.write(File.join(dir, "result.json"), JSON.generate(result))
@@ -321,7 +322,7 @@ module Tart
       manager = new_manager
       dir = File.join(manager.home, "02legacy-0000")
       FileUtils.mkdir_p(dir)
-      write_status(dir, "running", pid: live_pid, legacy: true)
+      write_status(dir, "running", pid: live_pid, legacy: true, session_id: manager.session_owner_id)
       manager.status(id: nil)
       rows = manager.box_snapshot[:rows]
       row = rows.find { |r| r[:id] == "02legacy-0000" }
@@ -340,7 +341,8 @@ module Tart
       manager = new_manager(with_channel: true)
       dir = File.join(manager.home, "03attention-000")
       FileUtils.mkdir_p(File.join(dir, "control", "supervisor-requests"))
-      write_status(dir, "running", pid: live_pid, model: "mock/mock-1", context: "fresh")
+      write_status(dir, "running", pid: live_pid, model: "mock/mock-1", context: "fresh",
+                   session_id: manager.session_owner_id)
       manager.status(id: nil) # the sweep adopts the staged dir
       File.write(File.join(dir, "control", "supervisor-requests", "ask-1.json"),
                  JSON.generate({"type" => "subagent.supervisor.request", "id" => "ask-1",
@@ -574,13 +576,17 @@ module Tart
       manager
     end
 
-    def write_status(dir, state, pid:, model: nil, context: nil, legacy: false)
+    # I99 staging: +session_id:+ passes the adopting Manager's session
+    # owner id through (the ownership stamp's staged seat — assertions
+    # unchanged; unstamped dirs are foreign-by-default now).
+    def write_status(dir, state, pid:, model: nil, context: nil, legacy: false, session_id: nil)
       payload = {"id" => File.basename(dir), "agent" => "worker", "task" => nil, "taskChars" => nil,
                  "mode" => "single", "state" => state, "pid" => pid, "cwd" => @cwd,
                  "asyncDir" => dir, "sessionRoot" => File.join(dir, "sessions"),
                  "startedAt" => BOOT, "lastUpdate" => BOOT + 30_000, "toolCallId" => nil}
       payload["model"] = model if model
       payload["context"] = context if context
+      payload["sessionId"] = session_id if session_id
       if legacy
         payload["startedAt"] = BOOT
         payload.delete("lastUpdate")
@@ -602,7 +608,8 @@ module Tart
       manager = new_manager
       dir = File.join(manager.home, "04chat-00000")
       FileUtils.mkdir_p(dir)
-      write_status(dir, "running", pid: live_pid, model: "mock/mock-1", context: "fresh")
+      write_status(dir, "running", pid: live_pid, model: "mock/mock-1", context: "fresh",
+                   session_id: manager.session_owner_id)
       manager.status(id: nil)
       Subagents.current_manager = manager
       with_chat_surface do |chat, session, kernel|

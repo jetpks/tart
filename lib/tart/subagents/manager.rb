@@ -133,6 +133,13 @@ module Tart
         @arm_deadline_supervisor = arm_deadline_supervisor
         @supervisor_channel = nil
         @endpoint = nil
+        # S2 — the per-boot identity (I99): minted ONCE in initialize and
+        # returned (never memoized) until a live recorder resolves. The
+        # pre-loop window matches nothing on disk by construction — this
+        # process has spawned nothing — and owner ids are unique per
+        # process, so the two windows cannot disagree observably (D2).
+        @boot_session_id = Agent::Session.uuidv7
+        @session_owner_id = nil
         @mutex = Mutex.new
         @runs = []
         @supervisors = []
@@ -218,6 +225,11 @@ module Tart
         record = {
           id:, agent: spec[:name], state: :running, dir:, pid: nil, pgid: nil, async: !!async,
           owned: true, # I78 Law 3: true exactly when THIS process spawned it
+          # S1 — the ownership stamp's internal seat (I99): the spawning
+          # session's id (S2). base_status rides it onto status.json's
+          # additive "sessionId" key; it never rides box_snapshot rows or
+          # any wire/tool surface (S7).
+          session_id: session_owner_id,
           timed_out: false, started_at: spawned_at, tool_call_id:,
           # Port-internal keys (beyond the §2.2 public contract) that
           # #spawn_argv_and_env derives the child harness from. I81 Law 3:
@@ -449,6 +461,31 @@ module Tart
         loop&.recorder&.id
       rescue StandardError
         nil
+      end
+
+      # S2 — the session owner id (I99): ONE identity per Manager life,
+      # pi's sessionId vocabulary at tart's value seat (D1 — the recorder
+      # id is tart's one cross-process session identity). The FIRST
+      # non-nil {parent_session_id} resolution is memoized under @mutex
+      # and wins for the Manager's whole life (a /new replacement keeps
+      # the process id — pi's in-process-replacement-inherits posture
+      # collapsed to one id, D2); until a recorder resolves — and forever
+      # when no agent is threaded (print boots, bare test Managers) — the
+      # per-boot id minted in initialize is returned WITHOUT memoizing.
+      # The resolution itself stays outside @mutex (the existing
+      # current_session_path/parent_session_id discipline: arbitrary
+      # callable code never runs under the registry lock).
+      def session_owner_id
+        hit = @mutex.synchronize { @session_owner_id }
+        return hit if hit
+
+        resolved = parent_session_id
+        return @boot_session_id unless resolved
+
+        @mutex.synchronize do
+          @session_owner_id ||= resolved
+          @session_owner_id
+        end
       end
 
       private
@@ -854,6 +891,14 @@ module Tart
           next unless disk.is_a?(Hash) && disk["state"].is_a?(String)
           next if TERMINAL_STATES.include?(disk["state"])
 
+          # S3 — session-scoped discovery (pi async-status.js :445-456,
+          # "session-scoped discovery does not own foreign runs"): a
+          # FOREIGN or unstamped dir is skipped BEFORE any adoption — no
+          # in-memory record, no disk write, ever (the reaper never
+          # touches another session's run; the two-parents-one-dir race is
+          # unreachable because owner ids are unique per process, D3/D6).
+          next unless owned_status?(disk)
+
           record = disk_find(child)
           reap_run(record) if record
         end
@@ -1037,10 +1082,23 @@ module Tart
       # status.json and adopted into the registry. I78 Law 3: the
       # synthesis carries owned: false — the adopter never speaks for a
       # run it did not spawn.
+      # S3/S4 — the ownership guard (pi run-ownership.js ownsRun): the
+      # on-disk status must carry a String "sessionId" equal to THIS
+      # Manager's session owner id. An unstamped dir is foreign to
+      # everyone (D6 — legacy dirs are tolerated, never rewritten).
+      def owned_status?(status)
+        status["sessionId"].is_a?(String) && status["sessionId"] == session_owner_id
+      end
+
       def disk_find(id)
         dir = File.join(@home, id)
         status = read_json(File.join(dir, "status.json"))
         return nil unless status.is_a?(Hash)
+        # S4 — scoped admission (pi resolveTargetedAsyncRun :134-138): a
+        # foreign or unstamped id is an UNKNOWN id — nil here makes
+        # targeted status/result/steer/stop take the existing unknown-id
+        # path (find_run!'s ArgumentError) before any write or signal (D4).
+        return nil unless owned_status?(status)
 
         record = {
           id: status["id"].to_s, agent: status["agent"].to_s,
@@ -1052,6 +1110,9 @@ module Tart
           # Law 3 — the additive box facts ride the synthesis (nil-tolerant:
           # a historical dir without them renders no badge/model).
           model: status["model"], context: status["context"],
+          # S1 — the stamp rides the synthesis from disk, so the settle/reap
+          # flips (base_status merges) preserve it verbatim.
+          session_id: status["sessionId"],
           last_update: status["lastUpdate"], ended_at: status["endedAt"], error: status["error"]
         }
         @mutex.synchronize do
@@ -1210,6 +1271,12 @@ module Tart
         payload["context"] = record[:context] if record[:context]
         payload["timeoutMs"] = record[:timeout_ms] if record[:timeout_ms]
         payload["toolTimeoutMs"] = record[:tool_timeout_ms] if record[:tool_timeout_ms]
+        # S1 — the ownership stamp (pi async-execution.js :1437's key
+        # name), appended LAST so every existing key, their order, and
+        # every legacy/nil-tolerant shape stay byte-unchanged; the
+        # settle/reap flips merge over base_status, so the stamp is
+        # preserved verbatim on every transition.
+        payload["sessionId"] = record[:session_id] if record[:session_id]
         payload
       end
 
