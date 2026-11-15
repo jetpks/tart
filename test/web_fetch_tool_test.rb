@@ -100,7 +100,7 @@ module Tart
     end
 
     def test_savepath_selects_a_relative_path_inside_the_corpus
-      tool.execute(url: URL, save: true, savePath: "sub/dir/note.txt")
+      tool.execute(url: URL, save: true, save_path: "sub/dir/note.txt")
 
       expected = File.join(@dir, "build", "corpus", "sub", "dir", "note.txt")
       assert File.file?(expected)
@@ -112,7 +112,7 @@ module Tart
                  "~/escape.txt", "sub/../../../../escape.txt"]
 
       escapes.each do |save_path|
-        result = tool.execute(url: URL, save: true, savePath: save_path)
+        result = tool.execute(url: URL, save: true, save_path: save_path)
 
         assert result.key?(:error), "#{save_path.inspect} must fail loudly"
         assert_includes result[:error], "web_fetch refusing to save outside the corpus directory"
@@ -130,7 +130,7 @@ module Tart
       FileUtils.mkdir_p(corpus)
       FileUtils.ln_s(outside, File.join(corpus, "linked"))
 
-      result = tool.execute(url: URL, save: true, savePath: "linked/escape.txt")
+      result = tool.execute(url: URL, save: true, save_path: "linked/escape.txt")
 
       assert result.key?(:error), "a symlinked component must not smuggle the write out"
       refute File.exist?(File.join(outside, "escape.txt"))

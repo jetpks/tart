@@ -92,14 +92,14 @@ module Tart
       refute body.fetch("contents").key?("text"), "text is off by default"
 
       text_http = FakeHttp.new(code: 200, payload: search_response(sample_results))
-      tool(text_http).execute(query: "q", includeText: true)
+      tool(text_http).execute(query: "q", include_text: true)
       assert_equal({"maxCharacters" => Tools::WebSearch::INLINE_TEXT_MAX_CHARS},
         text_http.requests.first.fetch(:body).fetch("contents").fetch("text"))
     end
 
     def test_num_results_default_cap_and_float_floor
       capped_http = FakeHttp.new(code: 200, payload: search_response(sample_results))
-      tool(capped_http).execute(query: "q", numResults: 500)
+      tool(capped_http).execute(query: "q", num_results: 500)
 
       assert_equal Tools::WebSearch::MAX_NUM_RESULTS,
         capped_http.requests.first.fetch(:body).fetch("numResults"),
@@ -114,20 +114,20 @@ module Tart
       # An integral float floors to the request integer; a float above the
       # cap floors then clamps. The wire never carries a fractional count.
       float_http = FakeHttp.new(code: 200, payload: search_response(sample_results))
-      tool(float_http).execute(query: "q", numResults: 7.0)
+      tool(float_http).execute(query: "q", num_results: 7.0)
       assert_equal 7, float_http.requests.first.fetch(:body).fetch("numResults")
       assert_predicate float_http.requests.first.fetch(:body).fetch("numResults"), :integer?,
         "an integral float is floored to the request integer"
 
       capped_float_http = FakeHttp.new(code: 200, payload: search_response(sample_results))
-      tool(capped_float_http).execute(query: "q", numResults: 500.0)
+      tool(capped_float_http).execute(query: "q", num_results: 500.0)
       assert_equal Tools::WebSearch::MAX_NUM_RESULTS,
         capped_float_http.requests.first.fetch(:body).fetch("numResults")
     end
 
     def test_the_request_surface_is_pinned_against_the_exa_search_api
       http = FakeHttp.new(code: 200, payload: search_response(sample_results))
-      tool(http).execute(query: "the query", includeText: true)
+      tool(http).execute(query: "the query", include_text: true)
 
       request = http.requests.first
       assert_equal "https://exa.example.test", request.fetch(:base)
@@ -143,7 +143,7 @@ module Tart
          "highlights" => ["lorem ipsum " * 400]}
       end
       t = tool(FakeHttp.new(code: 200, payload: search_response(long)))
-      result = t.execute(query: "q", includeText: true)
+      result = t.execute(query: "q", include_text: true)
 
       assert_operator result.bytesize, :<, Tools::Truncate::DEFAULT_MAX_BYTES + 1024,
         "the render is house-truncated (#{Tools::Truncate::DEFAULT_MAX_BYTES} bytes)"
@@ -189,7 +189,7 @@ module Tart
     # --- the I43 input contract ---
 
     def test_wrong_typed_input_rejects_through_the_contract
-      result = tool.execute(query: "q", numResults: "five")
+      result = tool.execute(query: "q", num_results: "five")
 
       assert result.key?(:error)
       assert_includes result[:error], 'Validation failed for tool "web_search"'

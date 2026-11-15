@@ -45,6 +45,8 @@ module Tart
 
       parameters PARAMETERS_SCHEMA.dup
 
+      schema_contract
+
       # pi write.ts :57 — one of EXACTLY four core tools pi tags with
       # constrainedSampling; the strict engine rewrites `parameters` and
       # ships `strict: true` on a strict-capable dialect (I64).

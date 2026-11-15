@@ -78,11 +78,13 @@ module Tart
 
       parameters PARAMETERS_SCHEMA.dup
 
+      schema_contract
+
       # @return [String] the model-facing result list, or {error:} on
       #   failure (SafeExecute — never a loop crash).
-      def execute(query:, numResults: nil, includeText: false)
+      def execute(query:, num_results: nil, include_text: false)
         safe_execute do
-          failure = validate_input(query:, numResults:, includeText:)
+          failure = validate_input(query:, num_results:, include_text:)
           return failure if failure
 
           key = @env["EXA_API_KEY"]
@@ -92,11 +94,11 @@ module Tart
           # floats. Floor floats to the request integer, THEN clamp to
           # 1..MAX_NUM_RESULTS; a value above the cap is clamped, never
           # sent.
-          requested = numResults || DEFAULT_NUM_RESULTS
+          requested = num_results || DEFAULT_NUM_RESULTS
           requested = requested.floor if requested.is_a?(Float)
           count = requested.clamp(1, MAX_NUM_RESULTS)
           contents = {"highlights" => true}
-          contents["text"] = {"maxCharacters" => INLINE_TEXT_MAX_CHARS} if includeText
+          contents["text"] = {"maxCharacters" => INLINE_TEXT_MAX_CHARS} if include_text
 
           Fast::Completions::Cancellation.check
           code, payload = http_post(key:, path: "/search",
