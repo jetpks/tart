@@ -241,7 +241,13 @@ module Tart
                  root: nil)
       manager = Manager.new(cwd:, home: home || self.home(env:, identity:), env:, identity:,
                             hooks:, kernel:, agent:, root: root || Agent::Session.default_root)
-      channel = SupervisorChannel.new(home: manager.home, hooks:, kernel:, agent:)
+      # S5 — the scoped channel (I99): the resolver threads the Manager's
+      # session owner id (ONE memoization seat — the Manager; D5), so the
+      # registered channel scans/answers ONLY this session's asks. Direct
+      # constructions (tests, the architect_loop harness) omit owner_id
+      # and keep today's unscoped bytes.
+      channel = SupervisorChannel.new(home: manager.home, hooks:, kernel:, agent:,
+                                      owner_id: -> { manager.session_owner_id })
       channel.start
       manager.supervisor_channel = channel
       hooks.register_tool(Tools::Subagent.new(manager:))

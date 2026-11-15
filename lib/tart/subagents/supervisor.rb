@@ -185,11 +185,17 @@ module Tart
       #   #async; the SAME object the Manager holds). nil = queue only.
       # @param agent [Proc, Agent::Loop, nil] the current parent loop (or a
       #   callable returning it) — the wake target. nil = queue only.
-      def initialize(home:, hooks:, kernel: nil, agent: nil)
+      # @param owner_id [Proc, nil] the session-ownership resolver (I99
+      #   S5 — a callable returning the current session owner id). nil
+      #   (the default) = UNSCOPED, today's bytes — reachable only by
+      #   direct construction (tests, the architect_loop harness);
+      #   production {Subagents.register} ALWAYS threads the resolver.
+      def initialize(home:, hooks:, kernel: nil, agent: nil, owner_id: nil)
         @home = home
         @hooks = hooks
         @kernel = kernel
         @agent = agent
+        @owner_id = owner_id
         @mutex = Mutex.new
         @pending = {}
         @seen = {}
@@ -299,6 +305,11 @@ module Tart
       def scan_requests
         Dir.glob(request_glob).sort.each do |path|
           next if seen?(path)
+          # S5 — the per-dir ownership guard BEFORE mark_seen: a foreign
+          # ask is NOT registered, NOT surfaced, NOT unlinked (it stays on
+          # disk, examinable every tick — it can never become owned; owner
+          # ids are unique per process).
+          next unless owned_request_file?(path)
           mark_seen(path)
 
           request = parse_request_file(path)
@@ -379,6 +390,23 @@ module Tart
         File.join(@home, "*", "control", "supervisor-requests", "*.json")
       end
 
+      # S5 — the ownership guard for ONE request file (pi run-ownership.js
+      # ownsRun): the containing run dir is derived from the request PATH
+      # (dirname ×3 — <home>/<run-id>/control/supervisor-requests/<file> —
+      # NEVER the payload runId), and its status.json must carry a
+      # "sessionId" equal to the owner resolver's id. @owner_id nil (the
+      # default) = UNSCOPED — every file is owned (D5).
+      def owned_request_file?(path)
+        return true unless @owner_id
+
+        owner = @owner_id.call
+        return false unless owner.is_a?(String)
+
+        run_dir = File.dirname(File.dirname(File.dirname(path)))
+        status = read_json(File.join(run_dir, "status.json"))
+        status.is_a?(Hash) && status["sessionId"] == owner
+      end
+
       # The disk-first reply fallback: an EXACT request-id file anywhere
       # under the runs root whose lifecycle is still pending. A path-unsafe
       # id (separators, dot segments) can never name a request file —
@@ -389,6 +417,10 @@ module Tart
         Dir.glob(File.join(@home, "*", "control", "supervisor-requests")).each do |dir|
           path = File.join(dir, "#{id}.json")
           next unless File.file?(path)
+          # S5 — the same per-dir guard as the scan: a foreign ask is
+          # never answered, its file never removed (the reply fallback
+          # keeps scanning — only an OWNED dir can satisfy the lookup).
+          next unless owned_request_file?(path)
 
           request = parse_request_file(path)
           return nil if request.nil?
