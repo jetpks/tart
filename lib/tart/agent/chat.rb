@@ -254,22 +254,66 @@ module Tart
         children.map(&:wait)
       end
 
+      # The executor never-rejects belt (I98 — pi agent-loop.ts:806-809
+      # "Never rejects for tool failures"): every StandardError raised
+      # between the checkpoint and the Message.tool return — a before/after
+      # hook raise, a raise escaping the gate/dispatch (the TypeError a
+      # malformed arguments object throws at the ** splat included) —
+      # becomes the call's PERSISTED error record, never a re-raise: the
+      # child returns a Message.tool, the frozen join completes, `step`
+      # appends in call order, and the run continues with the real error in
+      # context. pi order: start fires BEFORE prepare (:541-548) and end
+      # fires for immediate outcomes too (:568-573) — the not-found arm
+      # rides both hooks (duration 0.0) around its exact bytes. The belt
+      # fires the end hooks only when the failure happened BEFORE them (an
+      # after-hook raise has already run the emitters; re-firing would
+      # double-emit and re-raise through the raiser — pi's :898-901 catch
+      # replaces the result without a re-run). Cancellation is NOT belt
+      # material (S6): the checkpoint stays first and untouched,
+      # CancelledError re-raises through the first arm (the D10/I50 ladder
+      # owns it), Exception-level raises never enter these arms.
       def execute_tool_call(tool_call)
         # The gem checkpoint: raises when the turn task is cancelled (the
         # D10 task-keyed belt — no flag pairing anywhere).
         Fast::Completions::Cancellation.check
-        tool = @tools.find { |candidate| candidate.name == tool_call.name }
-        return error_tool_result(tool_call, "Tool not found: #{tool_call.name}") unless tool
-
         started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        @before_tool_call_hooks.each { |hook| hook.call(tool_call) }
-        result = tool.call(**tool_call.arguments, tool_call: tool_call)
-        duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
-        @after_tool_result_hooks.each { |hook| hook.call(tool_call, result, duration:) }
-        # The details side channel rides the recorded/replayed message, not
-        # the wire (I57 P3 — the wire tool message stays exactly
-        # {role, content, tool_call_id}; the conversion reads content only).
-        Message.tool(tool_call_id: tool_call.id, content: result_content(result), details: tool_call.details)
+        ended = false
+        begin
+          @before_tool_call_hooks.each { |hook| hook.call(tool_call) }
+          tool = @tools.find { |candidate| candidate.name == tool_call.name }
+          unless tool
+            ended = true
+            result = {error: "Tool not found: #{tool_call.name}"}
+            @after_tool_result_hooks.each { |hook| hook.call(tool_call, result, duration: 0.0) }
+            return error_tool_result(tool_call, result[:error])
+          end
+
+          result = tool.call(**tool_call.arguments, tool_call: tool_call)
+          duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at
+          ended = true
+          @after_tool_result_hooks.each { |hook| hook.call(tool_call, result, duration:) }
+          # The details side channel rides the recorded/replayed message, not
+          # the wire (I57 P3 — the wire tool message stays exactly
+          # {role, content, tool_call_id}; the conversion reads content only).
+          Message.tool(tool_call_id: tool_call.id, content: result_content(result), details: tool_call.details)
+        rescue Fast::Completions::CancelledError
+          raise
+          # The belt (S2): WHAT broke and WHERE, the I94 in-tool idiom —
+          # re-implemented inline (safe_execute.rb is byte-frozen, no shared
+          # helper). The end hooks fire with the belted error result so the
+          # TUI's pending block finalizes and the session sink records the
+          # call through the existing :tool_execution_end machinery (S3).
+        rescue StandardError => e
+          site = e.backtrace&.first
+          message = "#{e.class}: #{e.message}#{" (at #{site})" if site}"
+          unless ended
+            @after_tool_result_hooks.each do |hook|
+              hook.call(tool_call, {error: message},
+                duration: Process.clock_gettime(Process::CLOCK_MONOTONIC) - started_at)
+            end
+          end
+          error_tool_result(tool_call, message)
+        end
       end
 
       def append_tool_result(result)
