@@ -86,9 +86,13 @@ module Tart
                             strip_trailing_whitespace:, identity:, session_env:)]
         end.to_h
         loadout = mcp_servers ? builtins.merge(Mcp.tools_for(mcp_servers)) : builtins
-        return loadout unless hooks
+        unless hooks
+          verify_schema_bindings(loadout)
+          return loadout
+        end
 
         hooks.registered_tools.each { |tool| loadout[tool.name.to_s] = tool }
+        verify_schema_bindings(loadout)
         return loadout unless hooks.tool_call_handlers?
 
         # One wrap, never two: the merged loadout passes through the gate
@@ -112,6 +116,21 @@ module Tart
           kwargs[:identity] = identity
         end
         Object.const_get(class_name).new(**kwargs)
+      end
+
+      # I97 Law 2 — the boot proof over the ENTIRE assembled loadout (the
+      # builtins + MCP merge, and again after the hooks-registered merge —
+      # memory, subagent, architect_loop, architect_compact all flow through
+      # here), BEFORE the ToolGate wrap: every SafeExecute tool's declared
+      # schema must biject its execute keywords, so a drifted tool is
+      # unloadable — raises at session construction, no loadout, no wire
+      # declaration, no call. The verdict is memoized per class; MCP tools
+      # skip via the predicate (their catch-all **arguments binding cannot
+      # drift — I96 D5).
+      def verify_schema_bindings(loadout)
+        loadout.each_value do |tool|
+          tool.class.verify_schema_binding! if tool.class.include?(SafeExecute)
+        end
       end
 
     end

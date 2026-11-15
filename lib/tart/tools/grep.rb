@@ -46,6 +46,8 @@ module Tart
 
       parameters PARAMETERS_SCHEMA.dup
 
+      schema_contract
+
       # @return [String] formatted matches, or {error:} on failure.
       def execute(pattern:, path: nil, glob: nil, ignore_case: nil, literal: nil, context: nil, limit: nil)
         safe_execute do
