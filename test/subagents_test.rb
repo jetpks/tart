@@ -482,7 +482,10 @@ module Tart
         {"id" => id, "agent" => "worker", "task" => nil, "taskChars" => 5, "mode" => "single",
          "state" => "running", "pid" => pid, "cwd" => @cwd, "asyncDir" => dir,
          "sessionRoot" => File.join(dir, "sessions"), "startedAt" => nil, "lastUpdate" => nil,
-         "toolCallId" => nil}))
+         "toolCallId" => nil,
+         # I99 staging: stamped-ours (the adopting Manager's session owner
+         # id) — unstamped dirs are foreign-by-default now.
+         "sessionId" => manager.session_owner_id}))
 
       # The fleet read reconciles the legacy dir — dead pid → the failed
       # repair — WITHOUT raising, and the on-disk legacy task:null stays
@@ -849,6 +852,21 @@ module Tart
       second = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"), env: default_env,
                                       identity: "pi", hooks: Hooks.new)
       @managers << second
+
+      # I99 refused arm (the ownership law): the run is stamped with the
+      # FIRST manager's id — a targeted read from the SECOND manager takes
+      # the existing unknown-id path, before any write, and result is nil.
+      error = assert_raises(ArgumentError) { second.status(id: run[:id]) }
+      assert_includes error.message, "unknown subagent run"
+      assert_includes error.message, "Active runs: (none)"
+      assert_nil second.result(id: run[:id])
+
+      # I99 restage: the disk-first arm keeps its intent by moving the
+      # run's stamp to the SECOND manager's id (the owned shape).
+      status = JSON.parse(File.read(File.join(run[:dir], "status.json")))
+      status["sessionId"] = second.session_owner_id
+      File.write(File.join(run[:dir], "status.json"), JSON.generate(status))
+
       lines = second.status(id: run[:id])
       assert_includes lines, "State: completed", "disk-first: terminal even though this watcher never saw it"
       assert_includes lines, "Output: "

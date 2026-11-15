@@ -85,8 +85,11 @@ module Tart
     end
 
     # Fabricates the dead-run specimen dir (the 01a14e3c shape): a stale
-    # running status.json, legacy nil fields, no result.json.
-    def fabricate_run(id:, state: "running", pid:, agent: "worker", stderr: nil, result: nil, status: {})
+    # running status.json, legacy nil fields, no result.json. I99 staging:
+    # +session_id:+ passes the adopting Manager's session owner id through
+    # (the ownership stamp's staged seat — assertions unchanged).
+    def fabricate_run(id:, state: "running", pid:, agent: "worker", stderr: nil, result: nil, status: {},
+                      session_id: nil)
       dir = File.join(@home, "subagents", id)
       FileUtils.mkdir_p([dir, File.join(dir, "control", "steer-requests"),
                          File.join(dir, "control", "stop-requests"), File.join(dir, "sessions")])
@@ -94,6 +97,7 @@ module Tart
                  "state" => state, "pid" => pid, "cwd" => @home, "asyncDir" => dir,
                  "sessionRoot" => File.join(dir, "sessions"), "startedAt" => nil,
                  "lastUpdate" => nil, "toolCallId" => nil}.merge(status)
+      payload["sessionId"] = session_id if session_id
       File.write(File.join(dir, "status.json"), JSON.generate(payload))
       File.write(File.join(dir, "runner.stderr.log"), stderr) if stderr
       File.write(File.join(dir, "result.json"), JSON.generate(result)) if result
@@ -109,9 +113,11 @@ module Tart
     def test_dead_run_specimen_converges_through_the_fleet_read
       id = "01deadbee-0000-7000-8000-000000000001"
       pid = dead_pid
-      dir = fabricate_run(id:, pid:, stderr: "a ruby warning line\nsecond diagnostic line\n")
+      manager = new_manager
+      dir = fabricate_run(id:, pid:, session_id: manager.session_owner_id,
+                          stderr: "a ruby warning line\nsecond diagnostic line\n")
 
-      list = new_manager.status(id: nil)
+      list = manager.status(id: nil)
 
       # The fleet lists the converged run (fleet-line format byte-kept).
       assert_includes list, "- #{id} | failed | single | worker"
@@ -149,7 +155,7 @@ module Tart
       legs.each_with_index do |(result, want_state, want_timed_out, want_error), index|
         id = "01deadbee-0000-7000-8000-0000000001%02d" % index
         pid = dead_pid
-        dir = fabricate_run(id:, pid:, result: result)
+        dir = fabricate_run(id:, pid:, session_id: manager.session_owner_id, result: result)
         result_before = File.read(File.join(dir, "result.json"))
 
         manager.status(id: nil)
@@ -171,10 +177,10 @@ module Tart
     def test_live_pid_is_left_byte_identical_listed_running_and_never_wedges_drain
       id = "01deadbee-0000-7000-8000-000000000003"
       pid = live_pid
-      dir = fabricate_run(id:, pid:)
+      manager = new_manager
+      dir = fabricate_run(id:, pid:, session_id: manager.session_owner_id)
       status_before = File.read(File.join(dir, "status.json"))
 
-      manager = new_manager
       list = manager.status(id: nil)
 
       assert_includes list, "- #{id} | running | single | worker"
@@ -196,7 +202,8 @@ module Tart
       # Adopt a foreign LIVE run through the fleet read.
       foreign_id = "01deadbee-0000-7000-8000-000000000004"
       foreign_pid = live_pid
-      fabricate_run(id: foreign_id, pid: foreign_pid, agent: "oracle")
+      fabricate_run(id: foreign_id, pid: foreign_pid, agent: "oracle",
+                    session_id: manager.session_owner_id)
       manager.status(id: nil)
 
       # The foreign run settles terminal only through its own death; while
@@ -228,7 +235,8 @@ module Tart
       manager = new_manager
       foreign_id = "01deadbee-0000-7000-8000-000000000005"
       foreign_pid = live_pid
-      fabricate_run(id: foreign_id, pid: foreign_pid, agent: "oracle")
+      fabricate_run(id: foreign_id, pid: foreign_pid, agent: "oracle",
+                    session_id: manager.session_owner_id)
       manager.status(id: nil) # adopt the live foreign run
 
       manager.shutdown
@@ -350,12 +358,13 @@ module Tart
 
     def test_legacy_and_null_status_fields_never_raise_and_nil_pid_reads_unknown
       id = "01deadbee-0000-7000-8000-000000000006"
+      manager = new_manager
       # A NIL pid is unrecoverably gone (the exited? law); the repair
       # message reads pi's interpolation fallback "unknown", and every
       # nil/legacy field (taskChars, startedAt, NO timeoutMs key) passes
       # through without raising.
-      dir = fabricate_run(id:, pid: nil, agent: "worker")
-      list = new_manager.status(id: nil)
+      dir = fabricate_run(id:, pid: nil, agent: "worker", session_id: manager.session_owner_id)
+      list = manager.status(id: nil)
 
       assert_includes list, "- #{id} | failed | single | worker"
       result = JSON.parse(File.read(File.join(dir, "result.json")))
@@ -374,7 +383,8 @@ module Tart
       # Under the bound: 35 short lines → the LAST 30 exactly, no marker.
       id = "01deadbee-0000-7000-8000-000000000007"
       pid = dead_pid
-      dir = fabricate_run(id:, pid:, stderr: (1..35).map { |n| "line #{n}" }.join("\n") + "\n")
+      dir = fabricate_run(id:, pid:, session_id: manager.session_owner_id,
+                          stderr: (1..35).map { |n| "line #{n}" }.join("\n") + "\n")
 
       manager.status(id: nil)
 
@@ -388,7 +398,8 @@ module Tart
       # Over the bound: the last 4000 chars + the marker.
       id2 = "01deadbee-0000-7000-8000-000000000709"
       pid2 = dead_pid
-      dir2 = fabricate_run(id: id2, pid: pid2, stderr: (1..40).map { |n| "line #{n} #{"x" * 200}" }.join("\n") + "\n")
+      dir2 = fabricate_run(id: id2, pid: pid2, session_id: manager.session_owner_id,
+                           stderr: (1..40).map { |n| "line #{n} #{"x" * 200}" }.join("\n") + "\n")
 
       manager.status(id: nil)
 
@@ -404,8 +415,8 @@ module Tart
     def test_targeted_status_read_converges_the_dead_specimen_through_the_reaper
       id = "01deadbee-0000-7000-8000-000000000008"
       pid = dead_pid
-      dir = fabricate_run(id:, pid:)
       manager = new_manager
+      dir = fabricate_run(id:, pid:, session_id: manager.session_owner_id)
 
       rendered = manager.status(id: id)
 
