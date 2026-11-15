@@ -254,7 +254,7 @@ module Tart
 
       assert_nil validate_input("grep", {pattern: "p", ignore_case: true, literal: false, context: 2, limit: 10})
       assert_wrapper("grep", validate_input("grep", {pattern: 5}), "pattern: must be a string")
-      assert_wrapper("grep", validate_input("grep", {pattern: "p", ignore_case: "yes"}), "ignore_case: must be boolean")
+      assert_wrapper("grep", validate_input("grep", {pattern: "p", ignoreCase: "yes"}), "ignoreCase: must be boolean")
 
       assert_nil validate_input("find", {pattern: "*.rb", path: "d", limit: 5})
       assert_wrapper("find", validate_input("find", {pattern: "p", limit: {}}), "limit: must be an integer or must be a float")

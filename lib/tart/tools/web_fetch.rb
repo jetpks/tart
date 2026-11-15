@@ -77,11 +77,13 @@ module Tart
 
       parameters PARAMETERS_SCHEMA.dup
 
+      schema_contract
+
       # @return [String] title + capped page text (plus the saved path in
       #   save mode), or {error:} on failure.
-      def execute(url:, save: false, savePath: nil)
+      def execute(url:, save: false, save_path: nil)
         safe_execute do
-          failure = validate_input(url:, save:, savePath:)
+          failure = validate_input(url:, save:, save_path:)
           return failure if failure
 
           key = @env["EXA_API_KEY"]
@@ -105,7 +107,7 @@ module Tart
           Fast::Completions::Cancellation.check
           text = result["text"].to_s
           if save
-            saved = persist(url, text, savePath)
+            saved = persist(url, text, save_path)
             return saved if saved.is_a?(Hash)
             saved_path = saved
           end

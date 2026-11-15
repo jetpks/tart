@@ -36,6 +36,8 @@ module Tart
 
       parameters PARAMETERS_SCHEMA.dup
 
+      schema_contract
+
       # @return [String] newline-joined entries, or {error:} on failure.
       def execute(path: nil, limit: nil)
         safe_execute do
