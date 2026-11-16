@@ -155,6 +155,14 @@ module Tart
           reply = read_reply(reply_file, id)
           if reply
             File.unlink(request_path(id)) rescue nil
+            # I100 L5 — the child's error law (pi :117-118 `throw new
+            # Error(parsed.error)`): a String error RAISES with exactly
+            # those bytes, after the request-file unlink (pi removes the
+            # file in the catch, same effect); SafeExecute keeps the
+            # ArgumentError verbatim inside the {error:} result. A reply
+            # with no error key returns today's bytes exactly.
+            raise ArgumentError, reply["error"] if reply["error"].is_a?(String)
+
             return "**Reply from supervisor:**\n#{reply["message"]}"
           end
           sleep Subagents::Supervisor::POLL_INTERVAL

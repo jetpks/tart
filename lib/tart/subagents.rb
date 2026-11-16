@@ -245,9 +245,12 @@ module Tart
       # session owner id (ONE memoization seat — the Manager; D5), so the
       # registered channel scans/answers ONLY this session's asks. Direct
       # constructions (tests, the architect_loop harness) omit owner_id
-      # and keep today's unscoped bytes.
+      # and keep today's unscoped bytes. I100 L1 — the valve's predicate
+      # threads here the same way: the Manager consult answers whether
+      # the parent's own tool call is blocked awaiting the asking run.
       channel = SupervisorChannel.new(home: manager.home, hooks:, kernel:, agent:,
-                                      owner_id: -> { manager.session_owner_id })
+                                      owner_id: -> { manager.session_owner_id },
+                                      foreground_awaited: ->(run_id) { manager.foreground_run_awaited?(run_id) })
       channel.start
       manager.supervisor_channel = channel
       hooks.register_tool(Tools::Subagent.new(manager:))
