@@ -415,9 +415,7 @@ module Tart
           return format_activity_label(row[:ended_at], nil, row[:ended_at]).to_s
         end
 
-        if row[:attention]
-          return format_activity_label(row[:started_at], "needs_attention", row[:last_update]).to_s
-        end
+        return attention_activity(row) if row[:attention]
 
         format_activity_label(row[:started_at], nil, row[:last_update]) || "thinking…"
       end
@@ -429,9 +427,23 @@ module Tart
       def step_activity(row)
         return "" unless row[:state] == "running"
 
-        return format_activity_label(row[:started_at], "needs_attention", row[:last_update]).to_s if row[:attention]
+        return attention_activity(row) if row[:attention]
 
         "thinking…"
+      end
+
+      # I100 D3 — the attention detail with pi's asking-tool prefix
+      # (fleet-status.js:84-85 `tool ${node.currentTool}`): a running row
+      # carrying BOTH attention and attention_tool composes
+      # `tool <tool> · <the frozen attention label>`. The tool fact is
+      # born and dies with the mark, and its absence renders today's bytes
+      # exactly (the nil-tolerance additive law — the model/context
+      # precedent). stable_key is unchanged: the tool fact never flips
+      # independently of attention.
+      def attention_activity(row)
+        label = format_activity_label(row[:started_at], "needs_attention", row[:last_update]).to_s
+        tool = row[:attention_tool]
+        tool ? "tool #{tool} · #{label}" : label
       end
 
       # pi formatters.js:131-137 shortenPath — the HOME contraction.

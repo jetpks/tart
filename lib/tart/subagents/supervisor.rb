@@ -74,6 +74,18 @@ module Tart
       # I48 status.json state (Manager::TERMINAL_STATES).
       TERMINAL_RUN_STATES = %w[completed failed stopped].freeze
 
+      # I100 D1 — the blocked-parent valve's deterministic auto-reply, ADAPTED
+      # from pi native-supervisor-channel.js:813-815: pi names its own
+      # machinery ("an async:false workflow" / "Relaunch the workflow"); tart
+      # names the same shape "foreground subagent call" (the Manager's
+      # async:false blocking wait) and keeps the subagent tool's param token
+      # in the fix clause. The middle sentence is pi-verbatim — it instructs
+      # the child identically in both worlds. The valve payload carries it as
+      # the reply's `error`; the contact_supervisor error law (L5) surfaces it
+      # to the child model as a TOOL ERROR, verbatim.
+      BLOCKED_PARENT_ERROR = "Supervisor unavailable: the parent is blocked in a foreground subagent call and cannot answer this request. " \
+        "Report the blocker and any partial results, then stop. Relaunch the subagent with async: true to allow supervisor replies.".freeze
+
       module_function
 
       # D5 — pi applyIntercomBridgeToAgent (:172-198) with mode "always":
@@ -175,7 +187,11 @@ module Tart
     # wake drains the ask as the turn's opening messages; a BUSY parent's
     # queued ask rides the next add_user_message drain; kernel/agent nil
     # (print boots) = queue only — the child's ask timeout bounds every
-    # miss.
+    # miss. The foreground exception (I100): an ask from a run the parent's
+    # own tool call is blocked awaiting can NEVER be delivered that way —
+    # the valve auto-answers it (a tool error naming the blocker) and the
+    # foreground attention marks surface the asking child on the box so a
+    # human sees the ask event even though it was never queued.
     class SupervisorChannel
       attr_reader :home
 
@@ -190,15 +206,22 @@ module Tart
       #   (the default) = UNSCOPED, today's bytes — reachable only by
       #   direct construction (tests, the architect_loop harness);
       #   production {Subagents.register} ALWAYS threads the resolver.
-      def initialize(home:, hooks:, kernel: nil, agent: nil, owner_id: nil)
+      # @param foreground_awaited [Proc, nil] the blocked-parent valve's
+      #   predicate (I100 L1 — arity 1, run_id -> bool). nil (the default)
+      #   = NEVER VALVED, today's pre-I100 bytes — reachable only by direct
+      #   construction; production {Subagents.register} ALWAYS threads the
+      #   Manager consult.
+      def initialize(home:, hooks:, kernel: nil, agent: nil, owner_id: nil, foreground_awaited: nil)
         @home = home
         @hooks = hooks
         @kernel = kernel
         @agent = agent
         @owner_id = owner_id
+        @foreground_awaited = foreground_awaited
         @mutex = Mutex.new
         @pending = {}
         @seen = {}
+        @foreground_attention = {}
         @thread = nil
       end
 
@@ -262,6 +285,14 @@ module Tart
         @mutex.synchronize { @pending.values.map(&:dup) }
       end
 
+      # The foreground attention marks (I100 L3): run-id keyed
+      # {tool:, since:} — set at valve time, cleared by the sweep when the
+      # run turns terminal on disk or its dir vanishes (D2). The box
+      # snapshot's `attention_tool` fact reads this.
+      def foreground_attention
+        @mutex.synchronize { @foreground_attention.dup }
+      end
+
       # pi buildParentSupervisorTool's pending arm (:450-458): the empty
       # line is pi byte-exact; one formatted line per pending ask.
       def pending_text
@@ -269,6 +300,26 @@ module Tart
         return "No pending supervisor requests." if requests.empty?
 
         requests.map { |request| Supervisor.pending_line(request) }.join("\n")
+      end
+
+      # I101 D5/L4 — the succession prune's channel arm: forget the
+      # pending entries of the runs pruned from the Manager's registry at
+      # a recorded replacement (a keep-declared replacement inherits
+      # nothing). NO reply is written and NO request file is touched —
+      # the ask files stay on disk, examinable every tick, never answered
+      # (the I99 foreign-ask posture; their seen-marks keep the poll from
+      # re-registering them, and an unseen pruned ask fails the widened
+      # ownership guard on every later scan). Called STRICTLY OUTSIDE the
+      # manager mutex (the standing ordering law), under THIS channel's
+      # own mutex.
+      def drop_pending(run_ids)
+        ids = Array(run_ids)
+        return if ids.empty?
+
+        @mutex.synchronize do
+          @pending.delete_if { |_request_id, request| ids.include?(request[:run_id].to_s) }
+        end
+        nil
       end
 
       private
@@ -288,9 +339,11 @@ module Tart
       end
 
       # One pass: the pending sweep (lifecycle on registered asks) first —
-      # pi refreshPendingRequests — then the new-file scan.
+      # pi refreshPendingRequests — then the marks' clear sweep (I100 D2,
+      # the same tick), then the new-file scan.
       def tick
         sweep_pending
+        sweep_foreground_attention
         scan_requests
       end
 
@@ -305,12 +358,12 @@ module Tart
       def scan_requests
         Dir.glob(request_glob).sort.each do |path|
           next if seen?(path)
-          # S5 — the per-dir ownership guard BEFORE mark_seen: a foreign
-          # ask is NOT registered, NOT surfaced, NOT unlinked (it stays on
-          # disk, examinable every tick — it can never become owned; owner
-          # ids are unique per process).
+          # S5 — the per-dir ownership guard BEFORE the valve (I99): a
+          # foreign ask is NOT valved, NOT marked, NOT registered, NOT
+          # surfaced, NOT unlinked (it stays on disk, examinable every
+          # tick — it can never become owned; owner ids are unique per
+          # process).
           next unless owned_request_file?(path)
-          mark_seen(path)
 
           request = parse_request_file(path)
           if request.nil?
@@ -331,12 +384,86 @@ module Tart
             File.unlink(path) rescue nil
             next
           end
+          # I100 L2 — the blocked-parent valve (pi :809-826): an OWNED,
+          # pending, expects_reply ask from a run the parent's own tool
+          # call is blocked awaiting can never be delivered (the loop is
+          # IN that call) — write the deterministic auto-reply instead of
+          # renewing an unreachable ask to the deadline. Never registered,
+          # never surfaced (no queue entry, no wake kick).
+          if foreground_awaited?(request)
+            next unless write_valve_reply(request)
+            # Failure left the path UNSEEN — the next tick rescans and
+            # retries (pi's continue-without-seenFiles).
+            mark_seen(path)
+            remove_request_file(request)
+            record_foreground_attention(request)
+            @kernel&.async {} rescue nil # the box draw kick (kick_box_draw's idiom)
+            next # SKIP register + surface entirely
+          end
+          # The seen-mark rides AFTER the valve decision for every arm
+          # (behavior-neutral: the poll iteration is single-threaded and
+          # no yield sits between parse and action; @seen is
+          # poll-thread-only state).
+          mark_seen(path)
 
           @mutex.synchronize { @pending[request[:id]] = request }
           surface(request)
         end
       rescue SystemCallError
         nil # a vanished file loses to the next tick
+      end
+
+      # The marks' clear sweep (I100 D2): a mark dies when its run's
+      # status.json flips terminal on disk (the lifecycle's run_terminal?
+      # read) or its run dir vanishes — swept on the same tick as
+      # sweep_pending. Run-scoped by construction: the mark outlives every
+      # ask of the run (why the human frame can still observe it after the
+      # valve answered) and clears only where no expects_reply of the run
+      # can still pend (pi's pending-skip posture holds for free).
+      def sweep_foreground_attention
+        run_ids = @mutex.synchronize { @foreground_attention.keys }
+        run_ids.each do |run_id|
+          gone = !File.directory?(File.join(@home, run_id))
+          @mutex.synchronize { @foreground_attention.delete(run_id) } if gone || run_terminal?(run_id)
+        end
+      end
+
+      # L1 — the valve predicate consult: nil (the default — today's
+      # pre-I100 bytes, direct construction) never valves; a raising
+      # callable reads as false (a broken consult must not spin the poll
+      # loop — pi's unreadable-status posture). The call stays OUTSIDE
+      # every lock (the session_owner_id discipline: arbitrary callable
+      # code never runs under the registry lock).
+      def foreground_awaited?(request)
+        return false unless @foreground_awaited
+
+        @foreground_awaited.call(request[:run_id])
+      rescue StandardError
+        false
+      end
+
+      # L2a — the D1 reply: tart's reply_payload key order + the error key
+      # appended last (the additive-last law); `message` empty-String.
+      # False = the write failed; the caller leaves the path unseen.
+      def write_valve_reply(request)
+        Supervisor.atomic_write_json(reply_path(request),
+                                     reply_payload(request, "", error: Supervisor::BLOCKED_PARENT_ERROR))
+        true
+      rescue StandardError => e
+        warn "subagents: supervisor valve write failed: #{e.message}"
+        false
+      end
+
+      # L3 — the mark: run-scoped {tool:, since:} under @mutex, recorded at
+      # valve time (after the reply landed). Cleared by
+      # sweep_foreground_attention, never at ask-resolution (D2 — clearing
+      # at the valve write would erase the mark inside one poll tick,
+      # before any human frame could observe it).
+      def record_foreground_attention(request)
+        @mutex.synchronize do
+          @foreground_attention[request[:run_id].to_s] =
+            {tool: "contact_supervisor", since: request[:created_at]}
+        end
       end
 
       # The lifecycle verdict (pi requestLifecycle :333-341 minus the
@@ -394,17 +521,32 @@ module Tart
       # ownsRun): the containing run dir is derived from the request PATH
       # (dirname ×3 — <home>/<run-id>/control/supervisor-requests/<file> —
       # NEVER the payload runId), and its status.json must carry a
-      # "sessionId" equal to the owner resolver's id. @owner_id nil (the
-      # default) = UNSCOPED — every file is owned (D5).
+      # "sessionId" owned by the owner resolver's answer. I101 D6 — the
+      # answer is EITHER a String (the scalar contract — the I99 pin-7
+      # direct-construction shape, byte-held) OR an include?-answering
+      # collection (the register threading — the owner SET, current +
+      # inherited chain), so an inherited run's ask is matched through the
+      # run's recorded owner (pi native-supervisor-channel.js :372). An
+      # unreadable status counts as not owned (stamp nil misses both
+      # shapes). @owner_id nil (the default) = UNSCOPED — every file is
+      # owned (D5). A raising consult reads FALSE (the I100 L1 discipline
+      # — a broken consult must not spin the poll loop; pi's
+      # unreadable-status posture), and so does any non-conforming answer
+      # (nil / no include? — the loop never sees a raise).
       def owned_request_file?(path)
         return true unless @owner_id
 
-        owner = @owner_id.call
-        return false unless owner.is_a?(String)
+        owner = begin
+          @owner_id.call
+        rescue StandardError
+          return false
+        end
+        return false unless owner.is_a?(String) || owner.respond_to?(:include?)
 
         run_dir = File.dirname(File.dirname(File.dirname(path)))
         status = read_json(File.join(run_dir, "status.json"))
-        status.is_a?(Hash) && status["sessionId"] == owner
+        stamp = status.is_a?(Hash) ? status["sessionId"] : nil
+        owner.is_a?(String) ? stamp == owner : owner.include?(stamp)
       end
 
       # The disk-first reply fallback: an EXACT request-id file anywhere
@@ -454,9 +596,13 @@ module Tart
         }
       end
 
-      def reply_payload(request, message)
-        {type: Supervisor::REPLY_TYPE, requestId: request[:id],
-         createdAt: Supervisor.now_ms, message:}
+      # The +error:+ kwarg rides ONLY the valve payload (I100 D1) — the
+      # no-error shape is today's bytes exactly (the parent reply path).
+      def reply_payload(request, message, error: nil)
+        payload = {type: Supervisor::REPLY_TYPE, requestId: request[:id],
+                   createdAt: Supervisor.now_ms, message:}
+        payload[:error] = error if error
+        payload
       end
 
       def reply_path(request)
