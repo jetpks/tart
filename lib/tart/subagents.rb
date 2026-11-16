@@ -241,18 +241,34 @@ module Tart
                  root: nil)
       manager = Manager.new(cwd:, home: home || self.home(env:, identity:), env:, identity:,
                             hooks:, kernel:, agent:, root: root || Agent::Session.default_root)
-      # S5 — the scoped channel (I99): the resolver threads the Manager's
-      # session owner id (ONE memoization seat — the Manager; D5), so the
-      # registered channel scans/answers ONLY this session's asks. Direct
-      # constructions (tests, the architect_loop harness) omit owner_id
-      # and keep today's unscoped bytes. I100 L1 — the valve's predicate
-      # threads here the same way: the Manager consult answers whether
-      # the parent's own tool call is blocked awaiting the asking run.
+      # S5 — the scoped channel (I99 + I101 D6): the resolver threads the
+      # Manager's owner SET (current session + inherited chain — ONE
+      # memoization/detection seat — the Manager; I99 D5), so the
+      # registered channel scans/answers this session's AND its
+      # predecessors' asks. Direct constructions (tests, the
+      # architect_loop harness) omit owner_id and keep today's unscoped
+      # bytes. I100 L1 — the valve's predicate threads here the same way:
+      # the Manager consult answers whether the parent's own tool call is
+      # blocked awaiting the asking run.
       channel = SupervisorChannel.new(home: manager.home, hooks:, kernel:, agent:,
-                                      owner_id: -> { manager.session_owner_id },
+                                      owner_id: -> { manager.owner_session_ids },
                                       foreground_awaited: ->(run_id) { manager.foreground_run_awaited?(run_id) })
       channel.start
       manager.supervisor_channel = channel
+      # I101 D4/L5 — the keep-work declaration: the ONE operator surface
+      # reachable inside the touch set (the I47 registered-command seam —
+      # the /loop precedent; exact match, no args, listed in /help,
+      # dispatched after builtins so it can never shadow one). It marks
+      # the CURRENT session; the NEXT replacement of this session inherits
+      # nothing. The command prints nothing (D4's declared trade: register
+      # has no output callable — threading one would widen the touch set
+      # to bin/tart); the /help row + the fleet emptying at the next /new
+      # are the surface. Registered on EVERY register call (a print boot's
+      # agent-less Manager can never replace, so the mark can never be
+      # consulted — one harmless /help row).
+      hooks.register_command("leave-work",
+                             description: "Leave this session's subagent work behind on the next /new or /resume",
+                             args: false) { manager.keep_session_work(manager.session_owner_id) }
       hooks.register_tool(Tools::Subagent.new(manager:))
       self.current_manager = manager
       manager
