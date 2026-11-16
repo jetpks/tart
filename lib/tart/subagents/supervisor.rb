@@ -302,6 +302,26 @@ module Tart
         requests.map { |request| Supervisor.pending_line(request) }.join("\n")
       end
 
+      # I101 D5/L4 — the succession prune's channel arm: forget the
+      # pending entries of the runs pruned from the Manager's registry at
+      # a recorded replacement (a keep-declared replacement inherits
+      # nothing). NO reply is written and NO request file is touched —
+      # the ask files stay on disk, examinable every tick, never answered
+      # (the I99 foreign-ask posture; their seen-marks keep the poll from
+      # re-registering them, and an unseen pruned ask fails the widened
+      # ownership guard on every later scan). Called STRICTLY OUTSIDE the
+      # manager mutex (the standing ordering law), under THIS channel's
+      # own mutex.
+      def drop_pending(run_ids)
+        ids = Array(run_ids)
+        return if ids.empty?
+
+        @mutex.synchronize do
+          @pending.delete_if { |_request_id, request| ids.include?(request[:run_id].to_s) }
+        end
+        nil
+      end
+
       private
 
       def poll_loop
@@ -501,17 +521,32 @@ module Tart
       # ownsRun): the containing run dir is derived from the request PATH
       # (dirname ×3 — <home>/<run-id>/control/supervisor-requests/<file> —
       # NEVER the payload runId), and its status.json must carry a
-      # "sessionId" equal to the owner resolver's id. @owner_id nil (the
-      # default) = UNSCOPED — every file is owned (D5).
+      # "sessionId" owned by the owner resolver's answer. I101 D6 — the
+      # answer is EITHER a String (the scalar contract — the I99 pin-7
+      # direct-construction shape, byte-held) OR an include?-answering
+      # collection (the register threading — the owner SET, current +
+      # inherited chain), so an inherited run's ask is matched through the
+      # run's recorded owner (pi native-supervisor-channel.js :372). An
+      # unreadable status counts as not owned (stamp nil misses both
+      # shapes). @owner_id nil (the default) = UNSCOPED — every file is
+      # owned (D5). A raising consult reads FALSE (the I100 L1 discipline
+      # — a broken consult must not spin the poll loop; pi's
+      # unreadable-status posture), and so does any non-conforming answer
+      # (nil / no include? — the loop never sees a raise).
       def owned_request_file?(path)
         return true unless @owner_id
 
-        owner = @owner_id.call
-        return false unless owner.is_a?(String)
+        owner = begin
+          @owner_id.call
+        rescue StandardError
+          return false
+        end
+        return false unless owner.is_a?(String) || owner.respond_to?(:include?)
 
         run_dir = File.dirname(File.dirname(File.dirname(path)))
         status = read_json(File.join(run_dir, "status.json"))
-        status.is_a?(Hash) && status["sessionId"] == owner
+        stamp = status.is_a?(Hash) ? status["sessionId"] : nil
+        owner.is_a?(String) ? stamp == owner : owner.include?(stamp)
       end
 
       # The disk-first reply fallback: an EXACT request-id file anywhere

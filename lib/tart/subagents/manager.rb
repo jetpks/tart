@@ -74,6 +74,13 @@ module Tart
 
       TERMINAL_STATES = %w[completed failed stopped].freeze
 
+      # I101 L1 — the succession registry's bounds, pi's own numbers
+      # (session-succession.js :6/:9): a chain holds the 8 newest real
+      # predecessors; the registry and the kept set cap at 64 recorded
+      # sessions (a long-lived host can replace sessions for days).
+      MAX_INHERITED_SESSIONS = 8
+      MAX_RECORDED_SESSIONS = 64
+
       # I80 encoding hygiene — Law 1's floor value (the owner's measured
       # machine locale): set as LC_ALL (overriding a present non-UTF-8
       # value, which would mask LC_CTYPE) or LC_CTYPE (masking a non-UTF-8
@@ -140,6 +147,13 @@ module Tart
         # process, so the two windows cannot disagree observably (D2).
         @boot_session_id = Agent::Session.uuidv7
         @session_owner_id = nil
+        # I101 L1 — the succession registry (pi session-succession.js at
+        # the Manager seat, D1): id => inherited chain Array
+        # (insertion-ordered Hash = pi's Map) + the kept-work ordered set
+        # (Array). In-process state only — it dies with the process, so a
+        # fresh startup inherits nothing (I99 D7 stands).
+        @session_chains = {}
+        @kept_work = []
         @mutex = Mutex.new
         @runs = []
         @supervisors = []
@@ -463,29 +477,126 @@ module Tart
         nil
       end
 
-      # S2 — the session owner id (I99): ONE identity per Manager life,
+      # S2/D3 — the session owner id (I99 + I101): the LIVE recorder's id,
       # pi's sessionId vocabulary at tart's value seat (D1 — the recorder
-      # id is tart's one cross-process session identity). The FIRST
-      # non-nil {parent_session_id} resolution is memoized under @mutex
-      # and wins for the Manager's whole life (a /new replacement keeps
-      # the process id — pi's in-process-replacement-inherits posture
-      # collapsed to one id, D2); until a recorder resolves — and forever
-      # when no agent is threaded (print boots, bare test Managers) — the
-      # per-boot id minted in initialize is returned WITHOUT memoizing.
-      # The resolution itself stays outside @mutex (the existing
-      # current_session_path/parent_session_id discipline: arbitrary
-      # callable code never runs under the registry lock).
+      # id is tart's one cross-process session identity). The consult
+      # re-resolves on every call: within one recorder's window the id is
+      # stable and memoized (the I99 freeze, generalized to a
+      # per-identity-window freeze); a window change (a /new or resume
+      # swap — every replacement mints a FRESH recorder id,
+      # agent/session.rb:402, never revisited in-process) IS the
+      # replacement, recorded lazily HERE (D2 — pi records at the
+      # session_start event, but tart's replacement seams live in
+      # bin/tart, outside this iteration's touch set; every ownership/
+      # stamping decision consults THIS method, so the chain is recorded
+      # before any decision that could depend on it, by construction).
+      # A nil resolution (no agent, or a transiently raising callable —
+      # parent_session_id rescues) is NEVER a replacement: the memoized
+      # id when one exists, else the per-boot mint, unchanged. No agent
+      # threaded (print boots, bare test Managers): the boot mint
+      # byte-held (the I99 fast path). The resolution itself stays
+      # outside @mutex (the standing discipline: arbitrary callable code
+      # never runs under the registry lock).
       def session_owner_id
-        hit = @mutex.synchronize { @session_owner_id }
-        return hit if hit
+        return @boot_session_id unless @agent
 
         resolved = parent_session_id
-        return @boot_session_id unless resolved
+        memo = @mutex.synchronize { @session_owner_id }
+        return memo || @boot_session_id unless resolved
+        return memo if memo == resolved
 
+        pruned_ids = nil
         @mutex.synchronize do
-          @session_owner_id ||= resolved
-          @session_owner_id
+          # Re-read the memo first: concurrent consults of one swap record
+          # exactly once (the loser finds the memo already moved).
+          previous = @session_owner_id
+          next previous if previous == resolved
+
+          if previous
+            record_session_replacement_locked(resolved, previous)
+            # L4 — the prune: forget every run the new owner set does not
+            # own (a normal replacement prunes nothing — the chain owns
+            # the predecessors; a keep-marked replacement prunes the
+            # declared session's records). The set reads the just-recorded
+            # chain directly — owner_session_ids would re-enter the mutex.
+            owner_set = [resolved, *@session_chains.fetch(resolved, [])]
+            pruned_ids = @runs.reject { |record| owner_set.include?(record[:session_id]) }
+              .map { |record| record[:id] }
+            @runs.delete_if { |record| !owner_set.include?(record[:session_id]) }
+          else
+            # First-ever resolution arms the registry (pi's startup arm —
+            # on a fresh registry this is a no-op). No prune: L4 rides
+            # replacements only, and pi's start arm never prunes.
+            record_session_start_locked(resolved, startup: true)
+          end
+          @session_owner_id = resolved
         end
+        # The channel drop runs STRICTLY AFTER the manager mutex is
+        # released (the standing ordering law — no manager→channel
+        # nesting ever exists under the manager lock). NO files are
+        # touched: pruned asks stay on disk, examinable, never answered
+        # (D5).
+        @supervisor_channel&.drop_pending(pruned_ids) if pruned_ids
+        resolved
+      end
+
+      # --- I101 L1 — the succession registry (pi session-succession.js
+      # --- verbatim laws at the Manager seat, D1; public API, all
+      # --- mutex-guarded, no callable code under the lock) ---
+
+      # Records that new_id replaced previous_id in this process: the
+      # successor inherits previous_id's chain UNLESS previous_id's work
+      # was kept there (the /leave-work mark — D4), and keeps its own
+      # recorded chain only when ITS work is kept (a kept session reopens
+      # with its own chain). The de-dup law (pi :41-42): the chain is
+      # distinct and free of the successor itself, so the bound holds real
+      # predecessors. Recency + FIFO at pi's bounds; then the mark on
+      # previous_id is released — the mark is spent (D4).
+      def record_session_replacement(new_id, previous_id)
+        @mutex.synchronize { record_session_replacement_locked(new_id, previous_id) }
+      end
+
+      # Records a session start: with startup, the session drops its own
+      # chain AND its kept mark (a startup replaces no session — whoever
+      # replaced it took those runs over); ALWAYS the session is removed
+      # from every chain — a session live in this process is inherited by
+      # no one (pi recordSessionStart, verbatim).
+      def record_session_start(id, startup:)
+        @mutex.synchronize { record_session_start_locked(id, startup:) }
+      end
+
+      # The operator leaves THIS session's work behind (/leave-work, D4):
+      # its successor inherits nothing, and the session keeps its own
+      # chain when it is reopened. The mark lasts until it is released (a
+      # replacement spends it).
+      def keep_session_work(id)
+        @mutex.synchronize do
+          @kept_work.delete(id)
+          @kept_work << id
+          @kept_work.shift while @kept_work.size > MAX_RECORDED_SESSIONS
+        end
+        nil
+      end
+
+      # The not-left arm (pi releaseSessionWork): whoever replaces this
+      # session next inherits as usual.
+      def release_session_work(id)
+        @mutex.synchronize { @kept_work.delete(id) }
+        nil
+      end
+
+      # The sessions this process replaced on the way to id, newest first
+      # (pi inheritedSessionIds); their runs belong to id.
+      def inherited_session_ids(id)
+        @mutex.synchronize { @session_chains.fetch(id, []).dup }
+      end
+
+      # The owner SET (pi run-ownership.js): the session itself, then its
+      # inherited chain — membership, not scalar equality, is the
+      # admission law (L3).
+      def owner_session_ids
+        current = session_owner_id
+        [current, *inherited_session_ids(current)].uniq.freeze
       end
 
       # I100 L1 — the awaited-window consult (pi's blockingWorkflowChildren):
@@ -504,6 +615,41 @@ module Tart
       end
 
       private
+
+      # --- I101 — the registry's locked internals (the public API and
+      # --- the identity consult drive these under ONE @mutex
+      # --- synchronize; no public method is ever called under the lock
+      # --- — the no-nesting law) ---
+
+      def record_session_replacement_locked(new_id, previous_id)
+        inherited = kept_work?(previous_id) ? [] : [previous_id, *@session_chains.fetch(previous_id, [])]
+        own = kept_work?(new_id) ? @session_chains.fetch(new_id, []) : []
+        # pi :41-42 — Resuming back and forth can revisit a session: keep
+        # the chain distinct and free of the session itself, so the bound
+        # holds real predecessors and discovery never scans one session
+        # twice. (Unreachable through the lazy consult — recorder ids are
+        # never revisited in-process — kept for law-faithfulness, D2.)
+        chain = (inherited + own).uniq.reject { |id| id == new_id }.first(MAX_INHERITED_SESSIONS)
+        @session_chains.delete(new_id)
+        @session_chains[new_id] = chain
+        @session_chains.shift while @session_chains.size > MAX_RECORDED_SESSIONS
+        @kept_work.delete(previous_id) # the mark is spent (D4)
+      end
+
+      def record_session_start_locked(id, startup:)
+        if startup
+          @session_chains.delete(id)
+          @kept_work.delete(id)
+        end
+        @session_chains.each_key do |key|
+          chain = @session_chains[key]
+          @session_chains[key] = chain - [id] if chain.include?(id)
+        end
+      end
+
+      def kept_work?(id)
+        @kept_work.include?(id)
+      end
 
       # --- spawn internals ---
 
@@ -1098,11 +1244,13 @@ module Tart
       # synthesis carries owned: false — the adopter never speaks for a
       # run it did not spawn.
       # S3/S4 — the ownership guard (pi run-ownership.js ownsRun): the
-      # on-disk status must carry a String "sessionId" equal to THIS
-      # Manager's session owner id. An unstamped dir is foreign to
+      # on-disk status must carry a String "sessionId" in THIS Manager's
+      # owner SET — the live session plus its inherited chain (I101 L3:
+      # membership, not scalar equality, so a predecessor's stamped runs
+      # stay owned across a replacement). An unstamped dir is foreign to
       # everyone (D6 — legacy dirs are tolerated, never rewritten).
       def owned_status?(status)
-        status["sessionId"].is_a?(String) && status["sessionId"] == session_owner_id
+        status["sessionId"].is_a?(String) && owner_session_ids.include?(status["sessionId"])
       end
 
       def disk_find(id)

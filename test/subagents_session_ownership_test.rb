@@ -85,14 +85,18 @@ module Tart
       manager = new_manager(agent: -> { current.first })
 
       assert_equal "01aaa111-0000-7000-8000-00000000aaaa", manager.session_owner_id
-      # A later swap keeps the first id — ONE identity per Manager life.
+      # A later swap is a REPLACEMENT (I101 D3 — the I99 freeze retires):
+      # the owner follows the live recorder, the first id rides the
+      # inherited chain, and the successor's stamp rides its OWN id.
       current[0] = loop2
-      assert_equal "01aaa111-0000-7000-8000-00000000aaaa", manager.session_owner_id,
-                   "the FIRST resolution is memoized for the Manager's life"
-      # And the stamp rides it.
+      assert_equal "01bbb222-0000-7000-8000-00000000bbbb", manager.session_owner_id,
+                   "the owner follows the swapped-in recorder"
+      assert_equal ["01bbb222-0000-7000-8000-00000000bbbb", "01aaa111-0000-7000-8000-00000000aaaa"],
+                   manager.owner_session_ids, "the owner set widens to [successor, predecessor]"
+      # And the successor's stamp rides ITS OWN recorder id.
       @server.script([{type: :stream, content: "stamped by the recorder id"}])
       run = manager.spawn_run(agent: "worker", task: "t", async: false, timeout_ms: 0, tool_timeout_ms: 0)
-      assert_equal "01aaa111-0000-7000-8000-00000000aaaa",
+      assert_equal "01bbb222-0000-7000-8000-00000000bbbb",
                    JSON.parse(File.read(File.join(run[:dir], "status.json")))["sessionId"]
 
       # No agent threaded (print boots, bare test Managers): a stable
