@@ -488,6 +488,21 @@ module Tart
         end
       end
 
+      # I100 L1 — the awaited-window consult (pi's blockingWorkflowChildren):
+      # the only spawn path for a foreground run is the subagent tool
+      # call's blocking wait, so an async:false record in @runs with state
+      # :running IS the parent's blocked await — exactly for that window
+      # (spawn_run appends the record then blocks in wait_for_exit;
+      # interrupts settle the record stopped inside the wait's rescue).
+      # The registry read rides @mutex; the CALLER (the channel's poll
+      # thread, via register's predicate) invokes it OUTSIDE every lock.
+      def foreground_run_awaited?(run_id)
+        id = run_id.to_s
+        @mutex.synchronize do
+          @runs.any? { |record| record[:id] == id && record[:async] == false && record[:state] == :running }
+        end
+      end
+
       private
 
       # --- spawn internals ---
@@ -1182,7 +1197,19 @@ module Tart
           end
         end
         attention_ids = @supervisor_channel&.pending&.filter_map { |request| request[:run_id] }
-        rows.each { |row| row[:attention] = !!(attention_ids&.include?(row[:id])) }
+        marks = @supervisor_channel&.foreground_attention || {}
+        rows.each do |row|
+          mark = marks[row[:id]]
+          # I100 L4 — the facts through the snapshot: attention widens to
+          # the foreground marks (pending run-ids ∪ marks keys);
+          # attention_tool rides the mark's asking tool, nil otherwise
+          # (async asks' pending-derived attention keeps today's bytes —
+          # no tool, no prefix). Both keys additive, nil-tolerant,
+          # always-present-with-nil-default beside attention (the I79
+          # row-fact law).
+          row[:attention] = !!(attention_ids&.include?(row[:id]) || mark)
+          row[:attention_tool] = mark && mark[:tool]
+        end
         { rows: rows }
       end
 
