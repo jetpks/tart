@@ -11,9 +11,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Every supported minor, from the floor (required_ruby_version) to
-        # the dev version; mise resolves each to its latest patch.
-        ruby: ["3.4", "4.0"]
+        # Every supported minor: the floor (required_ruby_version, 3.4) and the
+        # version we run (4.0.10 — security release); the floor floats to its latest patch.
+        ruby: ["3.4", "4.0.10"]
     env:
       # NOTE: deliberately NO BUNDLE_PATH / vendor-bundle caching here.
       # tart's I73 child-env law scrubs bundler's exported env from every
