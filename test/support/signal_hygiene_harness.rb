@@ -241,10 +241,13 @@ class LegRunner
     when :idle then nil
     when :mid_stream
       tmux("send-keys", "-t", @session, PROMPT_STREAM, "Enter")
-      deadline = monotonic + TOOL_WAIT_CAP
-      while @mock.request_count.zero?
-        fail!("the submitted turn never reached the mock") if monotonic > deadline
-        sleep 0.05
+      # I103 (B): the mock's request-arrival gate (MockLLMServer answers the
+      # state-signal seam; no minitest vocabulary here) — the wait parks on
+      # the event; the belt mirrors the old TOOL_WAIT_CAP.
+      until @mock.request_count >= 1
+        unless @mock.wait_state_change(@mock.state_version, belt: TOOL_WAIT_CAP)
+          fail!("the submitted turn never reached the mock")
+        end
       end
       sleep 0.6 # inside the drip (a 0.1s/char stream over ~240 chars)
     when :mid_tool

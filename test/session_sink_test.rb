@@ -369,12 +369,16 @@ module Tart
     def test_engine_debounce_coalesces_two_quick_events_into_one_post
       server = ingest_server
       hooks = Hooks.new
-      track(new_sink(hooks:, server:))
+      engine = track(new_sink(hooks:, server:))
       bind_session(hooks, session_id: "s-coal")
       emit_user(hooks, "one")
       emit_user(hooks, "two")
       assert server.wait_posts(1, 5), "the debounced batch landed"
-      sleep(0.15) # past the tuned debounce: no second POST may appear
+      # I103 (D): quiescence by construction — the engine is idle (queue
+      # empty, no due window, no in-flight POST) and the server holds no
+      # connection, so no second POST can EVER appear.
+      await(engine, "the engine idle past the debounce") { engine.idle? }
+      await(server, "the ingest connection closed") { server.active_connections.zero? }
       posts = server.posts
       assert_equal 1, posts.size, "two quick events coalesce into ONE POST"
       assert_equal 1, server.max_concurrent, "≤ 1 in-flight POST by construction"
@@ -397,7 +401,7 @@ module Tart
       emit_user(hooks, "second")
       emit_user(hooks, "third")
       assert server.wait_posts(2, 5), "the coalesced tail lands"
-      wait_for { server.post_count == 2 }
+      await(server, "the second POST landed") { server.post_count == 2 } # I103 (B)
       assert_equal 1, server.max_concurrent, "never two POSTs in flight"
       posts = server.posts
       assert_equal ["first"], records_text(posts[0])
@@ -429,7 +433,7 @@ module Tart
       stderr = capture_stderr do
         bind_session(hooks, session_id: "s-retry")
         emit_user(hooks, "ride three attempts")
-        wait_for { server.posts.any? { |post| post[:status] == 202 } }
+        await(server, "the batch's 202 landing") { server.posts.any? { |post| post[:status] == 202 } } # I103 (B)
       end
       posts = server.posts
       assert_equal [500, 500, 202], posts.map { |post| post[:status] }, "the SAME batch retried, MAX_ATTEMPTS total"
@@ -445,9 +449,9 @@ module Tart
       stderr = capture_stderr do
         bind_session(hooks, session_id: "s-drop")
         emit_user(hooks, "doomed")
-        wait_for { server.post_count >= 3 }
+        await(server, "all three attempts landed") { server.post_count >= 3 } # I103 (B)
         emit_user(hooks, "still accepted")
-        wait_for { server.posts.any? { |post| post[:status] == 202 } }
+        await(server, "the fresh batch's 202 landing") { server.posts.any? { |post| post[:status] == 202 } } # I103 (B)
       end
       assert_equal [500, 500, 500], server.posts[0, 3].map { |post| post[:status] }
       assert_includes stderr, "session-sink:", "final failure → ONE loss line"
@@ -465,7 +469,7 @@ module Tart
       bind_session(hooks, session_id: "s-new") # within the debounce window
       emit_user(hooks, "new turn")
       assert server.wait_posts(2, 5), "both captures flush"
-      wait_for { server.post_count == 2 }
+      await(server, "the second POST landed") { server.post_count == 2 } # I103 (B)
       old_post, new_post = server.posts
       assert_equal "s-old", old_post[:records][0]["id"]
       assert_equal "s-old/1", old_post[:records][1]["id"]
@@ -483,7 +487,7 @@ module Tart
       bind_session(hooks, session_id: "sid-9") # same session id — max(counter, seed)
       emit_user(hooks, "second")
       assert server.wait_posts(2, 5)
-      wait_for { server.post_count == 2 }
+      await(server, "the second POST landed") { server.post_count == 2 } # I103 (B)
       ids = server.posts.flat_map { |post| post[:records][1..].map { |r| r["id"] } }
       assert_equal ["sid-9/1", "sid-9/2"], ids, "n monotonic per session id ACROSS rebinds"
     end
@@ -576,7 +580,10 @@ module Tart
       boot_and_capture do |ingest, _llm, _home, _stderr, exit_status, workdir|
         assert_equal 0, exit_status, "the print boot succeeded"
         assert ingest.wait_posts(1, 15), "the boot streamed to the mock ingest"
-        sleep(0.3) # let any straggler land (a fast mock turn can coalesce everything)
+        # I103 (D): the child is reaped (boot_and_capture holds the exit
+        # status), so the only possible straggler is a POST still mid-serve;
+        # quiesce on the server's in-flight gate, then read the posts.
+        await(ingest, "every straggler landed (no connection left open)") { ingest.active_connections.zero? }
         posts = ingest.posts
         session_ids = posts.map { |post| post[:records][0] && post[:records][0]["id"] }.compact.uniq
         assert_equal 1, session_ids.size, "one session id"
@@ -616,7 +623,7 @@ module Tart
       boot_and_capture do |ingest, _llm, _home, _stderr, exit_status, _workdir|
         assert_equal 0, exit_status
         assert ingest.wait_posts(1, 15)
-        wait_for { ingest.post_count >= 1 }
+        await(ingest, "the terminal POST landed") { ingest.post_count >= 1 } # I103 (B)
         posts = ingest.posts
         terminal = posts.last
         assert_equal "true", terminal[:headers]["x-session-complete"], "the terminal POST carries X-Session-Complete"
@@ -630,7 +637,9 @@ module Tart
     def test_boot_inert_without_any_config
       boot_and_capture(config: nil) do |ingest, _llm, _home, _stderr, exit_status, _workdir|
         assert_equal 0, exit_status
-        sleep(0.5) # nothing may EVER connect
+        # I103 (D): the child is reaped and the server holds no connection —
+        # nothing may EVER connect.
+        await(ingest, "the server holds no connection") { ingest.active_connections.zero? }
         assert_equal 0, ingest.connections, "no config → zero connections (fully inert)"
         assert_equal 0, ingest.post_count
       end
@@ -639,7 +648,9 @@ module Tart
     def test_boot_inert_with_a_malformed_config_file
       boot_and_capture(config: :malformed) do |ingest, _llm, _home, _stderr, exit_status, _workdir|
         assert_equal 0, exit_status
-        sleep(0.5)
+        # I103 (D): the child is reaped and the server holds no connection —
+        # nothing may EVER connect.
+        await(ingest, "the server holds no connection") { ingest.active_connections.zero? }
         assert_equal 0, ingest.connections, "malformed file = unconfigured = zero connections"
         assert_equal 0, ingest.post_count
       end
@@ -648,7 +659,9 @@ module Tart
     def test_boot_inert_with_disabled_env_over_a_good_file
       boot_and_capture(env_extra: {"TART_SESSION_SINK_DISABLED" => "1"}) do |ingest, _llm, _home, _stderr, exit_status, _workdir|
         assert_equal 0, exit_status
-        sleep(0.5)
+        # I103 (D): the child is reaped and the server holds no connection —
+        # nothing may EVER connect.
+        await(ingest, "the server holds no connection") { ingest.active_connections.zero? }
         assert_equal 0, ingest.connections, "DISABLED env beats the good file → zero connections"
         assert_equal 0, ingest.post_count
       end
@@ -705,7 +718,7 @@ module Tart
       assert_equal :completed, run[:state],
                    "the child booted and completed (stderr: #{File.file?(child_log) ? File.read(child_log)[0, 400] : "(no log)"})"
       assert ingest.wait_posts(1, 15), "the child streamed to the mock ingest"
-      wait_for { ingest.post_count >= 1 }
+      await(ingest, "the child's POST landed") { ingest.post_count >= 1 } # I103 (B)
       posts = ingest.posts
       posts.each do |post|
         assert_equal "session", post[:records][0]["type"], "every child body opens with its session record"
@@ -761,16 +774,6 @@ module Tart
       io.string
     ensure
       $stderr = old
-    end
-
-    def wait_for(timeout: 5)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      until yield
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          flunk "condition never satisfied"
-        end
-        sleep 0.01
-      end
     end
 
     def write_config(hash)

@@ -177,6 +177,7 @@ module Tart
       hold = Queue.new
       lines = Queue.new
       deliveries = Queue.new
+      lines_gate = Gate.new
       acceptor = Thread.new do
         held = false
         loop do
@@ -184,6 +185,7 @@ module Tart
             client = @server.accept
             line = client.gets
             lines << line
+            lines_gate.ping # I103 (B) — the writer pings at the landed send
             hold.pop unless held # hold ONLY the first send in flight
             held = true
             client.write("ok")
@@ -199,7 +201,7 @@ module Tart
 
       reporter = Herdr::Reporter.new(socket_path: @sock, timeouts: [500, 500])
       reporter.report_state("working", session_ref: nil, pane_id: "p7")
-      wait_until { lines.size == 1 } # the first send is in flight
+      lines_gate.await("the first send to land in flight") { lines.size == 1 }
       reporter.report_state("working", session_ref: nil, pane_id: "p7") # deduped (same state+message)
       reporter.report_state("blocked", message: "ask user", session_ref: nil, pane_id: "p7")
       hold << :release

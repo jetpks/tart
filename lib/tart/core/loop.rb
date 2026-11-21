@@ -100,6 +100,9 @@ module Tart
               @work_task = root.async(&work) if work
               poller = Poller.new(@session, queue: @events, frame_interval: @frame_interval, stop_flag: self)
               poller.start
+              # I103 — the poller lifecycle's boot broadcast (the loop is
+              # live; foreign stoppers await this instead of a delay bet).
+              @stop_mutex.synchronize { signal_state_change }
               supervisor = root.async { supervise(@work_task) }
               frame_loop
             rescue StandardError => e
@@ -127,6 +130,8 @@ module Tart
                 # (I02: a missed join must surface).
                 raise unless contain_signal_path_error(e)
               end
+              # I103 — the poller lifecycle's broadcast (teardown done).
+              @stop_mutex.synchronize { signal_state_change }
             end
           end
         ensure
@@ -183,6 +188,8 @@ module Tart
           t0 = now
           ticks.times do |i|
             block.call(i + 1)
+            # I103 — the tick fire's broadcast (the block just ran).
+            @stop_mutex.synchronize { signal_state_change }
             d = t0 + (i + 1) * period - now
             sleep d if d > 0
           end
@@ -208,6 +215,8 @@ module Tart
             d = t0 + n * interval - now
             sleep d if d > 0
             request_draw
+            # I103 — the tick fire's broadcast (the fire just landed).
+            @stop_mutex.synchronize { signal_state_change }
           end
         end
       end
@@ -227,6 +236,29 @@ module Tart
       #   poller thread polls this every frame.
       def stop_requested?
         @stop_mutex.synchronize { @stop }
+      end
+
+      # --- I103 state-signal seam (ADDITIVE observability only) ----------
+      # The await-loop's version read + the test-only park, riding the
+      # kernel's existing @stop_mutex. The footprint is these two methods,
+      # signal_state_change, and its broadcast call sites: deleting them
+      # restores base behavior byte-for-byte (a broadcast with no waiter
+      # is a no-op; production never waits).
+      def state_version
+        @stop_mutex.synchronize { @state_version ||= 0 }
+      end
+
+      # Parks until the version moves past from_version, belt-bounded (nil
+      # on belt expiry with no change). Production never calls this.
+      def wait_state_change(from_version, belt: 60)
+        @stop_mutex.synchronize do
+          @state_version ||= 0
+          @state_cv ||= ConditionVariable.new
+          until @state_version > from_version
+            return nil unless @state_cv.wait(@stop_mutex, belt)
+          end
+          @state_version
+        end
       end
 
       # The signal-path containment seam (I75): on the signal path (the
@@ -284,7 +316,10 @@ module Tart
       # surface submits agent runs this way); with nothing alive, the
       # interrupt stops the loop.
       def interrupt!
-        @stop_mutex.synchronize { @interrupted = true }
+        @stop_mutex.synchronize do
+          @interrupted = true
+          signal_state_change
+        end
         interrupt_work! || stop!
       end
 
@@ -300,6 +335,17 @@ module Tart
         ensure
           signal(STOP)
         end
+      end
+
+      # I103 — the state-signal broadcast (additive observability): the
+      # tail of every observed mutation funnel (stat/draw accounting,
+      # tick/every fires, the stop/interrupt flips, the poller teardown).
+      # Bump the version, then broadcast under the lock — with no waiter
+      # this is a no-op.
+      def signal_state_change
+        @state_version = (@state_version || 0) + 1
+        (@state_cv ||= ConditionVariable.new).broadcast
+        nil
       end
 
       # Wakes the frame loop with a sentinel from reactor-side code (a
@@ -336,6 +382,8 @@ module Tart
             next_deadline = nil
             process(@events.pop, :native) # event-driven: no fixed-rate wake
             @wakes += 1
+            # I103 — stat accounting's broadcast.
+            @stop_mutex.synchronize { signal_state_change }
           end
         end
       end
@@ -372,7 +420,10 @@ module Tart
       # Sets the stop flag (mutex-guarded). The STOP sentinel that wakes the
       # idle loop is pushed by whoever asks for the stop.
       def request_stop
-        @stop_mutex.synchronize { @stop = true }
+        @stop_mutex.synchronize do
+          @stop = true
+          signal_state_change
+        end
       end
 
       # @return [Boolean] whether a signal exit is pending on this run's
@@ -390,6 +441,8 @@ module Tart
         rendered = @renderer.call
         @session.draw(rendered.is_a?(String) ? TUI.status_panel(rendered) : rendered)
         @draws += 1
+        # I103 — draw accounting's broadcast (the frame landed).
+        @stop_mutex.synchronize { signal_state_change }
       end
 
       # Installs the SIGINT trap net; returns the previous handler so run's

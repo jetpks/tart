@@ -858,17 +858,6 @@ module Tart
       @captures.concat(@server.captured_requests)
     end
 
-    def wait_until_bounded(timeout, what)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      loop do
-        value = yield
-        return value if value
-        raise "timed out after #{timeout}s waiting for #{what}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-
-        sleep 0.05
-      end
-    end
-
     def system_role_content(body)
       message = body["messages"].to_a.find { |m| %w[system developer].include?(m["role"]) }
       message && message["content"].to_s
@@ -909,24 +898,30 @@ module Tart
       @manager.runs.find { |record| record[:agent] == agent }
     end
 
-    def wait_terminal(manager, id, timeout = 40)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      record = nil
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+    # The run's terminal flip IS the manager's settle broadcast (I103):
+    # park on the manager's seam, then re-read the settled record.
+    def wait_terminal(manager, id)
+      await(manager, "run #{id} to settle", belt: CHILD_BELT_S) do
         record = manager.runs.find { |r| r[:id] == id }
-        break if record && record[:state] != :running
-
-        sleep 0.1
+        record && record[:state] != :running
       end
+      record = manager.runs.find { |r| r[:id] == id }
       flunk "run #{id} never settled: #{record && record[:state]}" unless record && record[:state] != :running
       debug_run(record)
       record[:state]
     end
 
+    # No zombie: block on the reap itself — the manager's spawn-time
+    # Process.detach owns the reap, so a second detach+join returns exactly
+    # when the zombie is gone (ECHILD: the manager's detach already reaped).
     def assert_ps_clean(pid)
-      wait_until_bounded(5, "pid #{pid} to be reaped (no zombie)") do
-        `ps -p #{Integer(pid)} -o pid=`.strip.empty?
+      begin
+        Process.detach(Integer(pid)).join
+      rescue Errno::ECHILD, Errno::ESRCH
+        nil
       end
+      assert_empty `ps -p #{Integer(pid)} -o pid=`.to_s.split,
+        "pid #{pid} to be reaped (no zombie)"
     end
 
     def debug_run(record)
@@ -978,11 +973,8 @@ module Tart
       return unless @kernel_thread
 
       @kernel&.stop!
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
-      until !@kernel_thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.02
-      end
-      flunk "the wake kernel never stopped" if @kernel_thread.alive?
+      # The stop request is the terminal event — the loop exits and the
+      # thread dies; a bare blocking join owns the wait (I103 class C).
       @kernel_thread.join
       @kernel_thread = nil
     end
@@ -1001,12 +993,9 @@ module Tart
       end
     end
 
-    def join_run(timeout = 60)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      until !@run_thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.05
-      end
-      flunk "the parent run never finished" if @run_thread.alive?
+    def join_run
+      # The driver run finishing IS the thread's own death — a bare
+      # blocking join owns the wait (I103 class C).
       @run_thread.join
     end
 
@@ -1058,14 +1047,17 @@ module Tart
 
       run_in_background(@driver, "Drive the toy plan")
       join_run # run 1: install + the spec spawn
-      spec_run = wait_until_bounded(30, "the spec run to register") { run_by_agent("architect-spec") }
+      await(@manager, "the spec run to register", belt: CHILD_BELT_S) { run_by_agent("architect-spec") }
+      spec_run = run_by_agent("architect-spec")
       assert_equal :completed, wait_terminal(@manager, spec_run[:id])
-      builder_run = wait_until_bounded(30, "the builder run to register") { run_by_agent("architect-builder") }
+      await(@manager, "the builder run to register", belt: CHILD_BELT_S) { run_by_agent("architect-builder") }
+      builder_run = run_by_agent("architect-builder")
       assert_equal :completed, wait_terminal(@manager, builder_run[:id])
-      judge_run = wait_until_bounded(30, "the judge run to register") { run_by_agent("architect-judge") }
+      await(@manager, "the judge run to register", belt: CHILD_BELT_S) { run_by_agent("architect-judge") }
+      judge_run = run_by_agent("architect-judge")
       assert_equal :completed, wait_terminal(@manager, judge_run[:id])
       # The final wake turn closed the arc.
-      wait_until_bounded(30, "the judge-completion wake turn") do
+      await(@server, "the judge-completion wake turn", belt: CHILD_BELT_S) do
         drain_captures
         @captures.any? do |body|
           driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-judge**") }
@@ -1191,9 +1183,10 @@ module Tart
       ])
 
       run_in_background(@driver, "Escalate the toy plan")
-      judge_run = wait_until_bounded(30, "the judge run to register") { run_by_agent("architect-judge") }
+      await(@manager, "the judge run to register", belt: CHILD_BELT_S) { run_by_agent("architect-judge") }
+      judge_run = run_by_agent("architect-judge")
       judge_run_holder << judge_run
-      assert_equal :completed, wait_terminal(@manager, judge_run[:id], 40), "the child unblocked and completed"
+      assert_equal :completed, wait_terminal(@manager, judge_run[:id]), "the child unblocked and completed"
       join_run
 
       drain_captures
@@ -1261,7 +1254,8 @@ module Tart
 
       run_in_background(@driver, "Compact the toy drive")
       join_run # run 1 ends after the compaction landed (the post-run drain)
-      spec_run = wait_until_bounded(30, "the spec run to register") { run_by_agent("architect-spec") }
+      await(@manager, "the spec run to register", belt: CHILD_BELT_S) { run_by_agent("architect-spec") }
+      spec_run = run_by_agent("architect-spec")
       assert_equal :completed, wait_terminal(@manager, spec_run[:id])
       drain_captures
 
@@ -1280,11 +1274,13 @@ module Tart
       assert_equal expected_playbook, ArchitectLoop.driver_playbook_text, "the driver state held the carried playbook"
 
       # The compaction LANDED before the wake: the wake request's history
-      # carries the summary marker and the original prompt is gone (bounded
-      # wait — the notify's kick fires right after the child settles).
-      wake_request = wait_until_bounded(15, "the completion wake turn") do
+      # carries the summary marker and the original prompt is gone (the
+      # notify's kick fires right after the child settles — the server's
+      # request-arrival seam pings each driver turn).
+      wake_request = nil
+      await(@server, "the completion wake turn", belt: CHILD_BELT_S) do
         drain_captures
-        @captures.find do |body|
+        wake_request = @captures.find do |body|
           driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") }
         end
       end

@@ -19,7 +19,7 @@ module Tart
   # a tool error, completed, and mark-cleared. Hermetic: staged homes,
   # direct-constructed channels + the production register path,
   # MockLLMServer, real bin/tart -p children. ZERO live API calls; no
-  # timing bets — the wait_until discipline throughout.
+  # timing bets — the deterministic event-await discipline throughout.
   class SupervisorAskDeliveryTest < Test
     # D1 — the valve message's frozen bytes (the pin restates the constant
     # so a drift fails here first, with the diff in the message).
@@ -32,7 +32,7 @@ module Tart
       @server = MockLLMServer.new.start
       @home = Dir.mktmpdir("i100-ask-home-")
       @cwd = Dir.mktmpdir("i100-ask-cwd-")
-      @hooks = Hooks.new
+      @hooks = PingedHooks.new
       @kernel = fake_kernel
       @managers = []
       @channels = []
@@ -63,7 +63,7 @@ module Tart
       channel = new_channel(predicate: ->(run_id) { run_id == run[:id] })
       staged = stage_ask(run[:dir], run_id: run[:id], message: "PAYLOAD-SHAPE-ASK")
       reply = reply_path_for(run[:dir], staged[:id])
-      wait_until { File.file?(reply) }
+      await(channel, "the valved reply to land") { File.file?(reply) }
 
       payload = JSON.parse(File.read(reply))
       assert_equal Subagents::Supervisor::REPLY_TYPE, payload["type"]
@@ -83,14 +83,19 @@ module Tart
       staged = stage_ask(run[:dir], run_id: run[:id], message: "VALVED-ASK")
       reply = reply_path_for(run[:dir], staged[:id])
 
-      wait_until { File.file?(reply) }
-      wait_until { !File.file?(File.join(run[:dir], "control", "supervisor-requests", "#{staged[:id]}.json")) }
+      await(channel, "the valved reply to land") { File.file?(reply) }
+      await(channel, "the consumed request file to go") do
+        !File.file?(File.join(run[:dir], "control", "supervisor-requests", "#{staged[:id]}.json"))
+      end
 
       assert_empty channel.pending, "the valved ask never registers pending"
       assert_empty @hooks.pending_next_turn, "the valved ask never surfaces (no queue entry)"
       assert_equal({tool: "contact_supervisor", since: staged[:createdAt]},
                    channel.foreground_attention[run[:id]],
                    "the mark rides the run id with the asking tool + the ask's createdAt")
+      # Rule-12 follow-up: the kick is captured AFTER the mark broadcast,
+      # so pin it with its own event before asserting on the capture.
+      await(@kernel, "the box draw kick to be captured") { !@kernel.calls.empty? }
       refute_empty @kernel.calls, "the box draw kick rode the kernel bridge"
     end
 
@@ -108,7 +113,9 @@ module Tart
       assert_equal [staged[:id]], channel.pending.map { |request| request[:id] }
       assert_empty channel.foreground_attention, "no mark without the valve"
 
-      sleep Subagents::Supervisor::POLL_INTERVAL * 3
+      # The non-event proof (D): the channel is STOPPED and its poll
+      # thread joined — no future tick can ever valve the ask.
+      channel.stop
       refute File.file?(reply), "no valve reply for a non-awaited run"
     end
 
@@ -126,7 +133,10 @@ module Tart
       assert_equal [staged[:id]], channel.pending.map { |request| request[:id] }
       refute_empty @kernel.calls, "the base wake kick still rides kernel.async"
       assert_empty channel.foreground_attention
-      sleep Subagents::Supervisor::POLL_INTERVAL * 3
+
+      # The non-event proof (D): the channel is STOPPED and its poll
+      # thread joined — the nil predicate can never valve, ever.
+      channel.stop
       refute File.file?(reply), "the nil predicate NEVER valves"
     end
 
@@ -146,7 +156,7 @@ module Tart
       channel = new_channel(predicate: ->(_run_id) { true }, owner: owner)
       owned = File.basename(Dir.glob(File.join(odir, "control", "supervisor-requests", "*.json")).first, ".json")
       owned_reply = reply_path_for(odir, owned)
-      wait_until { File.file?(owned_reply) } # the owned ask was valved — the poll is live
+      await(channel, "the owned ask to be valved — the poll is live") { File.file?(owned_reply) }
 
       refute File.file?(reply_path_for(fdir, foreign[:id])), "the foreign ask was never valved"
       assert_equal foreign_bytes, File.read(foreign_path), "the foreign file is byte-untouched"
@@ -161,25 +171,22 @@ module Tart
     def test_child_tool_raises_the_error_reply_verbatim
       ctrl = new_ctrl
       tool = tool_for(ctrl)
+      landing = stub_write_gate
       answerer = Thread.new do
-        100.times do
-          files = Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }
-          if (file = files.first)
-            begin
-              id = JSON.parse(File.read(File.join(ctrl, "supervisor-requests", file)))["id"]
-            rescue Errno::ENOENT
-              next # the child unlinked its consumed request between the snapshot and the read
-            end
-            sleep 0.05
-            Subagents::Supervisor.atomic_write_json(
-              File.join(ctrl, "supervisor-replies", "#{id}.json"),
-              {type: Subagents::Supervisor::REPLY_TYPE, requestId: id,
-               createdAt: Subagents::Supervisor.now_ms, message: "",
-               error: Subagents::Supervisor::BLOCKED_PARENT_ERROR})
-            next
-          end
-          sleep 0.05
+        Thread.current.report_on_exception = false
+        landing.await("the child's ask to land") do
+          !Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.empty?
         end
+        # The request file cannot vanish under this read: the tool unlinks
+        # its consumed request only AFTER the reply exists, and the reply
+        # is written below, after this read.
+        file = Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.first
+        id = JSON.parse(File.read(File.join(ctrl, "supervisor-requests", file)))["id"]
+        Subagents::Supervisor.atomic_write_json(
+          File.join(ctrl, "supervisor-replies", "#{id}.json"),
+          {type: Subagents::Supervisor::REPLY_TYPE, requestId: id,
+           createdAt: Subagents::Supervisor.now_ms, message: "",
+           error: Subagents::Supervisor::BLOCKED_PARENT_ERROR})
       end
 
       result = tool.execute(reason: "need_decision", message: "blocked parent ask?")
@@ -190,6 +197,7 @@ module Tart
                    "the request file is unlinked on the reply path before the raise"
     ensure
       answerer.kill if answerer
+      restore_write_gate
     end
 
     # --- pin 7 (AC3): the marks flow to the snapshot and the render ---
@@ -208,16 +216,15 @@ module Tart
       manager.supervisor_channel = channel
       spawner = foreground_spawn(manager, "run into the mark")
 
-      request_path = wait_request_file(manager, "MARK-ASK")
+      request_path = wait_valved_request(channel, manager, "the MARK-ASK child ask to land and valve")
       run_id = run_id_for(request_path)
       reply = reply_path_for_request(request_path)
-      wait_until { File.file?(reply) }
 
-      # The mark window: the valve set it in the reply tick; the child
-      # cannot settle until its own next poll (250ms cadence) plus a model
-      # round — the bounded wait rides wait_until, not a sleep bet.
+      # The mark window: the valve set it in the reply tick; the mark
+      # record IS the pinged arrival (the child cannot settle until its
+      # own next poll plus a model round).
       marked = nil
-      wait_until do
+      await(channel, "the mark window to open") do
         marked = manager.box_snapshot[:rows].find { |row| row[:id] == run_id }
         marked && marked[:attention] == true && marked[:attention_tool] == "contact_supervisor"
       end
@@ -234,7 +241,9 @@ module Tart
       adopt_dir = stage_run_dir(adopted_id, pid: live_pid, session_id: manager.session_owner_id)
       manager.status(id: nil) # the fleet read adopts the staged dir
       stage_ask(adopt_dir, run_id: adopted_id, message: "PENDING-DERIVED-ASK")
-      wait_until { channel.pending.any? { |request| request[:run_id] == adopted_id } }
+      await(channel, "the adopted ask to register pending") do
+        channel.pending.any? { |request| request[:run_id] == adopted_id }
+      end
       row2 = manager.box_snapshot[:rows].find { |row| row[:id] == adopted_id }
       refute_nil row2
       assert_equal true, row2[:attention]
@@ -252,8 +261,8 @@ module Tart
       assert lines2.any? { |l| l.include?("no activity for") }, "the pending-derived row renders the attention label"
       refute lines2.any? { |l| l.include?("tool contact_supervisor") }, "no prefix without the tool fact (today's bytes)"
 
-      wait_terminal(manager, run_id, 40)
-      wait_until { !spawner.alive? }
+      wait_terminal(manager, run_id)
+      spawner.join # the blocked spawn thread returned (blocking after the settle)
     end
 
     # --- pin 8 (AC3/D2): the marks clear on the terminal flip + dir vanish ---
@@ -268,8 +277,8 @@ module Tart
       manager.supervisor_channel = channel
 
       staged = stage_ask(dir1, run_id: id1, message: "CLEAR-LEG-1")
-      wait_until { File.file?(reply_path_for(dir1, staged[:id])) }
-      wait_until { !channel.foreground_attention.empty? }
+      await(channel, "the valved reply to land") { File.file?(reply_path_for(dir1, staged[:id])) }
+      await(channel, "the foreground mark to record") { !channel.foreground_attention.empty? }
       row = manager.box_snapshot[:rows].find { |candidate| candidate[:id] == id1 }
       assert_equal true, row[:attention]
       assert_equal "contact_supervisor", row[:attention_tool]
@@ -279,7 +288,7 @@ module Tart
       status = JSON.parse(File.read(File.join(dir1, "status.json")))
       status["state"] = "completed"
       Subagents::Supervisor.atomic_write_json(File.join(dir1, "status.json"), status)
-      wait_until { channel.foreground_attention.empty? }
+      await(channel, "the terminal flip to clear the mark") { channel.foreground_attention.empty? }
       row = manager.box_snapshot[:rows].find { |candidate| candidate[:id] == id1 }
       assert_equal false, row[:attention], "the cleared mark leaves no attention fact"
 
@@ -287,10 +296,10 @@ module Tart
       id2 = "01ddd000-0000-7000-8000-000000000002"
       dir2 = stage_run_dir(id2, pid: live_pid, session_id: manager.session_owner_id)
       staged2 = stage_ask(dir2, run_id: id2, message: "CLEAR-LEG-2")
-      wait_until { File.file?(reply_path_for(dir2, staged2[:id])) }
+      await(channel, "the second valved reply to land") { File.file?(reply_path_for(dir2, staged2[:id])) }
       assert channel.foreground_attention.key?(id2)
       FileUtils.rm_rf(dir2)
-      wait_until { channel.foreground_attention.empty? }
+      await(channel, "the dir vanish to clear the mark") { channel.foreground_attention.empty? }
       assert_empty channel.foreground_attention
     end
 
@@ -302,19 +311,20 @@ module Tart
       reply = reply_path_for(run[:dir], staged[:id])
       request = File.join(run[:dir], "control", "supervisor-requests", "#{staged[:id]}.json")
       attempts = []
-      stub_failing_atomic_write(attempts)
+      attempts_gate = Gate.new
+      stub_failing_atomic_write(attempts, gate: attempts_gate)
       channel = new_channel(predicate: ->(run_id) { run_id == run[:id] })
 
       # The failed tick: the write raised, the path was left UNSEEN, the
       # request file survived. The stub raises on EVERY call while
       # installed (the "one shot" is the install — restore is the unstub
       # event), so this window is race-free.
-      wait_until { !attempts.empty? }
+      await(attempts_gate, "the failed valve write attempt") { !attempts.empty? }
       refute File.file?(reply), "no reply on the failed tick"
       assert File.file?(request), "the unseen request file survives for the retry"
 
       restore_atomic_write
-      wait_until { File.file?(reply) }
+      await(channel, "the retried valve write to land") { File.file?(reply) }
       payload = JSON.parse(File.read(reply))
       assert_equal Subagents::Supervisor::BLOCKED_PARENT_ERROR, payload["error"]
       assert_equal "", payload["message"]
@@ -342,10 +352,11 @@ module Tart
       @managers << manager # register's channel stops with the manager
       spawner = foreground_spawn(manager, "ask the supervisor mid-run")
 
-      request_path = wait_request_file(manager, "ROUND-TRIP-VALVE-ASK")
+      request_path = wait_valved_request(manager.supervisor_channel, manager,
+                                         "the foreground ask to land and valve")
       run_id = run_id_for(request_path)
       reply = reply_path_for_request(request_path)
-      wait_until { File.file?(reply) } # arrival asserted, no ms bet
+      # arrival pinned by the mark broadcast, no ms bet
       payload = JSON.parse(File.read(reply))
       assert_equal Subagents::Supervisor::REPLY_TYPE, payload["type"]
       assert_equal File.basename(request_path, ".json"), payload["requestId"]
@@ -355,7 +366,7 @@ module Tart
       # The child's NEXT captured request carries the valve error as the
       # tool result — and never the timeout bytes.
       messages = []
-      wait_until do
+      await(@server, "the child's next captured request to carry the valve error") do
         @server.captured_requests.each { |request| messages.concat(request["messages"]) }
         messages.any? { |message| message["role"] == "tool" &&
           message["content"].to_s.include?("Supervisor unavailable") }
@@ -364,9 +375,9 @@ module Tart
         message["content"].to_s.include?("Timed out waiting for supervisor reply") },
         "the child never rode the ask deadline"
 
-      assert_equal :completed, wait_terminal(manager, run_id, 40)
-      wait_until { !spawner.alive? } # the blocked spawn thread returned
-      wait_until do
+      assert_equal :completed, wait_terminal(manager, run_id)
+      spawner.join # the blocked spawn thread returned (blocking after the settle)
+      await(manager.supervisor_channel, "the mark to clear after the terminal flip") do
         row = manager.box_snapshot[:rows].find { |candidate| candidate[:id] == run_id }
         row && row[:attention] != true
       end
@@ -379,12 +390,42 @@ module Tart
 
     def fake_kernel
       kernel = Object.new
+      kick_gate = Gate.new
       kernel.define_singleton_method(:async) do |&block|
         (@calls ||= []) << block
+        kick_gate.ping # I103 (B) — the capture event the tests await
         nil
       end
       kernel.define_singleton_method(:calls) { @calls ||= [] }
+      kernel.define_singleton_method(:state_version) { kick_gate.state_version }
+      kernel.define_singleton_method(:wait_state_change) do |from_version, belt: WEDGE_BELT_S|
+        kick_gate.wait_state_change(from_version, belt: belt)
+      end
       kernel
+    end
+
+    # The hooks double's Gate (I103 B): send_next_turn's append is the
+    # surfaced-ask mutation — a subclass pings a Gate right after it so
+    # wait_surfaced parks on the event, not a poll.
+    class PingedHooks < Hooks
+      def initialize
+        super
+        @queue_gate = Tart::Test::Gate.new
+      end
+
+      def send_next_turn(custom_type:, content:, display: false)
+        result = super
+        @queue_gate.ping
+        result
+      end
+
+      def state_version
+        @queue_gate.state_version
+      end
+
+      def wait_state_change(from_version, belt: WEDGE_BELT_S)
+        @queue_gate.wait_state_change(from_version, belt: belt)
+      end
     end
 
     def new_manager(**opts)
@@ -490,63 +531,73 @@ module Tart
       File.basename(File.dirname(File.dirname(File.dirname(request_path))))
     end
 
-    def wait_request_file(manager, message)
-      path = nil
-      wait_until do
-        path = Dir.glob(File.join(manager.home, "*", "control", "supervisor-requests", "*.json")).find do |candidate|
-          JSON.parse(File.read(candidate))["message"] == message
-        rescue JSON::ParserError, Errno::ENOENT
-          false
+    # The foreground child's ask has NO test-visible writer (a real
+    # bin/tart -p child): the only pinged landing is the channel's valve
+    # tick — the mark records right after the reply write + the request
+    # removal, so the mark broadcast is THE arrival event. Returns the
+    # consumed request file's path (derived from the marked run dir).
+    def wait_valved_request(channel, manager, what)
+      request_path = nil
+      await(channel, what) do
+        channel.foreground_attention.each_key do |marked_id|
+          run_dir = File.join(manager.home, marked_id)
+          valved = Dir.glob(File.join(run_dir, "control", "supervisor-replies", "*.json")).sort.first
+          next unless valved
+
+          request_path = File.join(run_dir, "control", "supervisor-requests", File.basename(valved))
         end
-        path
+        request_path
       end
-      path
+      request_path
     end
 
     def wait_surfaced(message)
       hit = nil
-      wait_until do
+      await(@hooks, "the ask to surface (#{message})") do
         batch = @hooks.pending_next_turn
         hit = batch.find do |entry|
           entry[:custom_type] == Subagents::Supervisor::REQUEST_CUSTOM_TYPE &&
             entry[:content].to_s.include?(message)
         end
-        hit
+        !hit.nil?
       end
       hit
     end
 
-    def wait_terminal(manager, id, timeout = 25)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    def wait_terminal(manager, id)
       record = nil
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      await(manager, "run #{id} to settle") do
         record = manager.runs.find { |candidate| candidate[:id] == id }
-        break if record && record[:state] != :running
-
-        sleep 0.1
+        record && record[:state] != :running
       end
-      flunk "run #{id} never settled: #{record && record[:state]}" unless record && record[:state] != :running
       record[:state]
     end
 
     # A REAL live pid the test owns (a pgroup leader, killed in teardown —
-    # the ownership family's idiom).
+    # the ownership family's idiom). The double-setpgid join is the C
+    # primitive: the spawn is confirmed exec'd, not a timed bet.
     def live_pid
       pid = Process.spawn("sleep", "60", pgroup: true)
       Process.detach(pid)
       @spawns << pid
-      sleep 0.05 # let it exec
+      begin
+        Process.setpgid(pid, pid)
+      rescue Errno::EACCES, Errno::ESRCH
+        nil
+      end
       pid
     end
 
     # The TOCTOU stub idiom (the intercom family's Dir.singleton_class
     # shape) at the Supervisor write seat: raises for EVERY write while
-    # installed so the failed-tick window is race-free; restore through
-    # +restore_atomic_write+ in the pin's body and ensure.
-    def stub_failing_atomic_write(attempts)
+    # installed so the failed-tick window is race-free; the optional Gate
+    # pings at the recorded-attempt mutation (the awaited event); restore
+    # through +restore_atomic_write+ in the pin's body and ensure.
+    def stub_failing_atomic_write(attempts, gate: nil)
       Subagents::Supervisor.singleton_class.send(:alias_method, :ask_delivery_unstubbed_write, :atomic_write_json)
       Subagents::Supervisor.singleton_class.send(:define_method, :atomic_write_json) do |path, payload|
         attempts << path
+        gate&.ping
         raise Errno::EIO, "stubbed valve write failure"
       end
     end
@@ -556,6 +607,28 @@ module Tart
 
       Subagents::Supervisor.singleton_class.send(:alias_method, :atomic_write_json, :ask_delivery_unstubbed_write)
       Subagents::Supervisor.singleton_class.send(:remove_method, :ask_delivery_unstubbed_write)
+    end
+
+    # The write-seat Gate (I103 B): the child tool's ask lands through
+    # Supervisor.atomic_write_json (its only test-visible write seat), so
+    # the stub pings a Gate at that mutation point. Restore through
+    # +restore_write_gate+ in the pin's ensure.
+    def stub_write_gate
+      gate = Gate.new
+      Subagents::Supervisor.singleton_class.send(:alias_method, :write_gate_unstubbed_write, :atomic_write_json)
+      Subagents::Supervisor.singleton_class.send(:define_method, :atomic_write_json) do |path, payload|
+        result = write_gate_unstubbed_write(path, payload)
+        gate.ping
+        result
+      end
+      gate
+    end
+
+    def restore_write_gate
+      return unless Subagents::Supervisor.singleton_class.method_defined?(:write_gate_unstubbed_write)
+
+      Subagents::Supervisor.singleton_class.send(:alias_method, :atomic_write_json, :write_gate_unstubbed_write)
+      Subagents::Supervisor.singleton_class.send(:remove_method, :write_gate_unstubbed_write)
     end
   end
 end

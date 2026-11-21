@@ -13,7 +13,7 @@ module Tart
   # back-and-forth laws (AC4), the consult discipline, and the live
   # end-to-end replacement. Hermetic: staged homes, real `bin/tart -p`
   # children on MockLLMServer, the duck-typed-loop swap idiom (the I99
-  # pin-2 family), the wait_until discipline — ZERO live API calls.
+  # pin-2 family), the event-wait discipline — ZERO live API calls.
   class SessionSuccessionTest < Test
     STAMP_A = "01aaa111-0000-7000-8000-00000000aaaa"
     STAMP_B = "01bbb222-0000-7000-8000-00000000bbbb"
@@ -31,6 +31,13 @@ module Tart
     end
 
     def teardown
+      # I103 (F2 — the D9 order-flake cure, the subagents_test.rb:30-38
+      # idiom): Subagents.register records the process-global
+      # current_manager slot; without this FIRST-line reset a leaked
+      # manager (its watcher/children long dead after teardown) arms
+      # whichever class minitest shuffles next — the ListingIdleKernel
+      # async NoMethodError at seed 41358.
+      Subagents.current_manager = nil
       @managers.each(&:shutdown)
       @channels.each(&:stop)
       @server.stop
@@ -163,7 +170,7 @@ module Tart
                                                  owner_id: -> { manager.owner_session_ids })
       @channels << channel
       channel.start
-      wait_until { !channel.pending.empty? }
+      await(channel, "the inherited ask to register") { !channel.pending.empty? }
 
       # The inherited ask registered + surfaced, EXACTLY once; the foreign
       # ask never.
@@ -247,7 +254,7 @@ module Tart
       manager.supervisor_channel = channel
       @channels << channel
       channel.start
-      wait_until { !channel.pending.empty? }
+      await(channel, "the spawned run's ask to register") { !channel.pending.empty? }
 
       # The /leave-work mark on the CURRENT session, then the replacement.
       manager.keep_session_work(manager.session_owner_id)
@@ -257,7 +264,7 @@ module Tart
 
       # The spawned run's pending ask is DROPPED (never answered); its file
       # stays on disk.
-      wait_until { channel.pending.empty? }
+      await(channel, "the pruned ask to drop") { channel.pending.empty? }
       error = assert_raises(ArgumentError) { channel.reply(reply_to: rid_own, message: "late") }
       assert_includes error.message, "No pending supervisor request found for reply_to '#{rid_own}'"
       assert File.file?(File.join(run_a[:dir], "control", "supervisor-requests", "#{rid_own}.json")),
@@ -274,7 +281,11 @@ module Tart
       rid_staged = "33333333-3333-4333-8333-333333333333"
       stage_ask(dir_a, rid_staged, run_id: "01aaa111-0000-7000-8000-000000000008")
       bytes_a = File.read(File.join(dir_a, "status.json"))
-      sleep(Subagents::Supervisor::POLL_INTERVAL * 4) # let several ticks run
+      # I103 (D — was the POLL_INTERVAL*4 grace sleep): the staged ask must
+      # NEVER register. The producer is stopped and JOINED first (no future
+      # tick can ever run), then the non-event is asserted — quiescence by
+      # construction, not a wall-clock bet.
+      channel.stop
       assert_empty channel.pending, "the staged ask never registers after the swap"
       error = assert_raises(ArgumentError) { channel.reply(reply_to: rid_staged, message: "nope") }
       assert_includes error.message, "No pending supervisor request found for reply_to '#{rid_staged}'"
@@ -454,10 +465,13 @@ module Tart
                                                  owner_id: -> { raise "owner boom" })
       @channels << channel
       channel.start
-      sleep(Subagents::Supervisor::POLL_INTERVAL * 4) # let several ticks run
+      # I103 (D — was the POLL_INTERVAL*4 grace sleep): the raising consult
+      # must refuse the ask across the poller's WHOLE lifetime. Stop + join
+      # the producer (no future tick can ever run), then assert the
+      # non-event; the file must be untouched on disk.
+      channel.stop
       assert_empty channel.pending, "a raising consult reads false: the ask never registers"
       assert File.file?(ask_path), "the ask file is untouched"
-      channel.stop
       channel.start # the poll machinery survives the raising ticks
       channel.stop
     end
@@ -546,19 +560,26 @@ module Tart
       pid = Process.spawn("sleep", "60", pgroup: true)
       Process.detach(pid)
       @spawns << pid
-      sleep 0.05 # let it exec
+      # I103 (C — was the 0.05 s let-it-exec bet): the exec handshake, the
+      # double-setpgid idiom. Success = the child sits in its own group (the
+      # kill(-pid) target exists); EACCES = it already execed as the group
+      # leader (same fact); ESRCH = it is gone. Either way the proceed is
+      # deterministic, not a timing bet.
+      begin
+        Process.setpgid(pid, pid)
+      rescue Errno::EACCES, Errno::ESRCH
+        nil
+      end
       pid
     end
 
+    # The owned run's terminal event, then the read (I103/A — was the
+    # deadline+sleep wall): the Manager broadcasts at the settle's
+    # terminal flip; the belt is the wedge guard only.
     def wait_owned_terminal(manager, id, timeout = 25)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      record = manager.runs.find { |candidate| candidate[:id] == id }
-      until record && record[:state] != :running
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          flunk "owned run #{id} never settled"
-        end
-        sleep 0.1
+      await(manager, "owned run #{id} to settle", belt: timeout) do
         record = manager.runs.find { |candidate| candidate[:id] == id }
+        record && record[:state] != :running
       end
     end
   end

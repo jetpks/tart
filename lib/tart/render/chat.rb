@@ -420,6 +420,28 @@ module Tart
         @interrupt_belt_arms
       end
 
+      # --- I103 state-signal seam (ADDITIVE observability only) ----------
+      # The await-loop's version read + the test-only park. The footprint
+      # is these two methods, signal_state_change, and its broadcast call
+      # sites: deleting them restores base behavior byte-for-byte (a
+      # broadcast with no waiter is a no-op; production never waits).
+      def state_version
+        @mutex.synchronize { @state_version ||= 0 }
+      end
+
+      # Parks until the version moves past from_version, belt-bounded (nil
+      # on belt expiry with no change). Production never calls this.
+      def wait_state_change(from_version, belt: 60)
+        @mutex.synchronize do
+          @state_version ||= 0
+          @state_cv ||= ConditionVariable.new
+          until @state_version > from_version
+            return nil unless @state_cv.wait(@mutex, belt)
+          end
+          @state_version
+        end
+      end
+
       # @return [Boolean] whether an agent run is in flight.
       def busy?
         @mutex.synchronize { @busy }
@@ -584,6 +606,7 @@ module Tart
             @logo_lines = Motd.motd_logo_lines(event.width, wordmark: @identity)
             rebuilt = @transcript_state.rebuild_live_expandables
           end
+          signal_state_change
         end
         @kernel.request_draw if rebuilt
       end
@@ -778,6 +801,10 @@ module Tart
               @kernel.async { @agent.run }
             end
           end
+          # I103 — the mutation funnel's broadcast (busy flip, transcript
+          # delivery, belt disarm — everything the case touched), at the
+          # CASE tail so every event kind signals, not just agent_end.
+          signal_state_change
         end
         # I58 — the tick discipline: this sink's tail requests ONE paint
         # per event (the delta arm paints on arrival; the retired tail
@@ -852,7 +879,10 @@ module Tart
       # newest first; keys route into the picker's +handle+ while open,
       # enter fires {on_resume} through the picker's on_select wiring.
       def open_session_picker(items)
-        @mutex.synchronize { @picker = Picker.new(items:, on_select: ->(item) { @on_resume&.call(item[:path]) }) }
+        @mutex.synchronize do
+          @picker = Picker.new(items:, on_select: ->(item) { @on_resume&.call(item[:path]) })
+          signal_state_change
+        end
       end
 
       # Slash-command output (pi's chat-line status UX): a muted line in
@@ -865,6 +895,18 @@ module Tart
       end
 
       private
+
+      # I103 — the state-signal broadcast (additive observability): called
+      # INSIDE the existing @mutex funnels at the tail of every observed
+      # mutation (agent events, resize/input, menus/picker, merge_listing,
+      # the belt arm/fire, the user-bash stream lifecycle). Bump the
+      # version, then broadcast under the lock — the version check makes a
+      # missed wakeup impossible. With no waiter this is a no-op.
+      def signal_state_change
+        @state_version = (@state_version || 0) + 1
+        (@state_cv ||= ConditionVariable.new).broadcast
+        nil
+      end
 
       # Completed content: queued for the transcript buffer.
       # Mutex context (called from on_agent_event); returns the final text
@@ -1192,6 +1234,9 @@ module Tart
         # check alone decides, so one re-query covers both — CJK trigger
         # chars cut, itemized). Movement keys leave the list (pi literal).
         @autocomplete.update(@editor) if printable
+        # I103 — the editor-input path's broadcast (the arm above touched
+        # the editor/autocomplete/picker/menu state).
+        @mutex.synchronize { signal_state_change }
       end
 
       # pi's submit path (interactive-mode.ts:3200-3442): a leading "/"
@@ -1306,6 +1351,9 @@ module Tart
         # is the expiry authority regardless.
         remaining = [@interrupt_belt_deadline_at - Process.clock_gettime(Process::CLOCK_MONOTONIC), 0.001].max
         @interrupt_belt_task = @kernel.tick(remaining)
+        # I103 — the arm's broadcast (the belt's armed state just moved;
+        # taken under the surface lock — the arm sites hold no lock).
+        @mutex.synchronize { signal_state_change }
       end
 
       # Law 3 — the escalation guard, evaluated at the top of every render
@@ -1336,6 +1384,8 @@ module Tart
         warn "tart: interrupt delivery failed — run aborted (kernel stopped)"
         @kernel.request_draw
         @kernel.stop!
+        # I103 — the fire's broadcast (the escalation's state moved).
+        @mutex.synchronize { signal_state_change }
       end
 
       # Law 2 — the disarm: ANY :agent_end is delivery evidence. Stops the
@@ -1400,14 +1450,20 @@ module Tart
       # post-compaction drain IS the loop's complete? arm), with pi's
       # flash text.
       def steer_submitted_text(text)
-        @mutex.synchronize { @queued[:steer] << text }
+        @mutex.synchronize do
+          @queued[:steer] << text
+          signal_state_change
+        end
         flash("Queued message for after compaction") if @compaction_reason
         @agent.steer(text)
         @kernel.request_draw
       end
 
       def follow_up_submitted_text(text)
-        @mutex.synchronize { @queued[:follow_up] << text }
+        @mutex.synchronize do
+          @queued[:follow_up] << text
+          signal_state_change
+        end
         flash("Queued message for after compaction") if @compaction_reason
         @agent.follow_up(text)
         @kernel.request_draw
@@ -1454,6 +1510,7 @@ module Tart
         @mutex.synchronize do
           @queued[:steer].clear
           @queued[:follow_up].clear
+          signal_state_change
         end
         @kernel.request_draw
       end
@@ -2456,6 +2513,7 @@ module Tart
       def start_user_bash_stream(command, excluded)
         @mutex.synchronize do
           @user_bash_stream = {command:, excluded:, content: +"", spinner_started_at: @clock.call}
+          signal_state_change
         end
         # pi adds the component then requestRender (:7033-7034) — the
         # header + loader row paint before the first chunk. The bash
@@ -2477,6 +2535,7 @@ module Tart
           # may still push after the reactor-side wait died) is dropped.
           appended = !@user_bash_stream.nil?
           @user_bash_stream[:content] << text if appended
+          signal_state_change
         end
         @kernel.request_draw if appended
       end
@@ -2487,7 +2546,10 @@ module Tart
       # frame the live rows vanish (AC2). The spinner tick cancels with
       # the stream unless an agent run keeps it (I58).
       def end_user_bash_stream
-        @mutex.synchronize { @user_bash_stream = nil }
+        @mutex.synchronize do
+          @user_bash_stream = nil
+          signal_state_change
+        end
         cancel_spinner_tick unless busy?
       end
 
@@ -2552,6 +2614,7 @@ module Tart
             search_text: ->(item) { "#{item[:value]} #{item[:description]}" },
             on_select: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: false) },
             on_select_as_default: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: true) })
+          signal_state_change
         end
       end
 
@@ -2591,6 +2654,7 @@ module Tart
             on_select: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: false) },
             on_select_as_default: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: true) }
           )
+          signal_state_change
         end
         spawn_listing_fetch
       end
@@ -2658,6 +2722,8 @@ module Tart
           else
             @menu.listing_failed!
           end
+          # I103 — the merge landed (the launcher listing wait's event).
+          signal_state_change
           true
         end
         @kernel.request_draw if merged
@@ -2737,6 +2803,7 @@ module Tart
         @mutex.synchronize do
           @thinking_level = level
           @transcript_state.enqueue_status("#{persist ? "Default thinking level" : "Thinking level"}: #{level}")
+          signal_state_change
         end
         @agent&.set_thinking_level(level)
         Settings.save(@settings_root, "thinkingLevel" => level) if persist
@@ -2797,6 +2864,7 @@ module Tart
           @runtime_model = entry
           @thinking_level = effective
           @transcript_state.enqueue_status(status)
+          signal_state_change
         end
         @agent&.switch_model(entry.id, provider: entry.provider,
           context_window: entry.context_window,

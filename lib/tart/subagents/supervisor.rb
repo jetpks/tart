@@ -236,6 +236,7 @@ module Tart
               poll_loop
             end
             @thread = thread
+            signal_state_change
           end
         end
         self
@@ -248,6 +249,7 @@ module Tart
         thread = @mutex.synchronize do
           caught = @thread
           @thread = nil
+          signal_state_change
           caught
         end
         sweep_pending
@@ -272,10 +274,16 @@ module Tart
         unless request
           raise ArgumentError, "No pending supervisor request found for reply_to '#{reply_to}'."
         end
-        @mutex.synchronize { @pending[request[:id]] = request }
+        @mutex.synchronize do
+          @pending[request[:id]] = request
+          signal_state_change
+        end
 
         Supervisor.atomic_write_json(reply_path(request), reply_payload(request, text.strip))
-        @mutex.synchronize { @pending.delete(request[:id]) }
+        @mutex.synchronize do
+          @pending.delete(request[:id])
+          signal_state_change
+        end
         remove_request_file(request)
         "Replied to supervisor request #{request[:id]}."
       end
@@ -291,6 +299,29 @@ module Tart
       # snapshot's `attention_tool` fact reads this.
       def foreground_attention
         @mutex.synchronize { @foreground_attention.dup }
+      end
+
+      # --- I103 state-signal seam (ADDITIVE observability only) ----------
+      # The await-loop's version read + the test-only park, riding the
+      # channel's existing @mutex. The footprint is these two methods,
+      # signal_state_change, and its broadcast call sites: deleting them
+      # restores base behavior byte-for-byte (a broadcast with no waiter
+      # is a no-op; production never waits).
+      def state_version
+        @mutex.synchronize { @state_version ||= 0 }
+      end
+
+      # Parks until the version moves past from_version, belt-bounded (nil
+      # on belt expiry with no change). Production never calls this.
+      def wait_state_change(from_version, belt: 60)
+        @mutex.synchronize do
+          @state_version ||= 0
+          @state_cv ||= ConditionVariable.new
+          until @state_version > from_version
+            return nil unless @state_cv.wait(@mutex, belt)
+          end
+          @state_version
+        end
       end
 
       # pi buildParentSupervisorTool's pending arm (:450-458): the empty
@@ -318,11 +349,24 @@ module Tart
 
         @mutex.synchronize do
           @pending.delete_if { |_request_id, request| ids.include?(request[:run_id].to_s) }
+          signal_state_change
         end
         nil
       end
 
       private
+
+      # I103 — the state-signal broadcast (additive observability): the
+      # tail of every observed channel mutation funnel under @mutex
+      # (pending add/remove/discover, the reply path's consumption, the
+      # poller's start/stop + terminal sweep, the foreground-attention
+      # set/clear). Bump the version, then broadcast under the lock —
+      # with no waiter this is a no-op.
+      def signal_state_change
+        @state_version = (@state_version || 0) + 1
+        (@state_cv ||= ConditionVariable.new).broadcast
+        nil
+      end
 
       def poll_loop
         until thread_stopped?
@@ -350,7 +394,10 @@ module Tart
       def sweep_pending
         stale = pending.select { |request| request_lifecycle(request, Supervisor.now_ms) != :pending }
         stale.each do |request|
-          @mutex.synchronize { @pending.delete(request[:id]) }
+          @mutex.synchronize do
+            @pending.delete(request[:id])
+            signal_state_change
+          end
           remove_request_file(request)
         end
       end
@@ -406,7 +453,10 @@ module Tart
           # poll-thread-only state).
           mark_seen(path)
 
-          @mutex.synchronize { @pending[request[:id]] = request }
+          @mutex.synchronize do
+            @pending[request[:id]] = request
+            signal_state_change
+          end
           surface(request)
         end
       rescue SystemCallError
@@ -424,7 +474,10 @@ module Tart
         run_ids = @mutex.synchronize { @foreground_attention.keys }
         run_ids.each do |run_id|
           gone = !File.directory?(File.join(@home, run_id))
-          @mutex.synchronize { @foreground_attention.delete(run_id) } if gone || run_terminal?(run_id)
+          @mutex.synchronize do
+            @foreground_attention.delete(run_id) if gone || run_terminal?(run_id)
+            signal_state_change
+          end
         end
       end
 
@@ -463,6 +516,7 @@ module Tart
         @mutex.synchronize do
           @foreground_attention[request[:run_id].to_s] =
             {tool: "contact_supervisor", since: request[:created_at]}
+          signal_state_change
         end
       end
 

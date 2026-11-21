@@ -6,15 +6,108 @@ require_relative "../lib/tart"
 module Tart
   # Shared base class for the minitest suite.
   class Test < Minitest::Test
-    # Runs until the block is satisfied, then returns. Fails after 5 s
-    # rather than hanging.
-    def wait_until
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      until yield
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          raise "work condition never satisfied"
+    # The wedge-guard belt (I103): a generous ceiling on every event wait —
+    # a failure mode, never a synchronization mechanism. A passing test
+    # never depends on it: the waiter wakes on the state-signal broadcast
+    # whenever the event lands. Real-child families (subagents_e2e,
+    # architect_loop live fire) pass belt: CHILD_BELT_S — a cold bundle-exec
+    # child boot measured ~40 s under contention (I82).
+    WEDGE_BELT_S = 60
+    CHILD_BELT_S = 300
+
+    # The deterministic event wait (I103): read the subject's state
+    # version, evaluate the predicate OUTSIDE the object lock (the public
+    # readers take it; MRI Mutexes are non-reentrant), on false park in
+    # wait_state_change until the version moves, re-evaluate, repeat. Belt
+    # expiry raises a loud assertion naming +what+. The subject is any
+    # object carrying the state-signal seam (state_version /
+    # wait_state_change) — a lib seamed surface or a Gate.
+    #
+    # cooperative: (REQUIRED at reactor-fiber call sites) — CV#wait parks
+    # the THREAD, which would stall the whole reactor; the cooperative
+    # variant re-checks the predicate after each cooperative yield
+    # (async's Kernel#sleep patch) instead. On this same thread every
+    # producer must run between yields, so a bounded cooperative re-check
+    # after every suspension misses no event — the belt caps it purely as
+    # the wedge guard. No clock lines either way.
+    COOPERATIVE_STEP_S = 0.005
+
+    def await(subject, what, belt: WEDGE_BELT_S, cooperative: false, &predicate)
+      Test.await_event(subject, what, belt: belt, cooperative: cooperative, &predicate)
+    end
+
+    # The shared version-loop (the Gate's #await delegates here too).
+    def self.await_event(subject, what, belt:, cooperative: false)
+      unless subject.respond_to?(:state_version) && subject.respond_to?(:wait_state_change)
+        raise ArgumentError,
+              "await needs a state-signal subject (got #{subject.class} — seamed surface or Gate)"
+      end
+
+      if cooperative
+        steps = [(belt / COOPERATIVE_STEP_S).round, 1].max
+        steps.times do
+          return if yield
+          task = (defined?(Async) && Async::Task.current?)
+          task ? task.sleep(COOPERATIVE_STEP_S) : sleep(COOPERATIVE_STEP_S)
         end
-        sleep 0.005
+        return if yield
+        raise Minitest::Assertion, "event never arrived: #{what} (belt #{belt}s expired)"
+      end
+
+      loop do
+        version = subject.state_version
+        return if yield
+        unless subject.wait_state_change(version, belt: belt)
+          # The belt is a wedge guard: one final predicate re-check closes
+          # a lost-broadcast race before the loud failure — only a
+          # genuinely never-arriving event raises.
+          return if yield
+
+          raise Minitest::Assertion, "event never arrived: #{what} (belt #{belt}s expired)"
+        end
+      end
+    end
+
+    # The test-owned observable's side of the state-signal mechanics
+    # (I103): a double / support server / test-local callback array pings
+    # at its mutation points; consumers await on predicates over its
+    # state. Zero lib involvement.
+    class Gate
+      def initialize
+        @mutex = Mutex.new
+        @cv = ConditionVariable.new
+        @version = 0
+      end
+
+      # Producer side: call at every mutation point of the observable
+      # (any thread; trap-free).
+      def ping
+        @mutex.synchronize do
+          @version += 1
+          @cv.broadcast
+        end
+        nil
+      end
+
+      # The await-loop's version read (under the lock).
+      def state_version
+        @mutex.synchronize { @version }
+      end
+
+      # The consumer-side park: until the version moves past from_version,
+      # belt-bounded — nil on belt expiry with no change.
+      def wait_state_change(from_version, belt: WEDGE_BELT_S)
+        @mutex.synchronize do
+          until @version > from_version
+            return nil unless @cv.wait(@mutex, belt)
+          end
+          @version
+        end
+      end
+
+      # Consumer side: the version-loop over this gate's state.
+      def await(what, belt: WEDGE_BELT_S, cooperative: false, &predicate)
+        Test.await_event(self, what, belt: belt, cooperative: cooperative, &predicate)
       end
     end
     # A scripted session double at the TUI seam: lets kernel tests drive the
@@ -42,6 +135,13 @@ module Tart
         @drawn = []
         @scrollback = []
         @draw_mutex = Mutex.new
+        # The drawn surface's Gate (I103): pinged at BOTH drawn-state
+        # mutation points (draw + insert_before — one version covers the
+        # session surface; a draw-only predicate merely re-checks on a
+        # scrollback ping, harmlessly). The read-through below lets
+        # await(session, …) ride the same vocabulary as the seamed lib
+        # surfaces.
+        @draw_gate = Gate.new
       end
 
       # The live viewport Rect double (the chat surface's wrap width).
@@ -57,6 +157,7 @@ module Tart
 
       def draw(widget)
         @draw_mutex.synchronize { @drawn << widget }
+        @draw_gate.ping
       end
 
       # Scrollback insertion (the chat surface's completed-content path);
@@ -64,6 +165,17 @@ module Tart
       # in order (test assertions).
       def insert_before(height, widget)
         @draw_mutex.synchronize { @scrollback << [height, widget] }
+        @draw_gate.ping
+      end
+
+      # The drawn surface's state-signal read-through (I103): await(session,
+      # …) waits on the draw/scrollback mutation events.
+      def state_version
+        @draw_gate.state_version
+      end
+
+      def wait_state_change(from_version, belt: WEDGE_BELT_S)
+        @draw_gate.wait_state_change(from_version, belt: belt)
       end
 
       attr_reader :scrollback

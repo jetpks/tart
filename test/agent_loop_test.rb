@@ -587,7 +587,7 @@ module Tart
       ])
       agent, events = agent_on_kernel(tools: {"sleep" => SleepTool.new})
       thread = run_in_background(agent, "start work")
-      wait_until { @server.request_count >= 1 } # request 1 served; the 0.5 s tool is running
+      await(@server, "request 1 served — the 0.5 s tool is running") { @server.request_count >= 1 } # I103 (B)
       agent.steer("sort by size")
       join_run(thread)
 
@@ -613,7 +613,7 @@ module Tart
       ])
       agent, events = agent_on_kernel(tools: {"sleep" => SleepTool.new})
       thread = run_in_background(agent, "start work")
-      wait_until { @server.request_count >= 1 }
+      await(@server, "request 1 served — the tool is running") { @server.request_count >= 1 } # I103 (B)
       agent.follow_up("after everything")
       join_run(thread)
 
@@ -637,7 +637,7 @@ module Tart
       ])
       agent, = agent_on_kernel(tools: {"sleep" => SleepTool.new}, recorder:)
       thread = run_in_background(agent, "start work")
-      wait_until { @server.request_count >= 1 }
+      await(@server, "request 1 served — the tool is running") { @server.request_count >= 1 } # I103 (B)
       agent.steer("sort by size")
       join_run(thread)
 
@@ -680,7 +680,7 @@ module Tart
       th = Thread.new do
         # the turn is streaming — the captured request is the mid-stream
         # marker (12 chars × 0.1 s pauses ≈ 1.2 s of stream remain)
-        wait_until { @server.request_count >= 1 }
+        await(@server, "the captured request — the turn is mid-stream") { @server.request_count >= 1 } # I103 (B)
         Process.kill("INT", Process.pid)
       end
       kernel.run { agent.run("long stream") }
@@ -760,7 +760,7 @@ module Tart
           end
         end
         root.async do
-          wait_until { @server.request_count >= 1 } # mid-stream
+          await(@server, "the captured request — mid-stream", cooperative: true) { @server.request_count >= 1 } # I103 (B)
           turn.stop
         end
         begin
@@ -799,7 +799,7 @@ module Tart
           end
         end
         root.async do
-          wait_until { @server.request_count >= 1 } # mid-stream
+          await(@server, "the captured request — mid-stream", cooperative: true) { @server.request_count >= 1 } # I103 (B)
           turn.stop
         end
         begin
@@ -827,7 +827,7 @@ module Tart
     # (waiting would surface the agent_end ≈0.4 s after the cancel).
     def test_cancel_during_tool_batch_aborts_fast
       @server.script(BATCH_SCRIPT.map(&:dup))
-      agent, stamped = stamped_agent_on_kernel(tools: {"sleep" => SleepTool.new})
+      agent, stamped, stamped_gate = stamped_agent_on_kernel(tools: {"sleep" => SleepTool.new})
 
       cancel_at = nil
       Async do |root|
@@ -841,7 +841,9 @@ module Tart
         root.async do
           # ~the first tool's start — the interrupt lands inside the 0.5 s
           # sleep batch (the abort-fast property pins the remaining span)
-          wait_until { stamped_events(stamped, :tool_execution_start).any? }
+          await(stamped_gate, "the first tool_execution_start stamped", cooperative: true) do
+            stamped_events(stamped, :tool_execution_start).any?
+          end
           cancel_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           turn.stop
         end
@@ -928,14 +930,10 @@ module Tart
       end
     end
 
-    # The bounded join: a wedged run fails the test instead of hanging it.
+    # The bounded join (I103 C): the join's own limit is the belt — a wedged
+    # run fails the test instead of hanging it.
     def join_run(thread)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
-      until !thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.02
-      end
-      flunk "the run never finished" if thread.alive?
-      thread.join
+      thread.join(15) or flunk "the run never finished"
     end
 
     # Runs #wake on the kernel (the reactor fiber — the documented
@@ -1618,7 +1616,7 @@ module Tart
           end
         end
         root.async do
-          wait_until { @server.request_count >= 1 } # mid-stream
+          await(@server, "the captured request — mid-stream", cooperative: true) { @server.request_count >= 1 } # I103 (B)
           turn.stop
         end
         begin
@@ -1809,7 +1807,7 @@ module Tart
       # Mid-stream: the request file lands while the turn runs — the
       # captured request is the marker (12 chars × 0.1 s pauses of stream
       # remain, ≥3× the write+consume action).
-      wait_until { @server.request_count >= 1 }
+      await(@server, "the captured request — the turn is mid-stream") { @server.request_count >= 1 } # I103 (B)
       request_id = "req-#{object_id}"
       File.write(File.join(inbox, "0001700000000000-#{request_id}.json"),
                  JSON.generate({"type" => "steer", "id" => request_id, "ts" => 1_700_000_000_000,
@@ -1838,7 +1836,7 @@ module Tart
       thread = run_in_background(agent, "long stream")
 
       # mid-stream (the captured request is the marker)
-      wait_until { @server.request_count >= 1 }
+      await(@server, "the captured request — the turn is mid-stream") { @server.request_count >= 1 } # I103 (B)
       File.write(File.join(stop_dir, "0001700000000000-stop.json"),
                  JSON.generate({"type" => "stop", "ts" => 1_700_000_000_000}))
       join_run(thread)
@@ -1861,7 +1859,7 @@ module Tart
       thread = run_in_background(agent, "start the work")
 
       # mid-stream (the captured request is the marker)
-      wait_until { @server.request_count >= 1 }
+      await(@server, "the captured request — the turn is mid-stream") { @server.request_count >= 1 } # I103 (B)
       File.write(File.join(inbox, "0001700000000001-garbage.json"), "{not json")
       File.write(File.join(inbox, "0001700000000002-ok.json"),
                  JSON.generate({"type" => "steer", "id" => "req-ok", "ts" => 1_700_000_000_002,
@@ -1918,7 +1916,10 @@ module Tart
       @server.script([{type: :slow_stream, content: "x" * 12, chunk_every: 0.1}])
       agent, = agent_on_kernel
       thread = run_in_background(agent, "long stream")
-      wait_until { agent.running? } # the run is in flight (mid-stream)
+      # I103 (B): the request arrival IS the in-flight marker (Agent::Loop
+      # carries no seam) — a mid-stream slow-stream request can only belong
+      # to the run.
+      await(@server, "the run is in flight — the request is being served") { @server.request_count >= 1 }
       assert agent.running?, "the run is in flight"
 
       result = nil
@@ -1941,18 +1942,22 @@ module Tart
     ].freeze
 
     # agent_on_kernel with a monotonic stamp per event (the overlap/attribution
-    # pins' clock — the event hashes themselves stay unmodified).
+    # pins' clock — the event hashes themselves stay unmodified). The stamp
+    # array's Gate (I103 B) is pinged at every append; the batch-abort pin
+    # awaits it.
     def stamped_agent_on_kernel(tools:)
       stamped = []
       stamped_mutex = Mutex.new
+      stamped_gate = Gate.new
       sink = lambda do |event|
         stamped_mutex.synchronize do
           stamped << event.merge(_at: Process.clock_gettime(Process::CLOCK_MONOTONIC))
+          stamped_gate.ping
         end
       end
       chat = TestChat.build(@server, tools: tools.values, system_prompt: "test prompt")
       agent = Agent::Loop.new(chat:, tools:, on_event: sink)
-      [agent, stamped]
+      [agent, stamped, stamped_gate]
     end
 
     def stamped_events(stamped, type)
@@ -1976,15 +1981,15 @@ module Tart
     end
 
     # Runs the agent on the kernel in a side thread with the house 5 s
-    # deadline: an unbounded run (the pre-fix error-path hang) fails the
-    # test instead of wedging the suite.
+    # deadline (I103 C: the join's own limit is the belt): an unbounded run
+    # (the pre-fix error-path hang) fails the test instead of wedging the
+    # suite.
     def run_agent_bounded(agent, prompt)
       thread = Thread.new do
         Thread.current.report_on_exception = false
         Core::Loop.new(session: ScriptedSession.new).run { agent.run(prompt) }
       end
-      wait_until { !thread.alive? }
-      thread.join
+      thread.join(5) or flunk "the run never finished"
     end
 
     # I45: the same kernel harness over a caller-built chat (the

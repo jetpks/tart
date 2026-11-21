@@ -46,9 +46,21 @@ module Tart
   class RecordingCommands
     def initialize
       @dispatched = []
+      # I103 — the dispatch event's gate (B: the test double pings at its
+      # mutation point).
+      @gate = Tart::Test::Gate.new
     end
 
     attr_reader :dispatched
+
+    # I103 state-signal read-through (await(commands, …) rides the gate).
+    def state_version
+      @gate.state_version
+    end
+
+    def wait_state_change(from_version, belt: 60)
+      @gate.wait_state_change(from_version, belt: belt)
+    end
 
     def expand_skill(text)
       text
@@ -56,6 +68,7 @@ module Tart
 
     def dispatch(text)
       @dispatched << text
+      @gate.ping
       true
     end
   end
@@ -66,8 +79,8 @@ module Tart
   # the frozen loud line on a missed delivery. Self-contained wiring (the
   # repro_a.rb inline shape): MockLLMServer + ScriptedSession + the real
   # kernel + the real (or swallow-surrogate) agent, built in-file —
-  # chat_test.rb is byte-frozen and never opened. Every wait polls an
-  # observable through the frozen wait_until; the file holds ZERO sleep
+  # chat_test.rb is byte-frozen and never opened. Every wait parks on an
+  # observable's state-signal (I103); the file holds ZERO sleep
   # tokens (I82 — the surrogate's park is a Queue#pop).
   class InterruptDeliveryBeltTest < Test
     # The frozen loud line (byte-exact, em-dash U+2014) — the escalation's
@@ -169,8 +182,8 @@ module Tart
     # the agent fiber parked at the SSE read, where cancellation delivery
     # is the designed mechanism. Deterministic green: the pin's subject is
     # the disarm, not the race. The 80-char slow stream (~8 s at the frozen
-    # 0.1 s/char pace) outlasts the 5 s wait_until — a dropped interrupt
-    # reds loudly, never a masked natural end.
+    # 0.1 s/char pace) outlasts the event waits' wedge belt — a dropped
+    # interrupt reds loudly, never a masked natural end.
     def test_belt_arms_on_esc_abort_and_disarms_on_delivery
       @server = MockLLMServer.new.start
       @server.script([{type: :slow_stream, content: "x" * 80}, {type: :message, content: "still there"}])
@@ -178,12 +191,12 @@ module Tart
       captured = []
       run_scenario(rig.kernel) do
         type(rig.session, "long stream")
-        wait_until { rig.chat.busy? }
-        wait_until { drain_captured(captured).any? { |request| user_text(request) == "long stream" } }
-        wait_until { rendered_text(rig.session).include?("xxx") }
+        await(rig.chat, "the run to start") { rig.chat.busy? }
+        await(@server, "the request to arrive") { drain_captured(captured).any? { |request| user_text(request) == "long stream" } }
+        await(rig.session, "the chunks to render") { rendered_text(rig.session).include?("xxx") }
         rig.session.push_event(Tart::TUI.key_event("esc"))
-        wait_until { !rig.chat.busy? }
-        wait_until { rig.chat.transcript_lines.join.include?("interrupted") }
+        await(rig.chat, "the run to end") { !rig.chat.busy? }
+        await(rig.session, "the interrupted row to render") { rig.chat.transcript_lines.join.include?("interrupted") }
         # Delivery evidence disarms the belt: flag false, exactly one arm,
         # no belt line, and the belt did NOT stop the kernel.
         assert_equal false, rig.chat.interrupt_belt_armed?
@@ -193,7 +206,7 @@ module Tart
         # The loop is still alive — a follow-up submit lands (the escape
         # twin's "still there" shape).
         type(rig.session, "still there")
-        wait_until { drain_captured(captured).any? { |request| user_text(request) == "still there" } }
+        await(@server, "the follow-up to arrive") { drain_captured(captured).any? { |request| user_text(request) == "still there" } }
       end
       assert_includes rig.chat.transcript_lines.join, "interrupted"
     end
@@ -201,8 +214,8 @@ module Tart
     # Pin 2 — the deterministic miss: the swallow surrogate parks forever
     # (never agent_end), the injected 0.2 s deadline expires, and the belt
     # escalates EXACTLY ONCE — the exact line on the transcript, the stderr
-    # warn, kernel.stop! — and kernel.run RETURNS bounded (the wait_until
-    # is the wall: esc→stop-observed < 5 s, never a sleep). ALSO the I90
+    # warn, kernel.stop! — and kernel.run RETURNS bounded (esc→stop-observed
+    # is pinned by the elapsed measurement: < 5 s, never a sleep). ALSO the I90
     # ruling's graceful-degradation proof: the belt's OWN tick is swept
     # (stopped) right after the ESC — with no re-dispatch to revive it, the
     # armed flag plus the busy spinner's I58 render cadence ALONE must fire
@@ -219,14 +232,14 @@ module Tart
           type(rig.session, "long stream")
           # The UNGATED busy ESC — whatever the delivery weather, the
           # surrogate never ends the run: the miss is deterministic.
-          wait_until { rig.chat.busy? }
+          await(rig.chat, "the run to start") { rig.chat.busy? }
           $stderr = stderr
           t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           rig.session.push_event(Tart::TUI.key_event("esc"))
           # The I90 §4 sweep: kill the belt's own watchdog tick — the
           # escalation below must ride the flag + the spinner cadence.
           rig.chat.instance_variable_get(:@interrupt_belt_task)&.stop
-          wait_until { rig.kernel.stop_requested? } # bounded — the belt fired
+          await(rig.kernel, "the belt's stop", belt: 5) { rig.kernel.stop_requested? } # bounded — the belt fired
           esc_to_stop = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
         end
       ensure
@@ -257,9 +270,9 @@ module Tart
       captured = []
       run_scenario(rig.kernel) do
         type(rig.session, "hello")
-        wait_until { drain_captured(captured).any? { |request| user_text(request) == "hello" } }
-        wait_until { rig.chat.transcript_lines.join.include?("done") }
-        wait_until { !rig.chat.busy? }
+        await(@server, "the request to arrive") { drain_captured(captured).any? { |request| user_text(request) == "hello" } }
+        await(rig.session, "the done row to render") { rig.chat.transcript_lines.join.include?("done") }
+        await(rig.chat, "the run to end") { !rig.chat.busy? }
       end
       assert_equal 0, rig.chat.interrupt_belt_arms
       assert_equal false, rig.chat.interrupt_belt_armed?
@@ -279,13 +292,13 @@ module Tart
       captured = []
       run_scenario(rig.kernel) do
         type(rig.session, "long stream")
-        wait_until { rig.chat.busy? }
-        wait_until { drain_captured(captured).any? { |request| user_text(request) == "long stream" } }
-        wait_until { rendered_text(rig.session).include?("xxx") }
+        await(rig.chat, "the run to start") { rig.chat.busy? }
+        await(@server, "the request to arrive") { drain_captured(captured).any? { |request| user_text(request) == "long stream" } }
+        await(rig.session, "the chunks to render") { rendered_text(rig.session).include?("xxx") }
         type(rig.session, "/compact")
-        wait_until { rig.chat.interrupt_belt_arms == 1 } # the abort-first armed it
-        wait_until { !rig.chat.busy? } # honest delivery
-        wait_until { commands.dispatched.include?("/compact") } # the I54 re-dispatch
+        await(rig.chat, "the abort-first arm") { rig.chat.interrupt_belt_arms == 1 } # the abort-first armed it
+        await(rig.chat, "honest delivery") { !rig.chat.busy? } # honest delivery
+        await(commands, "the I54 re-dispatch") { commands.dispatched.include?("/compact") } # the I54 re-dispatch
       end
       assert_equal 1, rig.chat.interrupt_belt_arms
       assert_equal false, rig.chat.interrupt_belt_armed?
@@ -316,11 +329,11 @@ module Tart
       end
       run_scenario(kernel) do
         type(rig.session, "long stream")
-        wait_until { rig.chat.busy? }
+        await(rig.chat, "the run to start") { rig.chat.busy? }
         rig.session.push_event(Tart::TUI.key_event("esc"))
         rig.session.push_event(Tart::TUI.key_event("esc"))
         rig.session.push_event(Tart::TUI.key_event("esc"))
-        wait_until { kernel.stop_requested? } # the belt fired, bounded
+        await(kernel, "the belt's stop", belt: 5) { kernel.stop_requested? } # the belt fired, bounded
       end
       assert_equal 3, interrupts.size # the dispatch ran per ESC
       assert_equal 1, rig.chat.interrupt_belt_arms # no re-arm
@@ -342,7 +355,7 @@ module Tart
       run_scenario(rig.kernel) do
         rig.session.push_event(Tart::TUI.key_event("esc"))
         type(rig.session, "still there") # the loop must be alive to submit
-        wait_until { drain_captured(captured).any? { |request| user_text(request) == "still there" } }
+        await(@server, "the follow-up to arrive") { drain_captured(captured).any? { |request| user_text(request) == "still there" } }
       end
       assert_equal 0, rig.chat.interrupt_belt_arms
       assert_equal false, rig.chat.interrupt_belt_armed?

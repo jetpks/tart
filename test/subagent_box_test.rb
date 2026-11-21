@@ -351,7 +351,7 @@ module Tart
                                 "expectsReply" => true,
                                 "createdAt" => (Time.now.to_f * 1000).to_i}))
       channel = manager.supervisor_channel
-      wait_until { channel.pending.any? } # the 250ms poll's scan
+      await(channel, "the staged ask's pending registration") { channel.pending.any? } # the poll's scan
       row = manager.box_snapshot[:rows].find { |r| r[:id] == "03attention-000" }
       assert row[:attention], "a pending ask names the run id"
       lines = Render::SubagentBox.render(rows: [row], now: row[:last_update], frame: 0,

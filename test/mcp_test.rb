@@ -81,7 +81,10 @@ module Tart
       assert_equal "Invalid MCP initialize result", result.failure.message
       assert_equal "closed", client.connection_state
       # pi: a failed connect closes the transport (client.ts catch -> close).
-      wait_until { transport.pid.nil? || !child_alive?(transport.pid) }
+      # I103 (C): Stdio#close reaps the child synchronously before it returns,
+      # so the reap is provable here without a wall — the pid is no longer a
+      # live child of this process (the same proof test_close_reaps pins).
+      assert_raises(Errno::ECHILD) { Process.waitpid(transport.pid, Process::WNOHANG) }
     end
 
     def test_unsupported_protocol_version_is_rejected
@@ -117,11 +120,12 @@ module Tart
         ENV["RUBYOPT"] = "-r/x/y/bundler/setup -EUTF-8"
         ENV["TART_MCP_TEST_MARKER"] = "parent-value"
         chunks = []
+        chunks_gate = Gate.new
         transport = Mcp::Stdio.new(command: RUBY, args: [dump],
                                    env: {"TART_MCP_TEST_MARKER" => "config-value"})
-        transport.on_stderr = ->(chunk) { chunks << chunk }
+        transport.on_stderr = ->(chunk) { chunks << chunk; chunks_gate.ping }
         transport.start
-        wait_until { !chunks.join.empty? }
+        chunks_gate.await("the child's env dump on stderr") { !chunks.join.empty? }
         child = JSON.parse(chunks.join)
 
         refute child.key?("BUNDLE_GEMFILE"), "the NIL record deleted the bundler key in the stdio child"
@@ -170,10 +174,12 @@ module Tart
 
     def test_transport_passes_child_stderr_through
       chunks = []
-      transport = echo_transport(env: {"MCP_ECHO_STDERR" => "echo-server: ready\n"}, on_stderr: ->(chunk) { chunks << chunk })
+      chunks_gate = Gate.new
+      transport = echo_transport(env: {"MCP_ECHO_STDERR" => "echo-server: ready\n"},
+                                 on_stderr: ->(chunk) { chunks << chunk; chunks_gate.ping })
       client = Mcp::Client.new
       client.connect(transport)
-      wait_until { chunks.join.include?("echo-server: ready") }
+      chunks_gate.await("the child's ready line on stderr") { chunks.join.include?("echo-server: ready") }
       client.close
       assert_includes chunks.join, "echo-server: ready"
     end
@@ -323,13 +329,6 @@ module Tart
       client.connect(echo_transport)
       (@clients ||= []) << client
       client
-    end
-
-    def child_alive?(pid)
-      Process.kill(0, pid)
-      true
-    rescue Errno::ESRCH, Errno::EPERM
-      false
     end
 
     def track_mcp(tools)

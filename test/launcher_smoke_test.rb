@@ -230,13 +230,18 @@ module Tart
         surface.footer_data = {cwd: home, model: boot.id, default_provider: boot.provider}
 
         surface.open_model_menu
-        wait_until { server.request_count == 1 }
-        # The merge lands on the listing thread — wait for it.
-        menu = surface.instance_variable_get(:@menu)
-        wait_until do
-          menu.instance_variable_get(:@filtered).map { |item| item[:id] }.include?("mock-3")
+        # The fetch fires on the listing thread — await the arrival (B:
+        # the MockLLMServer request gate; was the 5 s wall #1).
+        await(server, "the listing fetch to arrive") { server.request_count == 1 }
+        # The merge lands on the listing thread — await the merge event
+        # (A: the L1 broadcast at merge_listing; was the 5 s wall #2 —
+        # the F1 load-flake's race dies with the wall).
+        await(surface, "the listing merge into the menu") do
+          menu = surface.instance_variable_get(:@menu)
+          menu && menu.instance_variable_get(:@filtered).map { |item| item[:id] }.include?("mock-3")
         end
 
+        menu = surface.instance_variable_get(:@menu)
         ids = menu.instance_variable_get(:@filtered).map { |item| item[:id] }
         assert_includes ids, "mock-1", "the staged catalog entry renders immediately"
         assert_includes ids, "mock-3", "the listed id merged in — the endpoint threaded through build_surface"

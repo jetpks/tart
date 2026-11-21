@@ -256,7 +256,7 @@ module Tart
 
       # The child's first request proves it is mid-turn; the slow stream
       # holds the turn open for the steer to land and wait at the boundary.
-      wait_for_captures(15, "the child's first request") { child_requests(C_TASK).size == 1 }
+      wait_for_captures("the child's first request") { child_requests(C_TASK).size == 1 }
       assert_equal :running, @manager.runs.first[:state]
 
       receipt = @manager.steer(id: id, message: C_STEER, mode: "steer", ack_timeout_ms: 30_000)
@@ -270,7 +270,7 @@ module Tart
       assert log.any? { |e| e["requestId"] == receipt[:request_id] },
         "the child's steer log names the SAME request id (T1)"
 
-      wait_until_bounded(25, "the steered run to complete") { !@manager.outstanding? }
+      await(@manager, "the steered run to complete", belt: CHILD_BELT_S) { !@manager.outstanding? }
       assert_equal :completed, @manager.runs.first[:state]
       drain_captures
       steered = @captures.find do |r|
@@ -287,11 +287,14 @@ module Tart
       assert_equal "completed", status_json(run[:dir])["state"]
 
       # The completion notification queued on the hooks — the in-process
-      # seam the print drain records from (§2.6).
-      notify = wait_until_bounded(10, "the subagent-notify notification") do
+      # seam the print drain records from (§2.6). The settle queues the
+      # notification BEFORE its broadcast, so the manager's version only
+      # moves with the notification already visible.
+      await(@manager, "the subagent-notify notification", belt: CHILD_BELT_S) do
         @pending_notifications.concat(@hooks.pending_next_turn)
         @pending_notifications.find { |p| p[:custom_type] == "subagent-notify" }
       end
+      notify = @pending_notifications.find { |p| p[:custom_type] == "subagent-notify" }
       assert notify[:content].start_with?("Background task completed: **worker**"),
         "the §7 notification header through the real watcher"
       assert_ps_clean(@manager.runs.first[:pid])
@@ -310,10 +313,10 @@ module Tart
 
       @server.script([{type: :slow_stream, content: D_STOP_STREAM, chunk_every: 0.05}])
       run = @manager.spawn_run(agent: "worker", task: D_STOP_TASK, async: true, timeout_ms: 0)
-      wait_for_captures(15, "the stop target's first request") { child_requests(D_STOP_TASK).size == 1 }
+      wait_for_captures("the stop target's first request") { child_requests(D_STOP_TASK).size == 1 }
       receipt = @manager.stop(id: run[:id])
       assert_equal "Stop requested for async run #{run[:id]}.", receipt.to_s, "the §7 stop receipt bytes"
-      wait_until_bounded(10, "the stopped state") { run_state(run[:id]) == :stopped }
+      await(@manager, "the stopped state", belt: CHILD_BELT_S) { run_state(run[:id]) == :stopped }
       sj = status_json(run[:dir])
       assert_equal "stopped", sj["state"]
       assert_equal false, sj.fetch("timedOut", nil), "a user stop never sets timedOut"
@@ -322,7 +325,7 @@ module Tart
       @captures = []
       @server.script([{type: :slow_stream, content: D_DEADLINE_STREAM, chunk_every: 0.05}])
       deadline_run = @manager.spawn_run(agent: "worker", task: D_DEADLINE_TASK, async: true, timeout_ms: 1500)
-      wait_until_bounded(15, "the deadline state") { run_state(deadline_run[:id]) == :stopped }
+      await(@manager, "the deadline state", belt: CHILD_BELT_S) { run_state(deadline_run[:id]) == :stopped }
       sjd = status_json(deadline_run[:dir])
       assert_equal "stopped", sjd["state"]
       assert_equal true, sjd["timedOut"], "the run deadline lands stopped + timedOut true"
@@ -465,21 +468,14 @@ module Tart
       [out_r.read, err_r.read, status]
     end
 
-    # --- bounded polling (every wait carries an explicit bound) ---
+    # --- deterministic event waits (I103): the child's wire turns are
+    # awaited on the mock server's request-arrival seam, the run-state
+    # waits on the manager's settle broadcast (THE terminal event). The
+    # belt is the wedge guard only — CHILD_BELT_S because the producers
+    # are real child boots (~40 s cold under contention).
 
-    def wait_until_bounded(timeout, what)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      loop do
-        value = yield
-        return value if value
-        raise "timed out after #{timeout}s waiting for #{what}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-
-        sleep 0.05
-      end
-    end
-
-    def wait_for_captures(timeout, what)
-      wait_until_bounded(timeout, what) do
+    def wait_for_captures(what)
+      await(@server, what, belt: CHILD_BELT_S) do
         drain_captures
         yield
       end
@@ -505,12 +501,19 @@ module Tart
       run ? run[:state] : nil
     end
 
-    # No zombie (the T3 pin): the pid must vanish from the process table
-    # within a small reap allowance.
+    # No zombie (the T3 pin): block on the reap itself. Process.detach at
+    # spawn owns every owned child's reap, so a second detach+join returns
+    # exactly when the zombie is gone; ECHILD means it was already reaped
+    # (the manager's detach thread won the waitpid race) or was never ours
+    # to reap (a subprocess-owned child — its exited parent reaped it).
     def assert_ps_clean(pid)
-      wait_until_bounded(5, "pid #{pid} to be reaped (no zombie — T3)") do
-        `ps -p #{Integer(pid)} -o pid=`.strip.empty?
+      begin
+        Process.detach(Integer(pid)).join
+      rescue Errno::ECHILD, Errno::ESRCH
+        nil
       end
+      assert_empty `ps -p #{Integer(pid)} -o pid=`.to_s.split,
+        "pid #{pid} to be reaped (no zombie — T3)"
     end
 
     # --- artifact readers ---
@@ -712,16 +715,17 @@ module Tart
 
         # NO reply is ever written (the print parent never answers), and the
         # channel's terminal sweep leaves no request file after the run ends
-        # (T3's after-drain/shutdown letter — bounded poll).
+        # (T3's after-drain/shutdown letter). The sweep ran INSIDE the print
+        # parent before its exit (the drain joined the run; the poller stops
+        # with a final sweep), so the bare proof pins its product.
         replies = File.join(run_dir, "control", "supervisor-replies")
         requests = File.join(run_dir, "control", "supervisor-requests")
         assert File.directory?(replies), "the spawn created the supervisor-replies control dir"
         assert File.directory?(requests), "the spawn created the supervisor-requests control dir"
         assert_empty Dir.children(replies).reject { |f| f.start_with?(".") },
           "NO reply file is ever written under the run dir (OQ-8c)"
-        wait_until_bounded(5, "the channel's terminal sweep to clear the request files") do
-          Dir.children(requests).reject { |f| f.start_with?(".") }.empty?
-        end
+        assert_empty Dir.children(requests).reject { |f| f.start_with?(".") },
+          "the channel's terminal sweep to clear the request files"
         puts "[i48-e2e] leg E: exit 0, ask recorded on the parent session (request #{request_id}), " \
           "child bounded stopped/timedOut, no reply file, requests swept"
       ensure
@@ -783,7 +787,7 @@ module Tart
         assert_equal "Async: researcher [#{researcher[:id]}]", start.split("\n").first,
           "the profile's name rides the §7 start headline"
 
-        wait_for_captures(15, "the researcher child's request") { child_requests(F_RESEARCHER_TASK).size == 1 }
+        wait_for_captures("the researcher child's request") { child_requests(F_RESEARCHER_TASK).size == 1 }
         child = child_requests(F_RESEARCHER_TASK).first
         assert_equal F_RESEARCHER_MODEL_ID, child["model"],
           "the profile's model rides the child's wire (call model: > profile model > parent)"
@@ -812,7 +816,7 @@ module Tart
         assert prompt.include?("Do not use contact_supervisor for routine completion handoffs."),
           "the bridge closing rule byte-carried"
 
-        wait_until_bounded(25, "the researcher run to complete") { run_state(researcher[:id]) == :completed }
+        await(@manager, "the researcher run to complete", belt: CHILD_BELT_S) { run_state(researcher[:id]) == :completed }
         assert_equal F_RESEARCHER_FINAL, result_json(researcher[:dir])["output"].to_s.strip
         assert_ps_clean(researcher[:pid])
 
@@ -822,7 +826,7 @@ module Tart
         worker = @manager.runs.find { |r| r[:id] != researcher[:id] }
         assert worker, "the second run registered"
         assert_equal "Async: worker [#{worker[:id]}]", start2.split("\n").first
-        wait_until_bounded(25, "the worker run to complete") { run_state(worker[:id]) == :completed }
+        await(@manager, "the worker run to complete", belt: CHILD_BELT_S) { run_state(worker[:id]) == :completed }
         worker_prompt = File.read(File.join(worker[:dir], "system-prompt.md"))
         assert worker_prompt.include?(F_WORKER_BODY), "the PROJECT-tier body lands in the run dir"
         refute worker_prompt.include?(F_BUILTIN_WORKER_TOKEN),
@@ -1063,7 +1067,7 @@ module Tart
       id = run[:id]
       assert_equal "Async: worker [#{id}]", start.split("\n").first, "the §7 start message"
 
-      wait_for_captures(15, "the child's first request") { child_requests(C_TASK).size == 1 }
+      wait_for_captures("the child's first request") { child_requests(C_TASK).size == 1 }
       assert_equal :running, @manager.runs.first[:state]
 
       receipt = @manager.steer(id: id, message: C_STEER, mode: "steer", ack_timeout_ms: 30_000)
@@ -1077,7 +1081,7 @@ module Tart
       assert log.any? { |entry| entry["requestId"] == receipt[:request_id] },
         "the child's steer log names the SAME request id (T1)"
 
-      wait_until_bounded(25, "the steered run to complete") { !@manager.outstanding? }
+      await(@manager, "the steered run to complete", belt: CHILD_BELT_S) { !@manager.outstanding? }
       assert_equal :completed, @manager.runs.first[:state]
       drain_captures
       steered = @captures.find do |r|
@@ -1103,10 +1107,10 @@ module Tart
 
       @server.script([{type: :slow_stream, content: D_STOP_STREAM, chunk_every: 0.05}])
       run = @manager.spawn_run(agent: "worker", task: D_STOP_TASK, async: true, timeout_ms: 0)
-      wait_for_captures(15, "the stop target's first request") { child_requests(D_STOP_TASK).size == 1 }
+      wait_for_captures("the stop target's first request") { child_requests(D_STOP_TASK).size == 1 }
       receipt = @manager.stop(id: run[:id])
       assert_equal "Stop requested for async run #{run[:id]}.", receipt.to_s, "the §7 stop receipt bytes"
-      wait_until_bounded(10, "the stopped state") { run_state(run[:id]) == :stopped }
+      await(@manager, "the stopped state", belt: CHILD_BELT_S) { run_state(run[:id]) == :stopped }
       sj = status_json(run[:dir])
       assert_equal "stopped", sj["state"]
       assert_equal false, sj.fetch("timedOut", nil), "a user stop never sets timedOut"
