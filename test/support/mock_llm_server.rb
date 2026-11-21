@@ -82,6 +82,53 @@ class MockLLMServer
     # not interleave for concurrent requests (two requests matching the
     # SAME entry must serve that entry exactly once, in one piece).
     @script_mutex = Mutex.new
+    # I103 — the request-arrival gate (ADDITIVE; the rig shares this file):
+    # pinged when a captured request lands, so tests await arrivals instead
+    # of wall-clock budgets. No signature or behavior change. The mechanics
+    # live in the local +RequestGate+ (NOT Tart::Test::Gate) because the
+    # parity rig loads this file WITHOUT minitest.
+    @request_gate = RequestGate.new
+  end
+
+  # I103 state-signal read-through, so await(server, …) rides the same
+  # vocabulary as the lib seams.
+  def state_version
+    @request_gate.state_version
+  end
+
+  def wait_state_change(from_version, belt: 60)
+    @request_gate.wait_state_change(from_version, belt: belt)
+  end
+
+  # The request-arrival gate's mechanics (the Tart::Test::Gate shape,
+  # local: this file loads without minitest — the parity-rig contract).
+  class RequestGate
+    def initialize
+      @mutex = Mutex.new
+      @cv = ConditionVariable.new
+      @version = 0
+    end
+
+    def ping
+      @mutex.synchronize do
+        @version += 1
+        @cv.broadcast
+      end
+      nil
+    end
+
+    def state_version
+      @mutex.synchronize { @version }
+    end
+
+    def wait_state_change(from_version, belt: 60)
+      @mutex.synchronize do
+        until @version > from_version
+          return nil unless @cv.wait(@mutex, belt)
+        end
+        @version
+      end
+    end
   end
 
   # The Case-3 compaction instrument (I29): every response is served
@@ -192,6 +239,7 @@ class MockLLMServer
     }
     @request_logs << entry
     @requests << parsed_body unless parsed_body.nil?
+    @request_gate.ping # I103 — the arrival event
 
     spec = take_spec(parsed_body)
     if spec[:type] == :models

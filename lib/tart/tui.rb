@@ -114,6 +114,10 @@ module Tart
         @delivered_at = nil
         @laddering = false
         @exiting = false
+        # I103 seam state (waiter-side lock only — see signal_state_change).
+        @wait_mutex = Mutex.new
+        @state_cv = ConditionVariable.new
+        @state_version = 0
       end
 
       # Captures the current HUP/TERM handlers and installs tart's own. This
@@ -152,6 +156,30 @@ module Tart
         @codes.first
       end
 
+      # --- I103 state-signal seam (ADDITIVE observability only) ----------
+      # DELIVERED-FROM-TRAP-CONTEXT discipline (the class's own law — the
+      # handler touches no Mutex, @codes are GVL-atomic writes): the
+      # version bump + broadcast run LOCK-FREE on the producer side (the
+      # INT net's Queue#push-from-trap precedent), while the waiter side
+      # still locks. The waiter's version check + the await helper's final
+      # re-check close the producer-side race. Footprint: these two
+      # methods, signal_state_change, and its one call site — deleting
+      # them restores base behavior byte-for-byte.
+      def state_version
+        @state_version
+      end
+
+      # Parks until the version moves past from_version, belt-bounded (nil
+      # on belt expiry with no change). Production never calls this.
+      def wait_state_change(from_version, belt: 60)
+        @wait_mutex.synchronize do
+          until @state_version > from_version
+            return nil unless @state_cv.wait(@wait_mutex, belt)
+          end
+          @state_version
+        end
+      end
+
       # @return [Boolean] whether a signal exit is pending (the containment
       #   predicate: loop teardown and the bracket tail consult this).
       def signal_exit_pending?
@@ -177,6 +205,9 @@ module Tart
         if @codes.empty?
           @codes << code
           @delivered_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          # I103 — the pending_exit_code record's broadcast (lock-free
+          # here: trap context must never take a mutex).
+          signal_state_change
           # In-band routing (no raise): wake the loop's stop path. The push
           # from trap context is the INT net's proven pattern; when the loop
           # has not wired yet (boot window) the code just stays pending —
@@ -201,6 +232,19 @@ module Tart
       # containment law).
       def log_contained(error)
         warn "tart: contained after signal: #{error.class}: #{error.message.to_s[0, 160]}"
+      end
+
+      private
+
+      # I103 — the state-signal broadcast (additive observability): the
+      # pending_exit_code record inside {#deliver}. Runs in TRAP CONTEXT:
+      # it must never take a mutex (recursive-lock deadlock on the main
+      # thread), so the bump is the bare GVL-atomic write and the broadcast
+      # a bare CV broadcast — same discipline as @codes itself.
+      def signal_state_change
+        @state_version += 1
+        @state_cv.broadcast
+        nil
       end
 
       # The bounded ladder: each step is deadline-checked against the bound

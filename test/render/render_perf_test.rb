@@ -241,15 +241,19 @@ module Tart
       def test_render_perf_spinner_tick_fires_at_the_spinner_interval
         session = ScriptedSession.new
         fire_times = Queue.new
+        fire_gate = Gate.new
         event_loop = Core::Loop.new(session:, renderer: -> {
           fire_times << Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          fire_gate.ping # I103 (B): the fire landed
           "frame"
         })
 
         event_loop.run do
-          wait_until { !session.drawn.empty? } # the boot render
+          # I103 (B): the drawn surface's gate — the boot render.
+          await(session, "the boot render", cooperative: true) { !session.drawn.empty? }
           task = event_loop.tick(Chat::SPINNER_INTERVAL_SECONDS)
-          wait_until { fire_times.size >= 5 } # the boot + ≥4 fires at 80 ms
+          # I103 (B): the fire gate — the boot + ≥4 fires at 80 ms.
+          await(fire_gate, "the boot + ≥4 tick fires", cooperative: true) { fire_times.size >= 5 }
           task.stop
         end
 

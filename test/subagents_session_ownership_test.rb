@@ -251,7 +251,8 @@ module Tart
                                                  kernel: nil, agent: nil, owner_id: -> { owner_id })
       @channels << channel
       channel.start
-      wait_until { !channel.pending.empty? }
+      # The pending add is the channel's broadcast event (I103).
+      await(channel, "the owned ask to register") { !channel.pending.empty? }
 
       # The owned ask registered + surfaced, EXACTLY once; the foreign ask
       # never.
@@ -340,21 +341,11 @@ module Tart
       JSON.parse(File.read(File.join(dir, "status.json")))["pid"]
     end
 
-    # A REAL reaped pid (the health idiom): spawn, detach, wait for ESRCH.
+    # A REAL dead pid (the health idiom): the test owns the spawn, so a
+    # blocking waitpid reaps it — kill(0) then raises ESRCH (I103 class C).
     def dead_pid
       pid = Process.spawn("sleep", "0.05")
-      Process.detach(pid)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      begin
-        loop do
-          Process.kill(0, pid)
-          raise "reaped pid never died" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-
-          sleep 0.05
-        end
-      rescue Errno::ESRCH
-        nil
-      end
+      Process.waitpid(pid)
       pid
     end
 
@@ -363,19 +354,23 @@ module Tart
       pid = Process.spawn("sleep", "60", pgroup: true)
       Process.detach(pid)
       @spawns << pid
-      sleep 0.05 # let it exec
+      # The exec handshake (I103 class C): the child was spawned with
+      # pgroup: true, so this setpgid succeeds only until its exec —
+      # EACCES proves it is past exec; ESRCH that it is gone.
+      begin
+        Process.setpgid(pid, pid)
+      rescue Errno::EACCES, Errno::ESRCH
+        nil
+      end
       pid
     end
 
-    def wait_owned_terminal(manager, id, timeout = 25)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      record = manager.runs.find { |candidate| candidate[:id] == id }
-      until record && record[:state] != :running
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          flunk "owned run #{id} never settled"
-        end
-        sleep 0.1
+    # The run's terminal flip IS the manager's settle broadcast (I103):
+    # park on the manager's seam until the record leaves :running.
+    def wait_owned_terminal(manager, id)
+      await(manager, "owned run #{id} to settle", belt: CHILD_BELT_S) do
         record = manager.runs.find { |candidate| candidate[:id] == id }
+        record && record[:state] != :running
       end
     end
   end

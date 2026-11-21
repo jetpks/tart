@@ -448,6 +448,40 @@ module Tart
         @mutex.synchronize { @counters[session_id] || 0 }
       end
 
+      # Structural quiescence reader (I103 additive — the D-family's
+      # non-event predicate): queue-empty ∧ no due-window ∧ no in-flight
+      # POST across every capture. False mid-POST would break the
+      # then-assert-zero/one proofs (the queue is spliced before the POST
+      # runs, so queue-empty alone is not quiescence).
+      def idle?
+        @mutex.synchronize do
+          @due.nil? && !@posting && @captures.all? { |capture| capture.queue.empty? }
+        end
+      end
+
+      # --- I103 state-signal seam (ADDITIVE observability only) ----------
+      # The await-loop's version read + the test-only park, riding the
+      # engine's existing @mutex. The footprint is these two methods,
+      # idle?, signal_state_change, and its broadcast call sites: deleting
+      # them restores base behavior byte-for-byte (a broadcast with no
+      # waiter is a no-op; production never waits).
+      def state_version
+        @mutex.synchronize { @state_version ||= 0 }
+      end
+
+      # Parks until the version moves past from_version, belt-bounded (nil
+      # on belt expiry with no change). Production never calls this.
+      def wait_state_change(from_version, belt: 60)
+        @mutex.synchronize do
+          @state_version ||= 0
+          @state_cv ||= ConditionVariable.new
+          until @state_version > from_version
+            return nil unless @state_cv.wait(@mutex, belt)
+          end
+          @state_version
+        end
+      end
+
       def handle_session_start(event, context)
         context = context.is_a?(Hash) ? context : {}
         ref = context[:session].is_a?(Hash) ? context[:session] : nil
@@ -467,6 +501,7 @@ module Tart
           @counters[capture.session_id] = capture.counter
           ensure_thread
           @cond.signal
+          signal_state_change
         end
       rescue StandardError
         nil # swallowed — nothing thrown into the host, ever
@@ -512,6 +547,7 @@ module Tart
         @mutex.synchronize do
           @stop = true
           @cond.broadcast
+          signal_state_change
         end
         @thread&.join(2)
         @thread = nil
@@ -519,6 +555,17 @@ module Tart
       end
 
       private
+
+      # I103 — the state-signal broadcast (additive observability): the
+      # tail of every observed flusher mutation funnel under @mutex
+      # (bind/registry, queue push/pop, due-window arm/reset, capture
+      # close/unbind, POST completion, the stop flip). Bump the version,
+      # then broadcast under the lock — with no waiter this is a no-op.
+      def signal_state_change
+        @state_version = (@state_version || 0) + 1
+        (@state_cv ||= ConditionVariable.new).broadcast
+        nil
+      end
 
       # The last-bound capture (the one live events project into); a
       # closed capture is never re-projected.
@@ -537,6 +584,7 @@ module Tart
             @due = now_ms
             @cond.signal
           end
+          signal_state_change
         end
       end
 
@@ -545,6 +593,7 @@ module Tart
           capture.close
           @due = now_ms if @captures.any? { |c| !c.closed? && !c.queue.empty? }
           @cond.signal
+          signal_state_change
         end
       end
 
@@ -559,6 +608,7 @@ module Tart
           @due ||= now_ms + @tuning[:debounce_ms]
           ensure_thread
           @cond.signal
+          signal_state_change
         end
         report_loss(capture, "queue overflow: dropped #{dropped} oldest record(s) for session #{capture.session_id}") if dropped.positive?
       end
@@ -575,6 +625,7 @@ module Tart
           @captures.delete(capture)
           @due = nil
           records = capture.splice
+          signal_state_change
         end
         with_post_lock { post_batch(capture, records, terminal: true) }
         stop
@@ -591,6 +642,7 @@ module Tart
           @mutex.synchronize do
             @posting = false
             @cond.broadcast
+            signal_state_change # I103 — the POST completed
           end
         end
       end
@@ -611,6 +663,7 @@ module Tart
                 if remaining <= 0
                   @due = nil
                   work = splice_all
+                  signal_state_change # I103 — the queue pop
                   break
                 end
                 @cond.wait(@mutex, remaining / 1000.0)

@@ -54,23 +54,13 @@ module Tart
       {"PATH" => ENV["PATH"], "HOME" => @home, "PI_API_KEY" => "test-key", "PI_API_BASE" => @server.url}
     end
 
-    # A REAL reaped pid: spawn a short sleep, detach (the port's own reap
-    # discipline — no waitpid), and wait until kill(0) raises ESRCH on
-    # both the pid and its group — the exited? law's dead probe.
+    # A REAL dead pid: spawn a short sleep and block on its exit (and
+    # reap) — kill(0) then raises ESRCH on both the pid and its group,
+    # the exited? law's dead probe (I103 class C: the test owns the
+    # spawn, so a blocking waitpid is the primitive).
     def dead_pid
       pid = Process.spawn("sleep", "0.05")
-      Process.detach(pid)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      begin
-        loop do
-          Process.kill(0, pid)
-          raise "reaped pid never died" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-
-          sleep 0.05
-        end
-      rescue Errno::ESRCH
-        nil
-      end
+      Process.waitpid(pid)
       pid
     end
 
@@ -80,7 +70,14 @@ module Tart
       pid = Process.spawn("sleep", "60", pgroup: true)
       Process.detach(pid) # the port's own reap discipline — ESRCH must arrive on death
       @spawns << pid
-      sleep 0.05 # let it exec
+      # The exec handshake (I103 class C): the child was spawned with
+      # pgroup: true, so this setpgid succeeds only until its exec —
+      # EACCES proves it is past exec; ESRCH that it is gone.
+      begin
+        Process.setpgid(pid, pid)
+      rescue Errno::EACCES, Errno::ESRCH
+        nil
+      end
       pid
     end
 
@@ -265,8 +262,9 @@ module Tart
       record = manager.runs.find { |r| r[:id] == run[:id] }
       assert_equal true, %i[failed stopped].include?(record[:state]), record[:state].inspect
       assert File.file?(File.join(record[:dir], "result.json")), "the crash evidence landed in result.json"
-      # Owned async convergence still notifies (the frozen observable).
-      wait_until { !@hooks.pending_next_turn.empty? }
+      # Owned async convergence still notifies (the frozen observable) —
+      # the settle queues the notification before its broadcast (I103).
+      await(manager, "the completion notification", belt: CHILD_BELT_S) { !@hooks.pending_next_turn.empty? }
       assert_equal false, manager.outstanding?
       manager.shutdown
     end
@@ -429,26 +427,22 @@ module Tart
 
     # --- helpers (continuation) ---
 
-    def wait_owned_terminal(manager, id, timeout = 25)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      until manager.runs.find { |r| r[:id] == id } && manager.runs.find { |r| r[:id] == id }[:state] != :running
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          flunk "owned run #{id} never settled"
-        end
-        sleep 0.1
+    # The run's terminal flip IS the manager's settle broadcast (I103):
+    # park on the manager's seam until the record leaves :running.
+    def wait_owned_terminal(manager, id)
+      await(manager, "owned run #{id} to settle", belt: CHILD_BELT_S) do
+        record = manager.runs.find { |r| r[:id] == id }
+        record && record[:state] != :running
       end
     end
 
-    def wait_pid_gone(pid, timeout = 5)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    # The pid's death AND reap (I103 class C): the spawn-time detach owns
+    # the reap, so a second detach+join blocks exactly until the zombie
+    # is gone; ECHILD means the other detach already reaped it.
+    def wait_pid_gone(pid)
       begin
-        loop do
-          Process.kill(0, pid)
-          raise "pid never died" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-
-          sleep 0.05
-        end
-      rescue Errno::ESRCH
+        Process.detach(pid).join
+      rescue Errno::ECHILD, Errno::ESRCH
         nil
       end
     end

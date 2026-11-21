@@ -39,7 +39,7 @@ module Tart
       @server = MockLLMServer.new.start
       @home = Dir.mktmpdir("i49-intercom-home-")
       @cwd = Dir.mktmpdir("i49-intercom-cwd-")
-      @hooks = Hooks.new
+      @hooks = PingedHooks.new
       @kernel = fake_kernel
       @managers = []
       @channels = []
@@ -162,25 +162,21 @@ module Tart
       # the reply consumption).
       ctrl2 = new_ctrl
       seen = Queue.new
+      landing = stub_write_gate
       answerer = Thread.new do
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
-        while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-          files = Dir.glob(File.join(ctrl2, "supervisor-requests", "*.json"))
-          if (file = files.first)
-            begin
-              payload = JSON.parse(File.read(file))
-            rescue Errno::ENOENT
-              next # the child unlinked its own request between the glob and the read — the poll loop's next tick retries
-            end
-            seen << payload
-            Subagents::Supervisor.atomic_write_json(
-              File.join(ctrl2, "supervisor-replies", "#{payload['id']}.json"),
-              {type: Subagents::Supervisor::REPLY_TYPE, requestId: payload["id"],
-               createdAt: Subagents::Supervisor.now_ms, message: "STRUCTURED ANSWER"})
-            break
-          end
-          sleep 0.05
+        Thread.current.report_on_exception = false
+        landing.await("the child's interview ask to land") do
+          !Dir.glob(File.join(ctrl2, "supervisor-requests", "*.json")).empty?
         end
+        # The request file cannot vanish under this read: the tool unlinks
+        # its consumed request only AFTER the reply exists, and the reply
+        # is written below, after this read.
+        payload = JSON.parse(File.read(Dir.glob(File.join(ctrl2, "supervisor-requests", "*.json")).first))
+        seen << payload
+        Subagents::Supervisor.atomic_write_json(
+          File.join(ctrl2, "supervisor-replies", "#{payload['id']}.json"),
+          {type: Subagents::Supervisor::REPLY_TYPE, requestId: payload["id"],
+           createdAt: Subagents::Supervisor.now_ms, message: "STRUCTURED ANSWER"})
       end
       result = tool_for(ctrl2, timeout_ms: "8000").execute(
         reason: "interview_request", interview: {title: "shape", questions: ["q1"]})
@@ -195,6 +191,7 @@ module Tart
       assert request["expiresAt"].is_a?(Integer)
     ensure
       answerer.kill if answerer
+      restore_write_gate
     end
 
     def test_child_tool_rejects_over_the_64kb_cap
@@ -220,24 +217,21 @@ module Tart
     def test_child_tool_consumes_the_reply_and_unlinks_the_request
       ctrl = new_ctrl
       tool = tool_for(ctrl)
+      landing = stub_write_gate
       answerer = Thread.new do
-        100.times do
-          files = Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }
-          if (file = files.first)
-            begin
-              id = JSON.parse(File.read(File.join(ctrl, "supervisor-requests", file)))["id"]
-            rescue Errno::ENOENT
-              next # the child unlinked its consumed request between the Dir.children snapshot and the read — the poll loop's next tick retries
-            end
-            sleep 0.1
-            Subagents::Supervisor.atomic_write_json(
-              File.join(ctrl, "supervisor-replies", "#{id}.json"),
-              {type: Subagents::Supervisor::REPLY_TYPE, requestId: id,
-               createdAt: Subagents::Supervisor.now_ms, message: "YES PROCEED"})
-            next
-          end
-          sleep 0.05
+        Thread.current.report_on_exception = false
+        landing.await("the child's ask to land") do
+          !Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.empty?
         end
+        # The request file cannot vanish under this read: the tool unlinks
+        # its consumed request only AFTER the reply exists, and the reply
+        # is written below, after this read.
+        file = Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.first
+        id = JSON.parse(File.read(File.join(ctrl, "supervisor-requests", file)))["id"]
+        Subagents::Supervisor.atomic_write_json(
+          File.join(ctrl, "supervisor-replies", "#{id}.json"),
+          {type: Subagents::Supervisor::REPLY_TYPE, requestId: id,
+           createdAt: Subagents::Supervisor.now_ms, message: "YES PROCEED"})
       end
 
       result = tool.execute(reason: "need_decision", message: "may I proceed?")
@@ -247,6 +241,7 @@ module Tart
                    "the consumed request is unlinked"
     ensure
       answerer.kill if answerer
+      restore_write_gate
     end
 
     def test_child_tool_is_inert_without_a_channel
@@ -276,9 +271,10 @@ module Tart
       refute_empty @kernel.calls, "the wake kick rode kernel.async"
 
       # pending_next_turn is a drain (the loop's source): after consuming
-      # the first surface, three more ticks must NOT re-surface the ask
-      # (pi's request notice is never re-sent — pending is the re-read).
-      sleep Subagents::Supervisor::POLL_INTERVAL * 3
+      # the first surface, the STOPPED channel can never re-surface the
+      # ask (pi's request notice is never re-sent — pending is the
+      # re-read; the poller is joined, so the non-event is total).
+      channel.stop
       assert_empty @hooks.pending_next_turn, "the ask surfaces ONCE"
       assert_equal 1, channel.pending.size, "pending survives for the re-read path"
       assert_equal "Should I proceed?", channel.pending.first[:message]
@@ -302,17 +298,19 @@ module Tart
     def test_progress_requests_never_surface_and_are_consumed
       run = fake_run("worker")
       channel = new_channel
+      unlink_gate = stub_unlink_gate
       stage_request(run, reason: "progress_update", message: "PROGRESS-MARKER", expects_reply: false)
 
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      while File.exist?(request_path(run, "PROGRESS-MARKER")) && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        sleep 0.1
+      await(unlink_gate, "the progress request to be consumed") do
+        !File.exist?(request_path(run, "PROGRESS-MARKER"))
       end
 
       assert_empty channel.pending, "progress never registers pending"
       assert_empty @hooks.pending_next_turn.select { |p| p[:custom_type] == Subagents::Supervisor::REQUEST_CUSTOM_TYPE }
       assert_empty @kernel.calls, "progress never kicks the wake"
       refute File.exist?(request_path(run, "PROGRESS-MARKER")), "the progress request is consumed (unlinked)"
+    ensure
+      restore_unlink_gate
     end
 
     def test_lifecycle_sweep_reply_expiry_and_terminal_runs
@@ -321,15 +319,14 @@ module Tart
 
       # Terminal run (T3, pi's inactive): a stale ask for a settled run is
       # dropped + unlinked, never surfaced.
+      unlink_gate = stub_unlink_gate
       stage_request(done, reason: "need_decision", message: "STALE-RUN-MARKER")
       # Expired: past expiresAt.
       rid_expired = stage_request(done, reason: "need_decision", message: "EXPIRED-MARKER",
                                   expires_in_ms: -1_000)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      while (File.exist?(request_path(done, "STALE-RUN-MARKER")) ||
-             File.exist?(request_path(done, "EXPIRED-MARKER"))) &&
-            Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        sleep 0.1
+      await(unlink_gate, "the stale + expired asks to be swept") do
+        !File.exist?(request_path(done, "STALE-RUN-MARKER")) &&
+          !File.exist?(request_path(done, "EXPIRED-MARKER"))
       end
 
       refute File.exist?(request_path(done, "STALE-RUN-MARKER")), "the terminal-run ask is unlinked"
@@ -346,12 +343,13 @@ module Tart
         File.join(live[:dir], "control", "supervisor-replies", "#{rid}.json"),
         {type: Subagents::Supervisor::REPLY_TYPE, requestId: rid,
          createdAt: Subagents::Supervisor.now_ms, message: "answered elsewhere"})
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      while channel.pending.any? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        sleep 0.1
+      await(unlink_gate, "the reply to resolve the pending ask") do
+        channel.pending.empty? && !File.exist?(request_path(live, "RESOLVE-MARKER"))
       end
       assert_empty channel.pending, "the reply resolves the pending ask"
       refute File.exist?(request_path(live, "RESOLVE-MARKER")), "the resolved request is unlinked"
+    ensure
+      restore_unlink_gate
     end
 
     def test_t1_replies_address_request_ids_only
@@ -411,18 +409,19 @@ module Tart
     def test_channel_skips_poison_files_without_dying
       run = fake_run("worker")
       channel = new_channel
+      unlink_gate = stub_unlink_gate
       File.write(File.join(run[:dir], "control", "supervisor-requests", "garbage.json"), "{not json")
       rid = stage_request(run, reason: "need_decision", message: "the healthy ask")
 
       refute_nil wait_surfaced("the healthy ask"), "the healthy ask still surfaces"
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      while File.exist?(File.join(run[:dir], "control", "supervisor-requests", "garbage.json")) &&
-            Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        sleep 0.1
+      await(unlink_gate, "the poison file to be skipped") do
+        !File.exist?(File.join(run[:dir], "control", "supervisor-requests", "garbage.json"))
       end
       refute File.exist?(File.join(run[:dir], "control", "supervisor-requests", "garbage.json")),
              "the poison file is unlinked"
       assert_equal rid, channel.pending.first[:id]
+    ensure
+      restore_unlink_gate
     end
 
     # --- THE ROUND TRIP, channel form: a real print child unblocks ---
@@ -437,7 +436,9 @@ module Tart
       run = manager.spawn_run(agent: "worker", task: "ask the supervisor", async: true, timeout_ms: 0, tool_timeout_ms: 0)
       channel = new_channel
 
-      wait_for_request_file(run, "ROUND-TRIP-QUESTION")
+      # The child's ask landing is pinged by the channel's registration
+      # (the surface append follows it); the registered request file
+      # persists for read_single_request below.
       surfaced = wait_surfaced("ROUND-TRIP-QUESTION")
       refute_nil surfaced, "the child's own ask surfaces"
       child_rid = read_single_request(run)["id"]
@@ -445,7 +446,7 @@ module Tart
       receipt = channel.reply(reply_to: child_rid, message: "THE ANSWER")
       assert_equal "Replied to supervisor request #{child_rid}.", receipt
 
-      wait_terminal(manager, run[:id], 40)
+      wait_terminal(manager, run[:id])
       assert_equal :completed, manager.runs.first[:state]
 
       tool_results = @server.captured_requests.flat_map { |request| request["messages"] }
@@ -488,14 +489,13 @@ module Tart
                              tools: {"subagent" => tool}, hooks: @hooks, recorder:)
 
       run_in_background(loop, "kick off the asking child")
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
-      until (parent_run = manager.runs.first)
-        flunk "the parent never spawned the child" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.05
-      end
-      wait_for_request_file(parent_run, "PARENT-LOOP-QUESTION")
+      parent_run = nil
+      await(manager, "the parent to spawn the child") { parent_run = manager.runs.first }
       surfaced = wait_surfaced("PARENT-LOOP-QUESTION", requeue: true)
       refute_nil surfaced, "the channel surfaced the child's ask"
+      # Rule-12 follow-up: the kick is captured AFTER the surface append,
+      # so pin it with its own event before asserting on the capture.
+      await(@kernel, "the wake kick to be captured") { !@kernel.calls.empty? }
       refute_empty @kernel.calls, "the kick block was captured"
       child_run = parent_run
 
@@ -504,15 +504,16 @@ module Tart
       @kernel.calls.dup.each do |block|
         Core::Loop.new(session: Test::ScriptedSession.new).run { block.call }
       end
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
+      seen = []
       ask_request = nil
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline && ask_request.nil?
-        ask_request = @server.captured_requests.find do |request|
+      await(@server, "the wake turn to carry the ask") do
+        seen.concat(@server.captured_requests)
+        ask_request = seen.find do |request|
           request["messages"].any? do |message|
             message["role"] == "user" && message["content"].to_s.include?("PARENT-LOOP-QUESTION")
           end
         end
-        sleep 0.1
+        !ask_request.nil?
       end
       refute_nil ask_request, "the wake turn carried the ask to the model"
       # The wake request is the parent's NEXT turn (turn-1 history rides
@@ -532,9 +533,9 @@ module Tart
       child_rid = read_single_request(child_run)["id"]
       assert_equal "Replied to supervisor request #{child_rid}.",
                    manager.supervisor_channel.reply(reply_to: child_rid, message: "GO")
-      wait_terminal(manager, child_run[:id], 40)
+      wait_terminal(manager, child_run[:id])
       assert_equal :completed, manager.runs.find { |r| r[:id] == child_run[:id] }[:state]
-      join_run
+      @run_thread.join # blocking (the parent's turns all ended) — a bare join is not a sleep
     ensure
       manager&.shutdown
     end
@@ -563,10 +564,7 @@ module Tart
       receipt = tool.execute(action: "reply", reply_to: rid, message: "ANSWERED")
       assert_equal "Replied to supervisor request #{rid}.", receipt
 
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      while manager.supervisor_channel.pending.any? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        sleep 0.1
-      end
+      await(channel, "the reply to consume the pending ask") { manager.supervisor_channel.pending.empty? }
       assert_equal "No pending supervisor requests.", tool.execute(action: "pending")
 
       unknown = tool.execute(action: "wat")
@@ -802,14 +800,6 @@ module Tart
       flunk "the single request file vanished between the glob and the read (the channel consumed it mid-read): #{files.first.inspect}"
     end
 
-    def wait_for_request_file(run, message)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 20
-      until request_file(run, message)
-        flunk "the child never wrote its ask (#{message})" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.1
-      end
-    end
-
     def request_file(run, message)
       Dir.glob(File.join(requests_dir(run), "*.json")).find do |path|
         JSON.parse(File.read(path))["message"] == message
@@ -820,34 +810,30 @@ module Tart
 
     # pending_next_turn is a DRAIN (the loop's source) — +requeue:+ puts
     # the drained entries back (FIFO) for tests where the wake must be the
-    # consumer (the parent-loop round trip).
+    # consumer (the parent-loop round trip). The fence is the hooks
+    # double's Gate: send_next_turn pings right after the append.
     def wait_surfaced(message, requeue: false)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
       drained = []
       hit = nil
-      until hit || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      await(@hooks, "the ask to surface (#{message})") do
         batch = @hooks.pending_next_turn
         hit = batch.find do |pending|
           pending[:custom_type] == Subagents::Supervisor::REQUEST_CUSTOM_TYPE &&
             pending[:content].to_s.include?(message)
         end
         drained.concat(batch)
-        sleep 0.1 unless hit
+        !hit.nil?
       end
       drained.each { |entry| @hooks.send_next_turn(**entry) } if requeue
       hit
     end
 
-    def wait_terminal(manager, id, timeout = 25)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    def wait_terminal(manager, id)
       record = nil
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      await(manager, "run #{id} to settle") do
         record = manager.runs.find { |r| r[:id] == id }
-        break if record && record[:state] != :running
-
-        sleep 0.1
+        record && record[:state] != :running
       end
-      flunk "run #{id} never settled: #{record && record[:state]}" unless record && record[:state] != :running
       record[:state]
     end
 
@@ -866,23 +852,91 @@ module Tart
       end
     end
 
-    def join_run
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
-      until !@run_thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.02
-      end
-      flunk "the parent run never finished" if @run_thread.alive?
-      @run_thread.join
-    end
-
     def fake_kernel
       kernel = Object.new
+      kick_gate = Gate.new
       kernel.define_singleton_method(:async) do |&block|
         (@calls ||= []) << block
+        kick_gate.ping # I103 (B) — the capture event the tests await
         nil
       end
       kernel.define_singleton_method(:calls) { @calls ||= [] }
+      kernel.define_singleton_method(:state_version) { kick_gate.state_version }
+      kernel.define_singleton_method(:wait_state_change) do |from_version, belt: WEDGE_BELT_S|
+        kick_gate.wait_state_change(from_version, belt: belt)
+      end
       kernel
+    end
+
+    # The hooks double's Gate (I103 B): send_next_turn's append is the
+    # surfaced-ask mutation — a subclass pings a Gate right after it so
+    # queue drains park on the event, not a poll.
+    class PingedHooks < Hooks
+      def initialize
+        super
+        @queue_gate = Tart::Test::Gate.new
+      end
+
+      def send_next_turn(custom_type:, content:, display: false)
+        result = super
+        @queue_gate.ping
+        result
+      end
+
+      def state_version
+        @queue_gate.state_version
+      end
+
+      def wait_state_change(from_version, belt: WEDGE_BELT_S)
+        @queue_gate.wait_state_change(from_version, belt: belt)
+      end
+    end
+
+    # The write-seat Gate (I103 B): the child tool's ask lands through
+    # Supervisor.atomic_write_json (its only test-visible write seat), so
+    # the stub pings a Gate at that mutation point — the TOCTOU idiom's
+    # alias/restore shape. Restore through +restore_write_gate+ in the
+    # pin's ensure.
+    def stub_write_gate
+      gate = Gate.new
+      Subagents::Supervisor.singleton_class.send(:alias_method, :write_gate_unstubbed_write, :atomic_write_json)
+      Subagents::Supervisor.singleton_class.send(:define_method, :atomic_write_json) do |path, payload|
+        result = write_gate_unstubbed_write(path, payload)
+        gate.ping
+        result
+      end
+      gate
+    end
+
+    def restore_write_gate
+      return unless Subagents::Supervisor.singleton_class.method_defined?(:write_gate_unstubbed_write)
+
+      Subagents::Supervisor.singleton_class.send(:alias_method, :atomic_write_json, :write_gate_unstubbed_write)
+      Subagents::Supervisor.singleton_class.send(:remove_method, :write_gate_unstubbed_write)
+    end
+
+    # The unlink-seat Gate (I103 B): the channel's silent consumption arms
+    # (the progress drop, the poison skip, the stale/expired verdict, the
+    # resolve sweep's file removal) unlink with NO seam signal, so the
+    # test pings the writer it can see: a narrow File.unlink wrap (the
+    # same alias/restore idiom as stub_glob_unlinking_first). Restore
+    # through +restore_unlink_gate+ in the pin's ensure.
+    def stub_unlink_gate
+      gate = Gate.new
+      File.singleton_class.send(:alias_method, :unlink_gate_unstubbed_unlink, :unlink)
+      File.singleton_class.send(:define_method, :unlink) do |*args, **kwargs|
+        result = unlink_gate_unstubbed_unlink(*args, **kwargs)
+        gate.ping
+        result
+      end
+      gate
+    end
+
+    def restore_unlink_gate
+      return unless File.singleton_class.method_defined?(:unlink_gate_unstubbed_unlink)
+
+      File.singleton_class.send(:alias_method, :unlink, :unlink_gate_unstubbed_unlink)
+      File.singleton_class.send(:remove_method, :unlink_gate_unstubbed_unlink)
     end
 
     # The CLOSED manager env: the child boots the mock endpoint through

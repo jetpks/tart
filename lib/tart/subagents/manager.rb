@@ -274,9 +274,13 @@ module Tart
           @mutex.synchronize do
             record[:pid] = pid
             record[:pgid] = pid
+            signal_state_change
           end
           write_status(record)
-          @mutex.synchronize { @runs << record }
+          @mutex.synchronize do
+            @runs << record
+            signal_state_change
+          end
         rescue StandardError
           close_exit_pipe(record)
           raise
@@ -352,7 +356,10 @@ module Tart
         atomic_write_json(File.join(stop_requests_dir(record[:dir]),
                                     "#{ts.to_s.rjust(13, "0")}-#{Fast::UUID.uuid_v4}.json"),
                           {"type" => "stop", "ts" => ts})
-        @mutex.synchronize { record[:stopped] = true }
+        @mutex.synchronize do
+          record[:stopped] = true
+          signal_state_change
+        end
         await_exit(record, STOP_GRACE_SECONDS)
         escalate(record, "TERM", TERM_GRACE_SECONDS)
         escalate(record, "KILL", POLL_INTERVAL)
@@ -395,6 +402,29 @@ module Tart
         @mutex.synchronize { @runs.any? { |record| record[:owned] && record[:state] == :running } }
       end
 
+      # --- I103 state-signal seam (ADDITIVE observability only) ----------
+      # The await-loop's version read + the test-only park, riding the
+      # registry's existing @mutex. The footprint is these two methods,
+      # signal_state_change, and its broadcast call sites: deleting them
+      # restores base behavior byte-for-byte (a broadcast with no waiter
+      # is a no-op; production never waits).
+      def state_version
+        @mutex.synchronize { @state_version ||= 0 }
+      end
+
+      # Parks until the version moves past from_version, belt-bounded (nil
+      # on belt expiry with no change). Production never calls this.
+      def wait_state_change(from_version, belt: 60)
+        @mutex.synchronize do
+          @state_version ||= 0
+          @state_cv ||= ConditionVariable.new
+          until @state_version > from_version
+            return nil unless @state_cv.wait(@mutex, belt)
+          end
+          @state_version
+        end
+      end
+
       # §5.4 — the print agent-end drain: waits for every outstanding run
       # (each bounded by its own deadline — the supervisors enforce it),
       # the watcher recording each completion notification on the hooks
@@ -409,7 +439,10 @@ module Tart
       # then join the watcher + supervisor threads; the I49 supervisor
       # channel stops LAST (its terminal sweep sees the settled runs).
       def shutdown
-        @mutex.synchronize { @shutdown = true }
+        @mutex.synchronize do
+          @shutdown = true
+          signal_state_change
+        end
         # I78 Law 3: the stop ladder arms ONLY owned runs — stopping a
         # foreign child from teardown would signal another session's run.
         ids = @mutex.synchronize do
@@ -530,6 +563,7 @@ module Tart
             record_session_start_locked(resolved, startup: true)
           end
           @session_owner_id = resolved
+          signal_state_change
         end
         # The channel drop runs STRICTLY AFTER the manager mutex is
         # released (the standing ordering law — no manager→channel
@@ -574,6 +608,7 @@ module Tart
           @kept_work.delete(id)
           @kept_work << id
           @kept_work.shift while @kept_work.size > MAX_RECORDED_SESSIONS
+          signal_state_change
         end
         nil
       end
@@ -581,7 +616,10 @@ module Tart
       # The not-left arm (pi releaseSessionWork): whoever replaces this
       # session next inherits as usual.
       def release_session_work(id)
-        @mutex.synchronize { @kept_work.delete(id) }
+        @mutex.synchronize do
+          @kept_work.delete(id)
+          signal_state_change
+        end
         nil
       end
 
@@ -616,6 +654,19 @@ module Tart
 
       private
 
+      # I103 — the state-signal broadcast (additive observability): the
+      # tail of every observed run-record mutation funnel under @mutex
+      # (spawn/append, the pid/pgid stamp, stopped/signaled flags, the
+      # settle's terminal flip + notification, every reap leg, the
+      # deadline flags, the watcher/shutdown lifecycle, the succession
+      # registry writes). Bump the version, then broadcast under the lock
+      # — with no waiter this is a no-op.
+      def signal_state_change
+        @state_version = (@state_version || 0) + 1
+        (@state_cv ||= ConditionVariable.new).broadcast
+        nil
+      end
+
       # --- I101 — the registry's locked internals (the public API and
       # --- the identity consult drive these under ONE @mutex
       # --- synchronize; no public method is ever called under the lock
@@ -634,6 +685,7 @@ module Tart
         @session_chains[new_id] = chain
         @session_chains.shift while @session_chains.size > MAX_RECORDED_SESSIONS
         @kept_work.delete(previous_id) # the mark is spent (D4)
+        signal_state_change
       end
 
       def record_session_start_locked(id, startup:)
@@ -645,6 +697,7 @@ module Tart
           chain = @session_chains[key]
           @session_chains[key] = chain - [id] if chain.include?(id)
         end
+        signal_state_change
       end
 
       def kept_work?(id)
@@ -820,7 +873,10 @@ module Tart
         return if exited?(record) || terminal?(record[:state])
 
         kill_process_group(record[:pid], signal)
-        @mutex.synchronize { record[:signaled] = signal == "TERM" ? 15 : 9 }
+        @mutex.synchronize do
+          record[:signaled] = signal == "TERM" ? 15 : 9
+          signal_state_change
+        end
         await_exit(record, grace)
       end
 
@@ -913,6 +969,9 @@ module Tart
           # false` REALLY implies the notification is queued, as the comment
           # below always claimed.
           notify_completion(record) if record[:owned] && record[:async]
+          # I103 — the settle's broadcast (the terminal flip + the
+          # notification are both visible; THE reap/terminal event).
+          signal_state_change
         end
         close_exit_pipe(record)
         kick_box_draw
@@ -935,6 +994,7 @@ module Tart
           @mutex.synchronize do
             record[:state] = disk["state"].to_sym
             record[:timed_out] = disk["timedOut"] == true
+            signal_state_change
           end
           adopt_box_facts(record, disk)
           close_exit_pipe(record)
@@ -956,6 +1016,7 @@ module Tart
           return if @shutdown || @watcher&.alive?
 
           @watcher = Thread.new { watch_loop }
+          signal_state_change
         end
       end
 
@@ -1002,6 +1063,7 @@ module Tart
         @mutex.synchronize do
           record[:deadline_due] = true
           record[:timed_out] = true
+          signal_state_change
         end
         write_stop_request(record)
         await_exit(record, STOP_GRACE_SECONDS)
@@ -1105,6 +1167,7 @@ module Tart
         @mutex.synchronize do
           record[:state] = disk["state"].to_sym
           record[:timed_out] = disk["timedOut"] == true
+          signal_state_change
         end
         adopt_box_facts(record, disk)
         close_exit_pipe(record)
@@ -1151,6 +1214,7 @@ module Tart
           record[:last_update] = now
           record[:ended_at] = now
           record[:error] = result["error"]
+          signal_state_change
         end
         kick_box_draw
         record
@@ -1190,6 +1254,7 @@ module Tart
           record[:last_update] = now
           record[:ended_at] = now
           record[:error] = message
+          signal_state_change
         end
         kick_box_draw
         record

@@ -475,9 +475,9 @@ module Tart
       transcript = File.join(doubled, "2026-10-18T07-44-19-606Z_#{id}.jsonl")
       File.write(transcript, "{\"type\":\"session_start\"}\n")
       pid = Process.spawn("sleep", "0.05")
-      Process.detach(pid)
-      # Poll the sleeper's exit (and reap) instead of a fixed 0.5 s window.
-      wait_until { !system("ps -p #{pid} >/dev/null 2>&1") }
+      # Block on the sleeper's exit (and reap) instead of a fixed 0.5 s
+      # window — a blocking waitpid (the test owns the spawn, I103 class C).
+      Process.waitpid(pid)
       File.write(File.join(dir, "status.json"), JSON.generate(
         {"id" => id, "agent" => "worker", "task" => nil, "taskChars" => 5, "mode" => "single",
          "state" => "running", "pid" => pid, "cwd" => @cwd, "asyncDir" => dir,
@@ -644,20 +644,14 @@ module Tart
       manager = new_manager
       manager.spawn_run(agent: "worker", task: "invariant", async: true, timeout_ms: 0, tool_timeout_ms: 0)
 
-      # Hammer outstanding? until the run is observably terminal; at THAT
-      # first observation the queue must already carry the notification
-      # (atomic under the fix; any hit on the unfixed code is the race).
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
-      settled = false
-      until settled || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        next if manager.outstanding?
-
-        settled = true
-        pend = @hooks.pending_next_turn
-        refute_empty pend, "terminal observed but the notification was not yet queued (the settle/notify window)"
-        assert pend.any? { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
-      end
-      assert settled, "the run never settled within the window"
+      # The settle broadcast IS the terminal event (I103); at THAT first
+      # observation the queue must already carry the notification (atomic
+      # under the fix — the notify queues inside the settle's mutex, before
+      # the broadcast).
+      await(manager, "the run to settle", belt: CHILD_BELT_S) { !manager.outstanding? }
+      pend = @hooks.pending_next_turn
+      refute_empty pend, "terminal observed but the notification was not yet queued (the settle/notify window)"
+      assert pend.any? { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
       wait_terminal(manager, manager.runs.first[:id])
       assert_equal :completed, manager.runs.first[:state]
     end
@@ -686,8 +680,9 @@ module Tart
       manager = new_manager
       run = manager.spawn_run(agent: "worker", task: "steer me", async: true, timeout_ms: 0, tool_timeout_ms: 0)
       # The child is mid-stream — its first captured request is the marker
-      # (boot-time tolerant: the poll waits out the real child boot).
-      wait_until { @server.request_count >= 1 }
+      # (boot-time tolerant: the server's arrival seam waits out the real
+      # child boot).
+      await(@server, "the child's first wire request", belt: CHILD_BELT_S) { @server.request_count >= 1 }
 
       # The request file format — the follow_up write waits in the inbox
       # while the child streams (no boundary until the stream ends).
@@ -743,7 +738,7 @@ module Tart
       assert_equal "Failed to queue steering for async run #{run[:id]}: " \
                    "steer message exceeds #{Subagents::Manager::STEER_MESSAGE_CAP_BYTES} UTF-8 bytes.", big[:text]
 
-      wait_terminal(manager, run[:id], 40)
+      wait_terminal(manager, run[:id])
 
       # A terminal run misses.
       missed = manager.steer(id: run[:id], message: "late", mode: "steer", ack_timeout_ms: 100)
@@ -756,21 +751,28 @@ module Tart
       @server.script([{type: :slow_stream, content: "s" * 200, chunk_every: 0.5}, {type: :stream, content: "never"}])
       manager = new_manager
       run = manager.spawn_run(agent: "worker", task: "stop target", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      wait_until { manager.runs.first[:state] == :running } # the child is in flight
+      await(manager, "the child to be in flight", belt: CHILD_BELT_S) { manager.runs.first[:state] == :running }
       assert_equal :running, manager.runs.first[:state]
 
       receipt = manager.stop(id: run[:id])
       assert_equal "Stop requested for async run #{run[:id]}.", receipt
 
-      wait_terminal(manager, run[:id], 15)
+      wait_terminal(manager, run[:id])
       settled = manager.runs.first
       assert_equal :stopped, settled[:state]
       refute settled[:timed_out], "a user stop never sets timedOut"
       status = JSON.parse(File.read(File.join(settled[:dir], "status.json")))
       assert_equal "stopped", status["state"]
       assert_equal false, status["timedOut"]
-      # Poll the zombie's absence instead of a fixed 0.5 s window.
-      wait_until { `ps -o stat= -p #{settled[:pid]} 2>/dev/null`.strip.empty? }
+      # Block on the reap instead of polling the zombie's absence — the
+      # manager's spawn-time Process.detach owns it; this second detach+
+      # join returns exactly when the zombie is gone (ECHILD: the manager's
+      # detach thread already reaped it).
+      begin
+        Process.detach(settled[:pid]).join
+      rescue Errno::ECHILD, Errno::ESRCH
+        nil
+      end
       assert_empty `ps -o stat= -p #{settled[:pid]} 2>/dev/null`.strip,
                    "no zombie — Process.detach owns the reap"
     end
@@ -781,7 +783,7 @@ module Tart
       run = manager.spawn_run(agent: "worker", task: "deadline target", async: true,
                               timeout_ms: 1500, tool_timeout_ms: 0)
 
-      wait_terminal(manager, run[:id], 15)
+      wait_terminal(manager, run[:id])
       settled = manager.runs.first
       assert_equal :stopped, settled[:state]
       assert settled[:timed_out]
@@ -800,7 +802,7 @@ module Tart
       run = manager.spawn_run(agent: "worker", task: "self deadline", async: true,
                               timeout_ms: 1500, tool_timeout_ms: 0)
 
-      wait_terminal(manager, run[:id], 15)
+      wait_terminal(manager, run[:id])
       settled = manager.runs.first
       assert_equal :stopped, settled[:state]
       assert settled[:timed_out], "the child self-deadline enforced the run deadline"
@@ -982,22 +984,13 @@ module Tart
       {"PATH" => ENV["PATH"], "HOME" => @home, "PI_API_KEY" => "test-key", "PI_API_BASE" => @server.url}
     end
 
-    def wait_terminal(manager, id, timeout = 25)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      until manager.runs.find { |r| r[:id] == id } && manager.runs.find { |r| r[:id] == id }[:state] != :running
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          record = manager.runs.find { |r| r[:id] == id } || {}
-          flunk "run #{id} never settled: #{record[:state].inspect} (stderr: #{stderr_head(record)})"
-        end
-        sleep 0.1
+    # The run's terminal flip IS the manager's settle broadcast (I103):
+    # park on the manager's seam until the record leaves :running.
+    def wait_terminal(manager, id)
+      await(manager, "run #{id} to settle", belt: CHILD_BELT_S) do
+        record = manager.runs.find { |r| r[:id] == id }
+        record && record[:state] != :running
       end
-    end
-
-    def stderr_head(record)
-      return "(no dir)" unless record[:dir]
-
-      path = File.join(record[:dir], "runner.stderr.log")
-      File.file?(path) ? File.read(path)[0, 400] : "(no log)"
     end
 
     def result_path(run)

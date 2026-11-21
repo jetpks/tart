@@ -341,10 +341,8 @@ module Tart
                                              "PI_API_KEY" => "test-key", "PI_API_BASE" => @server.url},
                                        identity: "pi", hooks: Hooks.new, root: @root)
       run = manager.spawn_run(agent: "scout", task: "t", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 20
-      until manager.runs.first[:state] != :running || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.1
-      end
+      # The settle broadcast IS the terminal event (I103).
+      await(manager, "the scout run to settle", belt: CHILD_BELT_S) { manager.runs.first[:state] != :running }
       assert_equal :completed, manager.runs.first[:state]
       assert run[:dir].start_with?(File.join(@home, "subagents"))
       _, env = manager.spawn_argv_and_env(run)

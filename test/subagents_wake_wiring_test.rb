@@ -97,15 +97,14 @@ module Tart
       # parent's wake — a NEW model request, zero keypress.
       seen = []
       wake_request = nil
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
-      while wake_request.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      await(@server, "the completion notify to open a parent turn") do
         seen.concat(@server.captured_requests)
         wake_request = seen.find do |request|
           request["messages"].any? do |message|
             message["role"] == "user" && message["content"].to_s.include?("Background task completed: **worker**")
           end
         end
-        sleep 0.05 unless wake_request
+        !wake_request.nil?
       end
 
       refute_nil wake_request, "the completion notify never opened a parent turn"
@@ -141,13 +140,12 @@ module Tart
       # round-trip assertions shape).
       seen = []
       ask_request = nil
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
-      while ask_request.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      await(@server, "the supervisor ask to open a parent turn") do
         seen.concat(@server.captured_requests)
         ask_request = seen.find do |request|
           request["messages"].any? { |m| m["role"] == "user" && m["content"].to_s.include?(message) }
         end
-        sleep 0.05 unless ask_request
+        !ask_request.nil?
       end
 
       refute_nil ask_request, "the supervisor ask never opened a parent turn"
@@ -203,7 +201,7 @@ module Tart
 
     def test_print_mode_nil_kernel_never_wakes_and_never_warns
       @server.script([{type: :stream, content: "PRINT MODE CHILD DONE"}])
-      hooks = Hooks.new
+      hooks = PingedHooks.new
       manager = new_manager(hooks:, kernel: nil, agent: nil)
       channel = Subagents::SupervisorChannel.new(home: manager.home, hooks:, kernel: nil, agent: nil)
       @channels << channel
@@ -219,8 +217,11 @@ module Tart
         wait_terminal(manager, child[:id])
         assert_equal :completed, child[:state]
         # Terminal ⇒ queued (the settle atomicity pin); accumulate BOTH
-        # queue riders across the poll — pending_next_turn is a drain.
-        wait_until { drained.concat(hooks.pending_next_turn); drained.size >= 2 }
+        # queue riders across the drain — pending_next_turn is a drain.
+        await(hooks, "the ask + the notify to ride the queue") do
+          drained.concat(hooks.pending_next_turn)
+          drained.size >= 2
+        end
         manager.send(:kick_wake) # the nil arm: silent return, no raise
       end
 
@@ -233,6 +234,30 @@ module Tart
       assert_includes ask[:content], "PRINT-MODE ASK"
       notify = drained.find { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
       assert notify[:content].start_with?("Background task completed: **worker**")
+    end
+
+    # The hooks double's Gate (I103 B): send_next_turn's append is the
+    # surfaced/notify mutation — a subclass pings a Gate right after it so
+    # queue drains park on the event, not a poll.
+    class PingedHooks < Hooks
+      def initialize
+        super
+        @queue_gate = Tart::Test::Gate.new
+      end
+
+      def send_next_turn(custom_type:, content:, display: false)
+        result = super
+        @queue_gate.ping
+        result
+      end
+
+      def state_version
+        @queue_gate.state_version
+      end
+
+      def wait_state_change(from_version, belt: WEDGE_BELT_S)
+        @queue_gate.wait_state_change(from_version, belt: belt)
+      end
     end
 
     # --- harness (self-contained; the intercom/box idioms restated) ---
@@ -286,16 +311,12 @@ module Tart
       id
     end
 
-    def wait_terminal(manager, id, timeout = 40)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    def wait_terminal(manager, id)
       record = nil
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      await(manager, "run #{id} to settle") do
         record = manager.runs.find { |r| r[:id] == id }
-        break if record && record[:state] != :running
-
-        sleep 0.1
+        record && record[:state] != :running
       end
-      flunk "run #{id} never settled: #{record && record[:state]}" unless record && record[:state] != :running
       record[:state]
     end
 
@@ -323,17 +344,13 @@ module Tart
       [kernel, thread, rail_else]
     end
 
-    # The bounded teardown: a wedged kernel fails the pin instead of
-    # hanging the suite.
+    # The teardown: stop! requests the terminal event synchronously; the
+    # blocking join is the C primitive after it (a bare join is not a
+    # sleep).
     def stop_kernel(kernel, thread)
       return unless thread
 
       kernel&.stop!
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
-      until !thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.02
-      end
-      flunk "the wake kernel never stopped" if thread.alive?
       thread.join
     end
   end

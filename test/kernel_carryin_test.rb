@@ -34,12 +34,16 @@ module Tart
       # Yield to the reactor before raising: async 2.46 logs "Task may have
       # ended with unhandled exception" unless someone is waiting on the task
       # (task.rb:224-226 `unless @promise.waiting?`), and a synchronous raise
-      # beats the kernel's supervisor to the wait. The yield lets the
-      # supervisor register, so the failure stays observed as handled — the
-      # kernel still reraises it after teardown, which is what we assert.
+      # beats the kernel's supervisor to the wait. The boot await parks this
+      # work fiber until the kernel's post-boot broadcast, so the supervisor
+      # registers before the raise — the failure stays observed as handled —
+      # and the kernel still reraises it after teardown, which is what we
+      # assert.
       error = assert_raises(RuntimeError) do
         event_loop.run do
-          sleep 0.001
+          await(event_loop, "the kernel's boot broadcast", cooperative: true) do
+            event_loop.state_version >= 1
+          end
           raise "work boom"
         end
       end
@@ -103,7 +107,9 @@ module Tart
       session = ScriptedSession.new
       event_loop = Core::Loop.new(session:)
       thread = Thread.new do
-        sleep 0.1
+        # I103 (A): the kernel's post-boot broadcast — the foreign stopper
+        # parks on the loop's seam instead of betting a delay on the boot.
+        await(event_loop, "the kernel's boot broadcast") { event_loop.state_version >= 1 }
         event_loop.stop!
       end
 
