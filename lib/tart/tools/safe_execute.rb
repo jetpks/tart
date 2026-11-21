@@ -4,11 +4,26 @@ require_relative "../schemas/tools"
 
 module Tart
   module Tools
+    # I102 (KB I17 S1) — a tool call that exceeded its deadline and was killed by its
+    # own watchdog (grep's rg spawn). The raised message IS the complete,
+    # model-facing teaching refusal, so safe_execute renders it VERBATIM —
+    # no class prefix, no backtrace site — and the session survives.
+    class ToolTimeout < StandardError
+    end
+
     # Shared behavior of the built-in tools: every execution failure comes
     # back to the model as an {error: message} result (pi's agent loop turns
     # tool errors into error tool results), never as a loop crash. Cancellation
     # always propagates.
     module SafeExecute
+      # I102 (KB I15 S3) — the CLI-style flag hint: the engine's unknown-keyword
+      # validation error gains ONE line when the offending key looks
+      # CLI-style (starts with "-"; the observed class — grep called
+      # with "-i": "true"). Text only: no flag key is accepted
+      # anywhere, by any tool.
+      CLI_FLAG_HINT =
+        "CLI-style flag; tools take named parameters — e.g. `ignoreCase` for case-insensitive search".freeze
+
       def self.included(base)
         base.extend(ClassMethods)
       end
@@ -27,6 +42,18 @@ module Tart
         def declared_properties
           schema = parameters
           (schema[:properties] || schema["properties"] || {}).keys.map(&:to_s)
+        end
+
+        # I102 (KB I11.5) — the declared OPTIONAL property names (Strings): declared
+        # properties minus the schema's `required` list (same both-spelling
+        # read as declared_properties). The null-optional compaction set —
+        # an explicit nil for one of these is "not supplying the key".
+        def optional_properties
+          @optional_properties ||= begin
+            schema = parameters
+            required = schema[:required] || schema["required"] || []
+            declared_properties.reject { |name| required.include?(name) }
+          end
         end
 
         # I97 Law 1 — the schema is the SINGLE hand-maintained declaration
@@ -117,8 +144,15 @@ module Tart
       # arguments speak string keys, the schema speaks symbols; the
       # +tool_call+ duck rides only when #execute declares the keyword
       # (the replaced client's execute_accepts_tool_call? idiom).
+      #
+      # I102 (KB I11.5) null-optional compaction: an explicit nil for a DECLARED
+      # OPTIONAL property drops BEFORE the rename/binding and before any
+      # validation reaches the op — `param: null` behaves identically to
+      # omitting the key. Required properties keep their nil (the refusal
+      # is unchanged) and off-schema keys pass through untouched (Law 3's
+      # binds-or-raises posture).
       def call(tool_call: nil, **arguments)
-        normalized = arguments.transform_keys(&:to_sym)
+        normalized = compact_null_optionals(arguments.transform_keys(&:to_sym))
         # I97 Law 3 — the seam owns the translation (ONE place, schema-derived
         # from Law 1's map): ONLY schema-declared keys rename camel→snake,
         # every other key passes through UNTOUCHED — an off-schema key still
@@ -153,10 +187,32 @@ module Tart
           end
         consulted ||
           {error: "Validation failed for tool \"#{self.class.pi_name}\":\n  - #{e.message}\n\n" \
-                  "Received arguments:\n#{Schemas::Tools.pretty_arguments(received)}"}
+                  "Received arguments:\n#{Schemas::Tools.pretty_arguments(received)}#{cli_flag_hint(e.message)}"}
       end
 
       private
+
+      # I102 (KB I15 S3) — "" unless the binding error is the unknown-keyword class
+      # AND one of its keys is CLI-style. Ruby renders such symbols quoted
+      # (:\"-i\"), so the token scan strips the quotes before the dash test.
+      def cli_flag_hint(error_message)
+        return "" unless error_message.start_with?("unknown keyword")
+
+        cli_style = error_message.scan(/:(?:\"([^\"]+)\"|([A-Za-z_]\w*))/).flatten.compact.any? do |key|
+          key.start_with?("-")
+        end
+        cli_style ? "\n#{CLI_FLAG_HINT}" : ""
+      end
+
+      # I102 (KB I11.5) — drop {key => nil} pairs whose key is a declared OPTIONAL
+      # property (schema-derived). Memoized per class via
+      # optional_properties; value-nil is the ONLY trigger — wrong-typed
+      # NON-null values refuse exactly as before (compaction changes
+      # nothing about type checking).
+      def compact_null_optionals(arguments)
+        optional = self.class.optional_properties
+        arguments.reject { |key, value| value.nil? && optional.include?(key.to_s) }
+      end
 
       def execute_accepts_tool_call?
         method(:execute).parameters.any? { |(_kind, param)| param == :tool_call }
@@ -183,6 +239,10 @@ module Tart
         yield
       rescue Fast::Completions::CancelledError
         raise
+        # I102 (KB I17 S1) — the deadline refusal renders bare: the message is already
+        # the whole teaching text.
+      rescue ToolTimeout => e
+        {error: e.message}
         # I94 E5: ArgumentError stays byte-exact (pi's deliberate
         # contract-raise idiom — every golden error case); every other
         # StandardError is an internal defect and carries the class + first

@@ -17,6 +17,10 @@ module Tart
 
       DEFAULT_LIMIT = 100
 
+      # I102 (KB I17 S1) — the rg deadline default (seconds); TOOL_TIMEOUT_S env
+      # overrides per call.
+      DEFAULT_TIMEOUT_SECONDS = 120
+
       DESCRIPTION = "Search file contents for a pattern. Returns matching lines with file paths and line numbers. " \
         "Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). " \
         "Long lines are truncated to 500 chars."
@@ -94,7 +98,19 @@ module Tart
 
       # Streams `rg --json` lines until the match limit or EOF. Returns
       # [matches, match_limit_reached, exit_code_or_nil].
+      #
+      # I102 (KB I17 S1) — the deadline: rg spawns pgroup'd with stdin closed, and a
+      # watchdog thread enforces TOOL_TIMEOUT_S (default 120; ENV parsed at
+      # call time, non-numeric/absent/non-positive → the default). At the
+      # deadline it kills rg's whole process GROUP (TERM, KILL escalation)
+      # and closes the write-end copies so blocked reads EOF; every wait
+      # below is bounded (WNOHANG poll ≤ REAP_BUDGET_SECONDS then detach;
+      # err-drainer join 5 s then Thread#kill), and the call raises
+      # ToolTimeout — the teaching refusal — instead of hanging the session.
+      REAP_BUDGET_SECONDS = 5
+
       def run_rg(rg_path, pattern, search_path, glob, ignore_case, literal, effective_limit)
+        timeout = tool_timeout_seconds
         args = ["--json", "--line-number", "--color=never", "--hidden"]
         args << "--ignore-case" if ignore_case
         args << "--fixed-strings" if literal
@@ -103,14 +119,39 @@ module Tart
 
         matches = []
         match_limit_reached = false
+        timed_out = false
         status = nil
         out_rd, out_wr = IO.pipe
         err_rd, err_wr = IO.pipe
-        pid = Process.spawn(rg_path, *args, out: out_wr, err: err_wr, chdir: @cwd)
+        pid = Process.spawn(rg_path, *args, out: out_wr, err: err_wr, in: :close,
+                                            pgroup: true, chdir: @cwd)
         out_wr.close
         err_wr.close
         stderr = +""
         err_t = Thread.new { stderr << err_rd.read }
+        # TERM→KILL escalation is TIME-based, not send-failure-based: a
+        # target that merely IGNORES TERM must not wedge the call (probed:
+        # a rescue-only chain never escalates — the TERM send succeeds and
+        # the stream read blocks forever). Grace, then a liveness probe on
+        # the group, then KILL.
+        watchdog = Thread.new do
+          sleep(timeout)
+          timed_out = true
+          Process.kill("TERM", -pid) rescue nil
+          sleep(KILL_GRACE_SECONDS)
+          begin
+            Process.kill(0, -pid)
+            Process.kill("KILL", -pid)
+          rescue StandardError
+            nil # group already gone — TERM did the job
+          end
+          begin
+            out_wr.close unless out_wr.closed?
+            err_wr.close unless err_wr.closed?
+          rescue IOError
+            nil
+          end
+        end
         begin
           out_rd.each_line do |line|
             break if match_limit_reached
@@ -127,14 +168,62 @@ module Tart
             end
           end
         ensure
+          # Fast path (limit hit or EOF before the deadline): retire the
+          # watchdog before it can fire under us, then reap with bounded
+          # waits only — no unbounded waitpid, no unbounded join.
+          unless timed_out
+            watchdog.kill
+          else
+            # already fired: let the KILL escalation land (≤ grace + ε)
+            watchdog.join(REAP_BUDGET_SECONDS)
+            watchdog.kill
+          end
+          watchdog.join
           Process.kill("TERM", pid) rescue nil
-          _, status = Process.waitpid2(pid)
-          err_t.join
+          status = reap_rg(pid)
+          err_t.join(REAP_BUDGET_SECONDS) || err_t.kill
           out_rd.close
           err_rd.close
         end
+        raise ToolTimeout, timeout_message(pattern, search_path, glob, timeout) if timed_out
+
         killed_due_to_limit = match_limit_reached
         [matches, match_limit_reached, killed_due_to_limit ? 0 : status&.exitstatus]
+      end
+
+      # TOOL_TIMEOUT_S (I102, KB I17 S1) read at call time: a positive integer wins;
+      # absent, non-numeric, or non-positive falls back to the 120 s default.
+      KILL_GRACE_SECONDS = 2
+
+      def tool_timeout_seconds
+        raw = ENV["TOOL_TIMEOUT_S"]
+        parsed = raw.is_a?(String) && raw.match?("\\A\\d+\\z") ? Integer(raw, 10) : nil
+        parsed&.positive? ? parsed : DEFAULT_TIMEOUT_SECONDS
+      end
+
+      # Bounded reap: WNOHANG poll within REAP_BUDGET_SECONDS, then
+      # Process.detach fallback — the session never blocks on a child that
+      # refuses to die; nil stands in for the un-reaped status.
+      def reap_rg(pid)
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REAP_BUDGET_SECONDS
+        loop do
+          waited, status = Process.waitpid2(pid, Process::WNOHANG)
+          return status if waited
+          break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+          sleep 0.05
+        end
+        Process.detach(pid)
+        nil
+      end
+
+      # The I102 (KB I17 S1) teaching refusal: what ran, that it was killed, and how
+      # to narrow. Renders verbatim as the {error:} envelope via
+      # SafeExecute's ToolTimeout branch.
+      def timeout_message(pattern, search_path, glob, timeout)
+        "TOOL_TIMEOUT: grep exceeded #{timeout}s and was killed " \
+          "(pattern=#{pattern} path=#{search_path} glob=#{glob || '-'}). " \
+          "Narrow the search: a smaller path, a tighter glob, or a more specific pattern."
       end
       def safe_parse(line)
         JSON.parse(line)
