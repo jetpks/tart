@@ -39,6 +39,33 @@ module Tart
       Digest::SHA256.hexdigest(%({"edits": [], "path": ) + JSON.generate(args["path"]) + %(}))
     end
 
+    # ---- I102 (KB I11 S5): the legacy top-level oldText/newText shape, both key
+    # spellings — the descent observation's `edits: is missing` refusal
+    # (19:55:23Z) for a shape pi's recovery always intended to fold ----
+
+    def test_edit_legacy_toplevel_shape_folds_under_wire_string_keys
+      dir = Dir.mktmpdir("i11edit-")
+      begin
+        file = File.join(dir, "ledger.json")
+        File.write(file, '{"phase": {"state": "running"}}\n')
+        # the executor's wire form: string keys, no edits[] at all
+        out = Tools::Edit.new(cwd: dir).call("path" => "ledger.json",
+                                             "oldText" => '"state": "running"',
+                                             "newText" => '"state": "complete"')
+        assert_equal "Successfully replaced 1 block(s) in ledger.json.", out
+        assert File.read(file).include?("complete"), "the legacy shape executed"
+      ensure
+        FileUtils.rm_rf(dir)
+      end
+    end
+
+    def test_edit_legacy_toplevel_shape_folds_under_symbol_keys_too
+      got = Tools::Edit.normalize_arguments({path: "a.rb", oldText: "x", newText: "y"})
+      assert_equal "a.rb", got[:path]
+      assert_equal [{oldText: "x", newText: "y"}], got[:edits]
+      assert_nil got[:oldText], "the legacy keys are consumed, never forwarded"
+    end
+
     # ---- pin 1: the recorded payload, verbatim, recovers ----
 
     def test_edit_fold_recorded_payload_sha_and_recovery

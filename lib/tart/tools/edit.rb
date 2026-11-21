@@ -14,10 +14,12 @@ module Tart
 
       pi_name "edit"
 
-      DESCRIPTION = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, " \
+      DESCRIPTION = "Edit a single file using exact text replacement. Canonical shape: " \
+        "edit(path, edits: [{oldText, newText}, …]) — every edits[].oldText must match a unique, " \
         "non-overlapping region of the original file. If two changes affect the same block or nearby lines, " \
         "merge them into one edit instead of emitting overlapping edits. Do not include large unchanged " \
-        "regions just to connect distant changes."
+        "regions just to connect distant changes. The legacy single-edit shape — top-level oldText/newText " \
+        "beside path — is accepted as a one-element edits[] equivalent."
 
       # STRING-KEYED THROUGHOUT (I64): the gem's strict engine reads string
       # keys (pi's JS node["type"] shape) — a symbol-keyed root makes the
@@ -94,6 +96,12 @@ module Tart
       # shape, edit.ts:103-141): the 06:58Z session recorded six
       # byte-identical edit calls with the whole intended payload folded
       # INTO the `path` string beside a literal `"edits": []`.
+      #
+      # I102 (KB I11 S5): the legacy top-level oldText/newText shape is accepted under
+      # BOTH key spellings — the executor seam hands the provider's parsed
+      # arguments through with STRING keys, and the descent observation
+      # (19:55:23Z) caught the symbol-only check refusing `edits: is missing`
+      # for a shape this recovery always intended to fold.
       def self.normalize_arguments(arguments)
         args = recover_folded_path(arguments.dup)
         edits = args[:edits]
@@ -112,10 +120,12 @@ module Tart
           args[:edits] = [edits]
         end
 
-        if args[:oldText].is_a?(String) && args[:newText].is_a?(String)
+        legacy_old = args.key?(:oldText) ? args[:oldText] : args["oldText"]
+        legacy_new = args.key?(:newText) ? args[:newText] : args["newText"]
+        if legacy_old.is_a?(String) && legacy_new.is_a?(String)
           edits_array = args[:edits].is_a?(Array) ? args[:edits].dup : []
-          edits_array << {oldText: args[:oldText], newText: args[:newText]}
-          args = args.except(:oldText, :newText)
+          edits_array << {oldText: legacy_old, newText: legacy_new}
+          args = args.except(:oldText, :newText, "oldText", "newText")
           args[:edits] = edits_array
         end
         args

@@ -128,6 +128,24 @@ module Tart
       refute_includes mixed, "unknown keyword"
     end
 
+    # I102 (KB I15 S3) — the CLI-style flag hint: the engine's unknown-keyword error
+    # gains one teaching line when the offending key looks CLI-style (the
+    # observed class: grep called with "-i": "true"; the key is
+    # ignoreCase). Text only — no flag key is accepted anywhere.
+    def test_cli_style_unknown_keyword_gains_the_flag_hint_line
+      error = error_result(Tools::Grep.new(cwd: @dir).call("pattern" => "x", "-i" => "true"), "grep")
+
+      assert error.start_with?("Validation failed for tool \"grep\":\n")
+      assert_includes error, %(  - unknown keyword: :"-i"\n)
+      assert error.end_with?("\nCLI-style flag; tools take named parameters — e.g. `ignoreCase` for case-insensitive search"),
+        "the hint is ONE appended line, verbatim"
+
+      # the plain unknown keyword stays hint-free (the hint is dash-only)
+      plain = error_result(Tools::Bash.new(cwd: @dir, env: {}).call("command" => "echo hi", "zzz" => 1), "bash")
+      refute_includes plain, "CLI-style flag"
+      refute_includes plain, "ignoreCase"
+    end
+
     # Pin 6 — the contract-less belt: memory has no Schemas::Tools contract,
     # so the consult raises KeyError; the belt swallows it and speaks the
     # wrapper vocabulary. No escape, no raise.

@@ -87,6 +87,15 @@ module Tart
         text_content = File.binread(absolute_path).force_encoding(Encoding::UTF_8).scrub
         all_lines = text_content.split("\n", -1)
         total_file_lines = all_lines.length
+        # I102 (KB I17 S2) — a zero-byte file IS empty content (bytes verbatim), not
+        # an offset error: "".split("\n", -1) is [], which would otherwise
+        # fall into the beyond-end-of-file refusal below.
+        if all_lines.empty?
+          truncation = Truncate.truncate_head(text_content)
+          @details = {truncation: truncation.to_h}
+          return truncation.content
+        end
+
         # 1-indexed input to 0-indexed array access.
         start_line = offset ? [0, offset - 1].max : 0
         start_line_display = start_line + 1
