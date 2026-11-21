@@ -68,6 +68,43 @@ module Tart
       end
     end
 
+    # The seat-hermeticity law (I104 lever e): the ambient TART_*
+    # namespace (a live driver/subagent seat exports it) must never shape
+    # a test boot — tests measure the thing under test, not the seat.
+    # One require-time call at this file's bottom performs it, NOT a
+    # base-class setup hook: minitest subclass `setup`s shadow the base
+    # class's unless they call super (many suite files define their own),
+    # so a setup hook would silently miss them — require time covers the
+    # serial run AND every parallel worker by construction. The staged
+    # fixtures win by construction afterward; the exempt keys are the
+    # harness's own (the runner's jobs override; the e2e live-space gate).
+    SEAT_SCRUB_EXEMPT = %w[TART_TEST_JOBS TART_E2E_SPACE].freeze
+
+    # The pre-scrub snapshot (frozen {String => String}): exactly the
+    # keys the last scrub_seat_env! deleted, so scrub/restore are exact
+    # inverses. Re-seeded on every re-invocation (a frozen map cannot be
+    # mutated; the pins re-invoke the scrub mid-suite).
+    SEAT_TART_ENV = {}.freeze
+
+    # Idempotent: snapshot the present non-exempt TART_ keys, delete
+    # them, re-seed the frozen snapshot constant, return the snapshot.
+    def self.scrub_seat_env!
+      snapshot = (ENV.keys.grep(/\ATART_/) - SEAT_SCRUB_EXEMPT)
+        .to_h { |key| [key, ENV[key]] }.freeze
+      snapshot.each_key { |key| ENV.delete(key) }
+      remove_const(:SEAT_TART_ENV) if const_defined?(:SEAT_TART_ENV, false)
+      const_set(:SEAT_TART_ENV, snapshot)
+      snapshot
+    end
+
+    # The reversible half of the pair: re-apply the snapshot. The suite
+    # itself never needs it — test processes are disposable — but the
+    # pair is the documented restore discipline the pins prove.
+    def self.restore_seat_env!
+      SEAT_TART_ENV.each { |key, value| ENV[key] = value }
+      nil
+    end
+
     # The test-owned observable's side of the state-signal mechanics
     # (I103): a double / support server / test-local callback array pings
     # at its mutation points; consumers await on predicates over its
@@ -234,3 +271,9 @@ module Tart
     TUI_NONE = NoneEvent.new.freeze
   end
 end
+
+# The ONE require-time seat scrub (I104): every test process — the serial
+# run, the runner's enumeration pass, every parallel worker — boots
+# hermetic from ANY seat (the docstring on Tart::Test::SEAT_SCRUB_EXEMPT
+# above carries the law and the why).
+Tart::Test.scrub_seat_env!
