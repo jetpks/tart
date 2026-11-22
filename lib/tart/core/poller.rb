@@ -7,6 +7,19 @@ module Tart
 
     # Dedicated thread bridging native TUI input into the reactor (Design B).
     #
+    # THE ONE NAMED EXEMPTION under the owner concurrency law (2026-11-21,
+    # PR-#28 review — "Threads are NOT viable strategies in product code"),
+    # owner-ratified via the I107 spec's OQ1: this is the ONE surviving
+    # spawn site in lib/, and the concern it names is the unbridgeable
+    # ratatui FFI poll — RatatuiRuby#poll_event is
+    # rb_thread_call_without_gvl(poll_without_gvl, …, None, …) with NO
+    # unblock function (ext/ratatui_ruby/src/events.rs:358-365, :407-435),
+    # so a fiber calling it would block the reactor's own thread inside
+    # crossterm with no recovery (Thread#kill cannot break a GVL-free
+    # native poll — Grounds F4). BRIEF §4.1's adopted Design (b) owns the
+    # shape: a dedicated thread polls and bridges native events over the
+    # thread-safe Async::Queue (the sanctioned cross-thread seam).
+    #
     # Loops {Session#poll_event} — crossterm releases the GVL while blocked,
     # so the reactor fiber on the main thread keeps running — and hands every
     # event to the reactor over the thread-safe +Async::Queue+, the only

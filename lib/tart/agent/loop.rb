@@ -143,12 +143,13 @@ module Tart
         @stream_started = false
         # The queue split (I54 — pi's two PendingMessageQueues, agent.ts
         # :191-192): steering delivers after each tool batch / at the round
-        # boundaries; follow-up waits for FULL completion. Mutex-guarded
-        # Arrays, not ::Queue — the surface's snapshot readbacks need
-        # enumeration (Spec §1.1).
+        # boundaries; follow-up waits for FULL completion. I107 (V4): plain
+        # Arrays — the guard Mutex is deleted, not replaced. Every funnel
+        # (append, snapshot readback, the shift-drain) is a same-reactor
+        # Array operation containing no scheduler-visible suspension, and
+        # the readbacks only need enumeration, not blocking.
         @steering_queue = []
         @follow_up_queue = []
-        @queues_mutex = Mutex.new
         @steer_inbox = steer_inbox
         @wake_opening = false
         # The scheduled-manual compaction slot (I95 — architect_compact's
@@ -184,7 +185,7 @@ module Tart
       # round boundary; queued messages left after the loop would stop
       # continue it. The I03-era name is retained as the documented alias.
       def steer(text)
-        @queues_mutex.synchronize { @steering_queue << text }
+        @steering_queue << text
         self
       end
 
@@ -193,7 +194,7 @@ module Tart
       # steering — a new outer turn of the same session flow (pi
       # agent-loop.ts:302-308).
       def follow_up(text)
-        @queues_mutex.synchronize { @follow_up_queue << text }
+        @follow_up_queue << text
         self
       end
 
@@ -206,22 +207,20 @@ module Tart
       # Atomically clears BOTH queues (pi clearQueue + agent.clearAllQueues,
       # agent-session.ts:2402-2410). Returns nothing.
       def clear_queues
-        @queues_mutex.synchronize do
-          @steering_queue.clear
-          @follow_up_queue.clear
-        end
+        @steering_queue.clear
+        @follow_up_queue.clear
         nil
       end
 
-      # Thread-safe snapshot readbacks (pi getSteeringMessages/
+      # Snapshot readbacks (pi getSteeringMessages/
       # getFollowUpMessages, agent-session.ts:2418-2424) — the surface
       # queue mirror's render source.
       def steering_texts
-        @queues_mutex.synchronize { @steering_queue.dup }
+        @steering_queue.dup
       end
 
       def follow_up_texts
-        @queues_mutex.synchronize { @follow_up_queue.dup }
+        @follow_up_queue.dup
       end
 
       # @return [Boolean] whether steering OR follow-up messages are queued
@@ -229,7 +228,7 @@ module Tart
       #   agent_end to close the submit/stop race — pi's continue on either
       #   queue, hasQueuedMessages, agent-session.ts:1898).
       def queued_messages?
-        @queues_mutex.synchronize { !@steering_queue.empty? || !@follow_up_queue.empty? }
+        !@steering_queue.empty? || !@follow_up_queue.empty?
       end
 
       # @return [Boolean] whether a run is in flight (I48 — one Loop one
@@ -832,9 +831,7 @@ module Tart
 
       def drain_queue(queue)
         messages = []
-        @queues_mutex.synchronize do
-          messages << queue.shift until queue.empty?
-        end
+        messages << queue.shift until queue.empty?
         messages
       end
 

@@ -367,129 +367,157 @@ module Tart
     # ── /engine/ ──────────────────────────────────────────────────────
 
     def test_engine_debounce_coalesces_two_quick_events_into_one_post
-      server = ingest_server
-      hooks = Hooks.new
-      engine = track(new_sink(hooks:, server:))
-      bind_session(hooks, session_id: "s-coal")
-      emit_user(hooks, "one")
-      emit_user(hooks, "two")
-      assert server.wait_posts(1, 5), "the debounced batch landed"
-      # I103 (D): quiescence by construction — the engine is idle (queue
-      # empty, no due window, no in-flight POST) and the server holds no
-      # connection, so no second POST can EVER appear.
-      await(engine, "the engine idle past the debounce") { engine.idle? }
-      await(server, "the ingest connection closed") { server.active_connections.zero? }
-      posts = server.posts
-      assert_equal 1, posts.size, "two quick events coalesce into ONE POST"
-      assert_equal 1, server.max_concurrent, "≤ 1 in-flight POST by construction"
-      records = posts[0][:records]
-      assert_equal 3, records.size, "the session record opens EVERY body"
-      assert_equal "session", records[0]["type"]
-      assert_equal ["s-coal/1", "s-coal/2"], records[1..].map { |r| r["id"] }, "FIFO order preserved"
-      assert_equal "one", records[1]["message"]["content"][0]["text"]
-      assert_equal "two", records[2]["message"]["content"][0]["text"]
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = ingest_server
+        hooks = Hooks.new
+        engine = track(new_sink(hooks:, server:))
+        bind_session(hooks, session_id: "s-coal")
+        emit_user(hooks, "one")
+        emit_user(hooks, "two")
+        assert server.wait_posts(1, 5), "the debounced batch landed"
+        # I103 (D): quiescence by construction — the engine is idle (queue
+        # empty, no due window, no in-flight POST) and the server holds no
+        # connection, so no second POST can EVER appear.
+        await(engine, "the engine idle past the debounce") { engine.idle? }
+        await(server, "the ingest connection closed") { server.active_connections.zero? }
+        posts = server.posts
+        assert_equal 1, posts.size, "two quick events coalesce into ONE POST"
+        assert_equal 1, server.max_concurrent, "≤ 1 in-flight POST by construction"
+        records = posts[0][:records]
+        assert_equal 3, records.size, "the session record opens EVERY body"
+        assert_equal "session", records[0]["type"]
+        assert_equal ["s-coal/1", "s-coal/2"], records[1..].map { |r| r["id"] }, "FIFO order preserved"
+        assert_equal "one", records[1]["message"]["content"][0]["text"]
+        assert_equal "two", records[2]["message"]["content"][0]["text"]
+      end
     end
 
     def test_engine_fifo_and_single_in_flight_under_a_slow_mock
-      server = ingest_server
-      server.delay_with(0.3)
-      hooks = Hooks.new
-      track(new_sink(hooks:, server:))
-      bind_session(hooks, session_id: "s-fifo")
-      emit_user(hooks, "first")
-      assert server.wait_posts(1, 5), "the first POST lands"
-      emit_user(hooks, "second")
-      emit_user(hooks, "third")
-      assert server.wait_posts(2, 5), "the coalesced tail lands"
-      await(server, "the second POST landed") { server.post_count == 2 } # I103 (B)
-      assert_equal 1, server.max_concurrent, "never two POSTs in flight"
-      posts = server.posts
-      assert_equal ["first"], records_text(posts[0])
-      assert_equal %w[second third], records_text(posts[1]), "the tail rides ONE body, FIFO order"
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = ingest_server
+        server.delay_with(0.3)
+        hooks = Hooks.new
+        track(new_sink(hooks:, server:))
+        bind_session(hooks, session_id: "s-fifo")
+        emit_user(hooks, "first")
+        assert server.wait_posts(1, 5), "the first POST lands"
+        emit_user(hooks, "second")
+        emit_user(hooks, "third")
+        assert server.wait_posts(2, 5), "the coalesced tail lands"
+        await(server, "the second POST landed") { server.post_count == 2 } # I103 (B)
+        assert_equal 1, server.max_concurrent, "never two POSTs in flight"
+        posts = server.posts
+        assert_equal ["first"], records_text(posts[0])
+        assert_equal %w[second third], records_text(posts[1]), "the tail rides ONE body, FIFO order"
+      end
     end
 
     def test_engine_queue_cap_overflow_drops_the_oldest_and_reports
-      server = ingest_server
-      hooks = Hooks.new
-      track(new_sink(hooks:, server:, tuning: {debounce_ms: 60, queue_cap: 2}))
-      stderr = capture_stderr do
-        bind_session(hooks, session_id: "s-cap")
-        emit_user(hooks, "one")
-        emit_user(hooks, "two")
-        emit_user(hooks, "three")
-        assert server.wait_posts(1, 5)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = ingest_server
+        hooks = Hooks.new
+        track(new_sink(hooks:, server:, tuning: {debounce_ms: 60, queue_cap: 2}))
+        stderr = capture_stderr do
+          bind_session(hooks, session_id: "s-cap")
+          emit_user(hooks, "one")
+          emit_user(hooks, "two")
+          emit_user(hooks, "three")
+          assert server.wait_posts(1, 5)
+        end
+        records = server.posts[0][:records]
+        assert_equal ["two", "three"], records[1..].map { |record| record.dig("message", "content", 0, "text") }, "overflow drops the OLDEST records"
+        assert_includes stderr, "session-sink:", "the loss reports loudly"
+        assert_includes stderr, "queue overflow"
       end
-      records = server.posts[0][:records]
-      assert_equal ["two", "three"], records[1..].map { |record| record.dig("message", "content", 0, "text") }, "overflow drops the OLDEST records"
-      assert_includes stderr, "session-sink:", "the loss reports loudly"
-      assert_includes stderr, "queue overflow"
     end
 
     def test_engine_retry_lands_the_batch_on_the_third_attempt
-      server = ingest_server
-      server.fail_with([500, 500])
-      hooks = Hooks.new
-      track(new_sink(hooks:, server:, tuning: {debounce_ms: 20, backoff_ms: [20, 20]}))
-      stderr = capture_stderr do
-        bind_session(hooks, session_id: "s-retry")
-        emit_user(hooks, "ride three attempts")
-        await(server, "the batch's 202 landing") { server.posts.any? { |post| post[:status] == 202 } } # I103 (B)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = ingest_server
+        server.fail_with([500, 500])
+        hooks = Hooks.new
+        track(new_sink(hooks:, server:, tuning: {debounce_ms: 20, backoff_ms: [20, 20]}))
+        stderr = capture_stderr do
+          bind_session(hooks, session_id: "s-retry")
+          emit_user(hooks, "ride three attempts")
+          await(server, "the batch's 202 landing") { server.posts.any? { |post| post[:status] == 202 } } # I103 (B)
+        end
+        posts = server.posts
+        assert_equal [500, 500, 202], posts.map { |post| post[:status] }, "the SAME batch retried, MAX_ATTEMPTS total"
+        assert_equal "s-retry/1", posts[2][:records][1]["id"], "the batch lands intact on attempt 3"
+        refute_includes stderr, "session-sink:", "transient failures are silent (retry absorbs them)"
       end
-      posts = server.posts
-      assert_equal [500, 500, 202], posts.map { |post| post[:status] }, "the SAME batch retried, MAX_ATTEMPTS total"
-      assert_equal "s-retry/1", posts[2][:records][1]["id"], "the batch lands intact on attempt 3"
-      refute_includes stderr, "session-sink:", "transient failures are silent (retry absorbs them)"
     end
 
     def test_engine_final_failure_drops_the_batch_and_the_engine_keeps_accepting
-      server = ingest_server
-      server.fail_with([500, 500, 500])
-      hooks = Hooks.new
-      track(new_sink(hooks:, server:, tuning: {debounce_ms: 20, backoff_ms: [20, 20]}))
-      stderr = capture_stderr do
-        bind_session(hooks, session_id: "s-drop")
-        emit_user(hooks, "doomed")
-        await(server, "all three attempts landed") { server.post_count >= 3 } # I103 (B)
-        emit_user(hooks, "still accepted")
-        await(server, "the fresh batch's 202 landing") { server.posts.any? { |post| post[:status] == 202 } } # I103 (B)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = ingest_server
+        server.fail_with([500, 500, 500])
+        hooks = Hooks.new
+        track(new_sink(hooks:, server:, tuning: {debounce_ms: 20, backoff_ms: [20, 20]}))
+        stderr = capture_stderr do
+          bind_session(hooks, session_id: "s-drop")
+          emit_user(hooks, "doomed")
+          await(server, "all three attempts landed") { server.post_count >= 3 } # I103 (B)
+          emit_user(hooks, "still accepted")
+          await(server, "the fresh batch's 202 landing") { server.posts.any? { |post| post[:status] == 202 } } # I103 (B)
+        end
+        assert_equal [500, 500, 500], server.posts[0, 3].map { |post| post[:status] }
+        assert_includes stderr, "session-sink:", "final failure → ONE loss line"
+        landed = server.posts.find { |post| post[:status] == 202 }
+        assert_equal "still accepted", landed[:records][1]["message"]["content"][0]["text"],
+                     "the engine keeps accepting after a dropped batch"
       end
-      assert_equal [500, 500, 500], server.posts[0, 3].map { |post| post[:status] }
-      assert_includes stderr, "session-sink:", "final failure → ONE loss line"
-      landed = server.posts.find { |post| post[:status] == 202 }
-      assert_equal "still accepted", landed[:records][1]["message"]["content"][0]["text"],
-                   "the engine keeps accepting after a dropped batch"
     end
 
     def test_engine_rebind_flushes_the_previous_capture_non_terminally
-      server = ingest_server
-      hooks = Hooks.new
-      track(new_sink(hooks:, server:))
-      bind_session(hooks, session_id: "s-old")
-      emit_user(hooks, "old turn")
-      bind_session(hooks, session_id: "s-new") # within the debounce window
-      emit_user(hooks, "new turn")
-      assert server.wait_posts(2, 5), "both captures flush"
-      await(server, "the second POST landed") { server.post_count == 2 } # I103 (B)
-      old_post, new_post = server.posts
-      assert_equal "s-old", old_post[:records][0]["id"]
-      assert_equal "s-old/1", old_post[:records][1]["id"]
-      refute old_post[:headers].key?("x-session-complete"), "the rebind flush is NON-terminal"
-      assert_equal "s-new", new_post[:records][0]["id"], "the new capture's body opens with ITS session record"
-      assert_equal "s-new/1", new_post[:records][1]["id"]
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = ingest_server
+        hooks = Hooks.new
+        track(new_sink(hooks:, server:))
+        bind_session(hooks, session_id: "s-old")
+        emit_user(hooks, "old turn")
+        bind_session(hooks, session_id: "s-new") # within the debounce window
+        emit_user(hooks, "new turn")
+        assert server.wait_posts(2, 5), "both captures flush"
+        await(server, "the second POST landed") { server.post_count == 2 } # I103 (B)
+        old_post, new_post = server.posts
+        assert_equal "s-old", old_post[:records][0]["id"]
+        assert_equal "s-old/1", old_post[:records][1]["id"]
+        refute old_post[:headers].key?("x-session-complete"), "the rebind flush is NON-terminal"
+        assert_equal "s-new", new_post[:records][0]["id"], "the new capture's body opens with ITS session record"
+        assert_equal "s-new/1", new_post[:records][1]["id"]
+      end
     end
 
     def test_engine_record_ids_stay_monotonic_across_a_same_session_rebind
-      server = ingest_server
-      hooks = Hooks.new
-      track(new_sink(hooks:, server:))
-      bind_session(hooks, session_id: "sid-9")
-      emit_user(hooks, "first")
-      bind_session(hooks, session_id: "sid-9") # same session id — max(counter, seed)
-      emit_user(hooks, "second")
-      assert server.wait_posts(2, 5)
-      await(server, "the second POST landed") { server.post_count == 2 } # I103 (B)
-      ids = server.posts.flat_map { |post| post[:records][1..].map { |r| r["id"] } }
-      assert_equal ["sid-9/1", "sid-9/2"], ids, "n monotonic per session id ACROSS rebinds"
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = ingest_server
+        hooks = Hooks.new
+        track(new_sink(hooks:, server:))
+        bind_session(hooks, session_id: "sid-9")
+        emit_user(hooks, "first")
+        bind_session(hooks, session_id: "sid-9") # same session id — max(counter, seed)
+        emit_user(hooks, "second")
+        assert server.wait_posts(2, 5)
+        await(server, "the second POST landed") { server.post_count == 2 } # I103 (B)
+        ids = server.posts.flat_map { |post| post[:records][1..].map { |r| r["id"] } }
+        assert_equal ["sid-9/1", "sid-9/2"], ids, "n monotonic per session id ACROSS rebinds"
+      end
     end
 
     def test_engine_terminal_post_completes_with_pending_records_and_the_session_record
@@ -562,16 +590,20 @@ module Tart
     end
 
     def test_engine_non_quit_shutdown_reason_flushes_non_terminally
-      server = ingest_server
-      hooks = Hooks.new
-      track(new_sink(hooks:, server:))
-      bind_session(hooks, session_id: "s-other")
-      emit_user(hooks, "soon flushed")
-      hooks.emit({"type" => "session_shutdown", "reason" => "other"}, context: {})
-      assert server.wait_posts(1, 5)
-      post = server.posts[0]
-      refute post[:headers].key?("x-session-complete"), "non-quit reasons stay non-terminal"
-      assert_equal "s-other/1", post[:records][1]["id"]
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = ingest_server
+        hooks = Hooks.new
+        track(new_sink(hooks:, server:))
+        bind_session(hooks, session_id: "s-other")
+        emit_user(hooks, "soon flushed")
+        hooks.emit({"type" => "session_shutdown", "reason" => "other"}, context: {})
+        assert server.wait_posts(1, 5)
+        post = server.posts[0]
+        refute post[:headers].key?("x-session-complete"), "non-quit reasons stay non-terminal"
+        assert_equal "s-other/1", post[:records][1]["id"]
+      end
     end
 
     # ── /boot/ (process-level, Open3 — the launcher_smoke pattern) ────

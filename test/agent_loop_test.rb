@@ -760,7 +760,7 @@ module Tart
           end
         end
         root.async do
-          await(@server, "the captured request — mid-stream", cooperative: true) { @server.request_count >= 1 } # I103 (B)
+          await(@server, "the captured request — mid-stream") { @server.request_count >= 1 } # I103 (B)
           turn.stop
         end
         begin
@@ -799,7 +799,7 @@ module Tart
           end
         end
         root.async do
-          await(@server, "the captured request — mid-stream", cooperative: true) { @server.request_count >= 1 } # I103 (B)
+          await(@server, "the captured request — mid-stream") { @server.request_count >= 1 } # I103 (B)
           turn.stop
         end
         begin
@@ -841,7 +841,7 @@ module Tart
         root.async do
           # ~the first tool's start — the interrupt lands inside the 0.5 s
           # sleep batch (the abort-fast property pins the remaining span)
-          await(stamped_gate, "the first tool_execution_start stamped", cooperative: true) do
+          await(stamped_gate, "the first tool_execution_start stamped") do
             stamped_events(stamped, :tool_execution_start).any?
           end
           cancel_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -1616,7 +1616,7 @@ module Tart
           end
         end
         root.async do
-          await(@server, "the captured request — mid-stream", cooperative: true) { @server.request_count >= 1 } # I103 (B)
+          await(@server, "the captured request — mid-stream") { @server.request_count >= 1 } # I103 (B)
           turn.stop
         end
         begin

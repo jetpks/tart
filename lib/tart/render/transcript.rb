@@ -82,8 +82,10 @@ module Tart
         @history_sink = history_sink
         @reseed_sink = reseed_sink
         # Completed lines awaiting the transcript buffer on the next frame
-        # (thread-safe: agent fiber produces, frame loop consumes).
-        @scrollback = Queue.new
+        # (I107/Q1 — a plain Array: producer + consumer are fibers on the
+        # host reactor, drained each frame as today; the enqueue family's
+        # bytes are unchanged).
+        @scrollback = []
         # The surface-owned scrollback buffer (final display Lines) — the
         # transcript area draws its visible tail every frame.
         @transcript = []
@@ -92,7 +94,7 @@ module Tart
         # expandable block rebuilds in place; the status row reports
         # (coordinator-side). The expandable registry tracks each block's
         # transcript row range + row builder (recorded at drain time — the
-        # scrollback is a cross-thread queue, the transcript is flat).
+        # scrollback is a same-reactor hand-off Array (I107/Q1), the transcript is flat).
         @tool_output_expanded = false
         @expandable_blocks = []
         # The tail status pair's Line objects (the replace-in-place check
@@ -368,7 +370,7 @@ module Tart
       # wholesale every frame.
       def flush_scrollback
         until @scrollback.empty?
-          item = @scrollback.pop
+          item = @scrollback.shift
           case item
           when MarkedRegion
             registered = {start: @transcript.size, size: item.rows.length,
@@ -861,7 +863,7 @@ module Tart
         replacement = builder ? MarkedRegion.new(final_rows, builder) : final_rows
         requeue = []
         until @scrollback.empty?
-          item = @scrollback.pop
+          item = @scrollback.shift
           requeue << (item.equal?(region) ? replacement : item)
         end
         requeue.each { |item| @scrollback << item }

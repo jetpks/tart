@@ -13,7 +13,7 @@ module Tart
       # I103 (B): the drawn surface's gate — cooperative, the reactor runs
       # this fiber.
       event_loop.run do
-        await(session, "the boot frame", cooperative: true) { !session.drawn.empty? }
+        await(session, "the boot frame") { !session.drawn.empty? }
       end
 
       assert_operator event_loop.stats[:draws], :>=, 1,
@@ -29,10 +29,10 @@ module Tart
       event_loop = Core::Loop.new(session:, renderer: -> { "frame" })
 
       event_loop.run do
-        await(session, "the boot frame", cooperative: true) { !session.drawn.empty? }
+        await(session, "the boot frame") { !session.drawn.empty? }
         event_loop.async { event_loop.request_draw }
         # I103 (A): the kernel's stat accounting broadcast.
-        await(event_loop, "the second draw", cooperative: true) { event_loop.stats[:draws] > 1 }
+        await(event_loop, "the second draw") { event_loop.stats[:draws] > 1 }
       end
 
       assert_equal 2, event_loop.stats[:draws],
@@ -130,7 +130,7 @@ module Tart
       end)
 
       event_loop.run do
-        await(session, "the boot frame", cooperative: true) { !session.drawn.empty? } # the boot frame
+        await(session, "the boot frame") { !session.drawn.empty? } # the boot frame
         session.push_event(MouseEvent.new("moved"))
         await(received_gate, "the motion event to dispatch") { !received.empty? }
       end
@@ -143,9 +143,9 @@ module Tart
       event_loop = Core::Loop.new(session:, renderer: -> { "frame" })
 
       event_loop.run do
-        await(session, "the boot frame", cooperative: true) { !session.drawn.empty? } # the boot frame
+        await(session, "the boot frame") { !session.drawn.empty? } # the boot frame
         session.push_event(MouseEvent.new("drag"))
-        await(event_loop, "the second draw", cooperative: true) { event_loop.stats[:draws] > 1 }
+        await(event_loop, "the second draw") { event_loop.stats[:draws] > 1 }
       end
 
       assert_operator event_loop.stats[:draws], :>, 1, "press/drag/wheel events redraw"
@@ -237,7 +237,7 @@ module Tart
       work = ->(_task) do
         event_loop.every(0.02, ticks: 10) { |i| ticks << i }
         # I103 (A): the kernel's tick-fire broadcast (one per fire).
-        await(event_loop, "all 10 ticks to fire", cooperative: true) { ticks.size >= 10 }
+        await(event_loop, "all 10 ticks to fire") { ticks.size >= 10 }
       end
 
       event_loop.run(&work)
@@ -257,11 +257,11 @@ module Tart
       observed = {}
 
       event_loop.run do
-        await(session, "the boot frame", cooperative: true) { !session.drawn.empty? } # the boot frame
+        await(session, "the boot frame") { !session.drawn.empty? } # the boot frame
         boot_draws = event_loop.stats[:draws]
         task = event_loop.tick(0.02)
         # I103 (A): the kernel's draw accounting broadcast.
-        await(event_loop, "3 tick-driven draws", cooperative: true) { event_loop.stats[:draws] >= boot_draws + 3 }
+        await(event_loop, "3 tick-driven draws") { event_loop.stats[:draws] >= boot_draws + 3 }
         task.stop
         # I103 (D — was the 0.1 s grace sleeps): the cancel-quiet proof.
         # Task#stop takes effect at the tick fiber's next suspension, and
@@ -292,7 +292,7 @@ module Tart
       event_loop = Core::Loop.new(session:, renderer: -> { render_clock.call; "frame" })
 
       event_loop.run do
-        await(session, "the boot frame's render", cooperative: true) { !session.drawn.empty? } # the boot frame's render
+        await(session, "the boot frame's render") { !session.drawn.empty? } # the boot frame's render
         times = []
         begin
           loop { times << fire_times.pop(true) } # drain the boot renders
@@ -301,7 +301,7 @@ module Tart
         end
         task = event_loop.tick(0.02)
         # I103 (A): the kernel's draw accounting broadcast.
-        await(event_loop, "3 tick-driven fires", cooperative: true) { fire_times.size >= 4 } # the boot + ≥3 tick fires
+        await(event_loop, "3 tick-driven fires") { fire_times.size >= 4 } # the boot + ≥3 tick fires
         task.stop
       end
 

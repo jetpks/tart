@@ -41,7 +41,7 @@ module Tart
       # assert.
       error = assert_raises(RuntimeError) do
         event_loop.run do
-          await(event_loop, "the kernel's boot broadcast", cooperative: true) do
+          await(event_loop, "the kernel's boot broadcast") do
             event_loop.state_version >= 1
           end
           raise "work boom"

@@ -253,325 +253,365 @@ module Tart
     # --- the channel in-process (Spec §4.3/§4.4) ---
 
     def test_channel_surfaces_the_ask_once_with_the_pinned_bytes_and_kicks
-      run = fake_run("worker")
-      channel = new_channel
-      rid = stage_request(run, reason: "need_decision", message: "Should I proceed?")
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        run = fake_run("worker")
+        channel = new_channel
+        rid = stage_request(run, reason: "need_decision", message: "Should I proceed?")
 
-      surfaced = wait_surfaced("Should I proceed?")
-      refute_nil surfaced, "the synthetic ask surfaced"
+        surfaced = wait_surfaced("Should I proceed?")
+        refute_nil surfaced, "the synthetic ask surfaced"
 
-      want = "Subagent needs a supervisor decision.\nRun: #{run[:id]}\nAgent: worker\n\n" \
-             "Should I proceed?\n\n" \
-             "Reply with: subagent({ action: \"reply\", reply_to: \"#{rid}\", message: \"...\" })\n\n" \
-             "Live guidance: subagent({ action: \"steer\", id: \"#{run[:id]}\", message: \"...\" }) " \
-             "(Reply to the pending request first.)"
-      assert_equal want, surfaced[:content]
-      assert_equal Subagents::Supervisor::REQUEST_CUSTOM_TYPE, surfaced[:custom_type]
-      assert_equal true, surfaced[:display]
-      refute_empty @kernel.calls, "the wake kick rode kernel.async"
+        want = "Subagent needs a supervisor decision.\nRun: #{run[:id]}\nAgent: worker\n\n" \
+               "Should I proceed?\n\n" \
+               "Reply with: subagent({ action: \"reply\", reply_to: \"#{rid}\", message: \"...\" })\n\n" \
+               "Live guidance: subagent({ action: \"steer\", id: \"#{run[:id]}\", message: \"...\" }) " \
+               "(Reply to the pending request first.)"
+        assert_equal want, surfaced[:content]
+        assert_equal Subagents::Supervisor::REQUEST_CUSTOM_TYPE, surfaced[:custom_type]
+        assert_equal true, surfaced[:display]
+        refute_empty @kernel.calls, "the wake kick rode kernel.async"
 
-      # pending_next_turn is a drain (the loop's source): after consuming
-      # the first surface, the STOPPED channel can never re-surface the
-      # ask (pi's request notice is never re-sent — pending is the
-      # re-read; the poller is joined, so the non-event is total).
-      channel.stop
-      assert_empty @hooks.pending_next_turn, "the ask surfaces ONCE"
-      assert_equal 1, channel.pending.size, "pending survives for the re-read path"
-      assert_equal "Should I proceed?", channel.pending.first[:message]
+        # pending_next_turn is a drain (the loop's source): after consuming
+        # the first surface, the STOPPED channel can never re-surface the
+        # ask (pi's request notice is never re-sent — pending is the
+        # re-read; the poller is joined, so the non-event is total).
+        channel.stop
+        assert_empty @hooks.pending_next_turn, "the ask surfaces ONCE"
+        assert_equal 1, channel.pending.size, "pending survives for the re-read path"
+        assert_equal "Should I proceed?", channel.pending.first[:message]
+      end
     end
 
     def test_channel_surfaces_interview_asks_with_the_structured_block
-      run = fake_run("worker")
-      channel = new_channel
-      stage_request(run, reason: "interview_request", message: "Need structured input.",
-                    interview: {title: "Decision", questions: ["Go?", "Scope?"]})
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        run = fake_run("worker")
+        channel = new_channel
+        stage_request(run, reason: "interview_request", message: "Need structured input.",
+                      interview: {title: "Decision", questions: ["Go?", "Scope?"]})
 
-      surfaced = wait_surfaced("Need structured input.")
-      refute_nil surfaced
-      assert_includes surfaced[:content], "Subagent requests a structured supervisor interview."
-      assert_includes surfaced[:content],
-                      "Structured response requested. Reply with JSON, optionally fenced in ```json, " \
-                      "matching the requested interview shape."
-      assert_includes surfaced[:content], JSON.pretty_generate({title: "Decision", questions: ["Go?", "Scope?"]})
+        surfaced = wait_surfaced("Need structured input.")
+        refute_nil surfaced
+        assert_includes surfaced[:content], "Subagent requests a structured supervisor interview."
+        assert_includes surfaced[:content],
+                        "Structured response requested. Reply with JSON, optionally fenced in ```json, " \
+                        "matching the requested interview shape."
+        assert_includes surfaced[:content], JSON.pretty_generate({title: "Decision", questions: ["Go?", "Scope?"]})
+      end
     end
 
     def test_progress_requests_never_surface_and_are_consumed
-      run = fake_run("worker")
-      channel = new_channel
-      unlink_gate = stub_unlink_gate
-      stage_request(run, reason: "progress_update", message: "PROGRESS-MARKER", expects_reply: false)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        run = fake_run("worker")
+        channel = new_channel
+        unlink_gate = stub_unlink_gate
+        stage_request(run, reason: "progress_update", message: "PROGRESS-MARKER", expects_reply: false)
 
-      await(unlink_gate, "the progress request to be consumed") do
-        !File.exist?(request_path(run, "PROGRESS-MARKER"))
+        await(unlink_gate, "the progress request to be consumed") do
+          !File.exist?(request_path(run, "PROGRESS-MARKER"))
+        end
+
+        assert_empty channel.pending, "progress never registers pending"
+        assert_empty @hooks.pending_next_turn.select { |p| p[:custom_type] == Subagents::Supervisor::REQUEST_CUSTOM_TYPE }
+        assert_empty @kernel.calls, "progress never kicks the wake"
+        refute File.exist?(request_path(run, "PROGRESS-MARKER")), "the progress request is consumed (unlinked)"
+      ensure
+        restore_unlink_gate
       end
-
-      assert_empty channel.pending, "progress never registers pending"
-      assert_empty @hooks.pending_next_turn.select { |p| p[:custom_type] == Subagents::Supervisor::REQUEST_CUSTOM_TYPE }
-      assert_empty @kernel.calls, "progress never kicks the wake"
-      refute File.exist?(request_path(run, "PROGRESS-MARKER")), "the progress request is consumed (unlinked)"
-    ensure
-      restore_unlink_gate
     end
 
     def test_lifecycle_sweep_reply_expiry_and_terminal_runs
-      done = fake_run("worker", state: "completed")
-      channel = new_channel
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        done = fake_run("worker", state: "completed")
+        channel = new_channel
 
-      # Terminal run (T3, pi's inactive): a stale ask for a settled run is
-      # dropped + unlinked, never surfaced.
-      unlink_gate = stub_unlink_gate
-      stage_request(done, reason: "need_decision", message: "STALE-RUN-MARKER")
-      # Expired: past expiresAt.
-      rid_expired = stage_request(done, reason: "need_decision", message: "EXPIRED-MARKER",
-                                  expires_in_ms: -1_000)
-      await(unlink_gate, "the stale + expired asks to be swept") do
-        !File.exist?(request_path(done, "STALE-RUN-MARKER")) &&
-          !File.exist?(request_path(done, "EXPIRED-MARKER"))
+        # Terminal run (T3, pi's inactive): a stale ask for a settled run is
+        # dropped + unlinked, never surfaced.
+        unlink_gate = stub_unlink_gate
+        stage_request(done, reason: "need_decision", message: "STALE-RUN-MARKER")
+        # Expired: past expiresAt.
+        rid_expired = stage_request(done, reason: "need_decision", message: "EXPIRED-MARKER",
+                                    expires_in_ms: -1_000)
+        await(unlink_gate, "the stale + expired asks to be swept") do
+          !File.exist?(request_path(done, "STALE-RUN-MARKER")) &&
+            !File.exist?(request_path(done, "EXPIRED-MARKER"))
+        end
+
+        refute File.exist?(request_path(done, "STALE-RUN-MARKER")), "the terminal-run ask is unlinked"
+        refute File.exist?(File.join(done[:dir], "control", "supervisor-requests", "#{rid_expired}.json")),
+               "the expired ask is unlinked"
+        assert_empty channel.pending
+
+        # Resolved: a reply file appearing under a pending ask resolves it.
+        live = fake_run("worker")
+        rid = stage_request(live, reason: "need_decision", message: "RESOLVE-MARKER")
+        surfaced = wait_surfaced("RESOLVE-MARKER")
+        refute_nil surfaced
+        Subagents::Supervisor.atomic_write_json(
+          File.join(live[:dir], "control", "supervisor-replies", "#{rid}.json"),
+          {type: Subagents::Supervisor::REPLY_TYPE, requestId: rid,
+           createdAt: Subagents::Supervisor.now_ms, message: "answered elsewhere"})
+        await(unlink_gate, "the reply to resolve the pending ask") do
+          channel.pending.empty? && !File.exist?(request_path(live, "RESOLVE-MARKER"))
+        end
+        assert_empty channel.pending, "the reply resolves the pending ask"
+        refute File.exist?(request_path(live, "RESOLVE-MARKER")), "the resolved request is unlinked"
+      ensure
+        restore_unlink_gate
       end
-
-      refute File.exist?(request_path(done, "STALE-RUN-MARKER")), "the terminal-run ask is unlinked"
-      refute File.exist?(File.join(done[:dir], "control", "supervisor-requests", "#{rid_expired}.json")),
-             "the expired ask is unlinked"
-      assert_empty channel.pending
-
-      # Resolved: a reply file appearing under a pending ask resolves it.
-      live = fake_run("worker")
-      rid = stage_request(live, reason: "need_decision", message: "RESOLVE-MARKER")
-      surfaced = wait_surfaced("RESOLVE-MARKER")
-      refute_nil surfaced
-      Subagents::Supervisor.atomic_write_json(
-        File.join(live[:dir], "control", "supervisor-replies", "#{rid}.json"),
-        {type: Subagents::Supervisor::REPLY_TYPE, requestId: rid,
-         createdAt: Subagents::Supervisor.now_ms, message: "answered elsewhere"})
-      await(unlink_gate, "the reply to resolve the pending ask") do
-        channel.pending.empty? && !File.exist?(request_path(live, "RESOLVE-MARKER"))
-      end
-      assert_empty channel.pending, "the reply resolves the pending ask"
-      refute File.exist?(request_path(live, "RESOLVE-MARKER")), "the resolved request is unlinked"
-    ensure
-      restore_unlink_gate
     end
 
     def test_t1_replies_address_request_ids_only
-      run = fake_run("worker")
-      channel = new_channel
-      rid = stage_request(run, reason: "need_decision", message: "the leaf ask")
-      wait_surfaced("the leaf ask")
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        run = fake_run("worker")
+        channel = new_channel
+        rid = stage_request(run, reason: "need_decision", message: "the leaf ask")
+        wait_surfaced("the leaf ask")
 
-      # NO fuzzy matching, NO run-id/agent-name addressing (T1/OQ-5) —
-      # every wrong address fails with pi's byte-exact error and never
-      # writes a reply file (the child stays blocked until its bound).
-      [run[:id], "worker", "stale-id", rid[0, 8]].each do |bad|
-        error = assert_raises(ArgumentError) { channel.reply(reply_to: bad, message: "x") }
-        assert_equal "No pending supervisor request found for reply_to '#{bad}'.", error.message
+        # NO fuzzy matching, NO run-id/agent-name addressing (T1/OQ-5) —
+        # every wrong address fails with pi's byte-exact error and never
+        # writes a reply file (the child stays blocked until its bound).
+        [run[:id], "worker", "stale-id", rid[0, 8]].each do |bad|
+          error = assert_raises(ArgumentError) { channel.reply(reply_to: bad, message: "x") }
+          assert_equal "No pending supervisor request found for reply_to '#{bad}'.", error.message
+        end
+        blank = assert_raises(ArgumentError) { channel.reply(reply_to: rid, message: "   ") }
+        assert_equal "message is required for supervisor replies.", blank.message
+
+        replies = Dir.glob(File.join(run[:dir], "control", "supervisor-replies", "*"))
+        assert_empty replies, "the wrong-address replies never wrote a file"
+        assert File.exist?(request_path(run, "the leaf ask")), "the child's ask is untouched"
+
+        # The correct address: receipt bytes, the reply file shape, the
+        # request unlinked, the registry dropped.
+        receipt = channel.reply(reply_to: rid, message: "GO AHEAD")
+        assert_equal "Replied to supervisor request #{rid}.", receipt
+        reply = JSON.parse(File.read(File.join(run[:dir], "control", "supervisor-replies", "#{rid}.json")))
+        assert_equal Subagents::Supervisor::REPLY_TYPE, reply["type"]
+        assert_equal rid, reply["requestId"]
+        assert_equal "GO AHEAD", reply["message"]
+        assert reply["createdAt"].is_a?(Integer)
+        refute File.exist?(request_path(run, "the leaf ask"))
+        assert_empty channel.pending
+        assert_equal "No pending supervisor requests.", channel.pending_text
       end
-      blank = assert_raises(ArgumentError) { channel.reply(reply_to: rid, message: "   ") }
-      assert_equal "message is required for supervisor replies.", blank.message
-
-      replies = Dir.glob(File.join(run[:dir], "control", "supervisor-replies", "*"))
-      assert_empty replies, "the wrong-address replies never wrote a file"
-      assert File.exist?(request_path(run, "the leaf ask")), "the child's ask is untouched"
-
-      # The correct address: receipt bytes, the reply file shape, the
-      # request unlinked, the registry dropped.
-      receipt = channel.reply(reply_to: rid, message: "GO AHEAD")
-      assert_equal "Replied to supervisor request #{rid}.", receipt
-      reply = JSON.parse(File.read(File.join(run[:dir], "control", "supervisor-replies", "#{rid}.json")))
-      assert_equal Subagents::Supervisor::REPLY_TYPE, reply["type"]
-      assert_equal rid, reply["requestId"]
-      assert_equal "GO AHEAD", reply["message"]
-      assert reply["createdAt"].is_a?(Integer)
-      refute File.exist?(request_path(run, "the leaf ask"))
-      assert_empty channel.pending
-      assert_equal "No pending supervisor requests.", channel.pending_text
     end
 
     def test_pending_text_shapes
-      run = fake_run("worker")
-      channel = new_channel
-      assert_equal "No pending supervisor requests.", channel.pending_text
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        run = fake_run("worker")
+        channel = new_channel
+        assert_equal "No pending supervisor requests.", channel.pending_text
 
-      rid = stage_request(run, reason: "need_decision", message: "first line\nsecond line")
-      wait_surfaced("first line")
+        rid = stage_request(run, reason: "need_decision", message: "first line\nsecond line")
+        wait_surfaced("first line")
 
-      text = channel.pending_text
-      assert_includes text, "- #{rid}: worker [#{run[:id]}] need_decision. " \
-                            "Reply: subagent({ action: \"reply\", reply_to: \"#{rid}\", message: \"...\" })"
-      assert_includes text, "\n  first line\n  second line", "the message indents two spaces, newlines folded"
+        text = channel.pending_text
+        assert_includes text, "- #{rid}: worker [#{run[:id]}] need_decision. " \
+                              "Reply: subagent({ action: \"reply\", reply_to: \"#{rid}\", message: \"...\" })"
+        assert_includes text, "\n  first line\n  second line", "the message indents two spaces, newlines folded"
 
-      snapshot = channel.pending
-      assert_equal rid, snapshot.first[:id]
-      assert_equal run[:id], snapshot.first[:run_id]
-      assert_equal "worker", snapshot.first[:agent]
-      assert_equal true, snapshot.first[:expects_reply]
+        snapshot = channel.pending
+        assert_equal rid, snapshot.first[:id]
+        assert_equal run[:id], snapshot.first[:run_id]
+        assert_equal "worker", snapshot.first[:agent]
+        assert_equal true, snapshot.first[:expects_reply]
+      end
     end
 
     def test_channel_skips_poison_files_without_dying
-      run = fake_run("worker")
-      channel = new_channel
-      unlink_gate = stub_unlink_gate
-      File.write(File.join(run[:dir], "control", "supervisor-requests", "garbage.json"), "{not json")
-      rid = stage_request(run, reason: "need_decision", message: "the healthy ask")
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        run = fake_run("worker")
+        channel = new_channel
+        unlink_gate = stub_unlink_gate
+        File.write(File.join(run[:dir], "control", "supervisor-requests", "garbage.json"), "{not json")
+        rid = stage_request(run, reason: "need_decision", message: "the healthy ask")
 
-      refute_nil wait_surfaced("the healthy ask"), "the healthy ask still surfaces"
-      await(unlink_gate, "the poison file to be skipped") do
-        !File.exist?(File.join(run[:dir], "control", "supervisor-requests", "garbage.json"))
+        refute_nil wait_surfaced("the healthy ask"), "the healthy ask still surfaces"
+        await(unlink_gate, "the poison file to be skipped") do
+          !File.exist?(File.join(run[:dir], "control", "supervisor-requests", "garbage.json"))
+        end
+        refute File.exist?(File.join(run[:dir], "control", "supervisor-requests", "garbage.json")),
+               "the poison file is unlinked"
+        assert_equal rid, channel.pending.first[:id]
+      ensure
+        restore_unlink_gate
       end
-      refute File.exist?(File.join(run[:dir], "control", "supervisor-requests", "garbage.json")),
-             "the poison file is unlinked"
-      assert_equal rid, channel.pending.first[:id]
-    ensure
-      restore_unlink_gate
     end
 
     # --- THE ROUND TRIP, channel form: a real print child unblocks ---
 
     def test_round_trip_channel_form_real_child_asks_and_unblocks
-      @server.script([
-        {type: :stream, tool_calls: [{id: "ask1", name: "contact_supervisor",
-                                      arguments: {reason: "need_decision", message: "ROUND-TRIP-QUESTION"}}]},
-        {type: :stream, content: "CHILD DONE"}
-      ])
-      manager = new_manager
-      run = manager.spawn_run(agent: "worker", task: "ask the supervisor", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      channel = new_channel
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([
+          {type: :stream, tool_calls: [{id: "ask1", name: "contact_supervisor",
+                                        arguments: {reason: "need_decision", message: "ROUND-TRIP-QUESTION"}}]},
+          {type: :stream, content: "CHILD DONE"}
+        ])
+        manager = new_manager
+        run = manager.spawn_run(agent: "worker", task: "ask the supervisor", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        channel = new_channel
 
-      # The child's ask landing is pinged by the channel's registration
-      # (the surface append follows it); the registered request file
-      # persists for read_single_request below.
-      surfaced = wait_surfaced("ROUND-TRIP-QUESTION")
-      refute_nil surfaced, "the child's own ask surfaces"
-      child_rid = read_single_request(run)["id"]
+        # The child's ask landing is pinged by the channel's registration
+        # (the surface append follows it); the registered request file
+        # persists for read_single_request below.
+        surfaced = wait_surfaced("ROUND-TRIP-QUESTION")
+        refute_nil surfaced, "the child's own ask surfaces"
+        child_rid = read_single_request(run)["id"]
 
-      receipt = channel.reply(reply_to: child_rid, message: "THE ANSWER")
-      assert_equal "Replied to supervisor request #{child_rid}.", receipt
+        receipt = channel.reply(reply_to: child_rid, message: "THE ANSWER")
+        assert_equal "Replied to supervisor request #{child_rid}.", receipt
 
-      wait_terminal(manager, run[:id])
-      assert_equal :completed, manager.runs.first[:state]
+        wait_terminal(manager, run[:id])
+        assert_equal :completed, manager.runs.first[:state]
 
-      tool_results = @server.captured_requests.flat_map { |request| request["messages"] }
-                            .select { |message| message["role"] == "tool" }
-      assert tool_results.any? { |message| message["content"].to_s.include?("**Reply from supervisor:**\nTHE ANSWER") },
-             "the child's NEXT request carries the supervisor answer as the tool result"
-      refute File.exist?(File.join(run[:dir], "control", "supervisor-requests", "#{child_rid}.json"))
-    ensure
-      manager&.shutdown
+        tool_results = @server.captured_requests.flat_map { |request| request["messages"] }
+                              .select { |message| message["role"] == "tool" }
+        assert tool_results.any? { |message| message["content"].to_s.include?("**Reply from supervisor:**\nTHE ANSWER") },
+               "the child's NEXT request carries the supervisor answer as the tool result"
+        refute File.exist?(File.join(run[:dir], "control", "supervisor-requests", "#{child_rid}.json"))
+      ensure
+        manager&.shutdown
+      end
     end
 
     # --- THE ROUND TRIP, parent-loop form: the ask reaches a MODEL turn ---
 
     def test_round_trip_parent_loop_form_the_wake_turn_carries_the_ask
-      @server.script([
-        # The parent's spawn call, then its (fast) final — the child boot
-        # (~350ms) is the slow pole, so the parent's two requests consume
-        # slots 0/1 first (the I48 order-bet discipline, ~100x margin).
-        {type: :stream, tool_calls: [{id: "p1", name: "subagent",
-                                      arguments: {agent: "worker", task: "ask and report", async: true}}]},
-        {type: :stream, content: "SPAWN TURN DONE"},
-        # The child asks, then finishes after the reply.
-        {type: :stream, tool_calls: [{id: "c1", name: "contact_supervisor",
-                                      arguments: {reason: "need_decision", message: "PARENT-LOOP-QUESTION"}}]},
-        # The parent's WAKE turn (the ask drain).
-        {type: :stream, content: "ASK RECEIVED"},
-        {type: :stream, content: "CHILD DONE"}
-      ])
-      recorder = Agent::Session::Recorder.new(cwd: @cwd, root: File.join(@home, "agent"))
-      # The Manager's wake target is the CALLABLE resolving the loop
-      # (register's own shape — the /new-swap precedent): the tool needs
-      # the manager, the loop needs the tool — the callable breaks the
-      # construction cycle.
-      loop = nil
-      wake_target = -> { loop }
-      manager = new_manager(agent: wake_target)
-      manager.supervisor_channel = new_channel(agent: wake_target)
-      tool = Tools::Subagent.new(manager:)
-      loop = Agent::Loop.new(chat: Test::TestChat.build(@server, tools: [tool], system_prompt: "test prompt"),
-                             tools: {"subagent" => tool}, hooks: @hooks, recorder:)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([
+          # The parent's spawn call, then its (fast) final — the child boot
+          # (~350ms) is the slow pole, so the parent's two requests consume
+          # slots 0/1 first (the I48 order-bet discipline, ~100x margin).
+          {type: :stream, tool_calls: [{id: "p1", name: "subagent",
+                                        arguments: {agent: "worker", task: "ask and report", async: true}}]},
+          {type: :stream, content: "SPAWN TURN DONE"},
+          # The child asks, then finishes after the reply.
+          {type: :stream, tool_calls: [{id: "c1", name: "contact_supervisor",
+                                        arguments: {reason: "need_decision", message: "PARENT-LOOP-QUESTION"}}]},
+          # The parent's WAKE turn (the ask drain).
+          {type: :stream, content: "ASK RECEIVED"},
+          {type: :stream, content: "CHILD DONE"}
+        ])
+        recorder = Agent::Session::Recorder.new(cwd: @cwd, root: File.join(@home, "agent"))
+        # The Manager's wake target is the CALLABLE resolving the loop
+        # (register's own shape — the /new-swap precedent): the tool needs
+        # the manager, the loop needs the tool — the callable breaks the
+        # construction cycle.
+        loop = nil
+        wake_target = -> { loop }
+        manager = new_manager(agent: wake_target)
+        manager.supervisor_channel = new_channel(agent: wake_target)
+        tool = Tools::Subagent.new(manager:)
+        loop = Agent::Loop.new(chat: Test::TestChat.build(@server, tools: [tool], system_prompt: "test prompt"),
+                               tools: {"subagent" => tool}, hooks: @hooks, recorder:)
 
-      run_in_background(loop, "kick off the asking child")
-      parent_run = nil
-      await(manager, "the parent to spawn the child") { parent_run = manager.runs.first }
-      surfaced = wait_surfaced("PARENT-LOOP-QUESTION", requeue: true)
-      refute_nil surfaced, "the channel surfaced the child's ask"
-      # Rule-12 follow-up: the kick is captured AFTER the surface append,
-      # so pin it with its own event before asserting on the capture.
-      await(@kernel, "the wake kick to be captured") { !@kernel.calls.empty? }
-      refute_empty @kernel.calls, "the kick block was captured"
-      child_run = parent_run
+        run_in_background(loop, "kick off the asking child")
+        parent_run = nil
+        await(manager, "the parent to spawn the child") { parent_run = manager.runs.first }
+        surfaced = wait_surfaced("PARENT-LOOP-QUESTION", requeue: true)
+        refute_nil surfaced, "the channel surfaced the child's ask"
+        # Rule-12 follow-up: the kick is captured AFTER the surface append,
+        # so pin it with its own event before asserting on the capture.
+        await(@kernel, "the wake kick to be captured") { !@kernel.calls.empty? }
+        refute_empty @kernel.calls, "the kick block was captured"
+        child_run = parent_run
 
-      # Run the kick on a reactor (the documented wake contract): the ask
-      # must reach the parent's NEXT request as user-role wire text.
-      @kernel.calls.dup.each do |block|
-        Core::Loop.new(session: Test::ScriptedSession.new).run { block.call }
-      end
-      seen = []
-      ask_request = nil
-      await(@server, "the wake turn to carry the ask") do
-        seen.concat(@server.captured_requests)
-        ask_request = seen.find do |request|
-          request["messages"].any? do |message|
-            message["role"] == "user" && message["content"].to_s.include?("PARENT-LOOP-QUESTION")
-          end
+        # Run the kick on a reactor (the documented wake contract): the ask
+        # must reach the parent's NEXT request as user-role wire text.
+        @kernel.calls.dup.each do |block|
+          Core::Loop.new(session: Test::ScriptedSession.new).run { block.call }
         end
-        !ask_request.nil?
-      end
-      refute_nil ask_request, "the wake turn carried the ask to the model"
-      # The wake request is the parent's NEXT turn (turn-1 history rides
-      # it) and the ask rides as USER-role wire text — the reasonHeading +
-      # the reply hint + the live-guidance tail.
-      assert_includes JSON.generate(ask_request["messages"]), "SPAWN TURN DONE"
-      ask_message = ask_request["messages"].find do |message|
-        message["role"] == "user" && message["content"].to_s.include?("PARENT-LOOP-QUESTION")
-      end
-      refute_nil ask_message, "the ask rides as user-role text"
-      assert_includes ask_message["content"], "Subagent needs a supervisor decision."
-      assert_includes ask_message["content"], 'Reply with: subagent({ action: "reply", reply_to: "'
-      assert_includes ask_message["content"], "(Reply to the pending request first.)"
+        seen = []
+        ask_request = nil
+        await(@server, "the wake turn to carry the ask") do
+          seen.concat(@server.captured_requests)
+          ask_request = seen.find do |request|
+            request["messages"].any? do |message|
+              message["role"] == "user" && message["content"].to_s.include?("PARENT-LOOP-QUESTION")
+            end
+          end
+          !ask_request.nil?
+        end
+        refute_nil ask_request, "the wake turn carried the ask to the model"
+        # The wake request is the parent's NEXT turn (turn-1 history rides
+        # it) and the ask rides as USER-role wire text — the reasonHeading +
+        # the reply hint + the live-guidance tail.
+        assert_includes JSON.generate(ask_request["messages"]), "SPAWN TURN DONE"
+        ask_message = ask_request["messages"].find do |message|
+          message["role"] == "user" && message["content"].to_s.include?("PARENT-LOOP-QUESTION")
+        end
+        refute_nil ask_message, "the ask rides as user-role text"
+        assert_includes ask_message["content"], "Subagent needs a supervisor decision."
+        assert_includes ask_message["content"], 'Reply with: subagent({ action: "reply", reply_to: "'
+        assert_includes ask_message["content"], "(Reply to the pending request first.)"
 
-      # Reply to the CHILD's request id (T1 leaf routing): the child
-      # unblocks and completes.
-      child_rid = read_single_request(child_run)["id"]
-      assert_equal "Replied to supervisor request #{child_rid}.",
-                   manager.supervisor_channel.reply(reply_to: child_rid, message: "GO")
-      wait_terminal(manager, child_run[:id])
-      assert_equal :completed, manager.runs.find { |r| r[:id] == child_run[:id] }[:state]
-      @run_thread.join # blocking (the parent's turns all ended) — a bare join is not a sleep
-    ensure
-      manager&.shutdown
+        # Reply to the CHILD's request id (T1 leaf routing): the child
+        # unblocks and completes.
+        child_rid = read_single_request(child_run)["id"]
+        assert_equal "Replied to supervisor request #{child_rid}.",
+                     manager.supervisor_channel.reply(reply_to: child_rid, message: "GO")
+        wait_terminal(manager, child_run[:id])
+        assert_equal :completed, manager.runs.find { |r| r[:id] == child_run[:id] }[:state]
+        @run_thread.join # blocking (the parent's turns all ended) — a bare join is not a sleep
+      ensure
+        manager&.shutdown
+      end
     end
 
     # --- the parent tool's intercom actions (Spec §6) ---
 
     def test_parent_tool_reply_and_pending_actions
-      manager = new_manager
-      tool = Tools::Subagent.new(manager:)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        manager = new_manager
+        tool = Tools::Subagent.new(manager:)
 
-      # A bare Manager carries no channel: the state texts name exactly
-      # what is true — nothing is pending (the gate's driven shapes).
-      assert_equal "No pending supervisor requests.", tool.execute(action: "pending")
-      bad = tool.execute(action: "reply", reply_to: "nope", message: "x")
-      assert bad.is_a?(Hash) && bad[:error] == "No pending supervisor request found for reply_to 'nope'."
+        # A bare Manager carries no channel: the state texts name exactly
+        # what is true — nothing is pending (the gate's driven shapes).
+        assert_equal "No pending supervisor requests.", tool.execute(action: "pending")
+        bad = tool.execute(action: "reply", reply_to: "nope", message: "x")
+        assert bad.is_a?(Hash) && bad[:error] == "No pending supervisor request found for reply_to 'nope'."
 
-      run = manager.spawn_run(agent: "worker", task: "action target", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      channel = new_channel
-      manager.supervisor_channel = channel
-      rid = stage_request(run, reason: "need_decision", message: "THE ACTION ASK")
-      wait_surfaced("THE ACTION ASK")
+        run = manager.spawn_run(agent: "worker", task: "action target", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        channel = new_channel
+        manager.supervisor_channel = channel
+        rid = stage_request(run, reason: "need_decision", message: "THE ACTION ASK")
+        wait_surfaced("THE ACTION ASK")
 
-      text = tool.execute(action: "pending")
-      assert_includes text, "- #{rid}: worker [#{run[:id]}] need_decision."
+        text = tool.execute(action: "pending")
+        assert_includes text, "- #{rid}: worker [#{run[:id]}] need_decision."
 
-      receipt = tool.execute(action: "reply", reply_to: rid, message: "ANSWERED")
-      assert_equal "Replied to supervisor request #{rid}.", receipt
+        receipt = tool.execute(action: "reply", reply_to: rid, message: "ANSWERED")
+        assert_equal "Replied to supervisor request #{rid}.", receipt
 
-      await(channel, "the reply to consume the pending ask") { manager.supervisor_channel.pending.empty? }
-      assert_equal "No pending supervisor requests.", tool.execute(action: "pending")
+        await(channel, "the reply to consume the pending ask") { manager.supervisor_channel.pending.empty? }
+        assert_equal "No pending supervisor requests.", tool.execute(action: "pending")
 
-      unknown = tool.execute(action: "wat")
-      assert unknown.is_a?(Hash) && unknown[:error].include?("pending")
-      assert unknown[:error].include?("reply")
-    ensure
-      manager&.shutdown
+        unknown = tool.execute(action: "wat")
+        assert unknown.is_a?(Hash) && unknown[:error].include?("pending")
+        assert unknown[:error].include?("reply")
+      ensure
+        manager&.shutdown
+      end
     end
 
     # --- the workflow templates (Spec §7) ---
@@ -696,13 +736,17 @@ module Tart
     end
 
     def test_toctou_missing_marker_fallback_is_unchanged
-      run = fake_run("worker")
-      assert_equal File.join(requests_dir(run), "missing.json"), request_path(run, "TOCTOU-ABSENT")
-      assert_nil request_file(run, "TOCTOU-ABSENT")
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        run = fake_run("worker")
+        assert_equal File.join(requests_dir(run), "missing.json"), request_path(run, "TOCTOU-ABSENT")
+        assert_nil request_file(run, "TOCTOU-ABSENT")
 
-      stage_request(run, reason: "need_decision", message: "TOCTOU-OTHER")
-      assert_equal File.join(requests_dir(run), "missing.json"), request_path(run, "TOCTOU-ABSENT")
-      assert_nil request_file(run, "TOCTOU-ABSENT")
+        stage_request(run, reason: "need_decision", message: "TOCTOU-OTHER")
+        assert_equal File.join(requests_dir(run), "missing.json"), request_path(run, "TOCTOU-ABSENT")
+        assert_nil request_file(run, "TOCTOU-ABSENT")
+      end
     end
 
     # Deterministic TOCTOU staging: the Dir.glob stub unlinks the staged

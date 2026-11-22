@@ -191,41 +191,45 @@ module Tart
     # --- AC2: ownership flags across outstanding?/notify/shutdown ---
 
     def test_ownership_owned_runs_gate_drain_and_notify_adopted_runs_never_do
-      @server.script([{type: :stream, content: "owned answer"}])
-      manager = new_manager
-      owned = manager.spawn_run(agent: "worker", task: "owned", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      assert_equal true, manager.outstanding?, "the owned in-flight run gates outstanding?"
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "owned answer"}])
+        manager = new_manager
+        owned = manager.spawn_run(agent: "worker", task: "owned", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        assert_equal true, manager.outstanding?, "the owned in-flight run gates outstanding?"
 
-      # Adopt a foreign LIVE run through the fleet read.
-      foreign_id = "01deadbee-0000-7000-8000-000000000004"
-      foreign_pid = live_pid
-      fabricate_run(id: foreign_id, pid: foreign_pid, agent: "oracle",
-                    session_id: manager.session_owner_id)
-      manager.status(id: nil)
+        # Adopt a foreign LIVE run through the fleet read.
+        foreign_id = "01deadbee-0000-7000-8000-000000000004"
+        foreign_pid = live_pid
+        fabricate_run(id: foreign_id, pid: foreign_pid, agent: "oracle",
+                      session_id: manager.session_owner_id)
+        manager.status(id: nil)
 
-      # The foreign run settles terminal only through its own death; while
-      # it lives, the drain returns once the OWNED run settles (no wedge).
-      wait_owned_terminal(manager, owned[:id])
-      assert_equal false, manager.outstanding?, "the live foreign run must not gate the drain"
-      manager.drain
+        # The foreign run settles terminal only through its own death; while
+        # it lives, the drain returns once the OWNED run settles (no wedge).
+        wait_owned_terminal(manager, owned[:id])
+        assert_equal false, manager.outstanding?, "the live foreign run must not gate the drain"
+        manager.drain
 
-      # The foreign run's convergence queues NO notification: the adopter's
-      # chat carries exactly the owned run's completion (the queue DRAINS
-      # on read — capture once).
-      pending = @hooks.pending_next_turn
-      assert_equal 1, pending.size
-      assert_includes pending.first[:content], "worker"
+        # The foreign run's convergence queues NO notification: the adopter's
+        # chat carries exactly the owned run's completion (the queue DRAINS
+        # on read — capture once).
+        pending = @hooks.pending_next_turn
+        assert_equal 1, pending.size
+        assert_includes pending.first[:content], "worker"
 
-      # Killing the foreign pid and re-reading converges it disk-only.
-      Process.kill("KILL", -foreign_pid)
-      wait_pid_gone(foreign_pid)
-      list = manager.status(id: nil)
-      assert_includes list, "- #{foreign_id} | failed | single | oracle"
-      assert_empty @hooks.pending_next_turn, "a foreign convergence never notifies"
+        # Killing the foreign pid and re-reading converges it disk-only.
+        Process.kill("KILL", -foreign_pid)
+        wait_pid_gone(foreign_pid)
+        list = manager.status(id: nil)
+        assert_includes list, "- #{foreign_id} | failed | single | oracle"
+        assert_empty @hooks.pending_next_turn, "a foreign convergence never notifies"
 
-      # shutdown's stop ladder spares the (now terminal) foreign record;
-      # the LIVE-foreign-child case is the next pin.
-      manager.shutdown
+        # shutdown's stop ladder spares the (now terminal) foreign record;
+        # the LIVE-foreign-child case is the next pin.
+        manager.shutdown
+      end
     end
 
     def test_shutdown_spares_a_live_foreign_child
@@ -251,22 +255,26 @@ module Tart
     # --- AC3: a hard-killed OWNED runner settles through the watcher sweep ---
 
     def test_kill_9_owned_child_settles_terminal_through_the_watcher_sweep
-      @server.script([{type: :stream, content: "never read"}])
-      manager = new_manager
-      run = manager.spawn_run(agent: "worker", task: "crash", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      assert_equal :running, run[:state]
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "never read"}])
+        manager = new_manager
+        run = manager.spawn_run(agent: "worker", task: "crash", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        assert_equal :running, run[:state]
 
-      Process.kill("KILL", run[:pid])
+        Process.kill("KILL", run[:pid])
 
-      wait_owned_terminal(manager, run[:id])
-      record = manager.runs.find { |r| r[:id] == run[:id] }
-      assert_equal true, %i[failed stopped].include?(record[:state]), record[:state].inspect
-      assert File.file?(File.join(record[:dir], "result.json")), "the crash evidence landed in result.json"
-      # Owned async convergence still notifies (the frozen observable) —
-      # the settle queues the notification before its broadcast (I103).
-      await(manager, "the completion notification", belt: CHILD_BELT_S) { !@hooks.pending_next_turn.empty? }
-      assert_equal false, manager.outstanding?
-      manager.shutdown
+        wait_owned_terminal(manager, run[:id])
+        record = manager.runs.find { |r| r[:id] == run[:id] }
+        assert_equal true, %i[failed stopped].include?(record[:state]), record[:state].inspect
+        assert File.file?(File.join(record[:dir], "result.json")), "the crash evidence landed in result.json"
+        # Owned async convergence still notifies (the frozen observable) —
+        # the settle queues the notification before its broadcast (I103).
+        await(manager, "the completion notification", belt: CHILD_BELT_S) { !@hooks.pending_next_turn.empty? }
+        assert_equal false, manager.outstanding?
+        manager.shutdown
+      end
     end
 
     # --- AC4: the loud dispatch validation law ---

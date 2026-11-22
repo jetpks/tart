@@ -57,32 +57,42 @@ class MockIngestServer
   end
 
   # The observation gate's mechanics (the Tart::Test::Gate shape, local:
-  # this file must stay minitest-free for any standalone loader).
+  # this file must stay minitest-free for any standalone loader). The I107
+  # V1 vocabulary: plain-Integer version, Thread::Queue timed-pop park,
+  # dual-path ping (direct push + the scheduler-ready rider when a
+  # scheduler is present on the producer's thread). No Mutex, no
+  # ConditionVariable.
   class PostGate
+    Wake = Struct.new(:queue, :token) do
+      def alive? = true
+
+      def transfer
+        queue.push(token)
+      end
+    end
+    private_constant :Wake
+
     def initialize
-      @mutex = Mutex.new
-      @cv = ConditionVariable.new
+      @ready = ::Thread::Queue.new
       @version = 0
     end
 
     def ping
-      @mutex.synchronize do
-        @version += 1
-        @cv.broadcast
-      end
+      @version += 1
+      @ready.push(:wake)
+      Fiber.scheduler&.push(Wake.new(@ready, :wake))
       nil
     end
 
     def state_version
-      @mutex.synchronize { @version }
+      @version
     end
 
     def wait_state_change(from_version, belt: 60)
-      @mutex.synchronize do
-        until @version > from_version
-          return nil unless @cv.wait(@mutex, belt)
-        end
-        @version
+      loop do
+        return @version if @version > from_version
+
+        return nil if @ready.pop(timeout: belt).nil?
       end
     end
   end

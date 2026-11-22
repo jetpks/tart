@@ -51,6 +51,17 @@ module Tart
     # approval UI is deleted — pi has no permissions system; the plumbing
     # side lives in the agent lane.)
     class Chat
+      # The scheduler-ready rider (Notification::Signal's mechanism — async
+      # clone lib/async/notification.rb): the selector processes its ready
+      # list by calling #transfer, which pushes the same queue.
+      Wake = Struct.new(:queue, :token) do
+        def alive? = true
+
+        def transfer
+          queue.push(token)
+        end
+      end
+      private_constant :Wake
       SPINNER = %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏].freeze
 
       # pi loader.ts:17 DEFAULT_INTERVAL_MS — the spinner's frame dwell: the
@@ -188,7 +199,14 @@ module Tart
         # open; a landed fetch merges only when its open is still the
         # latest — a closed/superseded menu never merges stale rows.
         @listing_seq = 0
-        @mutex = Mutex.new
+        # I107 (V4/M2): the surface guard Mutex + CV die — every funnel is
+        # a same-reactor mutation (the frame loop's fibers, the agent-run
+        # task, the editor input path on the poller-dispatched fiber: ONE
+        # reactor thread, cooperative fibers, no yields inside the
+        # funnels). The I103 state-signal seam re-roots onto the V1 wake
+        # (plain-Integer version + Thread::Queue timed-pop park).
+        @ready = Async::Queue.new
+        @state_version = 0
         # The multi-line input editor (pi's Editor — the visual-line state
         # and operations) and its suggestion list over the injected
         # completion source (pi editor.ts autocompleteState/
@@ -322,9 +340,8 @@ module Tart
         # handle, its ABSOLUTE deadline (monotonic clock), and the monotonic
         # arm count. Reactor-serial state — every write happens on a kernel
         # reactor fiber (the two interrupt dispatch arms, the :agent_end
-        # arm, the render-path guard); the belt never reads through @mutex
-        # (the I79 discipline). The deadline seam stays unset → the frozen
-        # default applies.
+        # arm, the render-path guard). The deadline seam stays unset → the
+        # frozen default applies.
         @interrupt_belt_armed = false
         @interrupt_belt_task = nil
         @interrupt_belt_deadline_at = nil
@@ -425,38 +442,42 @@ module Tart
       # is these two methods, signal_state_change, and its broadcast call
       # sites: deleting them restores base behavior byte-for-byte (a
       # broadcast with no waiter is a no-op; production never waits).
+      # --- I103 state-signal seam (I107 V1 mechanics) ---------------------
+      # The await-loop's version read + the test-only park. The footprint
+      # is these two methods, signal_state_change, and its call sites:
+      # deleting them restores base behavior byte-for-byte (a ping with no
+      # waiter is a no-op; production never waits).
       def state_version
-        @mutex.synchronize { @state_version ||= 0 }
+        @state_version
       end
 
       # Parks until the version moves past from_version, belt-bounded (nil
-      # on belt expiry with no change). Production never calls this.
+      # on belt expiry with no change). Production never calls this. The
+      # park is the V1 timed pop (parks a reactor FIBER; blocks a plain
+      # thread).
       def wait_state_change(from_version, belt: 60)
-        @mutex.synchronize do
-          @state_version ||= 0
-          @state_cv ||= ConditionVariable.new
-          until @state_version > from_version
-            return nil unless @state_cv.wait(@mutex, belt)
-          end
-          @state_version
+        loop do
+          return @state_version if @state_version > from_version
+
+          return nil if @ready.pop(timeout: belt).nil?
         end
       end
 
       # @return [Boolean] whether an agent run is in flight.
       def busy?
-        @mutex.synchronize { @busy }
+        @busy
       end
 
       # @return [Boolean] whether a user-bash run's live rows are on
       #   screen (the spinner tick's second arm — @busy stays false: a
       #   bash run never lights the border's Working status).
       def user_bash_streaming?
-        @mutex.synchronize { !@user_bash_stream.nil? }
+        !@user_bash_stream.nil?
       end
 
       # @return [String] the input line buffer (the editor's).
       def input
-        @mutex.synchronize { @editor.input }
+        @editor.input
       end
 
       # The kernel handle (the escape-cancel path stops the user-bash task
@@ -472,12 +493,10 @@ module Tart
         # the full-width blank rows) drop off the readback; content spans
         # keep their bytes verbatim (art trailing spaces, markdown
         # spacing rows). The -e capture remains the style gate.
-        @mutex.synchronize do
-          @transcript_state.lines.map do |line|
-            spans = line.spans.dup
-            spans.pop while !spans.empty? && panel_fill_span?(spans.last)
-            spans.empty? ? "" : spans.map(&:content).join
-          end
+        @transcript_state.lines.map do |line|
+          spans = line.spans.dup
+          spans.pop while !spans.empty? && panel_fill_span?(spans.last)
+          spans.empty? ? "" : spans.map(&:content).join
         end
       end
 
@@ -492,47 +511,47 @@ module Tart
       # @return [Array<Hash>, nil] the active suggestion items (test
       #   readback — the list is otherwise visible only in the drawn tree).
       def suggestions
-        @mutex.synchronize { @autocomplete.suggestions }
+        @autocomplete.suggestions
       end
 
       # @return [Integer] the active list's selection index (test readback).
       def suggestions_index
-        @mutex.synchronize { @autocomplete.selected }
+        @autocomplete.selected
       end
 
       # @return [Array<Hash>, nil] the open session picker's items (test
       #   readback; nil = closed).
       def picker_items
-        @mutex.synchronize { @picker&.items }
+        @picker&.items
       end
 
       # @return [Integer] the picker's selection index (test readback).
       def picker_index
-        @mutex.synchronize { @picker ? @picker.selected : 0 }
+        @picker ? @picker.selected : 0
       end
 
       # The open selector menu's readbacks (test seams, the picker
       # readbacks' shape): whether a menu is open and its current
       # selection.
       def menu_open?
-        @mutex.synchronize { !@menu.nil? }
+        !@menu.nil?
       end
 
       def menu_selection
-        @mutex.synchronize { @menu&.selection }
+        @menu&.selection
       end
 
       # @return [Integer] the transcript viewport's top-line offset (test
       #   readback; maintained at render time).
       def scroll_offset
-        @mutex.synchronize { @viewport.offset }
+        @viewport.offset
       end
 
       # The jump pill's click readback (pi scrollToEndIndicatorRect) —
       # nil whenever the pill is absent (following, content fits, or the
       # label truncates away).
       def jump_pill_rect
-        @mutex.synchronize { @jump_pill_rect }
+        @jump_pill_rect
       end
 
       # The kernel renderer proc: builds the fullscreen three-area widget.
@@ -547,17 +566,15 @@ module Tart
         # escalation's scrollback line then paints in THIS frame.
         escalate_expired_interrupt_belt
         widget = nil
-        @mutex.synchronize do
-          enqueue_motd if @motd_pending
-          @motd_pending = false
-          @transcript_state.flush_scrollback
-          widget = build_widget
-          # One-frame latch semantics (I56): the resize event's dims drove
-          # THIS compose; the draw's autoresize has refreshed the gem area
-          # by the next frame (Grounds §2) — subsequent frames compose
-          # from the session area again.
-          @resize_dims = nil
-        end
+        enqueue_motd if @motd_pending
+        @motd_pending = false
+        @transcript_state.flush_scrollback
+        widget = build_widget
+        # One-frame latch semantics (I56): the resize event's dims drove
+        # THIS compose; the draw's autoresize has refreshed the gem area
+        # by the next frame (Grounds §2) — subsequent frames compose
+        # from the session area again.
+        @resize_dims = nil
         # I58 — pi's render discipline (tui.ts requestRender/scheduleRender):
         # nothing renders at a fixed rate here anymore. State changes —
         # agent events (the sink's tail request_draw), user-bash chunks
@@ -600,212 +617,208 @@ module Tart
       # respond_to? guard is what separates the classes).
       def handle_resize(event)
         rebuilt = false
-        @mutex.synchronize do
-          @resize_dims = [event.width, event.height]
-          if @header_enqueued
-            @logo_lines = Motd.motd_logo_lines(event.width, wordmark: @identity)
-            rebuilt = @transcript_state.rebuild_live_expandables
-          end
-          signal_state_change
+        @resize_dims = [event.width, event.height]
+        if @header_enqueued
+          @logo_lines = Motd.motd_logo_lines(event.width, wordmark: @identity)
+          rebuilt = @transcript_state.rebuild_live_expandables
         end
+        signal_state_change
         @kernel.request_draw if rebuilt
       end
 
       # Agent event sink (I03 event surface). Runs on the agent fiber.
       def on_agent_event(event)
         handled = nil
-        @mutex.synchronize do
-          case event[:type]
-          when :agent_start
-            @busy = true
-            # The failure row's double-render guard resets per run (D3 —
-            # set by the :message_end error-row arm; the agent_end error
-            # arm reads it).
-            @error_row_rendered = false
-            # pi turn_start creates the working indicator (interactive-mode.ts
-            # :3427-3433) — the Loader's frame-0 reset.
-            restart_spinner!
-            arm_spinner_tick
-            @footer.invalidate_branch # per-turn branch invalidation (pi's provider cache, reduced)
-          when :message_start
-            message = event[:message]
-            if message.respond_to?(:role) && message.role == :custom
-              # The custom-message arm (I47 — pi message_start case custom,
-              # interactive-mode.ts:3498-3502: the component is added at
-              # message_start, display-gated). The :message_end custom case
-              # needs no arm — the assistant guard below already no-ops it
-              # (pi renders the block ONCE).
-              @transcript_state.enqueue_custom_block(message.custom_type, message.content) if message.display
-            else
-              # The queued-message delivery arm (I54 — pi agent-session.ts
-              # :1122-1134 + interactive-mode.ts:3503-3507): a user-role
-              # message_start whose text matches a mirror's FIRST-index
-              # entry removes it and renders the user echo AT DELIVERY (the
-              # idle submit's opening message never matches — it already
-              # echoed at submit). Runs under the surface mutex (the sink
-              # holds it) — no re-synchronize.
-              deliver_queued_message(message) if message.respond_to?(:role) && message.role == :user
-              @live = +""
-              @reasoning = +""
-              @live_region_cache = nil # the reset invalidates (I58, §live_region_cache)
-            end
-          when :message_update
-            chunk = event[:chunk]
-            @live << chunk.content if chunk.content.is_a?(String) && !chunk.content.empty?
-            reasoning = chunk.thinking&.text
-            @reasoning << reasoning if reasoning.is_a?(String) && !reasoning.empty?
-          when :message_end
-            message = event[:message]
-            if message.role == :assistant
-              @footer.accumulate_usage(message)
-              handled = complete(message.content)
-              # pi getLastAssistantText (agent-session.ts:4347): the last
-              # assistant message's trimmed text — ctrl+x's fallback.
-              @last_assistant_text = handled&.strip
-              # The reasoning buffer threads in as data and clears after
-              # the render (the flush lived inside enqueue_message at
-              # base — same row order, buffer reset with the completion).
-              @transcript_state.enqueue_message(handled, reasoning: @reasoning)
-              @reasoning = +""
-              if message.respond_to?(:finish_reason) && message.finish_reason == "error"
-                # pi assistant-message.ts:184-198 — the failure component's
-                # row: Spacer(1), then "Error: <errorMessage>" in error fg
-                # (after any partial content), outputPad-led and wrapped.
-                # The flag arms the agent_end error arm's skip (pi's
-                # agent_end renders no error text — the component owns the
-                # row; without the guard the failure would double-render).
-                # The respond_to? guard is the footer's usage-read idiom:
-                # every real loop event carries the Message reader; reader-
-                # less display doubles (render_perf's Msg) stay inert.
-                @error_row_rendered = true
-                @transcript_state.enqueue_region([Panel.blank_line,
-                  *Panel.padded_fg_rows("Error: #{message.error_message}", viewport_width,
-                    fg: Theme[:error])])
-              end
-            end
-          when :tool_execution_start
-            @tool = event[:tool_call].name
-            # The PENDING block's enqueue (I34 — pi renders the running
-            # call's block immediately under toolPendingBg, the component
-            # added to the chat container at :tool_execution_start,
-            # interactive-mode.ts:3611-3621): paints on the next frame
-            # while the tool runs; the finalize replaces it in place.
-            call = event[:tool_call]
-            # I65 D2: the registry keys by the call id (pi pendingTools is
-            # a Map keyed by toolCallId, interactive-mode.ts:3611-3621).
-            # The reader-guard is the details idiom below — reader-less
-            # display doubles (render_perf) stay inert, the id threads
-            # nil, and the transcript's id-less arms keep today's shape.
-            id = call.respond_to?(:id) ? call.id : nil
-            @transcript_state.enqueue_pending_tool_block(id, call.name, call.arguments)
-          when :tool_execution_end
-            @tool = nil
-            call = event[:tool_call]
-            # The settle (I34): the pending block replaced IN PLACE with
-            # the per-tool block dispatch's rows (pi's per-tool renderers
-            # — bash owns the shell shapes, I17 — the frozen
-            # :tool_execution_end contract carries `duration:`; write/read
-            # their file-tool shapes, I18; edit the diff-display family
-            # fed the call's details side channel, I57 — the respond_to?
-            # guard keeps the recorded ToolCall-shape doubles without the
-            # member inert; the rest the generic ⎿ line).
-            # No live pending (the replay path) falls back to the append.
-            id = call.respond_to?(:id) ? call.id : nil
-            @transcript_state.finalize_tool_block(id, call.name, call.arguments, event[:result], event[:duration],
-                                                  details: call.respond_to?(:details) ? call.details : nil)
-          when :compaction_start
-            # The frozen I12 contract (Agent::Loop#run_compaction, after
-            # prepare succeeds): the border shows pi's per-reason label
-            # (status-indicator.ts:85-95 minus the cancel hint) until the
-            # result (+:compaction+) or the run end clears it.
-            @compaction_reason = event[:reason]
-            # pi constructs CompactionStatusIndicator (:3681) — a new
-            # Loader, frame 0.
-            restart_spinner!
-          when :compaction
-            # pi compaction_end's result arm (interactive-mode.ts:3686-3725):
-            # the chat container clears and rebuilds from the post-compaction
-            # KEPT entries (the payload's `entries` — the frozen lane
-            # contract, the same shape the replay consumes) through the
-            # replay machinery, then the panel appends LAST (pi
-            # addMessageToChat after renderSessionEntries). The footer
-            # INVALIDATES — post-compaction the context numerator is
-            # unknown until the next LLM response (the "?") — never /new's
-            # usage reset. The border status came from :compaction_start
-            # (the frozen I12 contract); its clearing here stays — and
-            # re-anchors the spinner (pi clearStatusIndicator :3694 → the
-            # next working indicator restarts).
-            @compaction_reason = nil
-            restart_spinner!
-            wipe_transcript
-            # The header container survives pi's chatContainer clear
-            # (interactive-mode.ts:633-639 — sibling containers; the s7
-            # capture: art + help + onboarding ride again, no resource
-            # listings). Re-enqueued as the EXPANDABLE block — rebuilt at
-            # its CURRENT expansion state (pi's live header rides the
-            # toggle).
-            enqueue_motd_header if @header_enqueued
-            entries = event[:entries].is_a?(Array) ? event[:entries] : []
-            @transcript_state.replay_entries(entries, update_footer: false, populate_history: false)
-            @transcript_state.enqueue_compaction_panel(event[:summary], event[:tokens_before])
-            @footer.mark_usage_stale
-          when :agent_end
-            @busy = false
-            # I90 belt disarm — ANY agent_end (interrupted, error, natural)
-            # is delivery evidence: the watchdog stops, zero residue.
-            disarm_interrupt_delivery_belt
-            @compaction_reason = nil
-            # The tick cancels with the run (I58) — unless a user-bash
-            # stream keeps it alive. Direct ivar read: this arm HOLDS the
-            # surface mutex (user_bash_streaming? would re-synchronize).
-            cancel_spinner_tick unless @user_bash_stream
-            # The deferred bashExecution records flush at agent end (pi's
-            # _pendingBashMessages flush) — never mid-tool-sequence.
-            @user_bash.flush_pending
-            if event[:interrupted] == true
-              # The orphaned pending block's finalize (I34 — pi's abort
-              # arm loops pendingTools with the "Operation aborted" error
-              # result, interactive-mode.ts:3573-3586); the interrupt
-              # scrollback line stays (additive).
-              @transcript_state.finalize_pending_as_error("Operation aborted")
-              handled = "interrupted"
-              @transcript_state.enqueue_scrollback(handled, fg: Theme[:warning])
-            elsif event[:error]
-              # pi's error arm: the same loop with the error's message. The
-              # flag-set case (the failure message's own message_end already
-              # rendered the pad-led error row — D3) SKIPS the scrollback
-              # line: pi's agent_end renders no error text (the component
-              # owns the row). The flag-UNSET case (a failure with no
-              # synthesized message_end) renders today's line byte-
-              # identically. The finalize stays in BOTH (defense).
-              @transcript_state.finalize_pending_as_error(event[:error].message.to_s)
-              unless @error_row_rendered
-                handled = "error: #{event[:error].message}"
-                @transcript_state.enqueue_scrollback(handled, fg: Theme[:error])
-              end
-            end
-            # A message submitted in the wind-down window (after the agent's
-            # final steering check, before agent_end) sits queued with no run
-            # in flight — continue the run (pi's queued-message semantics:
-            # pi polls the queue at loop start, agent-loop.ts:175). The
-            # deferred abort-first command (§busy_command_arm) takes THIS
-            # agent_end instead: re-dispatch through the EXACT idle paths
-            # (kernel.async schedules outside the mutex) and SKIP the
-            # wind-down — manual compaction never continues the interrupted
-            # turn (pi agent-session.ts:2762-2763).
-            if @pending_after_interrupt
-              deferred = @pending_after_interrupt
-              @pending_after_interrupt = nil
-              @kernel.async { @commands&.dispatch(deferred) }
-            elsif handled.nil? && @agent&.queued_messages?
-              @kernel.async { @agent.run }
+        case event[:type]
+        when :agent_start
+          @busy = true
+          # The failure row's double-render guard resets per run (D3 —
+          # set by the :message_end error-row arm; the agent_end error
+          # arm reads it).
+          @error_row_rendered = false
+          # pi turn_start creates the working indicator (interactive-mode.ts
+          # :3427-3433) — the Loader's frame-0 reset.
+          restart_spinner!
+          arm_spinner_tick
+          @footer.invalidate_branch # per-turn branch invalidation (pi's provider cache, reduced)
+        when :message_start
+          message = event[:message]
+          if message.respond_to?(:role) && message.role == :custom
+            # The custom-message arm (I47 — pi message_start case custom,
+            # interactive-mode.ts:3498-3502: the component is added at
+            # message_start, display-gated). The :message_end custom case
+            # needs no arm — the assistant guard below already no-ops it
+            # (pi renders the block ONCE).
+            @transcript_state.enqueue_custom_block(message.custom_type, message.content) if message.display
+          else
+            # The queued-message delivery arm (I54 — pi agent-session.ts
+            # :1122-1134 + interactive-mode.ts:3503-3507): a user-role
+            # message_start whose text matches a mirror's FIRST-index
+            # entry removes it and renders the user echo AT DELIVERY (the
+            # idle submit's opening message never matches — it already
+            # echoed at submit). Runs under the surface mutex (the sink
+            # holds it) — no re-synchronize.
+            deliver_queued_message(message) if message.respond_to?(:role) && message.role == :user
+            @live = +""
+            @reasoning = +""
+            @live_region_cache = nil # the reset invalidates (I58, §live_region_cache)
+          end
+        when :message_update
+          chunk = event[:chunk]
+          @live << chunk.content if chunk.content.is_a?(String) && !chunk.content.empty?
+          reasoning = chunk.thinking&.text
+          @reasoning << reasoning if reasoning.is_a?(String) && !reasoning.empty?
+        when :message_end
+          message = event[:message]
+          if message.role == :assistant
+            @footer.accumulate_usage(message)
+            handled = complete(message.content)
+            # pi getLastAssistantText (agent-session.ts:4347): the last
+            # assistant message's trimmed text — ctrl+x's fallback.
+            @last_assistant_text = handled&.strip
+            # The reasoning buffer threads in as data and clears after
+            # the render (the flush lived inside enqueue_message at
+            # base — same row order, buffer reset with the completion).
+            @transcript_state.enqueue_message(handled, reasoning: @reasoning)
+            @reasoning = +""
+            if message.respond_to?(:finish_reason) && message.finish_reason == "error"
+              # pi assistant-message.ts:184-198 — the failure component's
+              # row: Spacer(1), then "Error: <errorMessage>" in error fg
+              # (after any partial content), outputPad-led and wrapped.
+              # The flag arms the agent_end error arm's skip (pi's
+              # agent_end renders no error text — the component owns the
+              # row; without the guard the failure would double-render).
+              # The respond_to? guard is the footer's usage-read idiom:
+              # every real loop event carries the Message reader; reader-
+              # less display doubles (render_perf's Msg) stay inert.
+              @error_row_rendered = true
+              @transcript_state.enqueue_region([Panel.blank_line,
+                *Panel.padded_fg_rows("Error: #{message.error_message}", viewport_width,
+                  fg: Theme[:error])])
             end
           end
-          # I103 — the mutation funnel's broadcast (busy flip, transcript
-          # delivery, belt disarm — everything the case touched), at the
-          # CASE tail so every event kind signals, not just agent_end.
-          signal_state_change
+        when :tool_execution_start
+          @tool = event[:tool_call].name
+          # The PENDING block's enqueue (I34 — pi renders the running
+          # call's block immediately under toolPendingBg, the component
+          # added to the chat container at :tool_execution_start,
+          # interactive-mode.ts:3611-3621): paints on the next frame
+          # while the tool runs; the finalize replaces it in place.
+          call = event[:tool_call]
+          # I65 D2: the registry keys by the call id (pi pendingTools is
+          # a Map keyed by toolCallId, interactive-mode.ts:3611-3621).
+          # The reader-guard is the details idiom below — reader-less
+          # display doubles (render_perf) stay inert, the id threads
+          # nil, and the transcript's id-less arms keep today's shape.
+          id = call.respond_to?(:id) ? call.id : nil
+          @transcript_state.enqueue_pending_tool_block(id, call.name, call.arguments)
+        when :tool_execution_end
+          @tool = nil
+          call = event[:tool_call]
+          # The settle (I34): the pending block replaced IN PLACE with
+          # the per-tool block dispatch's rows (pi's per-tool renderers
+          # — bash owns the shell shapes, I17 — the frozen
+          # :tool_execution_end contract carries `duration:`; write/read
+          # their file-tool shapes, I18; edit the diff-display family
+          # fed the call's details side channel, I57 — the respond_to?
+          # guard keeps the recorded ToolCall-shape doubles without the
+          # member inert; the rest the generic ⎿ line).
+          # No live pending (the replay path) falls back to the append.
+          id = call.respond_to?(:id) ? call.id : nil
+          @transcript_state.finalize_tool_block(id, call.name, call.arguments, event[:result], event[:duration],
+                                                details: call.respond_to?(:details) ? call.details : nil)
+        when :compaction_start
+          # The frozen I12 contract (Agent::Loop#run_compaction, after
+          # prepare succeeds): the border shows pi's per-reason label
+          # (status-indicator.ts:85-95 minus the cancel hint) until the
+          # result (+:compaction+) or the run end clears it.
+          @compaction_reason = event[:reason]
+          # pi constructs CompactionStatusIndicator (:3681) — a new
+          # Loader, frame 0.
+          restart_spinner!
+        when :compaction
+          # pi compaction_end's result arm (interactive-mode.ts:3686-3725):
+          # the chat container clears and rebuilds from the post-compaction
+          # KEPT entries (the payload's `entries` — the frozen lane
+          # contract, the same shape the replay consumes) through the
+          # replay machinery, then the panel appends LAST (pi
+          # addMessageToChat after renderSessionEntries). The footer
+          # INVALIDATES — post-compaction the context numerator is
+          # unknown until the next LLM response (the "?") — never /new's
+          # usage reset. The border status came from :compaction_start
+          # (the frozen I12 contract); its clearing here stays — and
+          # re-anchors the spinner (pi clearStatusIndicator :3694 → the
+          # next working indicator restarts).
+          @compaction_reason = nil
+          restart_spinner!
+          wipe_transcript
+          # The header container survives pi's chatContainer clear
+          # (interactive-mode.ts:633-639 — sibling containers; the s7
+          # capture: art + help + onboarding ride again, no resource
+          # listings). Re-enqueued as the EXPANDABLE block — rebuilt at
+          # its CURRENT expansion state (pi's live header rides the
+          # toggle).
+          enqueue_motd_header if @header_enqueued
+          entries = event[:entries].is_a?(Array) ? event[:entries] : []
+          @transcript_state.replay_entries(entries, update_footer: false, populate_history: false)
+          @transcript_state.enqueue_compaction_panel(event[:summary], event[:tokens_before])
+          @footer.mark_usage_stale
+        when :agent_end
+          @busy = false
+          # I90 belt disarm — ANY agent_end (interrupted, error, natural)
+          # is delivery evidence: the watchdog stops, zero residue.
+          disarm_interrupt_delivery_belt
+          @compaction_reason = nil
+          # The tick cancels with the run (I58) — unless a user-bash
+          # stream keeps it alive. Direct ivar read: this arm HOLDS the
+          # surface mutex (user_bash_streaming? would re-synchronize).
+          cancel_spinner_tick unless @user_bash_stream
+          # The deferred bashExecution records flush at agent end (pi's
+          # _pendingBashMessages flush) — never mid-tool-sequence.
+          @user_bash.flush_pending
+          if event[:interrupted] == true
+            # The orphaned pending block's finalize (I34 — pi's abort
+            # arm loops pendingTools with the "Operation aborted" error
+            # result, interactive-mode.ts:3573-3586); the interrupt
+            # scrollback line stays (additive).
+            @transcript_state.finalize_pending_as_error("Operation aborted")
+            handled = "interrupted"
+            @transcript_state.enqueue_scrollback(handled, fg: Theme[:warning])
+          elsif event[:error]
+            # pi's error arm: the same loop with the error's message. The
+            # flag-set case (the failure message's own message_end already
+            # rendered the pad-led error row — D3) SKIPS the scrollback
+            # line: pi's agent_end renders no error text (the component
+            # owns the row). The flag-UNSET case (a failure with no
+            # synthesized message_end) renders today's line byte-
+            # identically. The finalize stays in BOTH (defense).
+            @transcript_state.finalize_pending_as_error(event[:error].message.to_s)
+            unless @error_row_rendered
+              handled = "error: #{event[:error].message}"
+              @transcript_state.enqueue_scrollback(handled, fg: Theme[:error])
+            end
+          end
+          # A message submitted in the wind-down window (after the agent's
+          # final steering check, before agent_end) sits queued with no run
+          # in flight — continue the run (pi's queued-message semantics:
+          # pi polls the queue at loop start, agent-loop.ts:175). The
+          # deferred abort-first command (§busy_command_arm) takes THIS
+          # agent_end instead: re-dispatch through the EXACT idle paths
+          # (kernel.async schedules outside the mutex) and SKIP the
+          # wind-down — manual compaction never continues the interrupted
+          # turn (pi agent-session.ts:2762-2763).
+          if @pending_after_interrupt
+            deferred = @pending_after_interrupt
+            @pending_after_interrupt = nil
+            @kernel.async { @commands&.dispatch(deferred) }
+          elsif handled.nil? && @agent&.queued_messages?
+            @kernel.async { @agent.run }
+          end
         end
+        # I103 — the mutation funnel's broadcast (busy flip, transcript
+        # delivery, belt disarm — everything the case touched), at the
+        # CASE tail so every event kind signals, not just agent_end.
+        signal_state_change
         # I58 — the tick discipline: this sink's tail requests ONE paint
         # per event (the delta arm paints on arrival; the retired tail
         # re-opened a 0.25 s animation window here on EVERY event — half
@@ -830,11 +843,9 @@ module Tart
       # bin/tart's reset lambda calls this after swapping in the fresh
       # agent (start_session + surface.new_session).
       def new_session
-        @mutex.synchronize do
-          clear_transcript
-          enqueue_motd_header
-          @transcript_state.enqueue_scrollback("✓ New session started", fg: Theme[:accent])
-        end
+        clear_transcript
+        enqueue_motd_header
+        @transcript_state.enqueue_scrollback("✓ New session started", fg: Theme[:accent])
       end
 
       # The resume surface (item 3, pi handleResumeSession → switchSession
@@ -847,30 +858,28 @@ module Tart
       # both CLI --resume and the picker's enter through this one method
       # after swapping in the fresh agent.
       def resume_session(path)
-        @mutex.synchronize do
-          clear_transcript
-          entries = Agent::Session.load_entries(path)
-          @transcript_state.replay_entries(entries)
-          # The resumed session's last assistant text is ctrl+x's fallback
-          # (pi getLastAssistantText reads the loaded messages). The entry
-          # gates ride the typed envelopes (the same nil-skip table the
-          # loader guards had).
-          @last_assistant_text = entries.filter_map { |entry|
-            envelope = Shapes::MessageEntry.of(entry)
-            next unless envelope && envelope.role == "assistant"
+        clear_transcript
+        entries = Agent::Session.load_entries(path)
+        @transcript_state.replay_entries(entries)
+        # The resumed session's last assistant text is ctrl+x's fallback
+        # (pi getLastAssistantText reads the loaded messages). The entry
+        # gates ride the typed envelopes (the same nil-skip table the
+        # loader guards had).
+        @last_assistant_text = entries.filter_map { |entry|
+          envelope = Shapes::MessageEntry.of(entry)
+          next unless envelope && envelope.role == "assistant"
 
-            text = envelope.message["content"]
-            next unless text.is_a?(String) && !text.strip.empty?
+          text = envelope.message["content"]
+          next unless text.is_a?(String) && !text.strip.empty?
 
-            text.strip
-          }.last
-          compactions = entries.count { |entry| Shapes::CompactionEntry.of(entry) }
-          if compactions.positive?
-            times = compactions == 1 ? "1 time" : "#{compactions} times"
-            @transcript_state.enqueue_scrollback("Session compacted #{times}", fg: Theme[:dim])
-          end
-          @transcript_state.enqueue_scrollback("Resumed session", fg: Theme[:accent])
+          text.strip
+        }.last
+        compactions = entries.count { |entry| Shapes::CompactionEntry.of(entry) }
+        if compactions.positive?
+          times = compactions == 1 ? "1 time" : "#{compactions} times"
+          @transcript_state.enqueue_scrollback("Session compacted #{times}", fg: Theme[:dim])
         end
+        @transcript_state.enqueue_scrollback("Resumed session", fg: Theme[:accent])
       end
 
       # The /resume picker (item 2, pi showSessionSelector →
@@ -879,10 +888,8 @@ module Tart
       # newest first; keys route into the picker's +handle+ while open,
       # enter fires {on_resume} through the picker's on_select wiring.
       def open_session_picker(items)
-        @mutex.synchronize do
-          @picker = Picker.new(items:, on_select: ->(item) { @on_resume&.call(item[:path]) })
-          signal_state_change
-        end
+        @picker = Picker.new(items:, on_select: ->(item) { @on_resume&.call(item[:path]) })
+        signal_state_change
       end
 
       # Slash-command output (pi's chat-line status UX): a muted line in
@@ -891,20 +898,25 @@ module Tart
       # Commands::Handler with +output: ->(text) { surface.command_line(text) }+
       # (the I13 /skills NoMethodError).
       def command_line(text)
-        @mutex.synchronize { @transcript_state.enqueue_scrollback(text, fg: Theme[:muted]) }
+        @transcript_state.enqueue_scrollback(text, fg: Theme[:muted])
       end
 
       private
 
-      # I103 — the state-signal broadcast (additive observability): called
-      # INSIDE the existing @mutex funnels at the tail of every observed
-      # mutation (agent events, resize/input, menus/picker, merge_listing,
-      # the belt arm/fire, the user-bash stream lifecycle). Bump the
-      # version, then broadcast under the lock — the version check makes a
-      # missed wakeup impossible. With no waiter this is a no-op.
+      # I103 — the state-signal broadcast (additive observability): the
+      # tail of every observed mutation funnel (agent events,
+      # resize/input, menus/picker, merge_listing, the belt arm/fire, the
+      # user-bash stream lifecycle). The V1 wake: bump the plain-Integer
+      # version, then ping BOTH paths — the direct queue push (the proven
+      # cross-thread wake) and, when a scheduler is present on the
+      # producer's thread, the scheduler-ready rider (Notification::Signal
+      # 's mechanism) — honoring the standing same-thread lost-wakeup
+      # claim. A ping with no waiter is a no-op (stale tokens only make
+      # the version-loop re-check).
       def signal_state_change
-        @state_version = (@state_version || 0) + 1
-        (@state_cv ||= ConditionVariable.new).broadcast
+        @state_version += 1
+        @ready.push(:wake)
+        Fiber.scheduler&.push(Wake.new(@ready, :wake))
         nil
       end
 
@@ -1105,6 +1117,17 @@ module Tart
           elsif busy?
             @kernel.interrupt_work!
             arm_interrupt_delivery_belt
+            # THE ABORT DISPATCH ORDER (I107): interrupt_work!'s Task#stop
+            # is a cross-fiber scheduler raise — the cancelled work
+            # fiber's unwind (agent_end → the belt disarm) can run INLINE
+            # inside the stop (Scheduler#raise hands control to the
+            # target). Base's surface mutex serialized this arm past the
+            # unwind; with the mutex deleted (the M2 collapse) the arm
+            # lands after it, so when the run already ended under the
+            # stop, the delivery is COMPLETE — settle the belt instead of
+            # guarding a window that closed (the busy spinner's I58
+            # cadence never has to fire the guard).
+            disarm_interrupt_delivery_belt unless busy?
           elsif @user_bash.running?
             @user_bash.cancel
           elsif @editor.bash_mode?
@@ -1236,7 +1259,7 @@ module Tart
         @autocomplete.update(@editor) if printable
         # I103 — the editor-input path's broadcast (the arm above touched
         # the editor/autocomplete/picker/menu state).
-        @mutex.synchronize { signal_state_change }
+        signal_state_change
       end
 
       # pi's submit path (interactive-mode.ts:3200-3442): a leading "/"
@@ -1299,6 +1322,9 @@ module Tart
         @pending_after_interrupt = text
         @kernel.interrupt_work!
         arm_interrupt_delivery_belt
+        # The same-dispatch settle (the ESC site's ordering law, I107):
+        # an inline unwind already delivered the abort.
+        disarm_interrupt_delivery_belt unless busy?
         @kernel.request_draw
         true
       end
@@ -1353,7 +1379,7 @@ module Tart
         @interrupt_belt_task = @kernel.tick(remaining)
         # I103 — the arm's broadcast (the belt's armed state just moved;
         # taken under the surface lock — the arm sites hold no lock).
-        @mutex.synchronize { signal_state_change }
+        signal_state_change
       end
 
       # Law 3 — the escalation guard, evaluated at the top of every render
@@ -1385,7 +1411,7 @@ module Tart
         @kernel.request_draw
         @kernel.stop!
         # I103 — the fire's broadcast (the escalation's state moved).
-        @mutex.synchronize { signal_state_change }
+        signal_state_change
       end
 
       # Law 2 — the disarm: ANY :agent_end is delivery evidence. Stops the
@@ -1394,9 +1420,7 @@ module Tart
       # monotonic). Duck-typed stop: the real Loop#tick task and the test
       # double's tick handle both answer #stop (one code path — no test
       # detection). Reactor context (the :agent_end arm runs on the
-      # agent's kernel task fiber); the stop takes no surface lock, so
-      # calling it under @mutex cannot deadlock (the I79 discipline — the
-      # belt itself never reads through @mutex).
+      # agent's kernel task fiber).
       def disarm_interrupt_delivery_belt
         @interrupt_belt_armed = false
         @interrupt_belt_task&.stop
@@ -1450,20 +1474,16 @@ module Tart
       # post-compaction drain IS the loop's complete? arm), with pi's
       # flash text.
       def steer_submitted_text(text)
-        @mutex.synchronize do
-          @queued[:steer] << text
-          signal_state_change
-        end
+        @queued[:steer] << text
+        signal_state_change
         flash("Queued message for after compaction") if @compaction_reason
         @agent.steer(text)
         @kernel.request_draw
       end
 
       def follow_up_submitted_text(text)
-        @mutex.synchronize do
-          @queued[:follow_up] << text
-          signal_state_change
-        end
+        @queued[:follow_up] << text
+        signal_state_change
         flash("Queued message for after compaction") if @compaction_reason
         @agent.follow_up(text)
         @kernel.request_draw
@@ -1472,7 +1492,7 @@ module Tart
       # The queued-message delivery (I54 — pi agent-session.ts:1122-1134
       # + interactive-mode.ts:3503-3507): the FIRST-index text match across
       # the mirror (steer first, else follow_up) is removed and echoed AT
-      # DELIVERY. CALLER HOLDS @mutex (the on_agent_event sink).
+      # DELIVERY (the on_agent_event sink — same-reactor funnels, I107/M2).
       def deliver_queued_message(message)
         text = message.content
         return unless text.is_a?(String)
@@ -1495,7 +1515,7 @@ module Tart
       # abort (the abort-restore arm is pi's extension abortHandler — no
       # extension seam, cut). pi's status texts.
       def dequeue_queued_messages
-        steer_texts, follow_texts = @mutex.synchronize { [@queued[:steer], @queued[:follow_up]].map(&:dup) }
+        steer_texts, follow_texts = [@queued[:steer], @queued[:follow_up]].map(&:dup)
         @agent.clear_queues
         all = [*steer_texts, *follow_texts]
         if all.empty?
@@ -1507,11 +1527,9 @@ module Tart
         @editor.set_text(combined)
         n = all.size
         flash("Restored #{n} queued message#{n > 1 ? "s" : ""} to editor")
-        @mutex.synchronize do
-          @queued[:steer].clear
-          @queued[:follow_up].clear
-          signal_state_change
-        end
+        @queued[:steer].clear
+        @queued[:follow_up].clear
+        signal_state_change
         @kernel.request_draw
       end
 
@@ -2003,10 +2021,10 @@ module Tart
       # The pending block's row count (pi updatePendingMessagesDisplay
       # :4724-4740): 0 when both mirror arrays are empty (the widget drops
       # out of the layout entirely); else the blank spacer row + one row
-      # per queued message + the dequeue hint row. Lock-free: the render
-      # frame holds @mutex, and the unlocked readbacks (the wheel/scroll
-      # math) tolerate a one-frame-stale count. Array size/each under MRI's
-      # GVL do not interleave with the mutators' single C-level ops.
+      # per queued message + the dequeue hint row. Same-reactor funnels
+      # (I107/M2): the render frame and the mutators are fibers on ONE
+      # reactor thread — Array size/each cannot interleave with the
+      # mutators' single C-level ops.
       def pending_rows
         count = @queued[:steer].size + @queued[:follow_up].size
         count.zero? ? 0 : 2 + count
@@ -2511,10 +2529,8 @@ module Tart
       # queue, Grounds §3 probe5); all render-state mutation stays under
       # the surface mutex, exactly the agent-event discipline.
       def start_user_bash_stream(command, excluded)
-        @mutex.synchronize do
-          @user_bash_stream = {command:, excluded:, content: +"", spinner_started_at: @clock.call}
-          signal_state_change
-        end
+        @user_bash_stream = {command:, excluded:, content: +"", spinner_started_at: @clock.call}
+        signal_state_change
         # pi adds the component then requestRender (:7033-7034) — the
         # header + loader row paint before the first chunk. The bash
         # loader's glyph must advance between chunks (pi's Loader ticks
@@ -2530,13 +2546,11 @@ module Tart
       # piece. The draw per chunk is pi's requestRender (:7050-7057).
       def append_user_bash_stream(text)
         appended = false
-        @mutex.synchronize do
-          # A late chunk after the clear (a cancelled run's partial chunks
-          # may still push after the reactor-side wait died) is dropped.
-          appended = !@user_bash_stream.nil?
-          @user_bash_stream[:content] << text if appended
-          signal_state_change
-        end
+        # A late chunk after the clear (a cancelled run's partial chunks
+        # may still push after the reactor-side wait died) is dropped.
+        appended = !@user_bash_stream.nil?
+        @user_bash_stream[:content] << text if appended
+        signal_state_change
         @kernel.request_draw if appended
       end
 
@@ -2546,10 +2560,8 @@ module Tart
       # frame the live rows vanish (AC2). The spinner tick cancels with
       # the stream unless an agent run keeps it (I58).
       def end_user_bash_stream
-        @mutex.synchronize do
-          @user_bash_stream = nil
-          signal_state_change
-        end
+        @user_bash_stream = nil
+        signal_state_change
         cancel_spinner_tick unless busy?
       end
 
@@ -2594,7 +2606,7 @@ module Tart
       def cycle_thinking_level
         return unless reasoning_capable?
 
-        current = @mutex.synchronize { thinking_level || Settings::DEFAULT_THINKING_LEVEL }
+        current = thinking_level || Settings::DEFAULT_THINKING_LEVEL
         levels = available_thinking_levels
         index = levels.index(current) || -1
         next_level = levels[(index + 1) % levels.size]
@@ -2609,13 +2621,11 @@ module Tart
       # the settings-resolved default carries the · default badge.
       # Selection applies through the same state the command path uses.
       def open_thinking_menu
-        @mutex.synchronize do
-          @menu = ModelMenu.new(variant: :thinking, items: thinking_menu_items, query_seed: nil,
-            search_text: ->(item) { "#{item[:value]} #{item[:description]}" },
-            on_select: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: false) },
-            on_select_as_default: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: true) })
-          signal_state_change
-        end
+        @menu = ModelMenu.new(variant: :thinking, items: thinking_menu_items, query_seed: nil,
+          search_text: ->(item) { "#{item[:value]} #{item[:description]}" },
+          on_select: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: false) },
+          on_select_as_default: ->(item) { close_menu; apply_thinking_selection(item[:value], persist: true) })
+        signal_state_change
       end
 
       # The gated menu's items (ModelMenu.thinking's item shape over
@@ -2648,14 +2658,12 @@ module Tart
       # works out of the box (itemized port extension). +seed+ pre-fills
       # the search (/model <unknown-arg>, pi's initialSearchInput).
       def open_model_menu(seed = nil)
-        @mutex.synchronize do
-          @menu = ModelMenu.model(
-            entries: model_menu_entries, current: current_model_ref, default: default_model_ref, seed:,
-            on_select: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: false) },
-            on_select_as_default: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: true) }
-          )
-          signal_state_change
-        end
+        @menu = ModelMenu.model(
+          entries: model_menu_entries, current: current_model_ref, default: default_model_ref, seed:,
+          on_select: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: false) },
+          on_select_as_default: ->(item) { close_menu; apply_model_selection(item.fetch(:entry), persist: true) }
+        )
+        signal_state_change
         spawn_listing_fetch
       end
 
@@ -2677,7 +2685,7 @@ module Tart
         # Lazily loaded (I71 R3): the listing's async-http stack never
         # loads at boot — only the menu-open demand path pulls it in.
         require_relative "../models/listing"
-        seq = @mutex.synchronize { @listing_seq += 1 }
+        seq = @listing_seq += 1
         Models::Listing.fetch(base_url: fetch_base, api_key: fetch_key,
           on_result: ->(ids) { merge_listing(seq, ids, block_base, &live_facts_for) })
       end
@@ -2714,19 +2722,21 @@ module Tart
       # every state touch under the surface mutex; a closed or superseded
       # menu never merges.
       def merge_listing(seq, ids, block_base, &live_facts_for)
-        merged = @mutex.synchronize do
-          next false if seq != @listing_seq || @menu.nil?
+        # Runs ON the listing task's fiber (I107 T5/V3 — the merge lands
+        # on-reactor); the superseded/closed-menu gate is the bare seq
+        # check (same-reactor funnels cannot interleave).
+        return false if seq != @listing_seq || @menu.nil?
 
-          if ids
-            @menu.refresh(entries: merged_listing_entries(ids, block_base, &live_facts_for))
-          else
-            @menu.listing_failed!
-          end
-          # I103 — the merge landed (the launcher listing wait's event).
-          signal_state_change
-          true
+        if ids
+          @menu.refresh(entries: merged_listing_entries(ids, block_base, &live_facts_for))
+        else
+          @menu.listing_failed!
         end
+        # I103 — the merge landed (the launcher listing wait's event).
+        signal_state_change
+        merged = true
         @kernel.request_draw if merged
+        merged
       end
 
       # The merged menu list: the user entries (the catalog — or the
@@ -2800,11 +2810,9 @@ module Tart
       # seam too ({Agent::Loop#set_thinking_level}) — the next request
       # carries it (pi sets session state the stream options read).
       def apply_thinking_selection(level, persist:)
-        @mutex.synchronize do
-          @thinking_level = level
-          @transcript_state.enqueue_status("#{persist ? "Default thinking level" : "Thinking level"}: #{level}")
-          signal_state_change
-        end
+        @thinking_level = level
+        @transcript_state.enqueue_status("#{persist ? "Default thinking level" : "Thinking level"}: #{level}")
+        signal_state_change
         @agent&.set_thinking_level(level)
         Settings.save(@settings_root, "thinkingLevel" => level) if persist
         @kernel.request_draw
@@ -2860,12 +2868,10 @@ module Tart
           (@thinking_level || @footer_data&.fetch(:thinking_level, nil))
         effective = Models.clamp_thinking_level(level, map: facts.thinking_level_map,
           reasoning: facts.reasoning)
-        @mutex.synchronize do
-          @runtime_model = entry
-          @thinking_level = effective
-          @transcript_state.enqueue_status(status)
-          signal_state_change
-        end
+        @runtime_model = entry
+        @thinking_level = effective
+        @transcript_state.enqueue_status(status)
+        signal_state_change
         @agent&.switch_model(entry.id, provider: entry.provider,
           context_window: entry.context_window,
           max_tokens: Models.entry_max_tokens(entry),

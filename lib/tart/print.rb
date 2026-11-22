@@ -91,11 +91,17 @@ module Tart
       agent = Agent::Loop.new(chat:, tools:, system_prompt:, on_event:,
         recorder:, seed_messages:, context_window:, max_tokens:, compaction:, hooks:, steer_inbox:,
         thinking_level:, model_reasoning:, thinking_level_map:, compat:, identity:)
-      deadline = arm_run_deadline(identity)
-      begin
-        Core::Loop.new(session: NullSession.new).run { agent.run(prompt) }
-      ensure
-        disarm_run_deadline(deadline)
+      # I107 (T7/V2): the deadline arms INSIDE the run's reactor — the
+      # deadline task is a child of the work subtree and the disarm below
+      # (in the same block) cancels it before the block returns, so the
+      # parked timer never outlives the run (the D2 unwind discipline).
+      Core::Loop.new(session: NullSession.new).run do
+        deadline = arm_run_deadline(identity)
+        begin
+          agent.run(prompt)
+        ensure
+          disarm_run_deadline(deadline)
+        end
       end
       return error_exit(agent, stderr) if agent.last_error || agent.interrupted?
 
@@ -108,34 +114,44 @@ module Tart
 
     # The child self-deadline (I48 §6 — T2 both-sides): the child spawn
     # env carries <IDENTITY>_RUN_DEADLINE_MS (the deadline EPOCH); when
-    # present, a thread sleeps the remainder and TERMs the child's own
-    # process group — the deadline holds even when the parent process is
-    # gone. Unset (every normal boot) = today's behavior, no thread.
+    # present, a task on the run's reactor sleeps the remainder to the
+    # epoch and TERMs the child's own process group — the deadline holds
+    # even when the parent process is gone (the parent process here IS
+    # this child: the TERM hits the whole group either way). Unset (every
+    # normal boot) = today's behavior, no task.
     def arm_run_deadline(identity, env: ENV)
       raw = env[Identity.env_key(identity, "RUN_DEADLINE_MS")]
       epoch = raw&.match(/\A\d+\z/) ? Integer(raw, 10) : nil
       return nil unless epoch
 
+      # The reactor seat (the caller wraps the arm inside Core::Loop#run's
+      # work block): the timer parks evented in Task#sleep to the epoch;
+      # Task#stop (the disarm) cancels it at the park. The term rides the
+      # epoch, never a wall-clock poll loop.
+      task = Async::Task.current? or return nil
       fired = false
-      mutex = Mutex.new
-      thread = Thread.new do
+      timer = task.async do
         remaining = (epoch - Process.clock_gettime(Process::CLOCK_REALTIME) * 1000) / 1000.0
         sleep(remaining) if remaining.positive?
-        mutex.synchronize { fired = true }
+        fired = true
         Process.kill("-TERM", 0) # pid 0 = this process's whole group (pgroup leader per the spawn)
       end
-      thread.name = "tart-run-deadline" if thread.respond_to?(:name=)
-      {thread:, fired?: -> { mutex.synchronize { fired } },
-       cancel: -> { mutex.synchronize { fired = true } }}
+      {task: timer, fired?: -> { fired },
+       cancel: -> { fired = true }}
     end
 
+    # Cancels the deadline task BEFORE the run block returns (the parked
+    # timer never outlives the reactor subtree — the D2 unwind
+    # discipline). Idempotent; the fired flag stays honest (an already-
+    # fired deadline is not un-fired by the cancel).
     def disarm_run_deadline(deadline)
       return unless deadline
 
       deadline[:cancel].call
-      deadline[:thread].join(0.1)
-      deadline[:thread].kill if deadline[:thread].alive?
-    rescue StandardError
+      timer = deadline[:task]
+      timer.stop if timer&.alive?
+      timer&.wait
+    rescue StandardError, Async::Cancel
       nil
     end
 

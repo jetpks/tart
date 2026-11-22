@@ -20,6 +20,10 @@ module Tart
   # - nextTurn injection (sendCustomMessage :2293-2331): queue only — no
   #   append, no events at send time; the loop drains after the user
   #   message (:2086-2095).
+  # - the extension seam is single-threaded since I107 (the concurrency
+  #   law, owner PR-#28 review): every registration and dispatch funnel is
+  #   a same-reactor Array/Hash operation containing no scheduler-visible
+  #   suspension, so the guard Mutex is deleted, not replaced (V4).
   class Hooks
     # The injected custom message the loop emits through
     # :message_start/:message_end (pi's role-"custom" AgentMessage; the
@@ -32,7 +36,6 @@ module Tart
     #   also deliver through its own on_event (double delivery).
     def initialize(on_event: nil)
       @on_event = on_event
-      @mutex = Mutex.new
       @handlers = {}
       @tool_call_handlers = []
       @next_turn = []
@@ -50,21 +53,19 @@ module Tart
     # unsubscribe Proc.
     def on(channel, &handler)
       key = channel_key(channel)
-      @mutex.synchronize { (@handlers[key] ||= []) << handler }
+      (@handlers[key] ||= []) << handler
       lambda do
-        @mutex.synchronize do
-          list = @handlers[key]
-          list&.delete(handler)
-        end
+        list = @handlers[key]
+        list&.delete(handler)
       end
     end
 
     # The tool_call channel with BLOCK semantics (see the class comment);
     # driven by the Registry gate, not by #emit.
     def on_tool_call(&handler)
-      @mutex.synchronize { @tool_call_handlers << handler }
+      @tool_call_handlers << handler
       lambda do
-        @mutex.synchronize { @tool_call_handlers.delete(handler) }
+        @tool_call_handlers.delete(handler)
       end
     end
 
@@ -74,10 +75,8 @@ module Tart
     # swallowed (pi emit's emitError discipline — OQ-4; the mcp.rb idiom).
     def emit(event, context:)
       channel = channel_key(event[:type] || event["type"])
-      handlers = @mutex.synchronize do
-        @last_context = context
-        (@handlers[channel] || []).dup
-      end
+      @last_context = context
+      handlers = (@handlers[channel] || []).dup
       handlers.each do |handler|
         begin
           handler.call(event, context)
@@ -94,8 +93,8 @@ module Tart
     # gate. The context is the most recent one #emit carried (the loop's
     # per-event emission precedes any tool execution in a run).
     def dispatch_tool_call(event)
-      handlers = @mutex.synchronize { @tool_call_handlers.dup }
-      context = @mutex.synchronize { @last_context }
+      handlers = @tool_call_handlers.dup
+      context = @last_context
       handlers.each do |handler|
         result = handler.call(event, context)
         return result if result.is_a?(Hash) && result[:block]
@@ -106,32 +105,34 @@ module Tart
     # Whether any tool_call handler is registered (the Registry's wrap
     # predicate; false = unwrapped build, zero behavior change).
     def tool_call_handlers?
-      @mutex.synchronize { !@tool_call_handlers.empty? }
+      !@tool_call_handlers.empty?
     end
 
     # Queues a nextTurn message (pi sendCustomMessage :2293-2331 — queue
     # only, no append, no events). The loop drains after the next user
     # message.
     def send_next_turn(custom_type:, content:, display: false)
-      @mutex.synchronize { @next_turn << {custom_type:, content:, display:} }
+      @next_turn << {custom_type:, content:, display:}
       nil
     end
 
     # The drain source (loop-internal): returns the pending queue FIFO and
     # clears it atomically.
     def pending_next_turn
-      @mutex.synchronize { drain = @next_turn; @next_turn = []; drain }
+      drain = @next_turn
+      @next_turn = []
+      drain
     end
 
     # Registers a tool instance; Registry.build merges these
     # AFTER built-ins + MCP (same name overrides — pi's registry merge).
     def register_tool(tool)
-      @mutex.synchronize { @registered_tools << tool }
+      @registered_tools << tool
       self
     end
 
     def registered_tools
-      @mutex.synchronize { @registered_tools.dup }
+      @registered_tools.dup
     end
 
     # Registers a slash command (pi registerCommand): exact match when
@@ -140,22 +141,20 @@ module Tart
     # command's argument string ("" on an exact match).
     def register_command(name, description:, args: false, &handler)
       key = name.to_s
-      @mutex.synchronize do
-        @registered_commands << {name: key, description:, args:}
-        @command_handlers[key] = handler
-      end
+      @registered_commands << {name: key, description:, args:}
+      @command_handlers[key] = handler
       self
     end
 
     # {name:, description:, args:} hashes in registration order.
     def registered_commands
-      @mutex.synchronize { @registered_commands.dup }
+      @registered_commands.dup
     end
 
     # The dispatch table's handler for one registered command (the
     # Commands::Handler consult).
     def command_handler(name)
-      @mutex.synchronize { @command_handlers[name.to_s] }
+      @command_handlers[name.to_s]
     end
 
     # pi shouldTerminateToolBatch (agent-loop.ts:690-691): TRUE iff the
@@ -163,21 +162,21 @@ module Tart
     # ledger is filled by the Registry gate and cleared per batch by the
     # loop ({clear_terminate_ledger}).
     def batch_terminate?(ids)
-      ledger = @mutex.synchronize { @terminate_ledger.dup }
+      ledger = @terminate_ledger.dup
       ids.is_a?(Array) && !ids.empty? && ids.all? { |id| ledger.key?(id) }
     end
 
     # Records one terminate-marked block (Registry gate-internal; the id
     # is the ToolCall's).
     def record_terminate(tool_call_id)
-      @mutex.synchronize { @terminate_ledger[tool_call_id] = true }
+      @terminate_ledger[tool_call_id] = true
       nil
     end
 
     # The loop clears the ledger after every batch consult (stale ids
     # never leak into the next batch).
     def clear_terminate_ledger
-      @mutex.synchronize { @terminate_ledger = {} }
+      @terminate_ledger = {}
       nil
     end
 

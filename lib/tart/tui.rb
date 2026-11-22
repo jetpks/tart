@@ -54,6 +54,18 @@ module Tart
       # the pi oracle dies with (Grounds F9). FROZEN.
       EXIT_FOR = {"HUP" => 129, "TERM" => 143}.freeze
 
+      # The scheduler-ready rider (Notification::Signal's mechanism — async
+      # clone lib/async/notification.rb): the selector processes its ready
+      # list by calling #transfer, which pushes the same queue.
+      Wake = Struct.new(:queue, :token) do
+        def alive? = true
+
+        def transfer
+          queue.push(token)
+        end
+      end
+      private_constant :Wake
+
       # Delivery → process exit, all legs, hard guarantee. The ladder's own
       # waits are bounded by construction below this (poller join ≤ 1s,
       # sink ≤ ~3s, herdr IO.select-bounded); steps not yet done when the
@@ -114,9 +126,11 @@ module Tart
         @delivered_at = nil
         @laddering = false
         @exiting = false
-        # I103 seam state (waiter-side lock only — see signal_state_change).
-        @wait_mutex = Mutex.new
-        @state_cv = ConditionVariable.new
+        # I107 seam state — the V1 wake (the concurrency law): the version
+        # is a plain Integer and the park is a Thread::Queue timed pop.
+        # The producer side (deliver, trap context) touches no lock — the
+        # version bump and the queue push are the lock-free discipline.
+        @ready = Async::Queue.new
         @state_version = 0
       end
 
@@ -156,15 +170,16 @@ module Tart
         @codes.first
       end
 
-      # --- I103 state-signal seam (ADDITIVE observability only) ----------
+      # --- I103 state-signal seam (I107 V1 mechanics) ---------------------
       # DELIVERED-FROM-TRAP-CONTEXT discipline (the class's own law — the
       # handler touches no Mutex, @codes are GVL-atomic writes): the
-      # version bump + broadcast run LOCK-FREE on the producer side (the
-      # INT net's Queue#push-from-trap precedent), while the waiter side
-      # still locks. The waiter's version check + the await helper's final
-      # re-check close the producer-side race. Footprint: these two
-      # methods, signal_state_change, and its one call site — deleting
-      # them restores base behavior byte-for-byte.
+      # version bump + the wake push run LOCK-FREE on the producer side
+      # (the INT net's Queue#push-from-trap precedent — tui.rb:161-163 —
+      # plus the scheduler-ready rider, trap-safe per the I107 probe).
+      # The waiter parks in the belt's timed pop (a fiber park under a
+      # scheduler; a thread park at the bare minitest seat). Footprint:
+      # these two methods, signal_state_change, and its one call site —
+      # deleting them restores base behavior byte-for-byte.
       def state_version
         @state_version
       end
@@ -172,11 +187,10 @@ module Tart
       # Parks until the version moves past from_version, belt-bounded (nil
       # on belt expiry with no change). Production never calls this.
       def wait_state_change(from_version, belt: 60)
-        @wait_mutex.synchronize do
-          until @state_version > from_version
-            return nil unless @state_cv.wait(@wait_mutex, belt)
-          end
-          @state_version
+        loop do
+          return @state_version if @state_version > from_version
+
+          return nil if @ready.pop(timeout: belt).nil?
         end
       end
 
@@ -239,11 +253,14 @@ module Tart
       # I103 — the state-signal broadcast (additive observability): the
       # pending_exit_code record inside {#deliver}. Runs in TRAP CONTEXT:
       # it must never take a mutex (recursive-lock deadlock on the main
-      # thread), so the bump is the bare GVL-atomic write and the broadcast
-      # a bare CV broadcast — same discipline as @codes itself.
+      # thread), so the bump is the bare GVL-atomic write and the wake the
+      # bare dual-path ping (direct queue push + the scheduler-ready rider
+      # when a scheduler is present — the Notification::Signal mechanism;
+      # the I107 probe drove this exact trap seat green).
       def signal_state_change
         @state_version += 1
-        @state_cv.broadcast
+        @ready.push(:wake)
+        Fiber.scheduler&.push(Wake.new(@ready, :wake))
         nil
       end
 

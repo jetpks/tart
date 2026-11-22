@@ -231,74 +231,78 @@ module Tart
     # steer-log entry naming the minted request id, with the steer text
     # reaching the child's NEXT captured request as a user message.
     def test_leg_c_steer_reaches_a_running_child
-      home = stage_subagents_home
-      @server.script([
-        {type: :slow_stream, content: C_LONG, chunk_every: 0.05},
-        {type: :stream, content: C_STEERED_ANSWER}
-      ])
-      @hooks = Hooks.new
-      @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
-        identity: "pi", hooks: @hooks)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        home = stage_subagents_home
+        @server.script([
+          {type: :slow_stream, content: C_LONG, chunk_every: 0.05},
+          {type: :stream, content: C_STEERED_ANSWER}
+        ])
+        @hooks = Hooks.new
+        @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
+          identity: "pi", hooks: @hooks)
 
-      # The builtin table the spawn resolves (§1/§6); the worker's
-      # allowlist order is the wire order (I41).
-      agents = Tart::Subagents::BUILTIN_AGENTS
-      assert_equal %w[oracle reviewer worker], agents.keys.sort
-      assert_equal %w[read grep find ls bash edit write], agents["worker"][:tools]
+        # The builtin table the spawn resolves (§1/§6); the worker's
+        # allowlist order is the wire order (I41).
+        agents = Tart::Subagents::BUILTIN_AGENTS
+        assert_equal %w[oracle reviewer worker], agents.keys.sort
+        assert_equal %w[read grep find ls bash edit write], agents["worker"][:tools]
 
-      tool = Tart::Tools::Subagent.new(manager: @manager)
-      start = tool.execute(agent: "worker", task: C_TASK, timeout_ms: 0).to_s
-      run = @manager.runs.first
-      assert run, "the dispatch registered the run"
-      id = run[:id]
-      assert_equal "Async: worker [#{id}]", start.split("\n").first,
-        "the dispatch returns the §7 start message (async defaults true)"
+        tool = Tart::Tools::Subagent.new(manager: @manager)
+        start = tool.execute(agent: "worker", task: C_TASK, timeout_ms: 0).to_s
+        run = @manager.runs.first
+        assert run, "the dispatch registered the run"
+        id = run[:id]
+        assert_equal "Async: worker [#{id}]", start.split("\n").first,
+          "the dispatch returns the §7 start message (async defaults true)"
 
-      # The child's first request proves it is mid-turn; the slow stream
-      # holds the turn open for the steer to land and wait at the boundary.
-      wait_for_captures("the child's first request") { child_requests(C_TASK).size == 1 }
-      assert_equal :running, @manager.runs.first[:state]
+        # The child's first request proves it is mid-turn; the slow stream
+        # holds the turn open for the steer to land and wait at the boundary.
+        wait_for_captures("the child's first request") { child_requests(C_TASK).size == 1 }
+        assert_equal :running, @manager.runs.first[:state]
 
-      receipt = @manager.steer(id: id, message: C_STEER, mode: "steer", ack_timeout_ms: 30_000)
-      assert_equal :delivered, receipt[:state],
-        "the receipt reports the child's correlated consumption: #{receipt.inspect}"
-      assert_equal 36, receipt[:request_id].to_s.length
-      assert_equal "Steering delivered to async run #{id} (request #{receipt[:request_id]}).",
-        receipt[:text], "the §7 steer receipt bytes"
+        receipt = @manager.steer(id: id, message: C_STEER, mode: "steer", ack_timeout_ms: 30_000)
+        assert_equal :delivered, receipt[:state],
+          "the receipt reports the child's correlated consumption: #{receipt.inspect}"
+        assert_equal 36, receipt[:request_id].to_s.length
+        assert_equal "Steering delivered to async run #{id} (request #{receipt[:request_id]}).",
+          receipt[:text], "the §7 steer receipt bytes"
 
-      log = File.readlines(File.join(run[:dir], "control", "steer-log.jsonl")).map { |l| JSON.parse(l) }
-      assert log.any? { |e| e["requestId"] == receipt[:request_id] },
-        "the child's steer log names the SAME request id (T1)"
+        log = File.readlines(File.join(run[:dir], "control", "steer-log.jsonl")).map { |l| JSON.parse(l) }
+        assert log.any? { |e| e["requestId"] == receipt[:request_id] },
+          "the child's steer log names the SAME request id (T1)"
 
-      await(@manager, "the steered run to complete", belt: CHILD_BELT_S) { !@manager.outstanding? }
-      assert_equal :completed, @manager.runs.first[:state]
-      drain_captures
-      steered = @captures.find do |r|
-        r["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(C_STEER) }
+        await(@manager, "the steered run to complete", belt: CHILD_BELT_S) { !@manager.outstanding? }
+        assert_equal :completed, @manager.runs.first[:state]
+        drain_captures
+        steered = @captures.find do |r|
+          r["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(C_STEER) }
+        end
+        assert steered, "the steer text rode a captured child request"
+        first_child = child_requests(C_TASK).first
+        assert first_child, "the child's first request was captured"
+        refute first_child["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(C_STEER) },
+          "the steer was NOT folded into the first request"
+        assert_operator @captures.index(steered), :>, @captures.index(first_child),
+          "the steer reached the child's NEXT request, not the first"
+        assert_equal C_STEERED_ANSWER, result_json(run[:dir])["output"].to_s.strip
+        assert_equal "completed", status_json(run[:dir])["state"]
+
+        # The completion notification queued on the hooks — the in-process
+        # seam the print drain records from (§2.6). The settle queues the
+        # notification BEFORE its broadcast, so the manager's version only
+        # moves with the notification already visible.
+        await(@manager, "the subagent-notify notification", belt: CHILD_BELT_S) do
+          @pending_notifications.concat(@hooks.pending_next_turn)
+          @pending_notifications.find { |p| p[:custom_type] == "subagent-notify" }
+        end
+        notify = @pending_notifications.find { |p| p[:custom_type] == "subagent-notify" }
+        assert notify[:content].start_with?("Background task completed: **worker**"),
+          "the §7 notification header through the real watcher"
+        assert_ps_clean(@manager.runs.first[:pid])
+        puts "[i48-e2e] leg C: steer delivered (request #{receipt[:request_id]}), child steered + completed"
       end
-      assert steered, "the steer text rode a captured child request"
-      first_child = child_requests(C_TASK).first
-      assert first_child, "the child's first request was captured"
-      refute first_child["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(C_STEER) },
-        "the steer was NOT folded into the first request"
-      assert_operator @captures.index(steered), :>, @captures.index(first_child),
-        "the steer reached the child's NEXT request, not the first"
-      assert_equal C_STEERED_ANSWER, result_json(run[:dir])["output"].to_s.strip
-      assert_equal "completed", status_json(run[:dir])["state"]
-
-      # The completion notification queued on the hooks — the in-process
-      # seam the print drain records from (§2.6). The settle queues the
-      # notification BEFORE its broadcast, so the manager's version only
-      # moves with the notification already visible.
-      await(@manager, "the subagent-notify notification", belt: CHILD_BELT_S) do
-        @pending_notifications.concat(@hooks.pending_next_turn)
-        @pending_notifications.find { |p| p[:custom_type] == "subagent-notify" }
-      end
-      notify = @pending_notifications.find { |p| p[:custom_type] == "subagent-notify" }
-      assert notify[:content].start_with?("Background task completed: **worker**"),
-        "the §7 notification header through the real watcher"
-      assert_ps_clean(@manager.runs.first[:pid])
-      puts "[i48-e2e] leg C: steer delivered (request #{receipt[:request_id]}), child steered + completed"
     end
 
     # Leg D (AC3 stop/T3 + AC4 deadline/T2): (1) stop mid-stream — the §7
@@ -306,31 +310,35 @@ module Tart
     # Process.detach owns the reap); (2) a 1500ms run deadline — stopped
     # with timedOut true inside the ~15s bound.
     def test_leg_d_stop_and_run_deadline
-      home = stage_subagents_home
-      @hooks = Hooks.new
-      @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
-        identity: "pi", hooks: @hooks)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        home = stage_subagents_home
+        @hooks = Hooks.new
+        @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
+          identity: "pi", hooks: @hooks)
 
-      @server.script([{type: :slow_stream, content: D_STOP_STREAM, chunk_every: 0.05}])
-      run = @manager.spawn_run(agent: "worker", task: D_STOP_TASK, async: true, timeout_ms: 0)
-      wait_for_captures("the stop target's first request") { child_requests(D_STOP_TASK).size == 1 }
-      receipt = @manager.stop(id: run[:id])
-      assert_equal "Stop requested for async run #{run[:id]}.", receipt.to_s, "the §7 stop receipt bytes"
-      await(@manager, "the stopped state", belt: CHILD_BELT_S) { run_state(run[:id]) == :stopped }
-      sj = status_json(run[:dir])
-      assert_equal "stopped", sj["state"]
-      assert_equal false, sj.fetch("timedOut", nil), "a user stop never sets timedOut"
-      assert_ps_clean(run[:pid])
+        @server.script([{type: :slow_stream, content: D_STOP_STREAM, chunk_every: 0.05}])
+        run = @manager.spawn_run(agent: "worker", task: D_STOP_TASK, async: true, timeout_ms: 0)
+        wait_for_captures("the stop target's first request") { child_requests(D_STOP_TASK).size == 1 }
+        receipt = @manager.stop(id: run[:id])
+        assert_equal "Stop requested for async run #{run[:id]}.", receipt.to_s, "the §7 stop receipt bytes"
+        await(@manager, "the stopped state", belt: CHILD_BELT_S) { run_state(run[:id]) == :stopped }
+        sj = status_json(run[:dir])
+        assert_equal "stopped", sj["state"]
+        assert_equal false, sj.fetch("timedOut", nil), "a user stop never sets timedOut"
+        assert_ps_clean(run[:pid])
 
-      @captures = []
-      @server.script([{type: :slow_stream, content: D_DEADLINE_STREAM, chunk_every: 0.05}])
-      deadline_run = @manager.spawn_run(agent: "worker", task: D_DEADLINE_TASK, async: true, timeout_ms: 1500)
-      await(@manager, "the deadline state", belt: CHILD_BELT_S) { run_state(deadline_run[:id]) == :stopped }
-      sjd = status_json(deadline_run[:dir])
-      assert_equal "stopped", sjd["state"]
-      assert_equal true, sjd["timedOut"], "the run deadline lands stopped + timedOut true"
-      assert_ps_clean(deadline_run[:pid])
-      puts "[i48-e2e] leg D: stop (stopped/timedOut false) + deadline (stopped/timedOut true), no zombies"
+        @captures = []
+        @server.script([{type: :slow_stream, content: D_DEADLINE_STREAM, chunk_every: 0.05}])
+        deadline_run = @manager.spawn_run(agent: "worker", task: D_DEADLINE_TASK, async: true, timeout_ms: 1500)
+        await(@manager, "the deadline state", belt: CHILD_BELT_S) { run_state(deadline_run[:id]) == :stopped }
+        sjd = status_json(deadline_run[:dir])
+        assert_equal "stopped", sjd["state"]
+        assert_equal true, sjd["timedOut"], "the run deadline lands stopped + timedOut true"
+        assert_ps_clean(deadline_run[:pid])
+        puts "[i48-e2e] leg D: stop (stopped/timedOut false) + deadline (stopped/timedOut true), no zombies"
+      end
     end
 
     private
@@ -751,97 +759,101 @@ module Tart
     # the profile body + bridge block in system-prompt.md, and the project
     # tier REPLACING the builtin worker body.
     def test_leg_f_profiles_end_to_end
-      i49_stage_home
-      stage_subagents_home
-      stage_i49_profiles
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        i49_stage_home
+        stage_subagents_home
+        stage_i49_profiles
 
-      begin
-        # FIRST frozen-surface touch — at base this leg is RED exactly here
-        # (NameError: uninitialized constant Tart::Subagents::Profiles).
-        table = Tart::Subagents::Profiles.resolve_table(cwd: @project_dir, root: File.join(@home, ".tart"), env: {})
-        researcher_row = table["researcher"]
-        assert researcher_row, "the user-tier profile is discovered into the merged table"
-        assert_equal %w[read grep find ls bash], researcher_row[:tools], "the profile's tool list (order preserved)"
-        assert_equal F_RESEARCHER_MODEL, researcher_row[:model], "the profile's raw model string"
-        assert_equal :user, researcher_row[:source]
-        worker_row = table["worker"]
-        assert_equal :project, worker_row[:source], "the project tier wins the same-name overlay"
-        assert_equal %w[read grep], worker_row[:tools]
-        assert worker_row[:system_prompt].to_s.include?(F_WORKER_BODY), "the project body replaced the builtin's"
-        assert table["oracle"] && table["reviewer"], "the builtins stay in the merged table"
-        spec = Tart::Subagents::Profiles.resolve("researcher", cwd: @project_dir, root: File.join(@home, ".tart"), env: {})
-        assert spec[:system_prompt].to_s.include?(F_RESEARCHER_BODY), "resolve returns the profile spec"
+        begin
+          # FIRST frozen-surface touch — at base this leg is RED exactly here
+          # (NameError: uninitialized constant Tart::Subagents::Profiles).
+          table = Tart::Subagents::Profiles.resolve_table(cwd: @project_dir, root: File.join(@home, ".tart"), env: {})
+          researcher_row = table["researcher"]
+          assert researcher_row, "the user-tier profile is discovered into the merged table"
+          assert_equal %w[read grep find ls bash], researcher_row[:tools], "the profile's tool list (order preserved)"
+          assert_equal F_RESEARCHER_MODEL, researcher_row[:model], "the profile's raw model string"
+          assert_equal :user, researcher_row[:source]
+          worker_row = table["worker"]
+          assert_equal :project, worker_row[:source], "the project tier wins the same-name overlay"
+          assert_equal %w[read grep], worker_row[:tools]
+          assert worker_row[:system_prompt].to_s.include?(F_WORKER_BODY), "the project body replaced the builtin's"
+          assert table["oracle"] && table["reviewer"], "the builtins stay in the merged table"
+          spec = Tart::Subagents::Profiles.resolve("researcher", cwd: @project_dir, root: File.join(@home, ".tart"), env: {})
+          assert spec[:system_prompt].to_s.include?(F_RESEARCHER_BODY), "resolve returns the profile spec"
 
-        @server.script([
-          {type: :stream, content: F_RESEARCHER_FINAL},
-          {type: :stream, content: F_WORKER_FINAL}
-        ])
-        @hooks = Hooks.new
-        @manager = Tart::Subagents::Manager.new(cwd: @project_dir, home: @subagents_home, env: child_env,
-          identity: "pi", hooks: @hooks, root: File.join(@home, ".tart"))
+          @server.script([
+            {type: :stream, content: F_RESEARCHER_FINAL},
+            {type: :stream, content: F_WORKER_FINAL}
+          ])
+          @hooks = Hooks.new
+          @manager = Tart::Subagents::Manager.new(cwd: @project_dir, home: @subagents_home, env: child_env,
+            identity: "pi", hooks: @hooks, root: File.join(@home, ".tart"))
 
-        tool = Tart::Tools::Subagent.new(manager: @manager)
-        start = tool.execute(agent: "researcher", task: F_RESEARCHER_TASK, timeout_ms: 0).to_s
-        researcher = @manager.runs.first
-        assert researcher, "the dispatch registered the run"
-        assert_equal "Async: researcher [#{researcher[:id]}]", start.split("\n").first,
-          "the profile's name rides the §7 start headline"
+          tool = Tart::Tools::Subagent.new(manager: @manager)
+          start = tool.execute(agent: "researcher", task: F_RESEARCHER_TASK, timeout_ms: 0).to_s
+          researcher = @manager.runs.first
+          assert researcher, "the dispatch registered the run"
+          assert_equal "Async: researcher [#{researcher[:id]}]", start.split("\n").first,
+            "the profile's name rides the §7 start headline"
 
-        wait_for_captures("the researcher child's request") { child_requests(F_RESEARCHER_TASK).size == 1 }
-        child = child_requests(F_RESEARCHER_TASK).first
-        assert_equal F_RESEARCHER_MODEL_ID, child["model"],
-          "the profile's model rides the child's wire (call model: > profile model > parent)"
-        assert_equal %w[read grep find ls bash contact_supervisor],
-          child["tools"].to_a.map { |t| t.dig("function", "name") },
-          "the child wire tools are the profile list + the bridge tool LAST (wire order = allowlist order)"
+          wait_for_captures("the researcher child's request") { child_requests(F_RESEARCHER_TASK).size == 1 }
+          child = child_requests(F_RESEARCHER_TASK).first
+          assert_equal F_RESEARCHER_MODEL_ID, child["model"],
+            "the profile's model rides the child's wire (call model: > profile model > parent)"
+          assert_equal %w[read grep find ls bash contact_supervisor],
+            child["tools"].to_a.map { |t| t.dig("function", "name") },
+            "the child wire tools are the profile list + the bridge tool LAST (wire order = allowlist order)"
 
-        argv, child_environment = @manager.spawn_argv_and_env(researcher)
-        assert_equal "read,grep,find,ls,bash,contact_supervisor", argv[argv.index("--tools") + 1],
-          "the argv allowlist gains contact_supervisor LAST (the D5 bridge)"
-        refute argv.include?("--resume"), "context: fresh spawns without the fork resume"
-        assert_equal File.join(researcher[:dir], "control"), child_environment["PI_SUPERVISOR_CHANNEL"],
-          "the channel env key points at the run dir's control dir (D3)"
-        assert_equal "researcher", child_environment["PI_SUBAGENTS_AGENT"], "the agent label env key (D3)"
-        assert_equal F_RESEARCHER_MODEL_ID, child_environment["PI_MODEL"]
-        assert_equal "mock", child_environment["PI_PROVIDER"]
-        assert_equal "high", child_environment["PI_THINKING_LEVEL"], "the profile's thinking level routes"
+          argv, child_environment = @manager.spawn_argv_and_env(researcher)
+          assert_equal "read,grep,find,ls,bash,contact_supervisor", argv[argv.index("--tools") + 1],
+            "the argv allowlist gains contact_supervisor LAST (the D5 bridge)"
+          refute argv.include?("--resume"), "context: fresh spawns without the fork resume"
+          assert_equal File.join(researcher[:dir], "control"), child_environment["PI_SUPERVISOR_CHANNEL"],
+            "the channel env key points at the run dir's control dir (D3)"
+          assert_equal "researcher", child_environment["PI_SUBAGENTS_AGENT"], "the agent label env key (D3)"
+          assert_equal F_RESEARCHER_MODEL_ID, child_environment["PI_MODEL"]
+          assert_equal "mock", child_environment["PI_PROVIDER"]
+          assert_equal "high", child_environment["PI_THINKING_LEVEL"], "the profile's thinking level routes"
 
-        prompt = File.read(File.join(researcher[:dir], "system-prompt.md"))
-        assert prompt.include?(F_RESEARCHER_BODY), "the profile body IS the child's system prompt"
-        assert prompt.end_with?(Tart::Subagents::Supervisor::BRIDGE_INSTRUCTION),
-          "system-prompt.md = the profile body + the bridge block (D5)"
-        assert prompt.include?("Intercom orchestration channel:\n"), "the bridge marker"
-        assert prompt.include?('contact_supervisor({ reason: "need_decision", message: "<question>" })'),
-          "the bridge template bytes (pi DEFAULT_INTERCOM_BRIDGE_TEMPLATE verbatim)"
-        assert prompt.include?("Do not use contact_supervisor for routine completion handoffs."),
-          "the bridge closing rule byte-carried"
+          prompt = File.read(File.join(researcher[:dir], "system-prompt.md"))
+          assert prompt.include?(F_RESEARCHER_BODY), "the profile body IS the child's system prompt"
+          assert prompt.end_with?(Tart::Subagents::Supervisor::BRIDGE_INSTRUCTION),
+            "system-prompt.md = the profile body + the bridge block (D5)"
+          assert prompt.include?("Intercom orchestration channel:\n"), "the bridge marker"
+          assert prompt.include?('contact_supervisor({ reason: "need_decision", message: "<question>" })'),
+            "the bridge template bytes (pi DEFAULT_INTERCOM_BRIDGE_TEMPLATE verbatim)"
+          assert prompt.include?("Do not use contact_supervisor for routine completion handoffs."),
+            "the bridge closing rule byte-carried"
 
-        await(@manager, "the researcher run to complete", belt: CHILD_BELT_S) { run_state(researcher[:id]) == :completed }
-        assert_equal F_RESEARCHER_FINAL, result_json(researcher[:dir])["output"].to_s.strip
-        assert_ps_clean(researcher[:pid])
+          await(@manager, "the researcher run to complete", belt: CHILD_BELT_S) { run_state(researcher[:id]) == :completed }
+          assert_equal F_RESEARCHER_FINAL, result_json(researcher[:dir])["output"].to_s.strip
+          assert_ps_clean(researcher[:pid])
 
-        # The PROJECT tier: spawning the builtin NAME resolves to the
-        # project override (its body + tools), never the builtin table.
-        start2 = tool.execute(agent: "worker", task: F_WORKER_TASK, timeout_ms: 0).to_s
-        worker = @manager.runs.find { |r| r[:id] != researcher[:id] }
-        assert worker, "the second run registered"
-        assert_equal "Async: worker [#{worker[:id]}]", start2.split("\n").first
-        await(@manager, "the worker run to complete", belt: CHILD_BELT_S) { run_state(worker[:id]) == :completed }
-        worker_prompt = File.read(File.join(worker[:dir], "system-prompt.md"))
-        assert worker_prompt.include?(F_WORKER_BODY), "the PROJECT-tier body lands in the run dir"
-        refute worker_prompt.include?(F_BUILTIN_WORKER_TOKEN),
-          "the override wins over BUILTIN_AGENTS (replaced, not merged)"
-        worker_argv, = @manager.spawn_argv_and_env(worker)
-        assert_equal "read,grep,contact_supervisor", worker_argv[worker_argv.index("--tools") + 1],
-          "the override's comma-string tool list + the bridge tool last"
-        assert_equal F_WORKER_FINAL, result_json(worker[:dir])["output"].to_s.strip
-        assert_ps_clean(worker[:pid])
-        puts "[i48-e2e] leg F: profile model/tools/bridge rode the researcher spawn; " \
-          "the project worker override won; both runs completed"
-      ensure
-        i49_leg_cleanup
+          # The PROJECT tier: spawning the builtin NAME resolves to the
+          # project override (its body + tools), never the builtin table.
+          start2 = tool.execute(agent: "worker", task: F_WORKER_TASK, timeout_ms: 0).to_s
+          worker = @manager.runs.find { |r| r[:id] != researcher[:id] }
+          assert worker, "the second run registered"
+          assert_equal "Async: worker [#{worker[:id]}]", start2.split("\n").first
+          await(@manager, "the worker run to complete", belt: CHILD_BELT_S) { run_state(worker[:id]) == :completed }
+          worker_prompt = File.read(File.join(worker[:dir], "system-prompt.md"))
+          assert worker_prompt.include?(F_WORKER_BODY), "the PROJECT-tier body lands in the run dir"
+          refute worker_prompt.include?(F_BUILTIN_WORKER_TOKEN),
+            "the override wins over BUILTIN_AGENTS (replaced, not merged)"
+          worker_argv, = @manager.spawn_argv_and_env(worker)
+          assert_equal "read,grep,contact_supervisor", worker_argv[worker_argv.index("--tools") + 1],
+            "the override's comma-string tool list + the bridge tool last"
+          assert_equal F_WORKER_FINAL, result_json(worker[:dir])["output"].to_s.strip
+          assert_ps_clean(worker[:pid])
+          puts "[i48-e2e] leg F: profile model/tools/bridge rode the researcher spawn; " \
+            "the project worker override won; both runs completed"
+        ensure
+          i49_leg_cleanup
+        end
+        assert_i49_hygiene
       end
-      assert_i49_hygiene
     end
 
     private
@@ -1050,72 +1062,80 @@ module Tart
     # E3 (the leg-C shape): the steering receipt — correlated consumption
     # by request id, the in-process Manager with the default-on HOME.
     def test_default_on_e3_steering_receipt
-      home = stage_subagents_home
-      assert_no_staged_settings
-      @server.script([
-        {type: :slow_stream, content: C_LONG, chunk_every: 0.05},
-        {type: :stream, content: C_STEERED_ANSWER}
-      ])
-      @hooks = Hooks.new
-      @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
-        identity: "pi", hooks: @hooks)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        home = stage_subagents_home
+        assert_no_staged_settings
+        @server.script([
+          {type: :slow_stream, content: C_LONG, chunk_every: 0.05},
+          {type: :stream, content: C_STEERED_ANSWER}
+        ])
+        @hooks = Hooks.new
+        @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
+          identity: "pi", hooks: @hooks)
 
-      tool = Tart::Tools::Subagent.new(manager: @manager)
-      start = tool.execute(agent: "worker", task: C_TASK, timeout_ms: 0).to_s
-      run = @manager.runs.first
-      assert run, "the dispatch registered the run"
-      id = run[:id]
-      assert_equal "Async: worker [#{id}]", start.split("\n").first, "the §7 start message"
+        tool = Tart::Tools::Subagent.new(manager: @manager)
+        start = tool.execute(agent: "worker", task: C_TASK, timeout_ms: 0).to_s
+        run = @manager.runs.first
+        assert run, "the dispatch registered the run"
+        id = run[:id]
+        assert_equal "Async: worker [#{id}]", start.split("\n").first, "the §7 start message"
 
-      wait_for_captures("the child's first request") { child_requests(C_TASK).size == 1 }
-      assert_equal :running, @manager.runs.first[:state]
+        wait_for_captures("the child's first request") { child_requests(C_TASK).size == 1 }
+        assert_equal :running, @manager.runs.first[:state]
 
-      receipt = @manager.steer(id: id, message: C_STEER, mode: "steer", ack_timeout_ms: 30_000)
-      assert_equal :delivered, receipt[:state],
-        "the receipt reports the child's correlated consumption: #{receipt.inspect}"
-      assert_equal 36, receipt[:request_id].to_s.length
-      assert_equal "Steering delivered to async run #{id} (request #{receipt[:request_id]}).",
-        receipt[:text], "the §7 steer receipt bytes"
+        receipt = @manager.steer(id: id, message: C_STEER, mode: "steer", ack_timeout_ms: 30_000)
+        assert_equal :delivered, receipt[:state],
+          "the receipt reports the child's correlated consumption: #{receipt.inspect}"
+        assert_equal 36, receipt[:request_id].to_s.length
+        assert_equal "Steering delivered to async run #{id} (request #{receipt[:request_id]}).",
+          receipt[:text], "the §7 steer receipt bytes"
 
-      log = File.readlines(File.join(run[:dir], "control", "steer-log.jsonl")).map { |line| JSON.parse(line) }
-      assert log.any? { |entry| entry["requestId"] == receipt[:request_id] },
-        "the child's steer log names the SAME request id (T1)"
+        log = File.readlines(File.join(run[:dir], "control", "steer-log.jsonl")).map { |line| JSON.parse(line) }
+        assert log.any? { |entry| entry["requestId"] == receipt[:request_id] },
+          "the child's steer log names the SAME request id (T1)"
 
-      await(@manager, "the steered run to complete", belt: CHILD_BELT_S) { !@manager.outstanding? }
-      assert_equal :completed, @manager.runs.first[:state]
-      drain_captures
-      steered = @captures.find do |r|
-        r["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(C_STEER) }
+        await(@manager, "the steered run to complete", belt: CHILD_BELT_S) { !@manager.outstanding? }
+        assert_equal :completed, @manager.runs.first[:state]
+        drain_captures
+        steered = @captures.find do |r|
+          r["messages"].to_a.any? { |m| m["role"] == "user" && m["content"].to_s.include?(C_STEER) }
+        end
+        assert steered, "the steer text rode a captured child request"
+        first_child = child_requests(C_TASK).first
+        assert_operator @captures.index(steered), :>, @captures.index(first_child),
+          "the steer reached the child's NEXT request, not the first"
+        assert_equal C_STEERED_ANSWER, result_json(run[:dir])["output"].to_s.strip
+        assert_ps_clean(@manager.runs.first[:pid])
+        puts "[i48-e2e] leg E3: default-on home, steer delivered (request #{receipt[:request_id]}), completed"
       end
-      assert steered, "the steer text rode a captured child request"
-      first_child = child_requests(C_TASK).first
-      assert_operator @captures.index(steered), :>, @captures.index(first_child),
-        "the steer reached the child's NEXT request, not the first"
-      assert_equal C_STEERED_ANSWER, result_json(run[:dir])["output"].to_s.strip
-      assert_ps_clean(@manager.runs.first[:pid])
-      puts "[i48-e2e] leg E3: default-on home, steer delivered (request #{receipt[:request_id]}), completed"
     end
 
     # E4 (the leg-D shape): stop — graceful interrupt, state stopped,
     # timedOut false, no zombie — on the default-on HOME.
     def test_default_on_e4_stop
-      home = stage_subagents_home
-      assert_no_staged_settings
-      @hooks = Hooks.new
-      @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
-        identity: "pi", hooks: @hooks)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        home = stage_subagents_home
+        assert_no_staged_settings
+        @hooks = Hooks.new
+        @manager = Tart::Subagents::Manager.new(cwd: REPO_ROOT, home: home, env: child_env,
+          identity: "pi", hooks: @hooks)
 
-      @server.script([{type: :slow_stream, content: D_STOP_STREAM, chunk_every: 0.05}])
-      run = @manager.spawn_run(agent: "worker", task: D_STOP_TASK, async: true, timeout_ms: 0)
-      wait_for_captures("the stop target's first request") { child_requests(D_STOP_TASK).size == 1 }
-      receipt = @manager.stop(id: run[:id])
-      assert_equal "Stop requested for async run #{run[:id]}.", receipt.to_s, "the §7 stop receipt bytes"
-      await(@manager, "the stopped state", belt: CHILD_BELT_S) { run_state(run[:id]) == :stopped }
-      sj = status_json(run[:dir])
-      assert_equal "stopped", sj["state"]
-      assert_equal false, sj.fetch("timedOut", nil), "a user stop never sets timedOut"
-      assert_ps_clean(run[:pid])
-      puts "[i48-e2e] leg E4: default-on home, stop lands stopped/timedOut false, no zombies"
+        @server.script([{type: :slow_stream, content: D_STOP_STREAM, chunk_every: 0.05}])
+        run = @manager.spawn_run(agent: "worker", task: D_STOP_TASK, async: true, timeout_ms: 0)
+        wait_for_captures("the stop target's first request") { child_requests(D_STOP_TASK).size == 1 }
+        receipt = @manager.stop(id: run[:id])
+        assert_equal "Stop requested for async run #{run[:id]}.", receipt.to_s, "the §7 stop receipt bytes"
+        await(@manager, "the stopped state", belt: CHILD_BELT_S) { run_state(run[:id]) == :stopped }
+        sj = status_json(run[:dir])
+        assert_equal "stopped", sj["state"]
+        assert_equal false, sj.fetch("timedOut", nil), "a user stop never sets timedOut"
+        assert_ps_clean(run[:pid])
+        puts "[i48-e2e] leg E4: default-on home, stop lands stopped/timedOut false, no zombies"
+      end
     end
 
     # *****************************************************************

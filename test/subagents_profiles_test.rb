@@ -330,27 +330,31 @@ module Tart
     # --- the spawn-seam model routing (manager integration) ---
 
     def test_spawned_profile_runs_are_hermetic_under_the_staged_root
-      # The Manager's default root is Agent::Session.default_root — the
-      # spawn seam passes the MANAGER's root explicitly, so a staged root
-      # keeps discovery off the real HOME.
-      write_profile("user", "scout.md", name: "scout", model: "mock/scout-model", body: "Scout body.")
-      @server = MockLLMServer.new.start
-      @server.script([{type: :stream, content: "scout child done"}])
-      manager = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"),
-                                       env: {"PATH" => ENV["PATH"], "HOME" => @home,
-                                             "PI_API_KEY" => "test-key", "PI_API_BASE" => @server.url},
-                                       identity: "pi", hooks: Hooks.new, root: @root)
-      run = manager.spawn_run(agent: "scout", task: "t", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      # The settle broadcast IS the terminal event (I103).
-      await(manager, "the scout run to settle", belt: CHILD_BELT_S) { manager.runs.first[:state] != :running }
-      assert_equal :completed, manager.runs.first[:state]
-      assert run[:dir].start_with?(File.join(@home, "subagents"))
-      _, env = manager.spawn_argv_and_env(run)
-      assert_equal "scout-model", env["PI_MODEL"]
-      assert_equal File.join(run[:dir], "control"), env["PI_SUPERVISOR_CHANNEL"]
-    ensure
-      manager&.shutdown
-      @server&.stop
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        # The Manager's default root is Agent::Session.default_root — the
+        # spawn seam passes the MANAGER's root explicitly, so a staged root
+        # keeps discovery off the real HOME.
+        write_profile("user", "scout.md", name: "scout", model: "mock/scout-model", body: "Scout body.")
+        @server = MockLLMServer.new.start
+        @server.script([{type: :stream, content: "scout child done"}])
+        manager = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"),
+                                         env: {"PATH" => ENV["PATH"], "HOME" => @home,
+                                               "PI_API_KEY" => "test-key", "PI_API_BASE" => @server.url},
+                                         identity: "pi", hooks: Hooks.new, root: @root)
+        run = manager.spawn_run(agent: "scout", task: "t", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        # The settle broadcast IS the terminal event (I103).
+        await(manager, "the scout run to settle", belt: CHILD_BELT_S) { manager.runs.first[:state] != :running }
+        assert_equal :completed, manager.runs.first[:state]
+        assert run[:dir].start_with?(File.join(@home, "subagents"))
+        _, env = manager.spawn_argv_and_env(run)
+        assert_equal "scout-model", env["PI_MODEL"]
+        assert_equal File.join(run[:dir], "control"), env["PI_SUPERVISOR_CHANNEL"]
+      ensure
+        manager&.shutdown
+        @server&.stop
+      end
     end
 
     private
