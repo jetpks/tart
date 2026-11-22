@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "async"
 require_relative "safe_execute"
 
 module Tart
@@ -99,14 +100,15 @@ module Tart
       # Streams `rg --json` lines until the match limit or EOF. Returns
       # [matches, match_limit_reached, exit_code_or_nil].
       #
-      # I102 (KB I17 S1) — the deadline: rg spawns pgroup'd with stdin closed, and a
-      # watchdog thread enforces TOOL_TIMEOUT_S (default 120; ENV parsed at
-      # call time, non-numeric/absent/non-positive → the default). At the
-      # deadline it kills rg's whole process GROUP (TERM, KILL escalation)
-      # and closes the write-end copies so blocked reads EOF; every wait
-      # below is bounded (WNOHANG poll ≤ REAP_BUDGET_SECONDS then detach;
-      # err-drainer join 5 s then Thread#kill), and the call raises
-      # ToolTimeout — the teaching refusal — instead of hanging the session.
+      # I106 (owner concurrency law, PR-#28 review) — the process shape:
+      # `Kernel#Sync` is the one gateway (the live tool task yields inline;
+      # a bare caller gets a fresh reactor on its own fiber), the deadline
+      # is a `with_timeout` fiber timer, the stderr drain is a sibling
+      # reactor task, and every wait — pipe reads, Process.waitpid2 — parks
+      # evented in the scheduler. Behavior is the I102 contract unchanged:
+      # the TOOL_TIMEOUT_S parse law (default 120), the teaching refusal on
+      # expiry, TERM→KILL escalation by TIME (never probed), and the
+      # ToolTimeout raise instead of a hung session.
       REAP_BUDGET_SECONDS = 5
 
       def run_rg(rg_path, pattern, search_path, glob, ignore_case, literal, effective_limit)
@@ -117,104 +119,118 @@ module Tart
         args += ["--glob", glob] if glob
         args += ["--", pattern, search_path]
 
-        matches = []
-        match_limit_reached = false
-        timed_out = false
-        status = nil
-        out_rd, out_wr = IO.pipe
-        err_rd, err_wr = IO.pipe
-        pid = Process.spawn(rg_path, *args, out: out_wr, err: err_wr, in: :close,
-                                            pgroup: true, chdir: @cwd)
-        out_wr.close
-        err_wr.close
-        stderr = +""
-        err_t = Thread.new { stderr << err_rd.read }
-        # TERM→KILL escalation is TIME-based, not send-failure-based: a
-        # target that merely IGNORES TERM must not wedge the call (probed:
-        # a rescue-only chain never escalates — the TERM send succeeds and
-        # the stream read blocks forever). Grace, then a liveness probe on
-        # the group, then KILL.
-        watchdog = Thread.new do
-          sleep(timeout)
-          timed_out = true
-          Process.kill("TERM", -pid) rescue nil
-          sleep(KILL_GRACE_SECONDS)
-          begin
-            Process.kill(0, -pid)
-            Process.kill("KILL", -pid)
-          rescue StandardError
-            nil # group already gone — TERM did the job
-          end
-          begin
-            out_wr.close unless out_wr.closed?
-            err_wr.close unless err_wr.closed?
-          rescue IOError
-            nil
-          end
-        end
-        begin
-          out_rd.each_line do |line|
-            break if match_limit_reached
+        Sync do
+          out_rd, out_wr = IO.pipe
+          err_rd, err_wr = IO.pipe
+          pid = Process.spawn(rg_path, *args, out: out_wr, err: err_wr, in: :close,
+                                              pgroup: true, chdir: @cwd)
+          out_wr.close
+          err_wr.close
 
-            event = safe_parse(line)
-            next unless event&.fetch("type", nil) == "match"
+          stderr = +""
+          # Stderr drains on a sibling fiber; the group's death closes the
+          # last write-end, the read EOFs, and #wait joins after the reap.
+          drain = Async::Task.current.async { stderr << err_rd.read }
 
-            data = event["data"]
-            matches << {file_path: data.dig("path", "text"), line_number: data["line_number"],
-                        line_text: data.dig("lines", "text")}
-            if matches.length >= effective_limit
-              match_limit_reached = true
-              Process.kill("TERM", pid) rescue Process.kill("KILL", pid) rescue nil
+          status = nil
+          match_limit_reached = false
+          matches = []
+          begin
+            Async::Task.current.with_timeout(timeout, Async::TimeoutError) do
+              out_rd.each_line do |line|
+                event = safe_parse(line)
+                next unless event&.fetch("type", nil) == "match"
+
+                data = event["data"]
+                matches << {file_path: data.dig("path", "text"), line_number: data["line_number"],
+                            line_text: data.dig("lines", "text")}
+                next unless matches.length >= effective_limit
+
+                match_limit_reached = true
+                kill_group(pid, "TERM") # the whole GROUP — the deadline path's shape
+                break
+              end
+              status = match_limit_reached ? expire_group(pid) : Process.waitpid2(pid).last
             end
+          rescue Async::TimeoutError
+            # The deadline: TERM the group, wait for death under the grace
+            # timer, KILL a survivor, reap bounded — then the teaching
+            # refusal goes out through SafeExecute's ToolTimeout arm.
+            expire_group(pid)
+            raise ToolTimeout, timeout_message(pattern, search_path, glob, timeout)
+          rescue Fast::Completions::CancelledError, Async::Cancel
+            # Interrupted mid-search: the group dies with the call and the
+            # cancellation propagates (Async::Cancel < Exception — the
+            # StandardError belt must never swallow it).
+            kill_group(pid, "KILL")
+            raise
+          ensure
+            # No unwind leaves rg behind — deadline, limit, cancellation,
+            # and plain errors all end in the same group hygiene. A reactor
+            # waits for its tasks, so the drain must ride the EOF that
+            # death guarantees before anything escapes the Sync body.
+            status ||= expire_group(pid)
+            drain.wait
+            out_rd.close unless out_rd.closed?
+            err_rd.close unless err_rd.closed?
           end
-        ensure
-          # Fast path (limit hit or EOF before the deadline): retire the
-          # watchdog before it can fire under us, then reap with bounded
-          # waits only — no unbounded waitpid, no unbounded join.
-          unless timed_out
-            watchdog.kill
-          else
-            # already fired: let the KILL escalation land (≤ grace + ε)
-            watchdog.join(REAP_BUDGET_SECONDS)
-            watchdog.kill
-          end
-          watchdog.join
-          Process.kill("TERM", pid) rescue nil
-          status = reap_rg(pid)
-          err_t.join(REAP_BUDGET_SECONDS) || err_t.kill
-          out_rd.close
-          err_rd.close
-        end
-        raise ToolTimeout, timeout_message(pattern, search_path, glob, timeout) if timed_out
 
-        killed_due_to_limit = match_limit_reached
-        [matches, match_limit_reached, killed_due_to_limit ? 0 : status&.exitstatus]
+          [matches, match_limit_reached, match_limit_reached ? 0 : status&.exitstatus]
+        end
       end
 
       # TOOL_TIMEOUT_S (I102, KB I17 S1) read at call time: a positive integer wins;
       # absent, non-numeric, or non-positive falls back to the 120 s default.
-      KILL_GRACE_SECONDS = 2
-
       def tool_timeout_seconds
         raw = ENV["TOOL_TIMEOUT_S"]
         parsed = raw.is_a?(String) && raw.match?("\\A\\d+\\z") ? Integer(raw, 10) : nil
         parsed&.positive? ? parsed : DEFAULT_TIMEOUT_SECONDS
       end
 
-      # Bounded reap: WNOHANG poll within REAP_BUDGET_SECONDS, then
-      # Process.detach fallback — the session never blocks on a child that
-      # refuses to die; nil stands in for the un-reaped status.
-      def reap_rg(pid)
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REAP_BUDGET_SECONDS
-        loop do
-          waited, status = Process.waitpid2(pid, Process::WNOHANG)
-          return status if waited
-          break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      # Nested timers: the escalation bounds raise their OWN expiry so a
+      # bound can never swallow the deadline's Async::TimeoutError, and the
+      # deadline can never be mistaken for a bound.
+      class EscalationExpiry < StandardError
+      end
 
-          sleep 0.05
+      # TERM→KILL escalation is TIME-based, not send-failure-based (I102's
+      # law, kept): a target that ignores TERM must not wedge the call, and
+      # the grace TIMER replaces any liveness probe — wait-bounded-then-KILL
+      # is strictly stronger than probe-then-KILL.
+      KILL_GRACE_SECONDS = 2
+
+      def expire_group(pid)
+        kill_group(pid, "TERM")
+        status = bounded_wait(pid, KILL_GRACE_SECONDS)
+        unless status
+          kill_group(pid, "KILL")
+          status = bounded_wait(pid, REAP_BUDGET_SECONDS)
         end
-        Process.detach(pid)
+        status
+      end
+
+      # ONE evented wait under a timer: REAP_BUDGET_SECONDS is the
+      # never-reached net after SIGKILL — on net expiry nil stands in for
+      # the unreapable status and the refusal still goes out.
+      def bounded_wait(pid, seconds)
+        Async::Task.current.with_timeout(seconds, EscalationExpiry) do
+          Process.waitpid2(pid).last
+        end
+      rescue EscalationExpiry, Errno::ECHILD
         nil
+      end
+
+      # Negative-pid signal hits the whole process group; the bare pid is
+      # the fallback when the group is already dissolved (Errno races
+      # between death and signal are normal).
+      def kill_group(pid, signal)
+        Process.kill("-#{signal}", pid)
+      rescue Errno::ESRCH, Errno::EPERM
+        begin
+          Process.kill(signal, pid)
+        rescue Errno::ESRCH, Errno::EPERM
+          nil
+        end
       end
 
       # The I102 (KB I17 S1) teaching refusal: what ran, that it was killed, and how
