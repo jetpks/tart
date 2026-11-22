@@ -2136,7 +2136,13 @@ module Tart
         chat.on_event(RatatuiRuby::Event::Resize.new(width: 50, height: 40))
         draw(chat, session)
         rows = transcript_lines(session, chat)
-        joined = rows.join("\n")
+        # Wrap-normalized join: at 50 cells the context lines wrap wherever
+        # the STAGED PATH length puts the boundary — a seat whose tmpdir
+        # length straddles it splits the filename itself (settings.jso|n).
+        # The pin's property is the no-rediscovery row set, not the boundary
+        # luck; continuation rows are space-led, so splicing them out
+        # reconstructs the wrapped words.
+        joined = rows.join("\n").gsub("\n ", "")
         assert_includes joined, "settings.json",
           "the DELETED source's row set is unchanged — no re-discovery in the sweep"
         assert_includes joined, "AGENTS-notes.md", "the second source survives the sweep too"
