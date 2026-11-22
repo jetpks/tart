@@ -44,7 +44,11 @@ module Tart
         "Narrow the search: a smaller path, a tighter glob, or a more specific pattern.",
         result[:error]
       # the fake rg's whole process group is gone
-      leftovers = `pgrep -f "#{@fake_bin}/rg" 2>/dev/null`.strip
+      # The [r]g bracket keeps the probe's own `sh -c` wrapper out of the
+      # match: the wrapper's cmdline carries the pattern literally, and
+      # procps pgrep -f matches it (macOS BSD pgrep does not — the seat
+      # difference that broke CI while local stayed green).
+      leftovers = `pgrep -f "#{@fake_bin}/r[g]" 2>/dev/null`.strip
       assert_equal "", leftovers, "stuck rg survived the deadline: #{leftovers}"
     end
 
@@ -61,7 +65,11 @@ module Tart
       assert_hash_error result
       assert_includes result[:error], "grep exceeded 1s"
       assert elapsed < 11, "TERM-ignoring rg wedged the call: #{elapsed.round(1)}s"
-      leftovers = `pgrep -f "#{@fake_bin}/rg" 2>/dev/null`.strip
+      # The [r]g bracket keeps the probe's own `sh -c` wrapper out of the
+      # match: the wrapper's cmdline carries the pattern literally, and
+      # procps pgrep -f matches it (macOS BSD pgrep does not — the seat
+      # difference that broke CI while local stayed green).
+      leftovers = `pgrep -f "#{@fake_bin}/r[g]" 2>/dev/null`.strip
       assert_equal "", leftovers, "TERM-ignoring rg survived the KILL escalation: #{leftovers}"
     end
 
@@ -130,7 +138,11 @@ module Tart
         "TOOL_TIMEOUT: grep exceeded 1s and was killed (pattern=hello path=#{@dir} glob=*.json). " \
         "Narrow the search: a smaller path, a tighter glob, or a more specific pattern.",
         result[:error]
-      leftovers = `pgrep -f "#{@fake_bin}/rg" 2>/dev/null`.strip
+      # The [r]g bracket keeps the probe's own `sh -c` wrapper out of the
+      # match: the wrapper's cmdline carries the pattern literally, and
+      # procps pgrep -f matches it (macOS BSD pgrep does not — the seat
+      # difference that broke CI while local stayed green).
+      leftovers = `pgrep -f "#{@fake_bin}/r[g]" 2>/dev/null`.strip
       assert_equal "", leftovers, "stuck rg survived the deadline: #{leftovers}"
     end
 
