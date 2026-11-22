@@ -315,7 +315,7 @@ module Tart
     # A live terminal session. The loop kernel and the bench hold one of
     # these; tests may substitute any object answering the same instance
     # methods (+draw+, +poll_event+, +push_event+, +drain_synthetic+,
-    # +synthetic_pending?+, +cell_symbol+, +insert_before+,
+    # +synthetic_pending?+, +input_wait_fds+, +cell_symbol+, +insert_before+,
     # +buffer_content+, +viewport_area+).
     class Session
       # @return [Boolean] whether a real terminal session is active.
@@ -329,16 +329,31 @@ module Tart
       end
 
       # Blocks up to +timeout+ seconds waiting for the next native event.
-      # Returns an event object; +none?+ is true on timeout. Releases the GVL
-      # while blocked (crossterm), which is what makes the poller-thread
-      # design viable. In headless (test-terminal) sessions this returns
-      # immediately with a None event.
+      # Returns an event object; +none?+ is true on timeout. The fd seam
+      # (I109) means the kernel only ever calls this with timeout 0 — the
+      # non-blocking ready-read, invoked when the input producer's selector
+      # reported readiness. In headless (test-terminal) sessions this
+      # returns immediately with a None event.
       def poll_event(timeout:)
         RatatuiRuby.poll_event(timeout:)
       end
 
+      # The input-wait fds for the kernel's fd-driven input producer (I109):
+      # forwards to the gem's fd seam. EMPTY when no real terminal is behind
+      # this session — the producer then no-ops and synthetic events remain
+      # the test rail (there is NO polling timer in that shape). The gem
+      # exposes its wake pipe at every seat; the tty fd only when stdin is a
+      # tty (the same file description crossterm's source polls).
+      # @return [Hash] <tt>{wake: Integer, tty: Integer}</tt>, or {}.
+      def input_wait_fds
+        fds = RatatuiRuby.input_wait_fds
+        fds.key?(:tty) ? fds : {}
+      end
+
       # Pushes a synthetic event from any thread. Thread-safe (Mutex-guarded
       # queue inside ratatui_ruby); drained by the loop kernel each frame.
+      # The push also writes the gem's wake byte (the seam's self-waking
+      # rail — the input producer unblocks the idle loop over the wake fd).
       # Deliberately NOT +inject_test_event+, whose queue is thread-local.
       def push_event(event)
         RatatuiRuby::SyntheticEvents.push(event)

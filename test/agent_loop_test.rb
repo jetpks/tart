@@ -692,7 +692,7 @@ module Tart
       assert events.find { |e| e[:type] == :agent_end }[:interrupted],
         "interrupt must be observable through the agent_end event"
       assert agent.interrupted?
-      refute kernel.poller&.thread&.alive?, "no orphan poller after interrupt"
+      assert_predicate kernel.input_seam, :stopped?, "no orphan input-seam producer after interrupt"
     end
 
     # ---- the de-bridge pins (I50 — the gate's -n anchors; names EXACT) -----

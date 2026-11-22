@@ -1,3 +1,12 @@
+GIT
+  remote: https://github.com/jetpks/RatatuiRuby.git
+  revision: 10dd18004dd55d6596c05673768f65f6c1328e03
+  branch: event-fd-seam
+  specs:
+    ratatui_ruby (1.5.2)
+      rb_sys (~> 0.9, >= 0.9.129)
+      rexml (~> 3.4)
+
 PATH
   remote: .
   specs:
@@ -10,7 +19,6 @@ PATH
       dry-types (~> 1.9)
       dry-validation (~> 1.11)
       fast-uuid (~> 0.1.0)
-      ratatui_ruby (= 1.5.0)
 
 GEM
   remote: https://rubygems.org/
@@ -121,15 +129,6 @@ GEM
     protocol-url (0.19.0)
     rake (13.4.2)
     rake-compiler-dock (1.12.0)
-    ratatui_ruby (1.5.0)
-      rb_sys (~> 0.9)
-      rexml (~> 3.4)
-    ratatui_ruby (1.5.0-arm64-darwin-24)
-      rb_sys (~> 0.9)
-      rexml (~> 3.4)
-    ratatui_ruby (1.5.0-x86_64-linux)
-      rb_sys (~> 0.9)
-      rexml (~> 3.4)
     rb_sys (0.9.130)
       rake-compiler-dock (= 1.12.0)
     rbs (4.2.0)
@@ -158,6 +157,7 @@ DEPENDENCIES
   irb
   minitest (~> 5.20)
   rake (~> 13.0)
+  ratatui_ruby!
   tart!
 
 CHECKSUMS
@@ -207,9 +207,7 @@ CHECKSUMS
   protocol-url (0.19.0) sha256=3f6b9f6aa742a259a0b3610fbbd9685dcd9506adf6734f428ff96259faabfb21
   rake (13.4.2) sha256=cb825b2bd5f1f8e91ca37bddb4b9aaf345551b4731da62949be002fa89283701
   rake-compiler-dock (1.12.0) sha256=f13205c2738f3d2053afcd03491a9e4541b22a59a0bfc53fc8bc883bd8188023
-  ratatui_ruby (1.5.0) sha256=85b164c432968d883557cd19333fb318953671052af990df71cd594cd8e59ece
-  ratatui_ruby (1.5.0-arm64-darwin-24) sha256=35a8c4aa01ff3fe177aaba80ba620c9185ee02ef0adc53960516d8be2523aed2
-  ratatui_ruby (1.5.0-x86_64-linux) sha256=8a0f48d1eaf5e686aa9d0de20622bbf5b8e1901860de1676ee1e6cc93aafb10b
+  ratatui_ruby (1.5.2)
   rb_sys (0.9.130) sha256=7d486d99c1da02635515deaf9860fc5aea90bb4ab2589b2deec7fdc7d3548615
   rbs (4.2.0) sha256=51f7b886dcc05bc09e10b901daa6a81829f6adc03101d6ca9ea4aac6103e0674
   rdoc (8.1.0) sha256=befc37880a5cfd36dcb176c748b5fd5ee39dd3536a75e81824e4972ce230f60a

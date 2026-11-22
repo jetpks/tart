@@ -3,20 +3,10 @@
 require_relative "test_helper"
 
 module Tart
-  # The none-event double for this file's session doubles (TUI_NONE lives on
-  # Tart::Test — not visible from these nested classes).
-  SH_NONE = Class.new do
-    def none? = true
-
-    def key? = false
-
-    def sync? = false
-  end.new.freeze
-
   # The I75 signal-hygiene unit table (the pins behind the frozen
   # signal-hygiene-units gate filters — `/routing/` and `/teardown/` are the
   # gate's frozen -n filters, so every pin name carries its substring).
-  # The LIVE proofs (real wedged pollers, real exit codes, real survivors)
+  # The LIVE proofs (real signals, real exit codes, real survivors)
   # are the six-leg harness legs — every unit here is mechanism-level, with
   # the hard-exit primitive STUBBED (the frozen division of labor: units pin
   # the guard/ladder/containment mechanics, the harness legs prove the
@@ -140,7 +130,8 @@ module Tart
       assert_equal 129, guard.pending_exit_code, "the delivered HUP recorded its code"
       assert_empty fired,
         "run() returned normally — the hard exit is the bracket tail's, not the loop's"
-      refute_predicate event_loop.poller.thread, :alive?, "the (fast) poller joined cleanly on this path"
+      assert_predicate event_loop.input_seam, :stopped?,
+        "the input seam stopped cleanly on this path (no orphan producer)"
     ensure
       guard&.disarm
       SignalGuardStub.deactivate
@@ -182,48 +173,6 @@ module Tart
       assert_predicate guard, :exited?, "the latch holds across repeated complete calls"
     end
 
-    def test_teardown_poller_linger_error_is_contained_on_the_signal_path
-      # The poller parks past the 1s join (the wedged-native-call shape at
-      # the Ruby seam, Grounds F4); on the signal path the linger raise is
-      # contained — logged, never re-raised — and run() RETURNS so the flush
-      # tail after kernel.run can run (the F5 mask is cured).
-      guard = TUI::SignalGuard.new(exit_primitive: ->(_code) { nil })
-      guard.arm
-      SignalGuardStub.activate(guard)
-      session = LingeringSession.new(2.5)
-      event_loop = Core::Loop.new(session:)
-      Thread.new { sleep 0.1; Process.kill("HUP", Process.pid) }
-      # The HUP lands while the poller is parked inside its poll — the wedged
-      # shape (deterministic: the run cannot wind down before it observed the
-      # park, then the recorded exit code).
-      event_loop.run do
-        await(session, "the poller parked inside its poll") { session.polling? }
-        await(guard, "the delivered HUP's recorded exit code") { guard.pending_exit_code }
-      end
-      assert_predicate event_loop.poller.thread, :alive?,
-        "the wedged poller was abandoned, not joined to death (the hard exit owns it)"
-    ensure
-      guard&.disarm
-      SignalGuardStub.deactivate
-    end
-
-    def test_teardown_poller_linger_error_still_surfaces_off_the_signal_path
-      # Containment is signal-path-ONLY. At the Loop#run level the inner
-      # ensure's re-raise is (async 2.x) swallowed+logged by the root task —
-      # the standing I02 SURFACE is the raise itself, pinned at the Poller
-      # seam (kernel_carryin_test pins it too; re-pinned here against the
-      # cure's containment so the two live side by side).
-      session = LingeringSession.new(2.5)
-      poller = Core::Poller.new(session, queue: Queue.new, frame_interval: 1.0 / 60,
-                                stop_flag: Object.new.tap { |o| o.define_singleton_method(:stop_requested?) { false } })
-      poller.start
-      await(session, "the poller parked inside its 2.5s poll") { session.polling? } # I103 (B): the poll-entry gate
-      error = assert_raises(Core::PollerLingerError) { poller.stop }
-      assert_includes error.message, "poller thread"
-    ensure
-      poller.thread.kill if poller.thread&.alive?
-    end
-
     def test_teardown_dead_tty_errors_are_contained_on_the_signal_path_only
       # The containment seam: dead-tty draw/restore errors (Errno::EIO, the
       # gem's "Failed to show the cursor" class) are contained on the signal
@@ -257,50 +206,6 @@ module Tart
     end
 
     # --- doubles ---
-
-    # A session double whose poll blocks LONGER than the poller's 1s join —
-    # the poller thread parks inside poll (the F4 shape at the Ruby seam) and
-    # lingers past the stop. +polling?+ flips true at poll entry so tests can
-    # sequence deterministically around the parked poll.
-    class LingeringSession
-      def initialize(poll_s)
-        @poll_s = poll_s
-        @polling = false
-        # I103 (B): the poll-entry gate — pinged when the poll parks, so
-        # awaits on polling? ride the event (the gate rides the Tart::Test
-        # shape; this double lives only in the suite).
-        @gate = Tart::Test::Gate.new
-      end
-
-      def polling?
-        @polling
-      end
-
-      def poll_event(timeout:)
-        @polling = true
-        @gate.ping
-        sleep(@poll_s)
-        SH_NONE
-      end
-
-      # The state-signal read-through (I103): await(session, …) waits on the
-      # poll-entry event.
-      def state_version
-        @gate.state_version
-      end
-
-      def wait_state_change(from_version, belt: 60)
-        @gate.wait_state_change(from_version, belt: belt)
-      end
-
-      def draw(_widget); end
-
-      def push_event(_event); end
-
-      def drain_synthetic = 0
-
-      def synthetic_pending? = false
-    end
 
     # The class-level active-registry seam for kernel-level units: the real
     # arming owner is TUI.run's bracket; a bare kernel unit wires via
