@@ -610,27 +610,283 @@ module Tart
         assert_equal before, line_bytes(transcript.lines), "byte-identical at constant width"
       end
 
-      # Once per winch, never per frame (AC2): a counting builder — the
-      # push materializes ONCE, the drain adds nothing, N sweeps invoke
-      # exactly N rebuilds, and drain/reads at constant width invoke
-      # nothing (the materialized-rows architecture stands).
-      def test_rebuilds_once_per_winch_never_per_frame
-        transcript, set_width = sweep_transcript(40)
-        count = 0
-        transcript.push_expandable(->(expanded) { count += 1; [TUI.line("counted #{count} expanded=#{expanded}")] })
-        assert_equal 1, count, "the push materializes the rows once"
+      # The mutable-width seam WITH the box visible (I108): the
+      # width_reader AND the pins' width-derived builders close over the
+      # same local, flipped between flush and slice — {sweep_transcript}'s
+      # shape plus the reader the test-side builders need (a builder
+      # lambda created at the test runs with the TEST's self, so it reads
+      # the box, not the Transcript's private seam).
+      def sweep_box(width)
+        w = width
+        transcript = Transcript.new(width_reader: -> { w }, history_sink: ->(_text) {}, reseed_sink: ->(_message) {})
+        [transcript, ->(new_width) { w = new_width }, -> { w }]
+      end
 
-        transcript.flush_scrollback
-        assert_equal 1, count, "the drain-materialize does not double-count"
-
-        3.times do
-          set_width.call(20)
-          transcript.rebuild_scrollback
-          transcript.flush_scrollback # a frame's drain at constant width
-          transcript.lines.map { |line| line.spans.map(&:content).join } # a render reads rows
+      # The I108 sweep pins' counting builder: a registration whose row
+      # count CHANGES with the width (the delta-carrying arithmetic's
+      # observable) and whose invocation count is the no-double-charge
+      # observable. Runs at the TEST's self — width through +read+.
+      def counting_builder(read, key, counts)
+        counts[key] = 0
+        ->(_expanded) do
+          counts[key] += 1
+          Text.wrap("#{key} counting prose long enough to wrap differently at each width for sure", read.call)
+            .map { |row| TUI.line(row) }
         end
-        assert_equal 4, count, "exactly one rebuild invocation per winch (3 sweeps + the push)"
-        assert_includes transcript.lines.map { |line| line.spans.map(&:content).join }.first, "counted 4", "the last sweep's rows landed"
+      end
+
+      # --- I108: the staged resize sweep (the stale-flag registry + the
+      # window-first slice walk; the schedule moves, the I105 semantics
+      # stand). The I105 once-per-winch counting discipline moved to
+      # chat pin 8 (Grounds S3 — the base pin named the retired schedule
+      # law; its def is RETIRED here, the suite-par gate's sup term 0). ---
+
+      # Pin 1 (AC3): the continuation slices are budget-bounded and the
+      # drain completes within the deterministic bound — each slice ≤ B
+      # rebuilds, ≤ ceil(R/B)+1 slices total, pending drains, every
+      # registration at the new width, each builder invoked exactly once
+      # across the drain (the push materialization aside).
+      def test_sweep_slices_are_bounded_and_eventually_complete
+        transcript, set_width, read = sweep_box(40)
+        counts = {}
+        7.times do |i|
+          transcript.push_expandable(counting_builder(read, i, counts))
+        end
+        transcript.flush_scrollback
+        assert_equal [1] * 7, counts.values, "the push materialized each registration once"
+
+        set_width.call(20)
+        transcript.mark_sweep_pending
+        per_slice = []
+        per_slice << transcript.sweep_slice(budget: 3) while transcript.sweep_pending?
+
+        assert per_slice.all? { |n| n <= 3 }, "each continuation slice respects the budget: #{per_slice.inspect}"
+        assert_operator per_slice.size, :<=, (7 / 3.0).ceil + 1, "the drain completed within ceil(R/B)+1 slices"
+        refute transcript.sweep_pending?, "the pending flag drained"
+        assert_equal [2] * 7, counts.values,
+          "exactly R builder invocations across the drain (push + one rebuild each; clean registrations never re-invoked)"
+        assert_operator widest_line(transcript.lines), :<=, 20, "every registration re-derived at the new width"
+        joined = transcript.lines.map { |line| line.spans.map(&:content).join }.join("\n")
+        7.times { |i| assert_includes joined, "#{i} counting", "registration #{i} present at the new width" }
+      end
+
+      # Pin 2 (AC3): the staged end state == the one-shot end state at the
+      # same dims — buffer bytes, registry starts/sizes/expands, the
+      # status pair's identity — BOTH toggle states. The one-shot
+      # {rebuild_scrollback} is the comparator.
+      def test_staged_sweep_is_byte_identical_to_one_shot
+        [false, true].each do |expanded|
+          one_shot, set_one = sweep_transcript(40)
+          staged, set_staged = sweep_transcript(40)
+          [one_shot, staged].each do |t|
+            t.enqueue_user_submission("user echo — a prompt long enough to wrap when narrowed down")
+            t.enqueue_message("assistant reply with **bold** prose\n\n- item one that wraps\n- item two also wraps", reasoning: "thinking prose long enough to wrap closely")
+            t.enqueue_tool_block("bash", {"command" => "ls -la"},
+              {"output" => (1..5).map { |j| "out line #{j} with padding" }.join("\n"), "isError" => false}, 1.23)
+            t.enqueue_status("status text long enough to wrap at twenty cells")
+            t.flush_scrollback
+            t.set_tool_output_expanded(expanded)
+          end
+
+          set_one.call(20)
+          set_staged.call(20)
+          assert one_shot.rebuild_scrollback, "the one-shot comparator ran"
+
+          staged.mark_sweep_pending
+          first = staged.sweep_slice(budget: 2, window: 4..14) # the window-first pass over the middle
+          slices = 1
+          slices += 1 while staged.sweep_pending? && staged.sweep_slice(budget: 2).positive? && slices < 200
+
+          assert_operator first, :>=, 1, "the window-first pass rebuilt"
+          refute staged.sweep_pending?, "the staged sweep completed"
+          assert_equal line_bytes(one_shot.lines), line_bytes(staged.lines),
+            "buffer bytes identical (expanded=#{expanded})"
+          ra = one_shot.instance_variable_get(:@expandable_blocks)
+          rb = staged.instance_variable_get(:@expandable_blocks)
+          assert_equal ra.map { |r| [r[:start], r[:size], r[:expands]] }, rb.map { |r| [r[:start], r[:size], r[:expands]] },
+            "registry starts/sizes/expands identical (expanded=#{expanded})"
+          pair_a = one_shot.instance_variable_get(:@status_pair)
+          pair_b = staged.instance_variable_get(:@status_pair)
+          assert_equal line_bytes(pair_a), line_bytes(pair_b), "the status pair's rebuilt rows identical"
+          assert pair_b.each_with_index.all? { |line, i| staged.lines[-pair_b.size + i].equal?(line) },
+            "the status pair re-pointed at the rebuilt tail rows (identity survives slices)"
+        end
+      end
+
+      # Pin 3 (AC4): the mark arms pending + every registration stale; the
+      # first slice rebuilds EXACTLY the window-intersecting stale range;
+      # out-of-window stale registrations keep their builders uninvoked
+      # (their starts still move — the walk's own delta invariant); clean
+      # registrations take the shift-only branch too.
+      def test_winch_marks_all_stale_and_the_first_slice_covers_the_window
+        transcript, set_width, read = sweep_box(40)
+        counts = {}
+        %w[a b c].each { |key| transcript.push_expandable(counting_builder(read, key, counts)) }
+        transcript.flush_scrollback
+        regs = transcript.instance_variable_get(:@expandable_blocks)
+        starts_before = regs.map { |r| r[:start] }
+
+        set_width.call(20)
+        transcript.mark_sweep_pending
+        assert transcript.sweep_pending?, "the mark arms the pending flag"
+        assert regs.all? { |r| r[:stale] }, "the mark makes every registration stale"
+
+        # A mid-pending arrival: registers CLEAN (built at the current width).
+        transcript.push_expandable(counting_builder(read, "clean", counts))
+        transcript.flush_scrollback
+        clean_reg = regs.last
+        refute clean_reg[:stale], "the mid-sweep arrival registered clean"
+
+        # The first slice: the window covers exactly registrations a+b.
+        window = 0..(regs[1][:start] + regs[1][:size] - 1)
+        built = transcript.sweep_slice(budget: 2, window: window)
+
+        assert_equal 2, built, "exactly the window-intersecting stale range rebuilt (a, b)"
+        assert_equal [2, 2, 1, 1], counts.values_at("a", "b", "c", "clean"),
+          "in-window stale rebuilt (push+1); out-of-window and clean builders uninvoked"
+        assert regs[2][:stale], "the out-of-window registration stays stale for the continuation"
+        assert_operator regs[2][:start], :>, starts_before[2], "the out-of-window start moved by the walk's delta"
+        refute clean_reg[:stale], "the clean registration took the shift-only branch"
+        assert_operator clean_reg[:start], :>, starts_before.last, "the clean start moved by the delta too"
+        assert transcript.sweep_pending?, "work remains pending"
+
+        transcript.sweep_slice(budget: 10) # the continuation drains c
+        assert_equal [2, 2, 2, 1], counts.values_at("a", "b", "c", "clean"),
+          "the continuation rebuilt the out-of-window registration exactly once; the clean one never again"
+        refute transcript.sweep_pending?
+      end
+
+      # Pin 4 (AC4): an enqueue/drain MID-sweep registers CLEAN at the
+      # current width, lands without corrupting the ascending walk, and
+      # completion stays exact (byte-identical to a width-20 boot).
+      def test_enqueue_mid_sweep_registers_clean_at_current_width
+        transcript, set_width, read = sweep_box(40)
+        transcript.enqueue_user_submission("the first echo long enough to wrap when narrowed down")
+        transcript.enqueue_message("assistant prose **bold** that wraps across rows when narrow", reasoning: "thinking prose wraps too")
+        transcript.flush_scrollback
+
+        set_width.call(20)
+        transcript.mark_sweep_pending
+        first = transcript.sweep_slice(budget: 1) # mid-drain
+        assert_operator first, :>=, 1, "the drain progressed"
+
+        arrival_count = 0
+        transcript.push_expandable(->(_expanded) do
+          arrival_count += 1
+          Text.wrap("the mid sweep arrival wraps at the live width for sure", read.call).map { |row| TUI.line(row) }
+        end)
+        transcript.flush_scrollback
+        arrival_reg = transcript.instance_variable_get(:@expandable_blocks).last
+        refute arrival_reg[:stale], "the mid-drain arrival registered CLEAN"
+
+        transcript.sweep_slice(budget: 1) while transcript.sweep_pending?
+        refute transcript.sweep_pending?, "completion exact"
+        assert_equal 1, arrival_count, "the arrival's builder invoked once (the push) — never re-invoked"
+
+        control = Transcript.new(width_reader: -> { 20 }, history_sink: ->(_text) {}, reseed_sink: ->(_message) {})
+        control.enqueue_user_submission("the first echo long enough to wrap when narrowed down")
+        control.enqueue_message("assistant prose **bold** that wraps across rows when narrow", reasoning: "thinking prose wraps too")
+        control.enqueue_scrollback("the mid sweep arrival wraps at the live width for sure", fg: nil)
+        control.flush_scrollback
+        assert_equal line_bytes(control.lines), line_bytes(transcript.lines),
+          "the interleaved end state equals the width-20 boot, byte for byte"
+        assert_operator widest_line(transcript.lines), :<=, 20, "the arrival landed at the current width"
+      end
+
+      # Pin 5 (AC4): ctrl+o WHILE pending — the flip rebuilds the
+      # expanding blocks at the CURRENT width and leaves them CLEAN; the
+      # remaining stale complete exactly; starts/sizes stay consistent
+      # (the whole buffer equals the width-20 expanded control).
+      def test_ctrl_o_mid_sweep_rebuilds_at_current_width_and_keeps_deltas
+        transcript, set_width, read = sweep_box(40)
+        counts = {}
+        transcript.enqueue_user_submission("the echo above the expandable wraps when narrowed down")
+        transcript.push_expandable(counting_builder(read, :exp, counts))
+        transcript.push_plain_region(->(_expanded) { counts[:plain] = 1; [TUI.line("a plain block")] })
+        transcript.enqueue_tool_block("bash", {"command" => "tail block"},
+          {"output" => "tail output that wraps when narrow with padding", "isError" => false}, 2.0)
+        transcript.flush_scrollback
+        counts[:echo] = counts.fetch(:echo, 0) # the echo's builder is closed inside the transcript — no counter
+
+        set_width.call(20)
+        transcript.mark_sweep_pending
+        regs = transcript.instance_variable_get(:@expandable_blocks)
+
+        assert transcript.set_tool_output_expanded(true), "the flip ran while pending"
+        assert transcript.sweep_pending?, "the flip does not touch the pending sweep"
+        assert_equal 2, counts[:exp], "the expanding block rebuilt at the CURRENT width (push + flip)"
+        expandable_reg = regs[1]
+        refute expandable_reg[:stale], "the flip's rebuild left the expanding block CLEAN"
+        assert regs[2][:stale], "the plain block stays stale (shift-only under the flip)"
+
+        transcript.sweep_slice(budget: 4) while transcript.sweep_pending?
+        refute transcript.sweep_pending?, "the remaining stale completed exactly"
+        assert_equal 2, counts[:exp], "the clean expanding block never re-invoked by the sweep"
+        assert_equal 1, counts[:plain], "the plain block rebuilt once by the sweep (push + 1)"
+
+        control = Transcript.new(width_reader: -> { 20 }, history_sink: ->(_text) {}, reseed_sink: ->(_message) {})
+        control.enqueue_user_submission("the echo above the expandable wraps when narrowed down")
+        control.push_expandable(->(_expanded) do
+          Text.wrap("exp counting prose long enough to wrap differently at each width for sure", 20).map { |row| TUI.line(row) }
+        end)
+        control.push_plain_region(->(_expanded) { [TUI.line("a plain block")] })
+        control.enqueue_tool_block("bash", {"command" => "tail block"},
+          {"output" => "tail output that wraps when narrow with padding", "isError" => false}, 2.0)
+        control.flush_scrollback
+        control.set_tool_output_expanded(true)
+        assert_equal line_bytes(control.lines), line_bytes(transcript.lines), "the interleaved end state equals the width-20 expanded control"
+        ra = transcript.instance_variable_get(:@expandable_blocks)
+        rc = control.instance_variable_get(:@expandable_blocks)
+        assert_equal rc.map { |r| [r[:start], r[:size], r[:expands]] }, ra.map { |r| [r[:start], r[:size], r[:expands]] },
+          "starts/sizes consistent through the interleaving"
+      end
+
+      # Pin 6 (AC4): /new mid-sweep — reset drops the registry, the
+      # pending flag and every stale flag (no stale residue), and the
+      # post-reset enqueue registers clean.
+      def test_new_mid_sweep_clears_all_sweep_state
+        transcript, set_width = sweep_transcript(40)
+        transcript.enqueue_user_submission("the pre reset echo that wraps when narrowed down")
+        transcript.flush_scrollback
+
+        set_width.call(20)
+        transcript.mark_sweep_pending
+        assert transcript.sweep_pending?, "armed mid-sweep"
+
+        transcript.reset
+        refute transcript.sweep_pending?, "pending cleared"
+        assert_empty transcript.instance_variable_get(:@expandable_blocks), "the registry dropped"
+        assert_empty transcript.lines, "the buffer dropped with it"
+        assert_equal 0, transcript.sweep_slice(budget: 4), "no stale residue — the slice is a no-op"
+
+        transcript.enqueue_user_submission("the post reset echo lands clean")
+        transcript.flush_scrollback
+        reg = transcript.instance_variable_get(:@expandable_blocks).last
+        refute reg[:stale], "the post-reset registration is clean"
+        refute transcript.sweep_pending?, "no pending residue"
+      end
+
+      # Pin 7 (AC3): mark + staged drain at the SAME width — the staged
+      # purity no-op: the slices run (by construction, not skipped) and
+      # the bytes come back identical.
+      def test_constant_width_staged_sweep_is_byte_identical_no_op
+        transcript, = sweep_transcript(40)
+        transcript.enqueue_message("constant width means the staged sweep changes nothing at all", reasoning: "thinking holds too")
+        transcript.enqueue_tool_block("grep", {}, "generic hit line", nil)
+        transcript.enqueue_status("Tool output: collapsed status")
+        transcript.flush_scrollback
+        before = line_bytes(transcript.lines)
+        size_before = transcript.lines.size
+
+        transcript.mark_sweep_pending
+        first = transcript.sweep_slice(budget: 2, window: 2..9) # the window-first pass
+        drained = 0
+        drained += 1 while transcript.sweep_pending? && transcript.sweep_slice(budget: 2).positive?
+
+        assert_operator first, :>=, 1, "the staged sweep RAN (the no-op is by construction, not skipped)"
+        assert_equal before, line_bytes(transcript.lines), "byte-identical at constant width through the staged path"
+        assert_equal size_before, transcript.lines.size, "row count stable (widths equal)"
+        refute transcript.sweep_pending?, "the staged drain completed"
       end
 
       # GROW re-wraps (AC1): 40→80 re-merges the previously-split rows;
