@@ -1,15 +1,18 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "async"
 require "tmpdir"
 require "fileutils"
 
 module Tart
-  # I102 (KB I17 S1) — the rg deadline: a stuck rg (never writes, never
-  # exits) is killed by the watchdog at TOOL_TIMEOUT_S and the call returns
-  # the teaching-refusal envelope instead of hanging the session. The fake
-  # rg honors TERM (trap → exit) per the frozen spec, so the process-group
-  # kill is exercised through the TERM path.
+  # I106 — the rg deadline (the I102 observables, the async rework): a
+  # stuck rg (never writes, never exits) is killed at TOOL_TIMEOUT_S —
+  # the reactor's fiber timer, TERM→KILL by time — and the call returns
+  # the teaching-refusal envelope instead of hanging the session. The
+  # fake rg honors TERM (trap → exit) per the frozen spec, so the
+  # process-group kill is exercised through the TERM path; the last pin
+  # drives the same deadline from INSIDE a reactor task (the live seat).
   class GrepDeadlineTest < Test
     def setup
       @dir = Dir.mktmpdir("tart-grep-deadline-")
@@ -101,11 +104,34 @@ module Tart
       assert_equal "apple.txt:1: one", Tools::Grep.new(cwd: @dir).execute(pattern: "one")
     end
 
-    # Normal paths unchanged: the watchdog retires quietly on completion.
+    # Normal paths unchanged: the reactor reaps quietly on completion.
     def test_normal_grep_unaffected_by_watchdog
       result = Tools::Grep.new(cwd: @dir).execute(pattern: "one")
       assert_equal "apple.txt:1: one", result
       assert_equal "No matches found", Tools::Grep.new(cwd: @dir).execute(pattern: "zzz")
+    end
+
+    # The live-path seat (I106): every real tool call runs as a reactor
+    # task (chat.rb's parent.async), so the deadline must fire identically
+    # from INSIDE the reactor — same envelope bytes, same group hygiene.
+    def test_deadline_fires_inside_a_reactor_task
+      inject_stuck_rg(honor_term: true)
+      ENV["TOOL_TIMEOUT_S"] = "1"
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      result = Sync do
+        Async::Task.current.async do
+          Tools::Grep.new(cwd: @dir).execute(pattern: "hello", path: @dir, glob: "*.json")
+        end.wait
+      end
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      assert elapsed < 11, "calling task must survive: took #{elapsed.round(1)}s"
+      assert_hash_error result
+      assert_equal \
+        "TOOL_TIMEOUT: grep exceeded 1s and was killed (pattern=hello path=#{@dir} glob=*.json). " \
+        "Narrow the search: a smaller path, a tighter glob, or a more specific pattern.",
+        result[:error]
+      leftovers = `pgrep -f "#{@fake_bin}/rg" 2>/dev/null`.strip
+      assert_equal "", leftovers, "stuck rg survived the deadline: #{leftovers}"
     end
 
     private
