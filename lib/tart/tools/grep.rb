@@ -150,7 +150,7 @@ module Tart
                 kill_group(pid, "TERM") # the whole GROUP — the deadline path's shape
                 break
               end
-              status = match_limit_reached ? expire_group(pid) : Process.waitpid2(pid).last
+              status = match_limit_reached ? expire_group(pid) : waitpid_status(pid)
             end
           rescue Async::TimeoutError
             # The deadline: TERM the group, wait for death under the grace
@@ -216,7 +216,21 @@ module Tart
         Async::Task.current.with_timeout(seconds, EscalationExpiry) do
           Process.waitpid2(pid).last
         end
-      rescue EscalationExpiry, Errno::ECHILD
+        # ESRCH joins ECHILD: through the scheduler, io-event's EPoll
+        # process_wait can TOCTOU its own internal reap (waitid reaps the
+        # just-dead child, pidfd_open then finds the pid gone) and raises
+        # ESRCH where a direct waitpid raises ECHILD. Gone means exited;
+        # nil stands in for the unknowable status.
+      rescue EscalationExpiry, Errno::ECHILD, Errno::ESRCH
+        nil
+      end
+
+      # Same law for the happy-path reap: a vanished pid is an exited
+      # child; nil flows to the output-only result path (the ensure's
+      # expire_group backfill is ESRCH-safe via bounded_wait above).
+      def waitpid_status(pid)
+        Process.waitpid2(pid).last
+      rescue Errno::ESRCH, Errno::ECHILD
         nil
       end
 

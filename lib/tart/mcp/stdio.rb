@@ -211,7 +211,13 @@ module Tart
           kill_group("TERM")
           unless exited_within?(@close_timeout_ms)
             kill_group("KILL")
-            Process.waitpid(@pid)
+            # ESRCH/ECHILD-tolerant (the io-event process_wait TOCTOU): a
+            # vanished server pid is a dead server — nothing left to reap.
+            begin
+              Process.waitpid(@pid)
+            rescue Errno::ESRCH, Errno::ECHILD
+              nil
+            end
           end
         end
       ensure

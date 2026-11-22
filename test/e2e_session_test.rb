@@ -242,9 +242,24 @@ module Tart
     # The launcher_smoke env pattern, closed: unsetenv_others makes the
     # child env EXACTLY this hash (no live keys, no owner TART_* leaks —
     # the OS injects only PKG_CONFIG_PATH/__CF_USER_TEXT_ENCODING).
+    # I102 judge residual, closed (2026-11-22): the child PATH must not
+    # carry mise shims — a staged HOME makes the shim's config untrusted
+    # and it exits 1 with empty output, which is byte-identical to rg's
+    # no-matches code (the tool then truthfully answers "No matches
+    # found" about a search that never ran). Resolve rg to a REAL binary
+    # dir: the child inherits no mise machinery at all.
+    def hermetic_child_path
+      @hermetic_child_path ||= begin
+        dirs = ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).reject { |d| d.include?("mise/shims") }
+        rg_dir = dirs.find { |d| File.executable?(File.join(d, "rg")) }
+        raise "e2e needs a real (non-shim) rg on PATH" unless rg_dir
+        ([rg_dir] + dirs).uniq.join(File::PATH_SEPARATOR)
+      end
+    end
+
     def tart_env(extra)
       {
-        "PATH" => ENV.fetch("PATH", nil),
+        "PATH" => hermetic_child_path,
         "HOME" => @home,
         # The child boots tart itself (bin/tart runs Bundler.setup beside
         # its Gemfile): pass the bundle location through so vendored CI gems

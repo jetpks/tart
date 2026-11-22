@@ -75,8 +75,11 @@ module Tart
           stdout, stderr, status = run_fd(fd_path, args)
           Fast::Completions::Cancellation.check
 
-          unless status.exitstatus == 0 || status.exitstatus == 1
-            error_message = stderr.strip.empty? ? "fd exited with code #{status.exitstatus}" : stderr.strip
+          # A nil status (externally-reaped child — the ESRCH law above)
+          # reads as success: fd's drained output is the truth.
+          exit_code = status&.exitstatus
+          unless exit_code.nil? || exit_code == 0 || exit_code == 1
+            error_message = stderr.strip.empty? ? "fd exited with code #{exit_code}" : stderr.strip
             raise ArgumentError, error_message if stdout.empty?
 
             return format_results(stdout.split("\n"), search_path, effective_limit)
@@ -132,7 +135,16 @@ module Tart
           err_wr.close
           out_task = Async::Task.current.async { stdout << out_rd.read }
           err_task = Async::Task.current.async { stderr << err_rd.read }
-          _, status = Process.waitpid2(pid)
+          # ESRCH/ECHILD-tolerant reap (the io-event process_wait TOCTOU —
+          # a child this process spawned can surface as ESRCH through the
+          # scheduler on Linux): gone means exited; the drained output is
+          # the truth, so a nil status reads as success rather than a
+          # fabricated code.
+          _, status = begin
+            Process.waitpid2(pid)
+          rescue Errno::ESRCH, Errno::ECHILD
+            nil
+          end
           out_task.wait
           err_task.wait
           out_rd.close
