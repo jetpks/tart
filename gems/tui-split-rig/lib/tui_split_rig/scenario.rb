@@ -71,6 +71,13 @@ module TuiSplitRig
 #                              # resize-window — resize-PANE does not move a
 #                              # manual-size session). The SIGWINCH instrument
 #                              # (s16). Default: none (today's behavior).
+#   resize_after: [80, 40]     # optional (I105): the same pair applied AFTER
+#                              # the reply settle and BEFORE the post-settle
+#                              # keys (tmux resize-window + a re-settle) —
+#                              # content enqueued BEFORE the resize is the
+#                              # owner-complaint target (the boot-width
+#                              # residue the s19 instrument sees). Default:
+#                              # none (today's behavior).
 #   replay: true               # optional (I57): AFTER the completed turn and
 #                              # the primary teardown, re-boot the app on its
 #                              # RECORDED session (pi `--continue`; tart the
@@ -95,7 +102,7 @@ module TuiSplitRig
 
     attr_reader :name, :prompt, :expected_requests, :responses, :env, :context_window, :suppress_usage,
                 :post_settle_keys, :mid_run_keys, :stage_project_resources, :stage_memory, :paste, :submit,
-                :resize, :replay
+                :resize, :resize_after, :replay
 
     def self.load(path)
       raise Error, "#{path}: no such scenario file" unless File.readable?(path)
@@ -130,6 +137,7 @@ module TuiSplitRig
       @paste = parse_paste(data)
       @submit = parse_submit(data)
       @resize = parse_resize(data)
+      @resize_after = parse_resize_after(data)
       @replay = parse_replay(data)
       @env = parse_env(data)
       @context_window = parse_context_window(data)
@@ -182,6 +190,21 @@ module TuiSplitRig
 
       unless raw.is_a?(Array) && raw.length == 2 && raw.all? { |value| value.is_a?(Integer) && value.positive? }
         raise Error, "#{@path}: resize must be a [width, height] pair of positive integers"
+      end
+
+      raw
+    end
+
+    # The resize_after knob (the s19 instrument, I105): EXACTLY the
+    # resize knob's parse/validation shape — a positive-integer pair or
+    # absent → nil, a loud rig error otherwise. Applied at a different
+    # point in {Runner#run_app} (after the reply settle).
+    def parse_resize_after(data)
+      raw = data["resize_after"]
+      return nil if raw.nil?
+
+      unless raw.is_a?(Array) && raw.length == 2 && raw.all? { |value| value.is_a?(Integer) && value.positive? }
+        raise Error, "#{@path}: resize_after must be a [width, height] pair of positive integers"
       end
 
       raw

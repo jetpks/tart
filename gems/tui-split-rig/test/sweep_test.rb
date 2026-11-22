@@ -31,7 +31,10 @@ module TuiSplitRig
       output, = sweep_cmd("--list")
       jobs, entries = parse_plan(output)
       assert_equal 8, jobs, "--jobs defaults to 8"
-      assert_equal 19, entries.size, "the s-battery is 19 scenarios today"
+      # I105: s19_transcript_resize joins the battery (the resize-reweave
+      # instrument) — the protective count moves 19→20; the set stays the
+      # sorted s*.yml glob.
+      assert_equal 20, entries.size, "the s-battery is 20 scenarios today"
       assert_equal BATTERY, entries.map { |e| e.fetch(:name) }
       assert_includes entries.map { |e| e.fetch(:name) }, "s1_tart",
         "s1_tart matches s*.yml and IS a battery member"
@@ -40,7 +43,7 @@ module TuiSplitRig
     def test_probes_add_the_three_probe_ymls
       output, = sweep_cmd("--list", "--probes")
       _jobs, entries = parse_plan(output)
-      assert_equal 22, entries.size
+      assert_equal 23, entries.size # 20 s-battery + 3 probes (I105: s19 joined)
       assert_equal (BATTERY + PROBES).sort, entries.map { |e| e.fetch(:name) }
     end
 
