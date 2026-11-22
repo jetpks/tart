@@ -597,23 +597,31 @@ module Tart
         edit_input(event)
       end
 
-      # The SIGWINCH arm (I56): latch the event dims as the compose-time
-      # geometry (one frame — {render_frame} clears the latch after
-      # {build_widget}; on a real terminal the draw's autoresize refreshes
-      # the gem area by then), re-pick the header art at the new width and
-      # rebuild the resize-live header block in place, then request the
-      # draw. No header enqueued (motd: false — the /resume screens) → no
-      # art re-pick, no rebuild; the latch still sets (the editor reflow
-      # works headless too). The predicate form mirrors the mouse arm (the
-      # base Event answers every ? predicate via method_missing — the
-      # respond_to? guard is what separates the classes).
+      # The SIGWINCH arm (I56 latch; I105 generalization): latch the event
+      # dims as the compose-time geometry (one frame — {render_frame}
+      # clears the latch after {build_widget}; on a real terminal the
+      # draw's autoresize refreshes the gem area by then), re-pick the
+      # header art at the new width ({@header_enqueued} now gates ONLY the
+      # re-pick), then DRAIN the scrollback queue (queued items materialize
+      # at the latched width and join the sweep — an item enqueued at the
+      # old width but unflushed at the winch lands at the NEW width; the
+      # queue is a plain same-reactor Array, the drain fiber-synchronous —
+      # I107) and run THE SWEEP: every scrollback registration re-derives
+      # at the latched dims, once per winch (never per frame), then request
+      # the draw. The viewport offset clamps on shrink in {Viewport#window}
+      # (no viewport change — the I105 pin proves the property). No header
+      # enqueued (motd: false — the /resume screens) → no art re-pick; the
+      # drain + sweep still run (the /resume screens re-wrap too). The
+      # predicate form mirrors the mouse arm (the base Event answers every
+      # ? predicate via method_missing — the respond_to? guard is what
+      # separates the classes).
       def handle_resize(event)
-        rebuilt = false
         @resize_dims = [event.width, event.height]
         if @header_enqueued
           @logo_lines = Motd.motd_logo_lines(event.width, wordmark: @identity)
-          rebuilt = @transcript_state.rebuild_live_expandables
         end
+        @transcript_state.flush_scrollback
+        rebuilt = @transcript_state.rebuild_scrollback
         signal_state_change
         @kernel.request_draw if rebuilt
       end
@@ -684,9 +692,15 @@ module Tart
               # every real loop event carries the Message reader; reader-
               # less display doubles (render_perf's Msg) stay inert.
               @error_row_rendered = true
-              @transcript_state.enqueue_region([Panel.blank_line,
-                *Panel.padded_fg_rows("Error: #{message.error_message}", viewport_width,
-                  fg: Theme[:error])])
+              error_text = message.error_message
+              error_fg = Theme[:error]
+              # The width-derived error region (I105 — the :681 family): the
+              # pad-led wrapped rows re-derive at the invoked width (never
+              # ctrl+o-participating — the flip walk skips it, the winch
+              # sweep re-wraps it).
+              @transcript_state.push_plain_region(->(_expanded) do
+                [Panel.blank_line, *Panel.padded_fg_rows("Error: #{error_text}", viewport_width, fg: error_fg)]
+              end)
             end
           end
         when :tool_execution_start
@@ -941,8 +955,8 @@ module Tart
       # The header-container block: the identity's header content between
       # its Spacers, built at the CURRENT global toggle state (pi
       # getStartupExpansionState = verbose || toolOutputExpanded; the port
-      # has no --verbose, cut, itemized). Registered RESIZE-LIVE (I56 —
-      # the SIGWINCH rebuild sweeps only this block). The tart art comes
+      # has no --verbose, cut, itemized). An expanding registration (I105 —
+      # the winch sweep re-wraps it like every block). The tart art comes
       # from the LADDER at the current width (I56 — deterministic per
       # width; the random sample is retired): the pick re-runs at boot,
       # /new, and the compaction re-enqueue (all through here, at the
@@ -953,7 +967,7 @@ module Tart
       def enqueue_motd_header
         @header_enqueued = true
         @logo_lines = Motd.motd_logo_lines(viewport_width, wordmark: @identity)
-        @transcript_state.push_expandable(->(expanded) { motd_header_rows(expanded) }, resize_live: true)
+        @transcript_state.push_expandable(->(expanded) { motd_header_rows(expanded) })
       end
 
       def motd_header_rows(expanded)
@@ -973,11 +987,21 @@ module Tart
       # state (Motd is stateless — everything threads).
       def enqueue_motd_sections
         cwd = @footer_data&.fetch(:cwd, nil) || Dir.pwd
-        Motd.sections(viewport_width,
-          context: @context_files.map { |file| file.fetch(:path) } + Motd.context_sources(@settings_root, cwd),
+        # The purity law (I105): the section builders close over the
+        # BOOT-GATHERED, ALREADY-FILTERED inputs — the File.file? filter
+        # hoisted boot-side ({Motd.sections} keeps it for its direct
+        # callers; {Motd.build_sections} never re-stats). A context file
+        # DELETED after boot keeps its row set through any resize.
+        inputs = {
+          context: (@context_files.map { |file| file.fetch(:path) } + Motd.context_sources(@settings_root, cwd))
+            .select { |path| File.file?(path) },
           skills: @skills, prompts: @prompts, extensions: @extensions,
-          user_root: @settings_root, project_root: File.join(cwd, Settings::CONFIG_DIR)).each do |section|
-          @transcript_state.push_expandable(->(expanded) { motd_section_rows(section, expanded) })
+          user_root: @settings_root, project_root: File.join(cwd, Settings::CONFIG_DIR)
+        }
+        Motd.build_sections(viewport_width, **inputs).each_with_index do |section, i|
+          @transcript_state.push_expandable(->(expanded) do
+            motd_section_rows(Motd.build_sections(viewport_width, **inputs)[i], expanded)
+          end)
         end
       end
 

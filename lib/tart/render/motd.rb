@@ -259,13 +259,25 @@ module Tart
       # (ExpandableText(..., 0, 0), addLoadedSection :1810) — no pad,
       # wrapped at the full width through {wrap_resource_row}. The caller
       # threads the gathered pieces: +context+ the candidate config paths
-      # (filtered to existing files here), +skills+ the loaded Skill
+      # (filtered to existing files here — the PUBLIC shape keeps the
+      # filter for its direct callers; the I105 resize builders close over
+      # boot-filtered inputs and re-derive through {build_sections}, which
+      # never re-stats), +skills+ the loaded Skill
       # structs, +prompts+ the loaded prompt templates, +extensions+ the
       # MCP server names, +user_root+/+project_root+ the discovery roots
       # the scope groups classify by ({scope_group}).
       def sections(width, context:, skills:, prompts:, extensions:, user_root:, project_root:)
-        sections = []
         context = context.select { |path| File.file?(path) }
+        build_sections(width, context:, skills:, prompts:, extensions:, user_root:, project_root:)
+      end
+
+      # The pre-filtered construction (I105 — the purity law's seam): the
+      # resize builders re-derive the section structs at the invoked width
+      # from the BOOT-GATHERED, ALREADY-FILTERED inputs; a rebuild performs
+      # zero filesystem re-stats (a source deleted after boot keeps its
+      # row set). +context+ arrives ALREADY filtered.
+      def build_sections(width, context:, skills:, prompts:, extensions:, user_root:, project_root:)
+        sections = []
         unless context.empty?
           sections << Section.new("[Context]",
             dim_compact_list(context, width - Panel::OUTPUT_PAD.length * 2),
