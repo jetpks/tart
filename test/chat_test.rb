@@ -1655,7 +1655,7 @@ module Tart
 
       refute kernel.interrupted?, "the escape interrupt never stops the loop (I15)"
       assert chat.agent.interrupted?
-      refute kernel.poller&.thread&.alive?, "no orphan poller"
+      assert_predicate kernel.input_seam, :stopped?, "no orphan input-seam producer"
       assert_includes chat.transcript_lines.join, "interrupted",
         "the interrupted turn renders coherently"
     end

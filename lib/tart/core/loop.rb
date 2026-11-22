@@ -1,18 +1,21 @@
 # frozen_string_literal: true
 
 require "async"
-
-require_relative "poller"
+require "io/wait"
 
 module Tart
   module Core
     # The event-loop kernel (Design B, BRIEF §4/§4.1).
     #
     # One +Async+ reactor owns all reactor-side work — timers, socket/pipe
-    # readers, the frame loop. A dedicated {Poller} thread polls the TUI and
-    # bridges native events over the thread-safe +Async::Queue+. Synthetic
-    # events cross threads via +SyntheticEvents.push+ (through the TUI
-    # module) and are drained each frame in-loop.
+    # readers, the frame loop, and the input seam (I109): fiber tasks that
+    # park on the session's exposed input-wait fds (IO#wait_readable —
+    # io-event under the Async scheduler) and push onto the SAME
+    # thread-safe +Async::Queue+ the poller thread used to bridge over.
+    # Native input is read (poll_event(timeout: 0), the GVL-free call)
+    # only when the selector reports readiness; synthetic events cross
+    # threads via +SyntheticEvents.push+ (self-waking through the gem's
+    # wake pipe) and are drained each frame in-loop.
     #
     # Ctrl+C is handled in-band: in raw mode byte 0x03 arrives as a Key event
     # ("c" + ctrl), which cancels the in-flight work task subtree via
@@ -32,7 +35,8 @@ module Tart
     # foreign thread stays supported (the flag write + the +Async::Queue+
     # push are thread-safe). All other mutable state (@work_task, @tasks,
     # @animation_deadline, stats) is touched only by reactor fibers on the
-    # main thread.
+    # main thread. With the poller thread retired (I109), ZERO threads are
+    # spawned by lib/ — the census is SPAWN 0.
     class Loop
       WAKE = :wake # sentinel: unblock the idle loop (drain synthetic etc.)
       STOP = :stop # sentinel: exit the frame loop
@@ -95,7 +99,8 @@ module Tart
       # to supervise, so nothing pushes STOP on its own.
       #
       # Teardown is exception-safe (I02 carry-in): whatever the work block
-      # or an event handler raises, the poller is stopped and the SIGINT
+      # or an event handler raises, the input seam's tasks are stopped with
+      # the reactor's own Task#stop (no join, no linger class) and the SIGINT
       # trap net is restored to its pre-run handler. A {Loop} is single-use;
       # build a new one to run again.
       #
@@ -111,9 +116,10 @@ module Tart
           Async do |root|
             begin
               @work_task = root.async(&work) if work
-              poller = Poller.new(@session, queue: @events, frame_interval: @frame_interval, stop_flag: self)
-              poller.start
-              # I103 — the poller lifecycle's boot broadcast (the loop is
+              input_seam = InputSeam.new(@session, queue: @events)
+              @input_seam = input_seam
+              input_seam.start(root)
+              # I103 — the input seam's boot broadcast (the loop is
               # live; foreign stoppers await this instead of a delay bet).
               signal_state_change
               supervisor = root.async { supervise(@work_task) }
@@ -125,25 +131,16 @@ module Tart
               @work_error = e
             ensure
               # Exception-safe teardown (I02 carry-in): whatever raised — the
-              # work subtree, an event handler, the renderer — the poller must
-              # see the stop flag before it is joined, or it lingers (and the
-              # linger error would mask the original failure).
+              # work subtree, an event handler, the renderer — the input
+              # seam's tasks are stopped (Task#stop; the reactor unwinds the
+              # cancelled fibers before the Async block exits — no join, no
+              # linger class, I109).
               request_stop
               @tasks.each(&:stop)
               @work_task&.stop
               supervisor&.stop
-              @poller = poller
-              begin
-                poller&.stop
-              rescue PollerLingerError => e
-                # I75: on the signal path the poller is wedged inside one
-                # native call (Grounds F4) and is ABANDONED — the linger raise
-                # must not mask the signal routing or it would skip the flush
-                # tail (F5's mask). Off the signal path it still surfaces
-                # (I02: a missed join must surface).
-                raise unless contain_signal_path_error(e)
-              end
-              # I103 — the poller lifecycle's broadcast (teardown done).
+              input_seam&.stop
+              # I103 — the input seam's teardown broadcast (teardown done).
               signal_state_change
             end
           end
@@ -241,12 +238,14 @@ module Tart
         signal(STOP)
       end
 
-      # @return [Boolean] whether the poller thread is still alive. Used by
-      #   tests to prove teardown leaves no orphan poller.
-      attr_reader :poller
+      # The input seam (I109 — the poller thread's replacement): the
+      # fd-driven input producer. Teardown assertions re-seat here
+      # (+stopped?+ — no orphan producer after a raise).
+      attr_reader :input_seam
 
       # @return [Boolean] whether shutdown was requested. Thread-safe — a
-      #   plain GVL-atomic read; the poller thread polls this every frame.
+      #   plain GVL-atomic read; the stop! path from a foreign thread rides
+      #   the STOP sentinel on the queue.
       def stop_requested?
         @stop
       end
@@ -348,7 +347,8 @@ module Tart
 
       # I103 — the state-signal broadcast (additive observability): the
       # tail of every observed mutation funnel (stat/draw accounting,
-      # tick/every fires, the stop/interrupt flips, the poller teardown).
+      # tick/every fires, the stop/interrupt flips, the input seam's boot
+      # and teardown).
       # The V1 wake: bump the plain-Integer version, then ping BOTH paths
       # — the direct queue push (the proven cross-thread wake) and, when a
       # scheduler is present on the producer's thread, the scheduler-ready
@@ -366,7 +366,7 @@ module Tart
       # Wakes the frame loop with a sentinel (V5 — the disposable per-wake
       # spawn-and-join is gone): the V1 ping against the loop's
       # @events Async::Queue. The direct push is the proven cross-thread
-      # path (the poller's, stop!'s); when a scheduler is present on the
+      # path (the input seam's, stop!'s); when a scheduler is present on the
       # producer's thread the scheduler-ready rider pushes the same
       # sentinel again (Notification::Signal's mechanism) — the
       # same-thread cross-fiber path the standing lost-wakeup claim names
@@ -477,6 +477,135 @@ module Tart
 
       def now
         Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+    end
+
+    # The fd-driven input producer (I109 — the poller Thread's replacement,
+    # the concurrency law's final exemption retired with it): reactor tasks
+    # that park on the session's exposed input-wait fds via IO#wait_readable
+    # (io-event under the Async scheduler — the park is the reactor's own,
+    # no thread) and push onto the SAME @events queue the poller bridged
+    # over. The wake fd drains its byte(s) and pushes the :wake sentinel
+    # when synthetic events are pending (the poller's rail, preserved); the
+    # tty fd runs the non-blocking ready-read (poll_event(timeout: 0) — the
+    # GVL-free call, invoked ONLY when the selector reports readiness). The
+    # exposed fds are never read except the wake fd's byte drain. A session
+    # that exposes no fds (headless/test mode) no-ops: there is NO polling
+    # timer — the idle loop stays parked on @events.
+    class InputSeam
+      # @param session [#input_wait_fds, #poll_event, #synthetic_pending?]
+      #   the TUI session (non-exposing doubles keep working unchanged —
+      #   the fd probe answers respond_to?(:input_wait_fds)).
+      # @param queue [Async::Queue] the kernel's event queue (the poller's
+      #   seam, preserved).
+      def initialize(session, queue:)
+        @session = session
+        @queue = queue
+        @tasks = []
+        @stopped = false
+        @wake_ios = {}
+      end
+
+      # Spawns one producer task per exposed fd on the reactor.
+      # @param reactor [Async::Task] the kernel's root task.
+      def start(reactor)
+        fds = @session.respond_to?(:input_wait_fds) ? @session.input_wait_fds : {}
+        @tasks << reactor.async { await_wake(fds.fetch(:wake)) } if fds.key?(:wake)
+        @tasks << reactor.async { await_tty(fds.fetch(:tty)) } if fds.key?(:tty)
+        nil
+      end
+
+      # Stops the producer tasks (Task#stop — the reactor's own cancel
+      # mechanism; no join, no linger class). +stopped?+ is the teardown
+      # observable: true the moment stop returns, and the tasks are dead
+      # once the reactor unwinds (Loop#run's ensure runs inside the Async
+      # block, so nothing outlives the run).
+      def stop
+        @stopped = true
+        @tasks.each(&:stop)
+        @tasks.clear
+        nil
+      end
+
+      # @return [Boolean] whether the seam is stopped (the I02 orphan
+      #   assertions re-seat here).
+      def stopped?
+        @stopped
+      end
+
+      private
+
+      # The wake-fd producer: parks until the fd is readable (a synthetic
+      # push or a SIGWINCH wrote a wake byte), drains the byte(s) (never
+      # blocks — the pipe is non-blocking), then — I109 ruling 3 (F1) —
+      # runs ONE non-blocking ready-read BEFORE the sentinel decision: a
+      # WINCH's Resize is queued by crossterm on its OWN internal signal
+      # pipe (not among the awaited fds), and the wake byte is the only
+      # readiness surface the seam gets for it — without this read the
+      # resize would sit until a later keystroke (measured 2.8 s or never;
+      # the poller's 16 ms cadence is the parity bar this restores). The
+      # fork's signal-handler chain writes crossterm's pipe and ours in the
+      # same delivery, so the queued Resize is visible to this read. A
+      # synthetic push rides the same read harmlessly (an empty native
+      # queue returns None). Then the unchanged sentinel: :wake only when
+      # synthetic events are pending (the poller's rail, preserved).
+      # Async::Cancel unwinds through wait_readable at teardown (Task#stop)
+      # — deliberately never rescued.
+      def await_wake(fd)
+        io = wake_io(fd)
+        until stopped?
+          io.wait_readable
+          drain_wake(io)
+          break if stopped?
+          event = @session.poll_event(timeout: 0)
+          @queue << event unless event.none?
+          @queue << Loop::WAKE if @session.respond_to?(:synthetic_pending?) && @session.synthetic_pending?
+        end
+      end
+
+      # The tty-fd producer: parks until input is readable on the tty, then
+      # drains crossterm's ready events UNTIL none return, pushing each
+      # returned event, and only then re-parks on the fd. The drain-to-None
+      # is load-bearing (measured, the s19 prompt-burst defect): crossterm's
+      # read consumes up to 1024 bytes of the SHARED device queue per poll,
+      # so a keystroke burst lands in crossterm's USERSPACE parser while the
+      # exposed tty fd goes quiet (the device queue is empty) — a single
+      # ready-read per park would strand the backlog until the NEXT device
+      # byte (the rig's prompt typed zero dispatches; the poller's 16 ms
+      # cadence is what drained the parser at base). Events still arriving
+      # during the drain keep it running; None (the parser drained) re-parks
+      # — no hot-spin, the park is still wait_readable. A dead/EOF'd tty
+      # surfaces as a RETURNING wait (EOF/HUP makes the fd readable), never
+      # a wedge — the I75 wedge class dies structurally (there is no
+      # blocking native wait anywhere on this path). Async::Cancel unwinds
+      # through wait_readable at teardown (Task#stop) — never rescued.
+      def await_tty(fd)
+        io = IO.for_fd(fd, autoclose: false)
+        until stopped?
+          io.wait_readable
+          break if stopped?
+          loop do
+            event = @session.poll_event(timeout: 0)
+            break if event.none?
+
+            @queue << event
+          end
+        end
+      end
+
+      def wake_io(fd)
+        @wake_ios[fd] ||= IO.for_fd(fd, autoclose: false)
+      end
+
+      # Read-drains every buffered byte (read_nonblock never blocks; the
+      # EOF/error tails are structural no-ops — the fd stays open).
+      def drain_wake(io)
+        loop do
+          chunk = io.read_nonblock(4096, exception: false)
+          break if chunk.nil? || chunk == :wait_readable
+        end
+      rescue EOFError, Errno::EIO, IOError
+        nil
       end
     end
   end
