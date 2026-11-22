@@ -1,6 +1,6 @@
 GIT
   remote: https://github.com/jetpks/RatatuiRuby.git
-  revision: 10dd18004dd55d6596c05673768f65f6c1328e03
+  revision: 4ad78c5e9433ee3d6d1ff42c41651b4027d58938
   branch: event-fd-seam
   specs:
     ratatui_ruby (1.5.2)
