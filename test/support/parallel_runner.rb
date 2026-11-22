@@ -367,7 +367,16 @@ module Tart
       out.puts verdict_line(workers, wall, ok)
       unless ok
         workers.select { |w| !w.status.success? || (w.failures + w.errors).positive? }
-               .each { |w| out.puts "failing worker=#{w.index} log=#{w.log_path}" }
+               .each do |w|
+          out.puts "failing worker=#{w.index} log=#{w.log_path}"
+          # Surface the failure/error sections inline: CI runners throw
+          # away /tmp with the runner — the summary counts alone are
+          # undebuggable from a check-run log.
+          w.log_text.to_s.each_line do |line|
+            break if line.start_with?("  ") && line.strip.start_with?("runs,")
+            out << line if line.match?(/\A\s*(\d+\) (Failure|Error):|#test_|Expected|\+|\s{4}\S.*\.rb:\d+)/)
+          end
+        end
       end
       ok ? 0 : 1
     end
