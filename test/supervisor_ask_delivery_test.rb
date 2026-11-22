@@ -205,12 +205,15 @@ module Tart
           # worker past the default belt; the landing is guaranteed by
           # the tool's own write inside execute below.
           landing.await("the child's ask to land", belt: 90) do
-            !Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.empty?
+            # Final names only (uuid ids carry dashes): atomic_write_json's
+            # mid-rename .tmp is NOT dot-prefixed and must not satisfy the
+            # landing check.
+            !Dir.children(File.join(ctrl, "supervisor-requests")).grep(/\A[\h-]+\.json\z/).empty?
           end
         # The request file cannot vanish under this read: the tool unlinks
         # its consumed request only AFTER the reply exists, and the reply
         # is written below, after this read.
-        file = Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.first
+        file = Dir.children(File.join(ctrl, "supervisor-requests")).grep(/\A[\h-]+\.json\z/).first
         id = JSON.parse(File.read(File.join(ctrl, "supervisor-requests", file)))["id"]
         Subagents::Supervisor.atomic_write_json(
           File.join(ctrl, "supervisor-replies", "#{id}.json"),
@@ -230,7 +233,7 @@ module Tart
 
       assert_equal({error: Subagents::Supervisor::BLOCKED_PARENT_ERROR}, result,
                    "SafeExecute keeps the ArgumentError verbatim in the {error:} result")
-      assert_empty Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") },
+      assert_empty Dir.children(File.join(ctrl, "supervisor-requests")).grep(/\A[\h-]+\.json\z/),
                    "the request file is unlinked on the reply path before the raise"
     ensure
       answerer.kill if answerer
