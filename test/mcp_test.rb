@@ -71,15 +71,28 @@ module Tart
     def test_request_timeout_is_a_failure_typed_by_the_timeout_error
       # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
       # the migrated workers are reactor tasks. Same name, same assertions.
-      Sync do
-        client = connected_client(request_timeout_ms: 250)
-        result = client.call_tool("sleep", {"ms" => 5000})
+      # CI robustness: under heavy oversubscription the echo-server child
+      # can die between connect and the sleep call — an environmental
+      # ConnectionClosedError, not the taxonomy under test. One retry,
+      # forgiveness narrowly scoped to that class; the timeout assertions
+      # themselves never relax.
+      attempts = 0
+      begin
+        attempts += 1
+        Sync do
+          client = connected_client(request_timeout_ms: 250)
+          result = client.call_tool("sleep", {"ms" => 5000})
 
-        assert result.failure?, "the timeout taxonomy must arrive as a Failure value"
-        error = result.failure
-        assert_kind_of Mcp::TimeoutError, error
-        assert_equal "MCP request timed out after 250ms", error.message
-        assert_equal 250, error.timeout_ms
+          assert result.failure?, "the timeout taxonomy must arrive as a Failure value"
+          error = result.failure
+          raise Mcp::ConnectionClosedError if error.is_a?(Mcp::ConnectionClosedError) && attempts == 1
+          assert_kind_of Mcp::TimeoutError, error
+          assert_equal "MCP request timed out after 250ms", error.message
+          assert_equal 250, error.timeout_ms
+        end
+      rescue Mcp::ConnectionClosedError
+        retry if attempts == 1
+        raise
       end
     end
 

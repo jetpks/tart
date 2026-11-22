@@ -13,6 +13,11 @@ module TuiSplitRig
   # pinned install (the staged bin/pi symlink tart's pi_package_dir walk
   # realpaths through).
   class OracleBinTest < Tart::Test
+    # The pinned pi oracle is local-only; skip whole-file on CI runners.
+    def setup
+      skip "pinned pi oracle clone absent (local grounding artifact)" unless TuiSplitRig.oracle_available?
+    end
+
     REPO_ROOT = File.expand_path("#{__dir__}/../../..")
     SCENARIO = File.join(REPO_ROOT, "gems/tui-split-rig/scenarios/s1_text_turn.yml")
 

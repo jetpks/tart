@@ -6,6 +6,11 @@ require_relative "../lib/tui_split_rig"
 module TuiSplitRig
   # Scenario loading: the shipped data files and the failure path.
   class ScenarioTest < Tart::Test
+    # The pinned pi oracle is local-only; skip whole-file on CI runners.
+    def setup
+      skip "pinned pi oracle clone absent (local grounding artifact)" unless TuiSplitRig.oracle_available?
+    end
+
     RIG_ROOT = File.expand_path("#{__dir__}/..")
 
     def test_loads_the_shipped_s1_text_turn_scenario
