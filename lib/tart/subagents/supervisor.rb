@@ -160,7 +160,10 @@ module Tart
       # Atomic temp+rename (the I48 control-channel idiom; rename over an
       # existing path is atomic on POSIX).
       def atomic_write_json(path, payload)
-        temp = "#{path}.#{Process.pid}.#{Thread.current.object_id}.tmp"
+        # I107 (I1): the temp name's uniqueness source is the Fast::UUID
+        # uuid_v7 (the old thread-identity source died with the poll
+        # thread's migration to a task).
+        temp = "#{path}.#{Process.pid}.#{Fast::UUID.uuid_v7}.tmp"
         File.write(temp, JSON.generate(payload))
         File.rename(temp, path)
       ensure
@@ -193,6 +196,9 @@ module Tart
     # foreground attention marks surface the asking child on the box so a
     # human sees the ask event even though it was never queued.
     class SupervisorChannel
+      # The scheduler-ready rider (Notification::Signal's mechanism — async
+      # clone lib/async/notification.rb): the selector processes its ready
+      # list by calling #transfer, which pushes the same queue.
       attr_reader :home
 
       # @param home [String] the runs root (the Manager's home).
@@ -218,40 +224,97 @@ module Tart
         @agent = agent
         @owner_id = owner_id
         @foreground_awaited = foreground_awaited
-        @mutex = Mutex.new
+        # I107 (V4/M5): the channel guard Mutex dies — every funnel (the
+        # pending add/remove/discover, the reply consumption, the
+        # foreground marks, the poller lifecycle) is a same-reactor
+        # Hash/Array operation with no scheduler-visible suspension (the
+        # poll task and the tool fibers share the host reactor).
         @pending = {}
         @seen = {}
         @foreground_attention = {}
         @thread = nil
+        @stopping = false
+        # The deferred arm (I107): production registers at the bare boot
+        # (bin/tart, before the loop reactor exists), so #start there can
+        # only MARK the arm; the poll task spawns at the first on-reactor
+        # seat (Manager#spawn_run — every run goes through it). Until then
+        # no owned request file can exist (run dirs are minted by local
+        # spawns), so the deferred ticks are observably equivalent to
+        # base's boot-time thread.
+        @armed = false
+        # The I103 state-signal seam's V1 wake (I107).
+        @ready = Async::Queue.new
+        @state_version = 0
       end
 
-      # Starts the poll thread (idempotent).
+      # Starts the poll task (idempotent) — I107 (T10/V2): a TRANSIENT
+      # task on the host reactor (never holds the reactor open; the
+      # teardown cancel is its unwind). An off-reactor seat (the boot
+      # register) cannot spawn a task, so it MARKS the arm; {ensure_poller}
+      # starts the task at the first on-reactor seat.
       def start
-        thread = nil
-        @mutex.synchronize do
-          thread = @thread
-          if thread.nil? || !thread.alive?
-            thread = Thread.new do
-              Thread.current.name = "tart-supervisor-channel" if Thread.current.respond_to?(:name=)
-              poll_loop
-            end
-            @thread = thread
-          end
+        return self if @thread&.alive?
+
+        unless (task = Async::Task.current?)
+          @armed = true # the bare boot register: mark, spawn later
+          return self
         end
+        # The arming flag must flip BEFORE the spawn: a task's eager first
+        # run executes the poll body synchronously inside #async, BEFORE
+        # the assignment below — a @thread-nil check there would kill the
+        # poll instantly (the arming race).
+        @stopping = false
+        @armed = true
+        thread = task.async(transient: true) { poll_loop }
+        @thread = thread
+        signal_state_change
         self
       end
 
-      # Stops the poll thread (idempotent; Manager#shutdown joins it). One
+      # The deferred arm's start (the manager's on-reactor seats call
+      # this every spawn): a no-op unless #start marked the arm at a bare
+      # seat, and idempotent like #start.
+      def ensure_poller
+        start if @armed && !@thread&.alive?
+        self
+      end
+
+      # ONE synchronous scan pass, exception-guarded like the poll loop.
+      # The drain-phase scan carrier (I107): in print mode the loop
+      # reactor ends with the final turn, and the reactor's termination
+      # reaps the poll task (a childless transient sleeper — async's
+      # run_once ignores transient tasks), so the WATCHER's sweep cadence
+      # (which survives until the runs settle) and the bare post-reactor
+      # drain call this every pass. Idempotent with the poll task: tick
+      # contains no scheduler-visible suspension, so same-reactor
+      # carriers cannot interleave, and the seen-guard makes cross-seat
+      # double scans a no-op.
+      def poll_once
+        tick
+        self
+      rescue StandardError
+        nil # a transient IO error never kills the carrier seat
+      end
+
+      # Stops the poll task (idempotent; Manager#shutdown calls it). One
       # final lifecycle sweep — resolution only, no new registrations — so
-      # a shutdown leaves no consumable request behind on disk.
+      # a shutdown leaves no consumable request behind on disk. The
+      # bounded stop is Task#stop (the Cancel lands at the sleep park); a
+      # dead task (the post-reactor seat) is a no-op.
       def stop
-        thread = @mutex.synchronize do
-          caught = @thread
-          @thread = nil
-          caught
-        end
+        thread = @thread
+        @thread = nil
+        @stopping = true
+        signal_state_change
         sweep_pending
-        thread&.join(Supervisor::POLL_INTERVAL * 8)
+        if thread&.alive?
+          thread.stop
+          begin
+            thread.wait
+          rescue Async::Cancel, StandardError
+            nil # the unwind is the point; the sweep cadence bounds it
+          end
+        end
         nil
       end
 
@@ -268,21 +331,23 @@ module Tart
         text = message.to_s
         raise ArgumentError, "message is required for supervisor replies." if text.strip.empty?
 
-        request = @mutex.synchronize { @pending[reply_to.to_s] } || discover_request(reply_to.to_s)
+        request = @pending[reply_to.to_s] || discover_request(reply_to.to_s)
         unless request
           raise ArgumentError, "No pending supervisor request found for reply_to '#{reply_to}'."
         end
-        @mutex.synchronize { @pending[request[:id]] = request }
+        @pending[request[:id]] = request
+        signal_state_change
 
         Supervisor.atomic_write_json(reply_path(request), reply_payload(request, text.strip))
-        @mutex.synchronize { @pending.delete(request[:id]) }
+        @pending.delete(request[:id])
+        signal_state_change
         remove_request_file(request)
         "Replied to supervisor request #{request[:id]}."
       end
 
       # The registry snapshot (request-id keyed; the tool's re-read path).
       def pending
-        @mutex.synchronize { @pending.values.map(&:dup) }
+        @pending.values.map(&:dup)
       end
 
       # The foreground attention marks (I100 L3): run-id keyed
@@ -290,7 +355,28 @@ module Tart
       # run turns terminal on disk or its dir vanishes (D2). The box
       # snapshot's `attention_tool` fact reads this.
       def foreground_attention
-        @mutex.synchronize { @foreground_attention.dup }
+        @foreground_attention.dup
+      end
+
+      # --- I103 state-signal seam (I107 V1 mechanics) ---------------------
+      # The await-loop's version read + the test-only park, riding the V1
+      # wake: a plain-Integer version and a Thread::Queue timed-pop park
+      # (parks a reactor FIBER; blocks a plain thread). The footprint is
+      # these two methods, signal_state_change, and its call sites:
+      # deleting them restores base behavior byte-for-byte (a ping with
+      # no waiter is a no-op; production never waits).
+      def state_version
+        @state_version
+      end
+
+      # Parks until the version moves past from_version, belt-bounded (nil
+      # on belt expiry with no change). Production never calls this.
+      def wait_state_change(from_version, belt: 60)
+        loop do
+          return @state_version if @state_version > from_version
+
+          return nil if @ready.pop(timeout: belt).nil?
+        end
       end
 
       # pi buildParentSupervisorTool's pending arm (:450-458): the empty
@@ -316,26 +402,54 @@ module Tart
         ids = Array(run_ids)
         return if ids.empty?
 
-        @mutex.synchronize do
-          @pending.delete_if { |_request_id, request| ids.include?(request[:run_id].to_s) }
-        end
+        @pending.delete_if { |_request_id, request| ids.include?(request[:run_id].to_s) }
+        signal_state_change
         nil
       end
 
       private
 
+      # I103 — the state-signal broadcast (additive observability): the
+      # tail of every observed channel mutation funnel (pending
+      # add/remove/discover, the reply path's consumption, the poller's
+      # start/stop + terminal sweep, the foreground-attention set/clear).
+      # The V1 wake: bump the plain-Integer version, then ping BOTH paths
+      # — the direct queue push (the proven cross-thread wake) and, when
+      # a scheduler is present on the producer's thread, the
+      # scheduler-ready rider (Notification::Signal's mechanism) —
+      # honoring the standing same-thread lost-wakeup claim. A ping with
+      # no waiter is a no-op.
+      def signal_state_change
+        @state_version += 1
+        @ready.push(:wake)
+        Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
+        nil
+      end
+
+      # The poll cadence rides the task timer (V2 — the tick + Task#sleep
+      # shape; the park is cooperative, never a wall-clock spin).
       def poll_loop
         until thread_stopped?
           tick
-          sleep Supervisor::POLL_INTERVAL
+          task_sleep(Supervisor::POLL_INTERVAL)
         end
       rescue StandardError
-        sleep 0.05 # a transient IO error never kills the channel
+        task_sleep(0.05) # a transient IO error never kills the channel
         retry
       end
 
+      def task_sleep(seconds)
+        if (task = Async::Task.current?)
+          task.sleep(seconds)
+        else
+          sleep(seconds) # unreachable from the poll task; kept for direct calls
+        end
+      end
+
+      # The stop flag only — the @thread handle is assigned AFTER a spawn's
+      # eager first run (the arming race), so it is not a stop signal.
       def thread_stopped?
-        @mutex.synchronize { @thread.nil? }
+        @stopping
       end
 
       # One pass: the pending sweep (lifecycle on registered asks) first —
@@ -350,7 +464,8 @@ module Tart
       def sweep_pending
         stale = pending.select { |request| request_lifecycle(request, Supervisor.now_ms) != :pending }
         stale.each do |request|
-          @mutex.synchronize { @pending.delete(request[:id]) }
+          @pending.delete(request[:id])
+          signal_state_change
           remove_request_file(request)
         end
       end
@@ -406,7 +521,8 @@ module Tart
           # poll-thread-only state).
           mark_seen(path)
 
-          @mutex.synchronize { @pending[request[:id]] = request }
+          @pending[request[:id]] = request
+          signal_state_change
           surface(request)
         end
       rescue SystemCallError
@@ -421,10 +537,11 @@ module Tart
       # valve answered) and clears only where no expects_reply of the run
       # can still pend (pi's pending-skip posture holds for free).
       def sweep_foreground_attention
-        run_ids = @mutex.synchronize { @foreground_attention.keys }
+        run_ids = @foreground_attention.keys
         run_ids.each do |run_id|
           gone = !File.directory?(File.join(@home, run_id))
-          @mutex.synchronize { @foreground_attention.delete(run_id) } if gone || run_terminal?(run_id)
+          @foreground_attention.delete(run_id) if gone || run_terminal?(run_id)
+          signal_state_change
         end
       end
 
@@ -460,10 +577,9 @@ module Tart
       # at the valve write would erase the mark inside one poll tick,
       # before any human frame could observe it).
       def record_foreground_attention(request)
-        @mutex.synchronize do
-          @foreground_attention[request[:run_id].to_s] =
-            {tool: "contact_supervisor", since: request[:created_at]}
-        end
+        @foreground_attention[request[:run_id].to_s] =
+          {tool: "contact_supervisor", since: request[:created_at]}
+        signal_state_change
       end
 
       # The lifecycle verdict (pi requestLifecycle :333-341 minus the
@@ -616,11 +732,11 @@ module Tart
       end
 
       def seen?(path)
-        @mutex.synchronize { @seen.key?(path) }
+        @seen.key?(path)
       end
 
       def mark_seen(path)
-        @mutex.synchronize { @seen[path] = true }
+        @seen[path] = true
       end
 
       def read_json(path)

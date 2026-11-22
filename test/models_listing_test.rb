@@ -112,16 +112,22 @@ module Tart
     end
 
     def test_menu_open_makes_exactly_one_request_and_merges
-      in_surface do |chat, session, server|
-        draw(chat, session)
-        chat.open_model_menu
-        wait_until { server.request_count == 1 }
-        assert_equal 1, server.request_count, "ONE fetch per menu open"
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        in_surface do |chat, session, server|
+          draw(chat, session)
+          chat.open_model_menu
+          # The fetch fires on the listing thread — await the arrival (B:
+          # the server gate).
+          await(server, "the menu-open listing fetch") { server.request_count == 1 }
+          assert_equal 1, server.request_count, "ONE fetch per menu open"
 
-        # The merge rides the callback thread; the listed ids land in the
-        # menu when the fetch resolves.
-        wait_until { menu_ids(chat).include?("m-1") }
-        assert_includes menu_ids(chat), "m-2"
+          # The merge rides the callback thread; await the merge event (A:
+          # the L1 broadcast at merge_listing) before reading the ids.
+          await(chat, "the listed rows to merge into the menu") { menu_ids(chat).include?("m-1") }
+          assert_includes menu_ids(chat), "m-2"
+        end
       end
     end
 

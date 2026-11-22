@@ -168,12 +168,25 @@ module Tart
 
     def test_synthetic_push_and_drain_round_trip
       TUI.run(headless: true) do |session|
-        Thread.new { session.push_event(TUI.sync_event) }
+        # I103 (B): the drain poll rides a Gate pinged at both mutation
+        # points — the producer thread's push and the drain callback's
+        # delivery — so the wait wakes exactly when the round trip lands.
+        gate = Gate.new
         received = nil
-        100.times do
-          session.drain_synthetic { |event| received = event }
-          break if received
-          sleep 0.005
+        Thread.new do
+          session.push_event(TUI.sync_event)
+          gate.ping
+        end
+        drain = lambda do
+          session.drain_synthetic do |event|
+            received = event
+            gate.ping
+          end
+        end
+        drain.call
+        gate.await("the synthetic event drains") do
+          drain.call unless received
+          received&.sync?
         end
         assert received&.sync?, "synthetic event must round-trip through SyntheticEvents"
         refute session.synthetic_pending?

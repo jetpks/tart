@@ -40,6 +40,53 @@ class MockIngestServer
     @fail_script = []
     @delay = 0
     @accept_thread = nil
+    # I103 — the observation surface's gate (connection open/close, post
+    # landed), so tests await arrivals instead of wall-clock budgets. The
+    # mechanics are local (this file loads standalone).
+    @post_gate = PostGate.new
+  end
+
+  # I103 state-signal read-through, so await(server, …) rides the same
+  # vocabulary as the lib seams.
+  def state_version
+    @post_gate.state_version
+  end
+
+  def wait_state_change(from_version, belt: 60)
+    @post_gate.wait_state_change(from_version, belt: belt)
+  end
+
+  # The observation gate's mechanics (the Tart::Test::Gate shape, local:
+  # this file must stay minitest-free for any standalone loader). The I107
+  # V1 vocabulary: plain-Integer version, Thread::Queue timed-pop park,
+  # dual-path ping (direct push + the scheduler-ready rider when a
+  # scheduler is present on the producer's thread). No Mutex, no
+  # ConditionVariable.
+  class PostGate
+
+    def initialize
+      @ready = ::Thread::Queue.new
+      @version = 0
+    end
+
+    def ping
+      @version += 1
+      @ready.push(:wake)
+      Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
+      nil
+    end
+
+    def state_version
+      @version
+    end
+
+    def wait_state_change(from_version, belt: 60)
+      loop do
+        return @version if @version > from_version
+
+        return nil if @ready.pop(timeout: belt).nil?
+      end
+    end
   end
 
   def start
@@ -88,13 +135,22 @@ class MockIngestServer
     @mutex.synchronize { @max_active }
   end
 
+  # The connections still mid-serve (the in-flight gate's predicate —
+  # I103 additive reader).
+  def active_connections
+    @mutex.synchronize { @active }
+  end
+
+  # The deterministic arrival wait (I103 — was a deadline+sleep wall):
+  # parks on the post-arrival gate until the count is met; +timeout+ is
+  # the wedge-guard belt only (a passing test never depends on it).
   def wait_posts(n, timeout)
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-    while post_count < n
-      return false if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-      sleep 0.01
+    loop do
+      version = @post_gate.state_version
+      return true if post_count >= n
+
+      return post_count >= n unless @post_gate.wait_state_change(version, belt: timeout)
     end
-    true
   end
 
   def stop
@@ -131,16 +187,19 @@ class MockIngestServer
       @max_active = [@max_active, @active].max
       status = @fail_script.shift || 202
     end
+    @post_gate.ping # I103 — the connection opened
     sleep(@delay) if @delay.positive? && status
     io.write("HTTP/1.1 #{status} Mock\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
     io.flush
     @mutex.synchronize do
       @posts << {status: status, headers: headers, body: body, records: records}
     end
+    @post_gate.ping # I103 — the post landed
   rescue StandardError
     nil
   ensure
     @mutex.synchronize { @active -= 1 if @active.positive? }
+    @post_gate.ping # I103 — the connection closed (the in-flight event)
     io.close rescue nil
   end
 end

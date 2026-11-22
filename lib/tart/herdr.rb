@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "io/wait"
 require "json"
 require "socket"
 
@@ -134,12 +135,19 @@ module Tart
     end
 
     # The UNIX-socket sender: non-blocking background delivery (sends run
-    # off the reactor thread — the UI never blocks), ONE attempt at the
+    # on a task of the HOST REACTOR — the UI never blocks — I107 T4/V2;
+    # the task is TRANSIENT: it never holds the reactor open, and the
+    # reactor's teardown cancel is its unwind path), ONE attempt at the
     # first timeout then ONE retry at the second, every failure swallowed,
     # session reports FIFO while state reports coalesce latest-wins in a
-    # single slot drained by one in-flight sender.
+    # single slot drained by one in-flight sender. The wake is the V1 ping
+    # (direct queue push + the scheduler-ready rider — the producer fibers
+    # share the reactor with the sender).
     class Reporter
       TIMEOUTS = [500, 1500].freeze
+
+      # The scheduler-ready rider (Notification::Signal's mechanism — async
+      # clone lib/async/notification.rb).
 
       # @param socket_path [String] the UNIX socket path.
       # @param timeouts [Array(Integer, Integer)] attempt/retry budgets in
@@ -147,8 +155,12 @@ module Tart
       def initialize(socket_path:, timeouts: TIMEOUTS)
         @socket_path = socket_path
         @timeouts = timeouts
-        @mutex = Mutex.new
-        @resource = ConditionVariable.new
+        # I107 (V4/M8): the guard Mutex + CondVar die — every mutation
+        # funnel (the dedup check, the seq allocation, the FIFO append, the
+        # slot write, the wake push) is a same-reactor operation with no
+        # scheduler-visible suspension (all reporter producers are hook
+        # handlers on the loop's reactor, the same thread as the sender).
+        @ready = Async::Queue.new
         @sessions = []
         @state_slot = nil
         @last_state = nil
@@ -159,7 +171,9 @@ module Tart
         # hook_report_is_newer is per-source, and the fresh "tart" source
         # starts clean).
         @seq = epoch_ms * 1000
-        @sender = Thread.new { drain_loop }
+        # The sender task spawns lazily on the FIRST report (report seats
+        # are hook handlers — on the host reactor).
+        @sender = nil
       end
 
       # pane.report_agent_session (pi reportSession): NO session ref → no
@@ -184,11 +198,10 @@ module Tart
           "method" => "pane.report_agent_session",
           "params" => params
         }
-        @mutex.synchronize do
-          request["params"]["seq"] = next_seq
-          @sessions << request
-          @resource.signal
-        end
+        ensure_sender
+        request["params"]["seq"] = next_seq
+        @sessions << request
+        ping
         nil
       end
 
@@ -197,39 +210,79 @@ module Tart
       # unless +force+ (the session_start publish). pi allocates the seq
       # at enqueue time — a deduped report consumes none.
       def report_state(state, message: nil, session_ref: nil, pane_id:, force: false)
-        @mutex.synchronize do
-          return if !force && state == @last_state && message == @last_message
+        return if !force && state == @last_state && message == @last_message
 
-          params = {"pane_id" => pane_id, "source" => SOURCE, "agent" => AGENT, "state" => state}
-          params["message"] = message unless message.nil?
-          if session_ref.is_a?(Hash)
-            params["agent_session_path"] = session_ref["agent_session_path"] if session_ref["agent_session_path"]
-            params["agent_session_id"] = session_ref["agent_session_id"] if session_ref["agent_session_id"]
-            params["resume_argv"] = resume_argv_for(session_ref) if resume_argv_for(session_ref)
-          end
-          @last_state = state
-          @last_message = message
-          @state_slot = {"id" => "#{SOURCE}:#{epoch_ms}:#{rand36}", "method" => "pane.report_agent",
-                         "params" => params.merge("seq" => next_seq)}
-          @resource.signal
+        params = {"pane_id" => pane_id, "source" => SOURCE, "agent" => AGENT, "state" => state}
+        params["message"] = message unless message.nil?
+        if session_ref.is_a?(Hash)
+          params["agent_session_path"] = session_ref["agent_session_path"] if session_ref["agent_session_path"]
+          params["agent_session_id"] = session_ref["agent_session_id"] if session_ref["agent_session_id"]
+          params["resume_argv"] = resume_argv_for(session_ref) if resume_argv_for(session_ref)
         end
+        @last_state = state
+        @last_message = message
+        @state_slot = {"id" => "#{SOURCE}:#{epoch_ms}:#{rand36}", "method" => "pane.report_agent",
+                       "params" => params.merge("seq" => next_seq)}
+        ensure_sender
+        ping
         nil
       end
 
       private
 
-      # One sender thread; states coalesce while in flight (the slot holds
+      # The V1 ping (the producer side of the wake): the direct queue push
+      # plus the scheduler-ready rider when a scheduler is present on the
+      # producer's fiber (Notification::Signal's mechanism) — both paths
+      # honor the standing same-thread lost-wakeup claim.
+      def ping
+        @ready.push(:wake)
+        Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
+        nil
+      end
+
+      # The sender task (TRANSIENT on the host reactor — it never holds
+      # the reactor open; the teardown cancel is its unwind path): parks
+      # in the V1 timed pop, drains sessions FIFO then the coalescing
+      # slot. Spawns lazily on the first report (report seats are hook
+      # handlers — on the host reactor); off-reactor callers enqueue and
+      # the next on-reactor report spawns the sender.
+      def ensure_sender
+        return if @sender&.alive?
+
+        task = Async::Task.current? or return # off-reactor: no seat to run on
+        @sender = task.async(transient: true) { drain_loop }
+      end
+
+      # One sender task; states coalesce while in flight (the slot holds
       # only the LATEST queued state), sessions queue FIFO.
       def drain_loop
         loop do
-          request = @mutex.synchronize do
-            @resource.wait(@mutex) while @sessions.empty? && @state_slot.nil?
-            @sessions.empty? ? @state_slot.tap { @state_slot = nil } : @sessions.shift
-          end
+          request = next_request
+          break unless request
+
           send_request(request)
-        rescue StandardError
-          # swallowed — the harness NEVER crashes on herdr
         end
+      rescue StandardError
+        # swallowed — the harness NEVER crashes on herdr
+      end
+
+      # The sender's park: the V1 timed pop (a fiber park under the
+      # reactor — the teardown cancel lands here). The belt is the wedge
+      # guard only: a lost wake (the historical claim) re-checks after at
+      # most WAKE_BELT_S; a report landing mid-park still sends within one
+      # belt. Never a synchronization mechanism.
+      WAKE_BELT_S = 30
+
+      def next_request
+        loop do
+          return @sessions.empty? ? @state_slot&.tap { @state_slot = nil } : @sessions.shift if pending?
+
+          @ready.pop(timeout: WAKE_BELT_S)
+        end
+      end
+
+      def pending?
+        !@sessions.empty? || !@state_slot.nil?
       end
 
       # One attempt at the first budget, ONE retry at the second; every
@@ -242,12 +295,14 @@ module Tart
       end
 
       # connect → write JSON+"\n" → ANY read byte = delivered; error/EOF/
-      # timeout = undelivered.
+      # timeout = undelivered. The read wait is scheduler-cooperative
+      # under the reactor (io/wait parks the fiber evented) — the
+      # 500/1500 ms budgets are unchanged.
       def send_attempt(request, timeout)
         sock = UNIXSocket.new(@socket_path)
         begin
           sock.write("#{JSON.generate(request)}\n")
-          return false unless IO.select([sock], nil, nil, timeout)
+          return false unless sock.wait_readable(timeout)
 
           sock.readpartial(1)
           true

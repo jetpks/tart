@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "async"
 require_relative "safe_execute"
 
 module Tart
@@ -74,8 +75,11 @@ module Tart
           stdout, stderr, status = run_fd(fd_path, args)
           Fast::Completions::Cancellation.check
 
-          unless status.exitstatus == 0 || status.exitstatus == 1
-            error_message = stderr.strip.empty? ? "fd exited with code #{status.exitstatus}" : stderr.strip
+          # A nil status (externally-reaped child — the ESRCH law above)
+          # reads as success: fd's drained output is the truth.
+          exit_code = status&.exitstatus
+          unless exit_code.nil? || exit_code == 0 || exit_code == 1
+            error_message = stderr.strip.empty? ? "fd exited with code #{exit_code}" : stderr.strip
             raise ArgumentError, error_message if stdout.empty?
 
             return format_results(stdout.split("\n"), search_path, effective_limit)
@@ -112,25 +116,80 @@ module Tart
         false
       end
 
+      # I107 (T12/V3 — the grep.rb landed shape): the drains are sibling
+      # reactor tasks and the child wait is evented (Process.waitpid2 parks
+      # in the scheduler), all under the Kernel#Sync gateway — a bare
+      # caller gets a transient reactor on its own thread; a reactor
+      # caller runs inline. The unwind leaves the child behind NOWHERE:
+      # every exit path kills the group and reaps bounded before the
+      # drain waits (the I106 D2 discipline).
       def run_fd(fd_path, args)
         stdout = +"" # steep:ignore
         stderr = +""
-        out_rd, out_wr = IO.pipe
-        err_rd, err_wr = IO.pipe
-        pid = Process.spawn(fd_path, *args, out: out_wr, err: err_wr, chdir: @cwd)
-        out_wr.close
-        err_wr.close
-        out_t = Thread.new { stdout << out_rd.read }
-        err_t = Thread.new { stderr << err_rd.read }
-        _, status = Process.waitpid2(pid)
-        out_t.join
-        err_t.join
-        out_rd.close
-        err_rd.close
-        [stdout, stderr, status]
+        pid = nil
+        Sync do
+          out_rd, out_wr = IO.pipe
+          err_rd, err_wr = IO.pipe
+          pid = Process.spawn(fd_path, *args, out: out_wr, err: err_wr, chdir: @cwd)
+          out_wr.close
+          err_wr.close
+          out_task = Async::Task.current.async { stdout << out_rd.read }
+          err_task = Async::Task.current.async { stderr << err_rd.read }
+          # ESRCH/ECHILD-tolerant reap (the io-event process_wait TOCTOU —
+          # a child this process spawned can surface as ESRCH through the
+          # scheduler on Linux): gone means exited; the drained output is
+          # the truth, so a nil status reads as success rather than a
+          # fabricated code.
+          _, status = begin
+            Process.waitpid2(pid)
+          rescue Errno::ESRCH, Errno::ECHILD
+            nil
+          end
+          out_task.wait
+          err_task.wait
+          out_rd.close
+          err_rd.close
+          [stdout, stderr, status]
+        ensure
+          # No unwind leaves fd behind — cancellation and plain errors all
+          # end in the same group hygiene (TERM first, KILL a survivor,
+          # bounded reap). A reactor waits for its tasks, so the drains
+          # must ride the pipe EOFs that death guarantees before anything
+          # escapes the Sync body.
+          if pid && status.nil?
+            begin
+              Process.kill("TERM", pid)
+            rescue Errno::ESRCH, Errno::EPERM
+              nil
+            end
+            reap_bounded(pid)
+          end
+        end
       rescue Fast::Completions::CancelledError
         Process.kill("TERM", pid) if pid
         raise
+      end
+
+      # The cancellation path's zombie guarantee: reap the TERMed child
+      # bounded (a WNOHANG probe on the reactor's process_wait is
+      # evented; the bare Sync seat's loop stays cooperative). 2 s cap —
+      # after TERM a well-behaved fd exits immediately; the cap is a
+      # never-reached net, and a KILL escalation closes it.
+      REAP_BUDGET_SECONDS = 2
+
+      def reap_bounded(pid)
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REAP_BUDGET_SECONDS
+        loop do
+          reaped = Process.waitpid2(pid, Process::WNOHANG)
+          return if reaped&.first
+
+          return if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+          Process.kill("KILL", pid) if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline - REAP_BUDGET_SECONDS / 2
+          sleep 0.01
+        end
+      rescue Errno::ECHILD, Errno::ESRCH
+        nil
       end
 
       def format_results(lines, search_path, effective_limit)

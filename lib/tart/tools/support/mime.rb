@@ -11,7 +11,11 @@ module Tart
 
       module_function
 
+      # I102 (KB I17 S2) — nil-tolerant for direct callers: a nil buffer (zero-byte
+      # file, missing read) is "no image", never a crash.
       def detect_supported_image_mime_type(buffer)
+        return nil if buffer.nil?
+
         return "image/jpeg" if starts_with(buffer, [0xff, 0xd8, 0xff]) && buffer.getbyte(3) != 0xf7
         return "image/png" if starts_with(buffer, PNG_SIGNATURE) && png? && !animated_png?(buffer)
         return "image/gif" if starts_with_ascii(buffer, 0, "GIF87a") || starts_with_ascii(buffer, 0, "GIF89a")
@@ -23,6 +27,10 @@ module Tart
 
       def detect_from_file(file_path)
         buffer = File.binread(file_path, IMAGE_TYPE_SNIFF_BYTES)
+        # I102 (KB I17 S2) — File.binread returns nil for a zero-byte file; that is
+        # text-shaped emptiness (read returns "" content), not an image.
+        return nil if buffer.nil?
+
         detect_supported_image_mime_type(buffer)
       end
 

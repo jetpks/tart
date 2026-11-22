@@ -38,6 +38,17 @@ module TuiSplitRig
                  "(repos/pi on tag v1.1.0 with a built dist/bundle/cli.js)"
   end
 
+  # CI-honesty guard (2026-11-22): the pinned pi oracle clone is a LOCAL
+  # grounding artifact — on a clean CI runner it does not exist, and the
+  # rig tests that need it SKIP rather than error. Explicit
+  # TUI_SPLIT_RIG_PI_BIN still wins; a set-but-broken env path stays loud.
+  def self.oracle_available?
+    resolve_pi_bin(env: {}, tart_root: nil)
+    true
+  rescue Error
+    false
+  end
+
   # The pi clone root: the sibling `pi` of the tart repo root. Explicit
   # tart_root → sibling, no fallback. Default root → the rig's own repo
   # root, and when the direct sibling clone is missing there, the

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "async"
 require_relative "../child_env"
 require_relative "safe_execute"
 
@@ -226,7 +227,23 @@ module Tart
         env
       end
 
+      # I107 (T11/V3 — the I106 D3 stderr-drain precedent + the grep.rb
+      # landed shape): the two pipe drains are sibling reactor tasks and
+      # the whole spawn-and-stream self-gates through Kernel#Sync — a
+      # bare caller gets a transient reactor on its own thread; a reactor
+      # caller runs inline. The reaper stays a task (the scheduler's
+      # process_wait is evented); `completed` rides an Async::Queue (Q3).
+      # The bare-seat pop-loop fallback (no reaper task) stays for callers
+      # with no reactor AND no Sync context — recorded posture (the Sync
+      # gateway makes it unreachable in practice; the code path is the
+      # base plain-thread behavior).
       def spawn_and_stream(command, output, timeout_seconds, on_chunk: nil, env:)
+        Sync do
+          spawn_and_stream_inner(command, output, timeout_seconds, on_chunk:, env:)
+        end
+      end
+
+      def spawn_and_stream_inner(command, output, timeout_seconds, on_chunk:, env:)
         out_rd, out_wr = IO.pipe
         err_rd, err_wr = IO.pipe
         pid = nil
@@ -249,9 +266,10 @@ module Tart
           out_wr.close
           err_wr.close
 
-          # One reader per output pipe (pi: one fiber per pipe).
-          readers = [Thread.new { drain_pipe(out_rd, output, on_chunk) },
-                     Thread.new { drain_pipe(err_rd, output, on_chunk) }]
+          # One reader per output pipe (pi: one fiber per pipe) — I107:
+          # reactor child tasks (the pipe read parks the fiber evented).
+          readers = [Async::Task.current.async { drain_pipe(out_rd, output, on_chunk) },
+                     Async::Task.current.async { drain_pipe(err_rd, output, on_chunk) }]
 
           deadline = timeout_seconds && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
 
@@ -265,7 +283,7 @@ module Tart
           # in-process drive — no task subtree on its bare thread) has no
           # fiber to park: no reaper task, and the pop-loop below polls the
           # exit itself — the base plain-thread behavior.
-          completed = Queue.new
+          completed = Async::Queue.new
           reaper = Async::Task.current?&.async { completed << Process.waitpid2(pid)[1] }
           status = nil
           term_sent = false
@@ -315,9 +333,30 @@ module Tart
           reap_after_kill(pid)
           raise
         ensure
-          readers&.each { |t| t.join(1) rescue nil }
+          join_tasks_bounded(readers)
           out_rd.close rescue nil
           err_rd.close rescue nil
+        end
+      end
+
+      # The drain tasks' bounded unwind (the D2 discipline): every reader
+      # rides its pipe EOF (the group kill guarantees it) or a 1 s cap —
+      # whichever first; a failed/cancelled sibling never blocks the
+      # unwind.
+      def join_tasks_bounded(tasks)
+        Array(tasks).each do |task|
+          next unless task
+
+          begin
+            if (current = Async::Task.current?)
+              current.with_timeout(1) { task.wait }
+            else
+              task.wait
+            end
+          rescue Async::TimeoutError, Async::Cancel, StandardError
+            task.stop if task.alive?
+            nil
+          end
         end
       end
 

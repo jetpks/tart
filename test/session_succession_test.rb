@@ -13,7 +13,7 @@ module Tart
   # back-and-forth laws (AC4), the consult discipline, and the live
   # end-to-end replacement. Hermetic: staged homes, real `bin/tart -p`
   # children on MockLLMServer, the duck-typed-loop swap idiom (the I99
-  # pin-2 family), the wait_until discipline — ZERO live API calls.
+  # pin-2 family), the event-wait discipline — ZERO live API calls.
   class SessionSuccessionTest < Test
     STAMP_A = "01aaa111-0000-7000-8000-00000000aaaa"
     STAMP_B = "01bbb222-0000-7000-8000-00000000bbbb"
@@ -31,6 +31,13 @@ module Tart
     end
 
     def teardown
+      # I103 (F2 — the D9 order-flake cure, the subagents_test.rb:30-38
+      # idiom): Subagents.register records the process-global
+      # current_manager slot; without this FIRST-line reset a leaked
+      # manager (its watcher/children long dead after teardown) arms
+      # whichever class minitest shuffles next — the ListingIdleKernel
+      # async NoMethodError at seed 41358.
+      Subagents.current_manager = nil
       @managers.each(&:shutdown)
       @channels.each(&:stop)
       @server.stop
@@ -47,55 +54,59 @@ module Tart
     # the swap widens ownership, the predecessor stays fully owned. ---
 
     def test_the_stamp_follows_the_live_recorder_and_the_swap_widens_ownership
-      @server.script([{type: :stream, content: "predecessor answer"},
-                      {type: :stream, content: "successor answer"},
-                      {type: :stream, content: "spare"}])
-      loop_a = duck_loop(STAMP_A)
-      loop_b = duck_loop(STAMP_B)
-      current = [loop_a]
-      manager = new_manager(agent: -> { current.first })
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "predecessor answer"},
+                        {type: :stream, content: "successor answer"},
+                        {type: :stream, content: "spare"}])
+        loop_a = duck_loop(STAMP_A)
+        loop_b = duck_loop(STAMP_B)
+        current = [loop_a]
+        manager = new_manager(agent: -> { current.first })
 
-      run_a = manager.spawn_run(agent: "worker", task: "predecessor run", async: true,
-                               timeout_ms: 0, tool_timeout_ms: 0)
-      @spawns << run_a[:pgid] if run_a[:pgid]
-      assert_equal STAMP_A, status_stamp(run_a[:dir]), "the first spawn stamps the first recorder id"
-      assert_equal STAMP_A, manager.session_owner_id
+        run_a = manager.spawn_run(agent: "worker", task: "predecessor run", async: true,
+                                 timeout_ms: 0, tool_timeout_ms: 0)
+        @spawns << run_a[:pgid] if run_a[:pgid]
+        assert_equal STAMP_A, status_stamp(run_a[:dir]), "the first spawn stamps the first recorder id"
+        assert_equal STAMP_A, manager.session_owner_id
 
-      # The predecessor run is steerable BEFORE the swap (follow_up queues
-      # deterministically — no consumption bet).
-      receipt = manager.steer(id: run_a[:id], message: "steer the predecessor", mode: "follow_up")
-      assert_includes %i[delivered queued], receipt[:state]
+        # The predecessor run is steerable BEFORE the swap (follow_up queues
+        # deterministically — no consumption bet).
+        receipt = manager.steer(id: run_a[:id], message: "steer the predecessor", mode: "follow_up")
+        assert_includes %i[delivered queued], receipt[:state]
 
-      # The replacement (/new shape): swap the live loop.
-      current[0] = loop_b
-      assert_equal STAMP_B, manager.session_owner_id, "the owner follows the live recorder"
-      assert_equal [STAMP_B, STAMP_A], manager.owner_session_ids, "the owner set is [successor, predecessor]"
-      assert_equal [STAMP_A], manager.inherited_session_ids(STAMP_B)
+        # The replacement (/new shape): swap the live loop.
+        current[0] = loop_b
+        assert_equal STAMP_B, manager.session_owner_id, "the owner follows the live recorder"
+        assert_equal [STAMP_B, STAMP_A], manager.owner_session_ids, "the owner set is [successor, predecessor]"
+        assert_equal [STAMP_A], manager.inherited_session_ids(STAMP_B)
 
-      run_b = manager.spawn_run(agent: "worker", task: "successor run", async: true,
-                               timeout_ms: 0, tool_timeout_ms: 0)
-      @spawns << run_b[:pgid] if run_b[:pgid]
-      assert_equal STAMP_B, status_stamp(run_b[:dir]), "the successor stamps its OWN recorder id"
-      assert_equal STAMP_A, status_stamp(run_a[:dir]), "the predecessor stamp is never rewritten"
+        run_b = manager.spawn_run(agent: "worker", task: "successor run", async: true,
+                                 timeout_ms: 0, tool_timeout_ms: 0)
+        @spawns << run_b[:pgid] if run_b[:pgid]
+        assert_equal STAMP_B, status_stamp(run_b[:dir]), "the successor stamps its OWN recorder id"
+        assert_equal STAMP_A, status_stamp(run_a[:dir]), "the predecessor stamp is never rewritten"
 
-      ids = manager.runs.map { |record| record[:id] }
-      assert_includes ids, run_a[:id]
-      assert_includes ids, run_b[:id]
-      row_ids = manager.box_snapshot.fetch(:rows).map { |row| row[:id] }
-      assert_includes row_ids, run_a[:id], "the box carries the predecessor row"
-      assert_includes row_ids, run_b[:id]
+        ids = manager.runs.map { |record| record[:id] }
+        assert_includes ids, run_a[:id]
+        assert_includes ids, run_b[:id]
+        row_ids = manager.box_snapshot.fetch(:rows).map { |row| row[:id] }
+        assert_includes row_ids, run_a[:id], "the box carries the predecessor row"
+        assert_includes row_ids, run_b[:id]
 
-      # The predecessor stays stoppable; the stop settle preserves its stamp.
-      assert_equal "Stop requested for async run #{run_a[:id]}.", manager.stop(id: run_a[:id])
-      wait_owned_terminal(manager, run_a[:id])
-      assert_equal "stopped", JSON.parse(File.read(File.join(run_a[:dir], "status.json")))["state"]
-      assert_equal STAMP_A, status_stamp(run_a[:dir]), "the stop settle preserves the stamp"
+        # The predecessor stays stoppable; the stop settle preserves its stamp.
+        assert_equal "Stop requested for async run #{run_a[:id]}.", manager.stop(id: run_a[:id])
+        wait_owned_terminal(manager, run_a[:id])
+        assert_equal "stopped", JSON.parse(File.read(File.join(run_a[:dir], "status.json")))["state"]
+        assert_equal STAMP_A, status_stamp(run_a[:dir]), "the stop settle preserves the stamp"
 
-      # The successor's result is readable through the successor.
-      wait_owned_terminal(manager, run_b[:id])
-      result = manager.result(id: run_b[:id])
-      assert result, "the successor's result is readable"
-      assert_equal true, result["success"]
+        # The successor's result is readable through the successor.
+        wait_owned_terminal(manager, run_b[:id])
+        result = manager.result(id: run_b[:id])
+        assert result, "the successor's result is readable"
+        assert_equal true, result["success"]
+      end
     end
 
     # --- pin 2 (AC1): the predecessor's DISK runs stay owned after the
@@ -143,49 +154,53 @@ module Tart
     # channel (the register-shaped resolver; the foreign ask never). ---
 
     def test_predecessor_asks_stay_owned_through_the_channel
-      rid_a = "11111111-1111-4111-8111-111111111111"
-      rid_f = "22222222-2222-4222-8222-222222222222"
-      dir_a = stage_run("01aaa111-0000-7000-8000-000000000003", pid: live_pid, session_id: STAMP_A)
-      dir_f = stage_run("01bbb222-0000-7000-8000-000000000004", pid: live_pid, session_id: FOREIGN_STAMP)
-      stage_ask(dir_a, rid_a, run_id: "01aaa111-0000-7000-8000-000000000003")
-      stage_ask(dir_f, rid_f, run_id: "01bbb222-0000-7000-8000-000000000004")
-      foreign_path = File.join(dir_f, "control", "supervisor-requests", "#{rid_f}.json")
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        rid_a = "11111111-1111-4111-8111-111111111111"
+        rid_f = "22222222-2222-4222-8222-222222222222"
+        dir_a = stage_run("01aaa111-0000-7000-8000-000000000003", pid: live_pid, session_id: STAMP_A)
+        dir_f = stage_run("01bbb222-0000-7000-8000-000000000004", pid: live_pid, session_id: FOREIGN_STAMP)
+        stage_ask(dir_a, rid_a, run_id: "01aaa111-0000-7000-8000-000000000003")
+        stage_ask(dir_f, rid_f, run_id: "01bbb222-0000-7000-8000-000000000004")
+        foreign_path = File.join(dir_f, "control", "supervisor-requests", "#{rid_f}.json")
 
-      current = [duck_loop(STAMP_A)]
-      manager = new_manager(agent: -> { current.first })
-      manager.session_owner_id
+        current = [duck_loop(STAMP_A)]
+        manager = new_manager(agent: -> { current.first })
+        manager.session_owner_id
 
-      current[0] = duck_loop(STAMP_B)
-      manager.session_owner_id # the replacement is recorded at the consult
+        current[0] = duck_loop(STAMP_B)
+        manager.session_owner_id # the replacement is recorded at the consult
 
-      channel = Subagents::SupervisorChannel.new(home: File.join(@home, "subagents"), hooks: @hooks,
-                                                 kernel: nil, agent: nil,
-                                                 owner_id: -> { manager.owner_session_ids })
-      @channels << channel
-      channel.start
-      wait_until { !channel.pending.empty? }
+        channel = Subagents::SupervisorChannel.new(home: File.join(@home, "subagents"), hooks: @hooks,
+                                                   kernel: nil, agent: nil,
+                                                   owner_id: -> { manager.owner_session_ids })
+        @channels << channel
+        channel.start
+        await(channel, "the inherited ask to register") { !channel.pending.empty? }
 
-      # The inherited ask registered + surfaced, EXACTLY once; the foreign
-      # ask never.
-      assert_equal [rid_a], channel.pending.map { |request| request[:id] }
-      drained = @hooks.pending_next_turn
-      assert_equal 1, drained.size
-      assert_equal Subagents::Supervisor::REQUEST_CUSTOM_TYPE, drained.first[:custom_type]
-      assert_equal true, drained.first[:display]
-      assert_includes drained.first[:content], rid_a
+        # The inherited ask registered + surfaced, EXACTLY once; the foreign
+        # ask never.
+        assert_equal [rid_a], channel.pending.map { |request| request[:id] }
+        drained = @hooks.pending_next_turn
+        assert_equal 1, drained.size
+        assert_equal Subagents::Supervisor::REQUEST_CUSTOM_TYPE, drained.first[:custom_type]
+        assert_equal true, drained.first[:display]
+        assert_includes drained.first[:content], rid_a
 
-      # The foreign ask is still on disk (never registered or unlinked) and
-      # the reply fallback refuses its id.
-      assert File.file?(foreign_path), "the foreign ask was never unlinked"
-      error = assert_raises(ArgumentError) { channel.reply(reply_to: rid_f, message: "nope") }
-      assert_includes error.message, "No pending supervisor request found for reply_to '#{rid_f}'"
-      assert File.file?(foreign_path), "the refused reply never removed the foreign file"
+        # The foreign ask is still on disk (never registered or unlinked) and
+        # the reply fallback refuses its id.
+        assert File.file?(foreign_path), "the foreign ask was never unlinked"
+        error = assert_raises(ArgumentError) { channel.reply(reply_to: rid_f, message: "nope") }
+        assert_includes error.message, "No pending supervisor request found for reply_to '#{rid_f}'"
+        assert File.file?(foreign_path), "the refused reply never removed the foreign file"
 
-      # The inherited ask is fully serviceable: reply lands, the file unlinks.
-      assert_equal "Replied to supervisor request #{rid_a}.",
-                   channel.reply(reply_to: rid_a, message: "inherited answer")
-      refute File.file?(File.join(dir_a, "control", "supervisor-requests", "#{rid_a}.json"))
-      assert File.file?(File.join(dir_a, "control", "supervisor-replies", "#{rid_a}.json"))
+        # The inherited ask is fully serviceable: reply lands, the file unlinks.
+        assert_equal "Replied to supervisor request #{rid_a}.",
+                     channel.reply(reply_to: rid_a, message: "inherited answer")
+        refute File.file?(File.join(dir_a, "control", "supervisor-requests", "#{rid_a}.json"))
+        assert File.file?(File.join(dir_a, "control", "supervisor-replies", "#{rid_a}.json"))
+      end
     end
 
     # --- pin 4 (AC2): a fresh manager (a whole predecessor PROCESS's
@@ -228,73 +243,81 @@ module Tart
     # replacement inherits NOTHING (records pruned, asks dropped). ---
 
     def test_keep_work_declaration_inherits_nothing
-      @server.script([{type: :stream, content: "kept run"},
-                      {type: :stream, content: "successor keeps working"},
-                      {type: :stream, content: "spare"}])
-      current = [duck_loop(STAMP_A)]
-      manager = new_manager(agent: -> { current.first })
-      run_a = manager.spawn_run(agent: "worker", task: "kept run", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      @spawns << run_a[:pgid] if run_a[:pgid]
-      assert_equal STAMP_A, manager.session_owner_id
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "kept run"},
+                        {type: :stream, content: "successor keeps working"},
+                        {type: :stream, content: "spare"}])
+        current = [duck_loop(STAMP_A)]
+        manager = new_manager(agent: -> { current.first })
+        run_a = manager.spawn_run(agent: "worker", task: "kept run", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        @spawns << run_a[:pgid] if run_a[:pgid]
+        assert_equal STAMP_A, manager.session_owner_id
 
-      # The REAL drop path: an ask on the SPAWNED (A-stamped) run dir,
-      # registered through the register-shaped channel while owned.
-      rid_own = "44444444-4444-4444-8444-444444444444"
-      stage_ask(run_a[:dir], rid_own, run_id: run_a[:id])
-      channel = Subagents::SupervisorChannel.new(home: File.join(@home, "subagents"), hooks: @hooks,
-                                                 kernel: nil, agent: nil,
-                                                 owner_id: -> { manager.owner_session_ids })
-      manager.supervisor_channel = channel
-      @channels << channel
-      channel.start
-      wait_until { !channel.pending.empty? }
+        # The REAL drop path: an ask on the SPAWNED (A-stamped) run dir,
+        # registered through the register-shaped channel while owned.
+        rid_own = "44444444-4444-4444-8444-444444444444"
+        stage_ask(run_a[:dir], rid_own, run_id: run_a[:id])
+        channel = Subagents::SupervisorChannel.new(home: File.join(@home, "subagents"), hooks: @hooks,
+                                                   kernel: nil, agent: nil,
+                                                   owner_id: -> { manager.owner_session_ids })
+        manager.supervisor_channel = channel
+        @channels << channel
+        channel.start
+        await(channel, "the spawned run's ask to register") { !channel.pending.empty? }
 
-      # The /leave-work mark on the CURRENT session, then the replacement.
-      manager.keep_session_work(manager.session_owner_id)
-      current[0] = duck_loop(STAMP_B)
-      assert_equal STAMP_B, manager.session_owner_id
-      assert_equal [STAMP_B], manager.owner_session_ids, "the kept session rides no chain"
+        # The /leave-work mark on the CURRENT session, then the replacement.
+        manager.keep_session_work(manager.session_owner_id)
+        current[0] = duck_loop(STAMP_B)
+        assert_equal STAMP_B, manager.session_owner_id
+        assert_equal [STAMP_B], manager.owner_session_ids, "the kept session rides no chain"
 
-      # The spawned run's pending ask is DROPPED (never answered); its file
-      # stays on disk.
-      wait_until { channel.pending.empty? }
-      error = assert_raises(ArgumentError) { channel.reply(reply_to: rid_own, message: "late") }
-      assert_includes error.message, "No pending supervisor request found for reply_to '#{rid_own}'"
-      assert File.file?(File.join(run_a[:dir], "control", "supervisor-requests", "#{rid_own}.json")),
-             "the dropped ask's file stays on disk, never answered"
+        # The spawned run's pending ask is DROPPED (never answered); its file
+        # stays on disk.
+        await(channel, "the pruned ask to drop") { channel.pending.empty? }
+        error = assert_raises(ArgumentError) { channel.reply(reply_to: rid_own, message: "late") }
+        assert_includes error.message, "No pending supervisor request found for reply_to '#{rid_own}'"
+        assert File.file?(File.join(run_a[:dir], "control", "supervisor-requests", "#{rid_own}.json")),
+               "the dropped ask's file stays on disk, never answered"
 
-      # The predecessor's records are PRUNED from every surface.
-      assert_empty manager.runs
-      assert_empty manager.box_snapshot.fetch(:rows)
+        # The predecessor's records are PRUNED from every surface.
+        assert_empty manager.runs
+        assert_empty manager.box_snapshot.fetch(:rows)
 
-      # A STAGED A-stamped dir (predecessor-process output) is invisible +
-      # refused, and its ask is neither surfaced nor answerable: after the
-      # swap the widened guard refuses it on every tick.
-      dir_a = stage_run("01aaa111-0000-7000-8000-000000000008", pid: live_pid, session_id: STAMP_A)
-      rid_staged = "33333333-3333-4333-8333-333333333333"
-      stage_ask(dir_a, rid_staged, run_id: "01aaa111-0000-7000-8000-000000000008")
-      bytes_a = File.read(File.join(dir_a, "status.json"))
-      sleep(Subagents::Supervisor::POLL_INTERVAL * 4) # let several ticks run
-      assert_empty channel.pending, "the staged ask never registers after the swap"
-      error = assert_raises(ArgumentError) { channel.reply(reply_to: rid_staged, message: "nope") }
-      assert_includes error.message, "No pending supervisor request found for reply_to '#{rid_staged}'"
-      assert File.file?(File.join(dir_a, "control", "supervisor-requests", "#{rid_staged}.json")),
-             "the refused staged ask's file is never removed"
+        # A STAGED A-stamped dir (predecessor-process output) is invisible +
+        # refused, and its ask is neither surfaced nor answerable: after the
+        # swap the widened guard refuses it on every tick.
+        dir_a = stage_run("01aaa111-0000-7000-8000-000000000008", pid: live_pid, session_id: STAMP_A)
+        rid_staged = "33333333-3333-4333-8333-333333333333"
+        stage_ask(dir_a, rid_staged, run_id: "01aaa111-0000-7000-8000-000000000008")
+        bytes_a = File.read(File.join(dir_a, "status.json"))
+        # I103 (D — was the POLL_INTERVAL*4 grace sleep): the staged ask must
+        # NEVER register. The producer is stopped and JOINED first (no future
+        # tick can ever run), then the non-event is asserted — quiescence by
+        # construction, not a wall-clock bet.
+        channel.stop
+        assert_empty channel.pending, "the staged ask never registers after the swap"
+        error = assert_raises(ArgumentError) { channel.reply(reply_to: rid_staged, message: "nope") }
+        assert_includes error.message, "No pending supervisor request found for reply_to '#{rid_staged}'"
+        assert File.file?(File.join(dir_a, "control", "supervisor-requests", "#{rid_staged}.json")),
+               "the refused staged ask's file is never removed"
 
-      list = manager.status(id: nil)
-      refute_includes list, "01aaa111-0000-7000-8000-000000000008"
-      error = assert_raises(ArgumentError) { manager.status(id: "01aaa111-0000-7000-8000-000000000008") }
-      assert_equal "unknown subagent run \"01aaa111-0000-7000-8000-000000000008\". Active runs: (none).", error.message
+        list = manager.status(id: nil)
+        refute_includes list, "01aaa111-0000-7000-8000-000000000008"
+        error = assert_raises(ArgumentError) { manager.status(id: "01aaa111-0000-7000-8000-000000000008") }
+        assert_equal "unknown subagent run \"01aaa111-0000-7000-8000-000000000008\". Active runs: (none).", error.message
 
-      # The declared session's disk bytes are never written again.
-      assert_equal bytes_a, File.read(File.join(dir_a, "status.json"))
+        # The declared session's disk bytes are never written again.
+        assert_equal bytes_a, File.read(File.join(dir_a, "status.json"))
 
-      # The successor's own spawn stamps B and stays owned.
-      run_b = manager.spawn_run(agent: "worker", task: "successor run", async: true,
-                               timeout_ms: 0, tool_timeout_ms: 0)
-      @spawns << run_b[:pgid] if run_b[:pgid]
-      assert_equal STAMP_B, status_stamp(run_b[:dir])
-      assert_includes manager.runs.map { |record| record[:id] }, run_b[:id]
+        # The successor's own spawn stamps B and stays owned.
+        run_b = manager.spawn_run(agent: "worker", task: "successor run", async: true,
+                                 timeout_ms: 0, tool_timeout_ms: 0)
+        @spawns << run_b[:pgid] if run_b[:pgid]
+        assert_equal STAMP_B, status_stamp(run_b[:dir])
+        assert_includes manager.runs.map { |record| record[:id] }, run_b[:id]
+      end
     end
 
     # --- pin 6 (AC3/D4/L5): /leave-work registers through the hooks seam;
@@ -418,77 +441,88 @@ module Tart
     # callables, stable windows, raising resolvers. ---
 
     def test_the_consult_discipline
-      # Agent-less: the boot mint is stable, the owner set is [boot].
-      bare = new_manager
-      boot = bare.session_owner_id
-      assert_instance_of String, boot
-      refute_empty boot
-      assert_equal boot, bare.session_owner_id, "stable within one Manager's life"
-      assert_equal [boot], bare.owner_session_ids
-      assert_empty bare.inherited_session_ids(boot)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        # Agent-less: the boot mint is stable, the owner set is [boot].
+        bare = new_manager
+        boot = bare.session_owner_id
+        assert_instance_of String, boot
+        refute_empty boot
+        assert_equal boot, bare.session_owner_id, "stable within one Manager's life"
+        assert_equal [boot], bare.owner_session_ids
+        assert_empty bare.inherited_session_ids(boot)
 
-      # A raising agent callable: the consult returns the boot mint and
-      # NEVER raises (the parent_session_id rescue).
-      raising = new_manager(agent: -> { raise "consult boom" })
-      boot2 = raising.session_owner_id
-      assert_instance_of String, boot2
-      assert_equal boot2, raising.session_owner_id
-      assert_equal [boot2], raising.owner_session_ids
+        # A raising agent callable: the consult returns the boot mint and
+        # NEVER raises (the parent_session_id rescue).
+        raising = new_manager(agent: -> { raise "consult boom" })
+        boot2 = raising.session_owner_id
+        assert_instance_of String, boot2
+        assert_equal boot2, raising.session_owner_id
+        assert_equal [boot2], raising.owner_session_ids
 
-      # Repeated consults within one window record nothing.
-      stable = new_manager(agent: -> { duck_loop(STAMP_A) })
-      id = stable.session_owner_id
-      3.times { assert_equal id, stable.session_owner_id }
-      assert_equal [id], stable.owner_session_ids
-      assert_empty stable.inherited_session_ids(id), "a stable window records no chain"
+        # Repeated consults within one window record nothing.
+        stable = new_manager(agent: -> { duck_loop(STAMP_A) })
+        id = stable.session_owner_id
+        3.times { assert_equal id, stable.session_owner_id }
+        assert_equal [id], stable.owner_session_ids
+        assert_empty stable.inherited_session_ids(id), "a stable window records no chain"
 
-      # The channel: a raising owner resolver reads FALSE — the ask never
-      # registers across several poll ticks and the poll machinery stays
-      # healthy (never a spin, never a raise into the loop).
-      dir = stage_run("01aaa111-0000-7000-8000-000000000009", pid: live_pid, session_id: STAMP_A)
-      rid = "55555555-5555-4555-8555-555555555555"
-      stage_ask(dir, rid, run_id: "01aaa111-0000-7000-8000-000000000009")
-      ask_path = File.join(dir, "control", "supervisor-requests", "#{rid}.json")
-      channel = Subagents::SupervisorChannel.new(home: File.join(@home, "subagents"), hooks: @hooks,
-                                                 kernel: nil, agent: nil,
-                                                 owner_id: -> { raise "owner boom" })
-      @channels << channel
-      channel.start
-      sleep(Subagents::Supervisor::POLL_INTERVAL * 4) # let several ticks run
-      assert_empty channel.pending, "a raising consult reads false: the ask never registers"
-      assert File.file?(ask_path), "the ask file is untouched"
-      channel.stop
-      channel.start # the poll machinery survives the raising ticks
-      channel.stop
+        # The channel: a raising owner resolver reads FALSE — the ask never
+        # registers across several poll ticks and the poll machinery stays
+        # healthy (never a spin, never a raise into the loop).
+        dir = stage_run("01aaa111-0000-7000-8000-000000000009", pid: live_pid, session_id: STAMP_A)
+        rid = "55555555-5555-4555-8555-555555555555"
+        stage_ask(dir, rid, run_id: "01aaa111-0000-7000-8000-000000000009")
+        ask_path = File.join(dir, "control", "supervisor-requests", "#{rid}.json")
+        channel = Subagents::SupervisorChannel.new(home: File.join(@home, "subagents"), hooks: @hooks,
+                                                   kernel: nil, agent: nil,
+                                                   owner_id: -> { raise "owner boom" })
+        @channels << channel
+        channel.start
+        # I103 (D — was the POLL_INTERVAL*4 grace sleep): the raising consult
+        # must refuse the ask across the poller's WHOLE lifetime. Stop + join
+        # the producer (no future tick can ever run), then assert the
+        # non-event; the file must be untouched on disk.
+        channel.stop
+        assert_empty channel.pending, "a raising consult reads false: the ask never registers"
+        assert File.file?(ask_path), "the ask file is untouched"
+        channel.start # the poll machinery survives the raising ticks
+        channel.stop
+      end
     end
 
     # --- pin 10 (AC1): the live end-to-end replacement — a real child
     # completes ACROSS a mid-flight swap; the successor sees everything. ---
 
     def test_the_in_process_replacement_end_to_end
-      @server.script([{type: :stream, content: "mid-flight answer"},
-                      {type: :stream, content: "spare"}])
-      current = [duck_loop(STAMP_A)]
-      manager = new_manager(agent: -> { current.first })
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "mid-flight answer"},
+                        {type: :stream, content: "spare"}])
+        current = [duck_loop(STAMP_A)]
+        manager = new_manager(agent: -> { current.first })
 
-      run_a = manager.spawn_run(agent: "worker", task: "mid-flight", async: true,
-                               timeout_ms: 0, tool_timeout_ms: 0)
-      @spawns << run_a[:pgid] if run_a[:pgid]
-      assert_equal STAMP_A, manager.session_owner_id
+        run_a = manager.spawn_run(agent: "worker", task: "mid-flight", async: true,
+                                 timeout_ms: 0, tool_timeout_ms: 0)
+        @spawns << run_a[:pgid] if run_a[:pgid]
+        assert_equal STAMP_A, manager.session_owner_id
 
-      # The swap while the child runs.
-      current[0] = duck_loop(STAMP_B)
-      assert_equal STAMP_B, manager.session_owner_id
+        # The swap while the child runs.
+        current[0] = duck_loop(STAMP_B)
+        assert_equal STAMP_B, manager.session_owner_id
 
-      wait_owned_terminal(manager, run_a[:id])
-      row = manager.box_snapshot.fetch(:rows).find { |candidate| candidate[:id] == run_a[:id] }
-      assert row, "the successor's box shows the completed row"
-      assert_equal "completed", row[:state]
+        wait_owned_terminal(manager, run_a[:id])
+        row = manager.box_snapshot.fetch(:rows).find { |candidate| candidate[:id] == run_a[:id] }
+        assert row, "the successor's box shows the completed row"
+        assert_equal "completed", row[:state]
 
-      pending = @hooks.pending_next_turn
-      assert_equal 1, pending.size, "exactly one completion notification"
-      assert_equal Subagents::NOTIFY_CUSTOM_TYPE, pending.first[:custom_type]
-      assert_equal "mid-flight answer", manager.result(id: run_a[:id])["output"]
+        pending = @hooks.pending_next_turn
+        assert_equal 1, pending.size, "exactly one completion notification"
+        assert_equal Subagents::NOTIFY_CUSTOM_TYPE, pending.first[:custom_type]
+        assert_equal "mid-flight answer", manager.result(id: run_a[:id])["output"]
+      end
     end
 
     # --- helpers (the ownership family's discipline) ---
@@ -546,19 +580,26 @@ module Tart
       pid = Process.spawn("sleep", "60", pgroup: true)
       Process.detach(pid)
       @spawns << pid
-      sleep 0.05 # let it exec
+      # I103 (C — was the 0.05 s let-it-exec bet): the exec handshake, the
+      # double-setpgid idiom. Success = the child sits in its own group (the
+      # kill(-pid) target exists); EACCES = it already execed as the group
+      # leader (same fact); ESRCH = it is gone. Either way the proceed is
+      # deterministic, not a timing bet.
+      begin
+        Process.setpgid(pid, pid)
+      rescue Errno::EACCES, Errno::ESRCH
+        nil
+      end
       pid
     end
 
+    # The owned run's terminal event, then the read (I103/A — was the
+    # deadline+sleep wall): the Manager broadcasts at the settle's
+    # terminal flip; the belt is the wedge guard only.
     def wait_owned_terminal(manager, id, timeout = 25)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      record = manager.runs.find { |candidate| candidate[:id] == id }
-      until record && record[:state] != :running
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          flunk "owned run #{id} never settled"
-        end
-        sleep 0.1
+      await(manager, "owned run #{id} to settle", belt: timeout) do
         record = manager.runs.find { |candidate| candidate[:id] == id }
+        record && record[:state] != :running
       end
     end
   end

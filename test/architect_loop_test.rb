@@ -858,17 +858,6 @@ module Tart
       @captures.concat(@server.captured_requests)
     end
 
-    def wait_until_bounded(timeout, what)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      loop do
-        value = yield
-        return value if value
-        raise "timed out after #{timeout}s waiting for #{what}" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-
-        sleep 0.05
-      end
-    end
-
     def system_role_content(body)
       message = body["messages"].to_a.find { |m| %w[system developer].include?(m["role"]) }
       message && message["content"].to_s
@@ -909,24 +898,30 @@ module Tart
       @manager.runs.find { |record| record[:agent] == agent }
     end
 
-    def wait_terminal(manager, id, timeout = 40)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      record = nil
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+    # The run's terminal flip IS the manager's settle broadcast (I103):
+    # park on the manager's seam, then re-read the settled record.
+    def wait_terminal(manager, id)
+      await(manager, "run #{id} to settle", belt: CHILD_BELT_S) do
         record = manager.runs.find { |r| r[:id] == id }
-        break if record && record[:state] != :running
-
-        sleep 0.1
+        record && record[:state] != :running
       end
+      record = manager.runs.find { |r| r[:id] == id }
       flunk "run #{id} never settled: #{record && record[:state]}" unless record && record[:state] != :running
       debug_run(record)
       record[:state]
     end
 
+    # No zombie: block on the reap itself — the manager's spawn-time
+    # Process.detach owns the reap, so a second detach+join returns exactly
+    # when the zombie is gone (ECHILD: the manager's detach already reaped).
     def assert_ps_clean(pid)
-      wait_until_bounded(5, "pid #{pid} to be reaped (no zombie)") do
-        `ps -p #{Integer(pid)} -o pid=`.strip.empty?
+      begin
+        Process.detach(Integer(pid)).join
+      rescue Errno::ECHILD, Errno::ESRCH
+        nil
       end
+      assert_empty `ps -p #{Integer(pid)} -o pid=`.to_s.split,
+        "pid #{pid} to be reaped (no zombie)"
     end
 
     def debug_run(record)
@@ -978,11 +973,8 @@ module Tart
       return unless @kernel_thread
 
       @kernel&.stop!
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
-      until !@kernel_thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.02
-      end
-      flunk "the wake kernel never stopped" if @kernel_thread.alive?
+      # The stop request is the terminal event — the loop exits and the
+      # thread dies; a bare blocking join owns the wait (I103 class C).
       @kernel_thread.join
       @kernel_thread = nil
     end
@@ -1001,12 +993,9 @@ module Tart
       end
     end
 
-    def join_run(timeout = 60)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      until !@run_thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.05
-      end
-      flunk "the parent run never finished" if @run_thread.alive?
+    def join_run
+      # The driver run finishing IS the thread's own death — a bare
+      # blocking join owns the wait (I103 class C).
       @run_thread.join
     end
 
@@ -1024,120 +1013,127 @@ module Tart
     # every child a real bin/tart -p boot over the project-tier profiles,
     # every wake the REAL notify path (the I94 W3 idiom, zero keypress).
     def test_live_arc_installs_the_playbook_and_three_role_children_run_and_wake
-      space = stage_live_space
-      build_live_harness(space)
-      @server.script([
-        # The driver's install turn (the only first driver request).
-        {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).empty? && user_texts(body) == ["Drive the toy plan"] },
-         tool_calls: [{id: "d1", name: "architect_loop", arguments: {from: File.join(space, "notes", "plan-toy.md")}}]},
-        # The spawn turn (d1's result rode back).
-        {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[d1] },
-         tool_calls: [{id: "d2", name: "subagent",
-                       arguments: {agent: "architect-spec", task: LIVE_SPEC_TASK, async: true,
-                                   timeout_ms: 3_600_000, model: "mock/toy-spec:high"}}]},
-        # The spec child: its system prompt IS the generated project-tier profile.
-        {type: :stream, match: ->(body) { child_request?(body, SPEC_PROFILE_MARKER) }, content: LIVE_SPEC_ANSWER},
-        # The spec completion wake turn: spawn the builder (the async spawn
-        # turns end on the server's empty-script fallback — the loop
-        # continues through the REAL wake path only).
-        {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") } },
-         tool_calls: [{id: "d4", name: "subagent",
-                       arguments: {agent: "architect-builder", task: LIVE_BUILDER_TASK, async: true,
-                                   timeout_ms: 7_200_000, model: "mock/toy-builder"}}]},
-        {type: :stream, match: ->(body) { child_request?(body, BUILDER_PROFILE_MARKER) }, content: LIVE_BUILDER_ANSWER},
-        # The builder completion wake turn: spawn the judge.
-        {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-builder**") } },
-         tool_calls: [{id: "d5", name: "subagent",
-                       arguments: {agent: "architect-judge", task: LIVE_JUDGE_TASK, async: true,
-                                   timeout_ms: 7_200_000, model: "mock/toy-judge"}}]},
-        {type: :stream, match: ->(body) { child_request?(body, JUDGE_PROFILE_MARKER) }, content: LIVE_JUDGE_ANSWER},
-        # The judge completion wake turn: the driver closes.
-        {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-judge**") } },
-         content: "TOY ARC DONE"}
-      ])
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        space = stage_live_space
+        build_live_harness(space)
+        @server.script([
+          # The driver's install turn (the only first driver request).
+          {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).empty? && user_texts(body) == ["Drive the toy plan"] },
+           tool_calls: [{id: "d1", name: "architect_loop", arguments: {from: File.join(space, "notes", "plan-toy.md")}}]},
+          # The spawn turn (d1's result rode back).
+          {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[d1] },
+           tool_calls: [{id: "d2", name: "subagent",
+                         arguments: {agent: "architect-spec", task: LIVE_SPEC_TASK, async: true,
+                                     timeout_ms: 3_600_000, model: "mock/toy-spec:high"}}]},
+          # The spec child: its system prompt IS the generated project-tier profile.
+          {type: :stream, match: ->(body) { child_request?(body, SPEC_PROFILE_MARKER) }, content: LIVE_SPEC_ANSWER},
+          # The spec completion wake turn: spawn the builder (the async spawn
+          # turns end on the server's empty-script fallback — the loop
+          # continues through the REAL wake path only).
+          {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") } },
+           tool_calls: [{id: "d4", name: "subagent",
+                         arguments: {agent: "architect-builder", task: LIVE_BUILDER_TASK, async: true,
+                                     timeout_ms: 7_200_000, model: "mock/toy-builder"}}]},
+          {type: :stream, match: ->(body) { child_request?(body, BUILDER_PROFILE_MARKER) }, content: LIVE_BUILDER_ANSWER},
+          # The builder completion wake turn: spawn the judge.
+          {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-builder**") } },
+           tool_calls: [{id: "d5", name: "subagent",
+                         arguments: {agent: "architect-judge", task: LIVE_JUDGE_TASK, async: true,
+                                     timeout_ms: 7_200_000, model: "mock/toy-judge"}}]},
+          {type: :stream, match: ->(body) { child_request?(body, JUDGE_PROFILE_MARKER) }, content: LIVE_JUDGE_ANSWER},
+          # The judge completion wake turn: the driver closes.
+          {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-judge**") } },
+           content: "TOY ARC DONE"}
+        ])
 
-      run_in_background(@driver, "Drive the toy plan")
-      join_run # run 1: install + the spec spawn
-      spec_run = wait_until_bounded(30, "the spec run to register") { run_by_agent("architect-spec") }
-      assert_equal :completed, wait_terminal(@manager, spec_run[:id])
-      builder_run = wait_until_bounded(30, "the builder run to register") { run_by_agent("architect-builder") }
-      assert_equal :completed, wait_terminal(@manager, builder_run[:id])
-      judge_run = wait_until_bounded(30, "the judge run to register") { run_by_agent("architect-judge") }
-      assert_equal :completed, wait_terminal(@manager, judge_run[:id])
-      # The final wake turn closed the arc.
-      wait_until_bounded(30, "the judge-completion wake turn") do
-        drain_captures
-        @captures.any? do |body|
-          driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-judge**") }
+        run_in_background(@driver, "Drive the toy plan")
+        join_run # run 1: install + the spec spawn
+        await(@manager, "the spec run to register", belt: CHILD_BELT_S) { run_by_agent("architect-spec") }
+        spec_run = run_by_agent("architect-spec")
+        assert_equal :completed, wait_terminal(@manager, spec_run[:id])
+        await(@manager, "the builder run to register", belt: CHILD_BELT_S) { run_by_agent("architect-builder") }
+        builder_run = run_by_agent("architect-builder")
+        assert_equal :completed, wait_terminal(@manager, builder_run[:id])
+        await(@manager, "the judge run to register", belt: CHILD_BELT_S) { run_by_agent("architect-judge") }
+        judge_run = run_by_agent("architect-judge")
+        assert_equal :completed, wait_terminal(@manager, judge_run[:id])
+        # The final wake turn closed the arc.
+        await(@server, "the judge-completion wake turn", belt: CHILD_BELT_S) do
+          drain_captures
+          @captures.any? do |body|
+            driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-judge**") }
+          end
         end
+        drain_captures
+
+        agents = @manager.runs.map { |record| record[:agent] }.sort
+        assert_equal %w[architect-builder architect-judge architect-spec], agents,
+          "the driver chained spec → builder → judge through the real subagent tool"
+        @manager.runs.each { |record| assert_run_terminal(record) }
+
+        # (1) The tool's RESULT text is the playbook (first + last lines pinned).
+        install_request = @captures.find { |body| tool_calls(body).map { |c| c["name"] }.include?("architect_loop") }
+        assert install_request, "the driver called architect_loop"
+        result_request = @captures.find do |body|
+          body["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "d1" }
+        end
+        playbook_result = result_request["messages"].find { |m| m["role"] == "tool" && m["tool_call_id"] == "d1" }["content"].to_s
+        expected = live_expected_playbook(space)
+        assert_equal expected, playbook_result, "the wire tool result IS the composed playbook"
+        assert_equal "You are the architect session driving one space-architect plan to completion by spawning role " \
+          "subagents and tending them. You never do lane work yourself.", playbook_result.lines.first.chomp
+        assert playbook_result.lines.last.chomp.end_with?("build/ stays ephemeral per-run scratch."),
+          "the playbook's closing law closes its last line: #{playbook_result.lines.last[0, 60].inspect}"
+        assert_includes @notices, "architect loop: driver mode engaged — this session now drives the plan " \
+          "(#{File.join(space, 'notes', 'plan-toy.md')}); driving starts this turn, first architect_compact after the first child launch."
+
+        # (1) The four role files exist with the routed model — byte-asserted
+        # against the composer; NO .pi/ dir anywhere.
+        config = live_expected_config(space)
+        ROLES.each do |role|
+          file = File.join(space, ".tart", "agents", "architect-#{role}.md")
+          assert File.exist?(file), "the role file exists: #{role}"
+          assert_equal ArchitectLoop.render_agent_file(role, config), File.read(file)
+          frontmatter, = Skills.parse_frontmatter(File.read(file))
+          assert_equal "mock/toy-#{role}", frontmatter["model"]
+        end
+        refute Dir.glob(File.join(space, "**", ".pi")).any?, "NO .pi/ dir anywhere under the scratch space"
+
+        # (2) The spec child booted the PROJECT-TIER profile: its system prompt
+        # is the spec playbook (+ the bridge), its wire tools the role file's.
+        spec_request = @captures.find { |body| child_request?(body, SPEC_PROFILE_MARKER) }
+        refute_nil spec_request, "the spec child made a real wire request"
+        assert_equal "toy-spec", spec_request["model"], "the routing model pin rode the child's wire"
+        spec_tools = spec_request["tools"].to_a.map { |t| t.dig("function", "name") }.compact
+        assert_equal %w[read grep find ls bash edit write contact_supervisor], spec_tools,
+          "the role file's tool list + the bridge tool LAST"
+        assert_equal 3_600_000, JSON.parse(File.read(File.join(spec_run[:dir], "status.json")))["timeoutMs"],
+          "the spawn contract's explicit spec timeout (never the 30-minute default)"
+        spec_prompt = File.read(File.join(spec_run[:dir], "system-prompt.md"))
+        assert_includes spec_prompt, ArchitectLoop::ROLE_PLAYBOOKS["spec"]
+        assert_includes spec_prompt, Subagents::Supervisor::BRIDGE_INSTRUCTION
+        assert_includes spec_request["messages"].last["content"].to_s, LIVE_SPEC_TASK
+        assert_equal 7_200_000, JSON.parse(File.read(File.join(builder_run[:dir], "status.json")))["timeoutMs"]
+        assert_equal "toy-builder", @captures.find { |body| child_request?(body, BUILDER_PROFILE_MARKER) }["model"]
+
+        # (3) The completion notify + wake landed the driver's NEXT request
+        # with the notify content and the prior turn's history (the I94 W3/W4
+        # idiom — bounded waits, ZERO keypress).
+        wake_request = @captures.find do |body|
+          driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") }
+        end
+        refute_nil wake_request, "the completion notify opened a driver turn"
+        notify_text = user_texts(wake_request).find { |text| text.include?("Background task completed: **architect-spec**") }
+        assert_includes notify_text, LIVE_SPEC_ANSWER, "the child's output preview rides the notify"
+        assert_includes JSON.generate(wake_request["messages"]), "Drive the toy plan",
+          "the wake request carries the prior turn's history"
+        assert_empty @rail_else, "the rail's non-wake arm never fired (ZERO native events)"
+        assert_equal LIVE_JUDGE_ANSWER, JSON.parse(File.read(File.join(judge_run[:dir], "result.json")))["output"].to_s.strip
+      ensure
+        kill_stray_children
       end
-      drain_captures
-
-      agents = @manager.runs.map { |record| record[:agent] }.sort
-      assert_equal %w[architect-builder architect-judge architect-spec], agents,
-        "the driver chained spec → builder → judge through the real subagent tool"
-      @manager.runs.each { |record| assert_run_terminal(record) }
-
-      # (1) The tool's RESULT text is the playbook (first + last lines pinned).
-      install_request = @captures.find { |body| tool_calls(body).map { |c| c["name"] }.include?("architect_loop") }
-      assert install_request, "the driver called architect_loop"
-      result_request = @captures.find do |body|
-        body["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "d1" }
-      end
-      playbook_result = result_request["messages"].find { |m| m["role"] == "tool" && m["tool_call_id"] == "d1" }["content"].to_s
-      expected = live_expected_playbook(space)
-      assert_equal expected, playbook_result, "the wire tool result IS the composed playbook"
-      assert_equal "You are the architect session driving one space-architect plan to completion by spawning role " \
-        "subagents and tending them. You never do lane work yourself.", playbook_result.lines.first.chomp
-      assert playbook_result.lines.last.chomp.end_with?("build/ stays ephemeral per-run scratch."),
-        "the playbook's closing law closes its last line: #{playbook_result.lines.last[0, 60].inspect}"
-      assert_includes @notices, "architect loop: driver mode engaged — this session now drives the plan " \
-        "(#{File.join(space, 'notes', 'plan-toy.md')}); driving starts this turn, first architect_compact after the first child launch."
-
-      # (1) The four role files exist with the routed model — byte-asserted
-      # against the composer; NO .pi/ dir anywhere.
-      config = live_expected_config(space)
-      ROLES.each do |role|
-        file = File.join(space, ".tart", "agents", "architect-#{role}.md")
-        assert File.exist?(file), "the role file exists: #{role}"
-        assert_equal ArchitectLoop.render_agent_file(role, config), File.read(file)
-        frontmatter, = Skills.parse_frontmatter(File.read(file))
-        assert_equal "mock/toy-#{role}", frontmatter["model"]
-      end
-      refute Dir.glob(File.join(space, "**", ".pi")).any?, "NO .pi/ dir anywhere under the scratch space"
-
-      # (2) The spec child booted the PROJECT-TIER profile: its system prompt
-      # is the spec playbook (+ the bridge), its wire tools the role file's.
-      spec_request = @captures.find { |body| child_request?(body, SPEC_PROFILE_MARKER) }
-      refute_nil spec_request, "the spec child made a real wire request"
-      assert_equal "toy-spec", spec_request["model"], "the routing model pin rode the child's wire"
-      spec_tools = spec_request["tools"].to_a.map { |t| t.dig("function", "name") }.compact
-      assert_equal %w[read grep find ls bash edit write contact_supervisor], spec_tools,
-        "the role file's tool list + the bridge tool LAST"
-      assert_equal 3_600_000, JSON.parse(File.read(File.join(spec_run[:dir], "status.json")))["timeoutMs"],
-        "the spawn contract's explicit spec timeout (never the 30-minute default)"
-      spec_prompt = File.read(File.join(spec_run[:dir], "system-prompt.md"))
-      assert_includes spec_prompt, ArchitectLoop::ROLE_PLAYBOOKS["spec"]
-      assert_includes spec_prompt, Subagents::Supervisor::BRIDGE_INSTRUCTION
-      assert_includes spec_request["messages"].last["content"].to_s, LIVE_SPEC_TASK
-      assert_equal 7_200_000, JSON.parse(File.read(File.join(builder_run[:dir], "status.json")))["timeoutMs"]
-      assert_equal "toy-builder", @captures.find { |body| child_request?(body, BUILDER_PROFILE_MARKER) }["model"]
-
-      # (3) The completion notify + wake landed the driver's NEXT request
-      # with the notify content and the prior turn's history (the I94 W3/W4
-      # idiom — bounded waits, ZERO keypress).
-      wake_request = @captures.find do |body|
-        driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") }
-      end
-      refute_nil wake_request, "the completion notify opened a driver turn"
-      notify_text = user_texts(wake_request).find { |text| text.include?("Background task completed: **architect-spec**") }
-      assert_includes notify_text, LIVE_SPEC_ANSWER, "the child's output preview rides the notify"
-      assert_includes JSON.generate(wake_request["messages"]), "Drive the toy plan",
-        "the wake request carries the prior turn's history"
-      assert_empty @rail_else, "the rail's non-wake arm never fired (ZERO native events)"
-      assert_equal LIVE_JUDGE_ANSWER, JSON.parse(File.read(File.join(judge_run[:dir], "result.json")))["output"].to_s.strip
-    ensure
-      kill_stray_children
     end
 
     # (5): the staged escalation round trip — a real child asks, the ask
@@ -1145,166 +1141,178 @@ module Tart
     # the driver replies via the subagent tool's reply action ON THE LEAF
     # REQUEST ID, the child unblocks and completes.
     def test_live_escalation_round_trip_replies_on_the_leaf_request_id
-      space = stage_live_space
-      build_live_harness(space)
-      judge_run_holder = []
-      # The reply's reply_to IS the leaf child's request id — read from the
-      # child's control dir AT MATCH TIME (the ask file precedes any wake:
-      # the channel surfaces only from the file), so the id is learned the
-      # way the driver learns it, with no timing bet.
-      reply_entry = {
-        type: :stream,
-        match: lambda do |body|
-          begin
-            next false unless driver_request?(body) &&
-                              user_texts(body).any? { |text| text.include?(LIVE_ESCALATION_QUESTION) }
-            run = judge_run_holder.first
-            files = run ? Dir.glob(File.join(run[:dir], "control", "supervisor-requests", "*.json")) : []
-            next false if files.empty?
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        space = stage_live_space
+        build_live_harness(space)
+        judge_run_holder = []
+        # The reply's reply_to IS the leaf child's request id — read from the
+        # child's control dir AT MATCH TIME (the ask file precedes any wake:
+        # the channel surfaces only from the file), so the id is learned the
+        # way the driver learns it, with no timing bet.
+        reply_entry = {
+          type: :stream,
+          match: lambda do |body|
+            begin
+              next false unless driver_request?(body) &&
+                                user_texts(body).any? { |text| text.include?(LIVE_ESCALATION_QUESTION) }
+              run = judge_run_holder.first
+              files = run ? Dir.glob(File.join(run[:dir], "control", "supervisor-requests", "*.json")) : []
+              next false if files.empty?
 
-            payload = JSON.parse(File.read(files.first))
-            reply_entry[:tool_calls] = [{id: "dR", name: "subagent",
-                                         arguments: {action: "reply", reply_to: payload["id"], message: "THE RULING: yes"}}]
-            true
-          rescue StandardError
-            false
+              payload = JSON.parse(File.read(files.first))
+              reply_entry[:tool_calls] = [{id: "dR", name: "subagent",
+                                           arguments: {action: "reply", reply_to: payload["id"], message: "THE RULING: yes"}}]
+              true
+            rescue StandardError
+              false
+            end
+          end
+        }
+        @server.script([
+          {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).empty? && user_texts(body) == ["Escalate the toy plan"] },
+           tool_calls: [{id: "e1", name: "architect_loop", arguments: {from: File.join(space, "notes", "plan-toy.md")}}]},
+          {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[e1] },
+           tool_calls: [{id: "e2", name: "subagent",
+                         arguments: {agent: "architect-judge", task: LIVE_JUDGE_TASK, async: true,
+                                     timeout_ms: 7_200_000, model: "mock/toy-judge"}}]},
+          # The judge child asks (the intercom bridge arms every role child).
+          {type: :stream, match: ->(body) { child_request?(body, JUDGE_PROFILE_MARKER) },
+           tool_calls: [{id: "j1", name: "contact_supervisor",
+                         arguments: {reason: "need_decision", message: LIVE_ESCALATION_QUESTION}}]},
+          reply_entry,
+          # The unblocked judge completes.
+          {type: :stream, match: ->(body) { child_request?(body, JUDGE_PROFILE_MARKER) }, content: LIVE_JUDGE_ANSWER},
+          # The judge completion wake turn: the driver closes.
+          {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-judge**") } },
+           content: "ESCALATION ARC DONE"}
+        ])
+
+        run_in_background(@driver, "Escalate the toy plan")
+        await(@manager, "the judge run to register", belt: CHILD_BELT_S) { run_by_agent("architect-judge") }
+        judge_run = run_by_agent("architect-judge")
+        judge_run_holder << judge_run
+        assert_equal :completed, wait_terminal(@manager, judge_run[:id]), "the child unblocked and completed"
+        join_run
+
+        drain_captures
+        # The surfaced ask rode the driver's wake request as USER-role wire
+        # text with the §4.4 byte-pinned strings.
+        ask_request = @captures.find do |body|
+          driver_request?(body) && user_texts(body).any? { |text| text.include?(LIVE_ESCALATION_QUESTION) }
+        end
+        refute_nil ask_request, "the child's own ask surfaced in the driver's next request"
+        assert_includes JSON.generate(ask_request["messages"]), "Escalate the toy plan",
+          "the wake request carries the prior turn's history"
+        ask_message = user_texts(ask_request).find { |text| text.include?(LIVE_ESCALATION_QUESTION) }
+        assert_includes ask_message, "Subagent needs a supervisor decision."
+        assert_includes ask_message, "Run: #{judge_run[:id]}"
+        assert_includes ask_message, "Agent: architect-judge"
+        assert_includes ask_message, 'Reply with: subagent({ action: "reply", reply_to: "'
+        assert_includes ask_message, "(Reply to the pending request first.)"
+
+        # The reply rode the LEAF request id (the driver's reply action), and
+        # the child's NEXT request carried the answer as the tool result.
+        reply_call = @captures.flat_map { |body| tool_calls(body) }
+                              .find { |call| call.is_a?(Hash) && call.dig("arguments", "action") == "reply" }
+        refute_nil reply_call, "the driver replied via the subagent tool's reply action"
+        assert_equal "subagent", reply_call["name"]
+        assert_match(/\A[0-9a-f-]{36}\z/, reply_call.dig("arguments", "reply_to").to_s, "ON the leaf request id")
+        judge_requests = @captures.select { |body| child_request?(body, JUDGE_PROFILE_MARKER) }
+        assert judge_requests.size >= 2, "the judge made a post-reply request"
+        assert judge_requests.any? do |body|
+          body["messages"].to_a.any? do |m|
+            m["role"] == "tool" && m["content"].to_s.include?("**Reply from supervisor:**\nTHE RULING: yes")
           end
         end
-      }
-      @server.script([
-        {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).empty? && user_texts(body) == ["Escalate the toy plan"] },
-         tool_calls: [{id: "e1", name: "architect_loop", arguments: {from: File.join(space, "notes", "plan-toy.md")}}]},
-        {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[e1] },
-         tool_calls: [{id: "e2", name: "subagent",
-                       arguments: {agent: "architect-judge", task: LIVE_JUDGE_TASK, async: true,
-                                   timeout_ms: 7_200_000, model: "mock/toy-judge"}}]},
-        # The judge child asks (the intercom bridge arms every role child).
-        {type: :stream, match: ->(body) { child_request?(body, JUDGE_PROFILE_MARKER) },
-         tool_calls: [{id: "j1", name: "contact_supervisor",
-                       arguments: {reason: "need_decision", message: LIVE_ESCALATION_QUESTION}}]},
-        reply_entry,
-        # The unblocked judge completes.
-        {type: :stream, match: ->(body) { child_request?(body, JUDGE_PROFILE_MARKER) }, content: LIVE_JUDGE_ANSWER},
-        # The judge completion wake turn: the driver closes.
-        {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-judge**") } },
-         content: "ESCALATION ARC DONE"}
-      ])
-
-      run_in_background(@driver, "Escalate the toy plan")
-      judge_run = wait_until_bounded(30, "the judge run to register") { run_by_agent("architect-judge") }
-      judge_run_holder << judge_run
-      assert_equal :completed, wait_terminal(@manager, judge_run[:id], 40), "the child unblocked and completed"
-      join_run
-
-      drain_captures
-      # The surfaced ask rode the driver's wake request as USER-role wire
-      # text with the §4.4 byte-pinned strings.
-      ask_request = @captures.find do |body|
-        driver_request?(body) && user_texts(body).any? { |text| text.include?(LIVE_ESCALATION_QUESTION) }
+        files = Dir.glob(File.join(judge_run[:dir], "control", "supervisor-requests", "*.json"))
+        assert_empty files, "the child's request file was swept (the reply consumed it)"
+        assert_equal LIVE_JUDGE_ANSWER, JSON.parse(File.read(File.join(judge_run[:dir], "result.json")))["output"].to_s.strip
+        assert_run_terminal(judge_run)
+      ensure
+        kill_stray_children
       end
-      refute_nil ask_request, "the child's own ask surfaced in the driver's next request"
-      assert_includes JSON.generate(ask_request["messages"]), "Escalate the toy plan",
-        "the wake request carries the prior turn's history"
-      ask_message = user_texts(ask_request).find { |text| text.include?(LIVE_ESCALATION_QUESTION) }
-      assert_includes ask_message, "Subagent needs a supervisor decision."
-      assert_includes ask_message, "Run: #{judge_run[:id]}"
-      assert_includes ask_message, "Agent: architect-judge"
-      assert_includes ask_message, 'Reply with: subagent({ action: "reply", reply_to: "'
-      assert_includes ask_message, "(Reply to the pending request first.)"
-
-      # The reply rode the LEAF request id (the driver's reply action), and
-      # the child's NEXT request carried the answer as the tool result.
-      reply_call = @captures.flat_map { |body| tool_calls(body) }
-                            .find { |call| call.is_a?(Hash) && call.dig("arguments", "action") == "reply" }
-      refute_nil reply_call, "the driver replied via the subagent tool's reply action"
-      assert_equal "subagent", reply_call["name"]
-      assert_match(/\A[0-9a-f-]{36}\z/, reply_call.dig("arguments", "reply_to").to_s, "ON the leaf request id")
-      judge_requests = @captures.select { |body| child_request?(body, JUDGE_PROFILE_MARKER) }
-      assert judge_requests.size >= 2, "the judge made a post-reply request"
-      assert judge_requests.any? do |body|
-        body["messages"].to_a.any? do |m|
-          m["role"] == "tool" && m["content"].to_s.include?("**Reply from supervisor:**\nTHE RULING: yes")
-        end
-      end
-      files = Dir.glob(File.join(judge_run[:dir], "control", "supervisor-requests", "*.json"))
-      assert_empty files, "the child's request file was swept (the reply consumed it)"
-      assert_equal LIVE_JUDGE_ANSWER, JSON.parse(File.read(File.join(judge_run[:dir], "result.json")))["output"].to_s.strip
-      assert_run_terminal(judge_run)
-    ensure
-      kill_stray_children
     end
 
     # (6): after a child launch the driver calls architect_compact — the
     # pending compaction runs at the post-run point with the playbook as
     # custom instructions, observed in the captured summarization request.
     def test_live_compaction_after_first_child_launch_carries_the_playbook
-      space = stage_live_space
-      build_live_harness(space)
-      @server.script([
-        {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).empty? && user_texts(body) == ["Compact the toy drive"] },
-         tool_calls: [{id: "k1", name: "architect_loop", arguments: {from: File.join(space, "notes", "plan-toy.md")}}]},
-        {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[k1] },
-         tool_calls: [{id: "k2", name: "subagent",
-                       arguments: {agent: "architect-spec", task: LIVE_SPEC_TASK, async: true,
-                                   timeout_ms: 3_600_000, model: "mock/toy-spec"}}]},
-        {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[k1 k2] },
-         tool_calls: [{id: "k3", name: "architect_compact", arguments: {}}]},
-        {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[k1 k2 k3] &&
-          user_texts(body).none? { |text| text.include?("Background task completed") } },
-         content: "driving on — compaction scheduled"},
-        # The scheduled-manual summarization request (the post-run point).
-        {type: :stream, match: ->(body) { summarization_request?(body) }, content: "TOY COMPACT SUMMARY"},
-        {type: :stream, match: ->(body) { child_request?(body, SPEC_PROFILE_MARKER) }, content: LIVE_SPEC_ANSWER},
-        {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") } },
-         content: "COMPACT DRIVE DONE"}
-      ])
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        space = stage_live_space
+        build_live_harness(space)
+        @server.script([
+          {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).empty? && user_texts(body) == ["Compact the toy drive"] },
+           tool_calls: [{id: "k1", name: "architect_loop", arguments: {from: File.join(space, "notes", "plan-toy.md")}}]},
+          {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[k1] },
+           tool_calls: [{id: "k2", name: "subagent",
+                         arguments: {agent: "architect-spec", task: LIVE_SPEC_TASK, async: true,
+                                     timeout_ms: 3_600_000, model: "mock/toy-spec"}}]},
+          {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[k1 k2] },
+           tool_calls: [{id: "k3", name: "architect_compact", arguments: {}}]},
+          {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[k1 k2 k3] &&
+            user_texts(body).none? { |text| text.include?("Background task completed") } },
+           content: "driving on — compaction scheduled"},
+          # The scheduled-manual summarization request (the post-run point).
+          {type: :stream, match: ->(body) { summarization_request?(body) }, content: "TOY COMPACT SUMMARY"},
+          {type: :stream, match: ->(body) { child_request?(body, SPEC_PROFILE_MARKER) }, content: LIVE_SPEC_ANSWER},
+          {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") } },
+           content: "COMPACT DRIVE DONE"}
+        ])
 
-      run_in_background(@driver, "Compact the toy drive")
-      join_run # run 1 ends after the compaction landed (the post-run drain)
-      spec_run = wait_until_bounded(30, "the spec run to register") { run_by_agent("architect-spec") }
-      assert_equal :completed, wait_terminal(@manager, spec_run[:id])
-      drain_captures
-
-      if ENV["I95_DEBUG"]
-        @captures.each_with_index do |body, index|
-          marks = user_texts(body).map { |t| t[0, 40].inspect } + [system_role_content(body)[0, 40].inspect]
-          puts "[i95-debug] capture #{index}: users=#{marks.uniq.inspect}"
-        end
-      end
-      summary_request = @captures.find { |body| summarization_request?(body) }
-      refute_nil summary_request, "the pending manual compaction ran at the post-run point"
-      prompt = summary_request["messages"].last["content"].to_s
-      expected_playbook = live_expected_playbook(space)
-      assert prompt.end_with?("\n\nAdditional focus: #{expected_playbook}"),
-        "the summarization request carries pi's exact carry bytes + the playbook text"
-      assert_equal expected_playbook, ArchitectLoop.driver_playbook_text, "the driver state held the carried playbook"
-
-      # The compaction LANDED before the wake: the wake request's history
-      # carries the summary marker and the original prompt is gone (bounded
-      # wait — the notify's kick fires right after the child settles).
-      wake_request = wait_until_bounded(15, "the completion wake turn") do
+        run_in_background(@driver, "Compact the toy drive")
+        join_run # run 1 ends after the compaction landed (the post-run drain)
+        await(@manager, "the spec run to register", belt: CHILD_BELT_S) { run_by_agent("architect-spec") }
+        spec_run = run_by_agent("architect-spec")
+        assert_equal :completed, wait_terminal(@manager, spec_run[:id])
         drain_captures
-        @captures.find do |body|
-          driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") }
+
+        if ENV["I95_DEBUG"]
+          @captures.each_with_index do |body, index|
+            marks = user_texts(body).map { |t| t[0, 40].inspect } + [system_role_content(body)[0, 40].inspect]
+            puts "[i95-debug] capture #{index}: users=#{marks.uniq.inspect}"
+          end
         end
+        summary_request = @captures.find { |body| summarization_request?(body) }
+        refute_nil summary_request, "the pending manual compaction ran at the post-run point"
+        prompt = summary_request["messages"].last["content"].to_s
+        expected_playbook = live_expected_playbook(space)
+        assert prompt.end_with?("\n\nAdditional focus: #{expected_playbook}"),
+          "the summarization request carries pi's exact carry bytes + the playbook text"
+        assert_equal expected_playbook, ArchitectLoop.driver_playbook_text, "the driver state held the carried playbook"
+
+        # The compaction LANDED before the wake: the wake request's history
+        # carries the summary marker and the original prompt is gone (the
+        # notify's kick fires right after the child settles — the server's
+        # request-arrival seam pings each driver turn).
+        wake_request = nil
+        await(@server, "the completion wake turn", belt: CHILD_BELT_S) do
+          drain_captures
+          wake_request = @captures.find do |body|
+            driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") }
+          end
+        end
+        summary_message = wake_request["messages"].to_a.find do |m|
+          m["role"] == "user" && m["content"].to_s.include?(Compaction::COMPACTION_SUMMARY_PREFIX)
+        end
+        refute_nil summary_message, "the post-compaction summary rides the history"
+        assert_includes summary_message["content"].to_s, "TOY COMPACT SUMMARY"
+        refute_includes JSON.generate(wake_request["messages"]), "Compact the toy drive",
+          "the pre-compaction prompt was summarized away"
+        # The tool's own result text rode the wire (pi's byte-carried string).
+        compact_result_request = @captures.find do |body|
+          body["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "k3" }
+        end
+        compact_result = compact_result_request["messages"].find { |m| m["role"] == "tool" && m["tool_call_id"] == "k3" }["content"].to_s
+        assert_equal "Session compaction scheduled with the driver playbook as customInstructions — the keep-essentials " \
+          "(plan reference, routing pins, per-iteration procedure) survive; ground everything else from disk.", compact_result
+        assert_run_terminal(spec_run)
+      ensure
+        kill_stray_children
       end
-      summary_message = wake_request["messages"].to_a.find do |m|
-        m["role"] == "user" && m["content"].to_s.include?(Compaction::COMPACTION_SUMMARY_PREFIX)
-      end
-      refute_nil summary_message, "the post-compaction summary rides the history"
-      assert_includes summary_message["content"].to_s, "TOY COMPACT SUMMARY"
-      refute_includes JSON.generate(wake_request["messages"]), "Compact the toy drive",
-        "the pre-compaction prompt was summarized away"
-      # The tool's own result text rode the wire (pi's byte-carried string).
-      compact_result_request = @captures.find do |body|
-        body["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "k3" }
-      end
-      compact_result = compact_result_request["messages"].find { |m| m["role"] == "tool" && m["tool_call_id"] == "k3" }["content"].to_s
-      assert_equal "Session compaction scheduled with the driver playbook as customInstructions — the keep-essentials " \
-        "(plan reference, routing pins, per-iteration procedure) survive; ground everything else from disk.", compact_result
-      assert_run_terminal(spec_run)
-    ensure
-      kill_stray_children
     end
 
     def live_expected_config(space)

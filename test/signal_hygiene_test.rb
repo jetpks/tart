@@ -129,7 +129,14 @@ module Tart
       SignalGuardStub.activate(guard)
       event_loop = Core::Loop.new(session: ScriptedSession.new)
       Thread.new { sleep 0.1; Process.kill("HUP", Process.pid) }
-      event_loop.run { wait_until { guard.pending_exit_code } }
+      event_loop.run do
+        # I103 (A): the guard's pending_exit_code record broadcast (the
+        # delivery runs in trap context) — the run parks cooperatively on
+        # the seam.
+        await(guard, "the delivered HUP's recorded exit code") do
+          guard.pending_exit_code
+        end
+      end
       assert_equal 129, guard.pending_exit_code, "the delivered HUP recorded its code"
       assert_empty fired,
         "run() returned normally — the hard exit is the bracket tail's, not the loop's"
@@ -187,8 +194,12 @@ module Tart
       event_loop = Core::Loop.new(session:)
       Thread.new { sleep 0.1; Process.kill("HUP", Process.pid) }
       # The HUP lands while the poller is parked inside its poll — the wedged
-      # shape (deterministic: wait for the park before the run can wind down).
-      event_loop.run { wait_until { session.polling? && guard.pending_exit_code } }
+      # shape (deterministic: the run cannot wind down before it observed the
+      # park, then the recorded exit code).
+      event_loop.run do
+        await(session, "the poller parked inside its poll") { session.polling? }
+        await(guard, "the delivered HUP's recorded exit code") { guard.pending_exit_code }
+      end
       assert_predicate event_loop.poller.thread, :alive?,
         "the wedged poller was abandoned, not joined to death (the hard exit owns it)"
     ensure
@@ -206,7 +217,7 @@ module Tart
       poller = Core::Poller.new(session, queue: Queue.new, frame_interval: 1.0 / 60,
                                 stop_flag: Object.new.tap { |o| o.define_singleton_method(:stop_requested?) { false } })
       poller.start
-      wait_until { session.polling? } # the poller is parked inside its 2.5s poll
+      await(session, "the poller parked inside its 2.5s poll") { session.polling? } # I103 (B): the poll-entry gate
       error = assert_raises(Core::PollerLingerError) { poller.stop }
       assert_includes error.message, "poller thread"
     ensure
@@ -255,6 +266,10 @@ module Tart
       def initialize(poll_s)
         @poll_s = poll_s
         @polling = false
+        # I103 (B): the poll-entry gate — pinged when the poll parks, so
+        # awaits on polling? ride the event (the gate rides the Tart::Test
+        # shape; this double lives only in the suite).
+        @gate = Tart::Test::Gate.new
       end
 
       def polling?
@@ -263,8 +278,19 @@ module Tart
 
       def poll_event(timeout:)
         @polling = true
+        @gate.ping
         sleep(@poll_s)
         SH_NONE
+      end
+
+      # The state-signal read-through (I103): await(session, …) waits on the
+      # poll-entry event.
+      def state_version
+        @gate.state_version
+      end
+
+      def wait_state_change(from_version, belt: 60)
+        @gate.wait_state_change(from_version, belt: belt)
       end
 
       def draw(_widget); end

@@ -10,7 +10,11 @@ module Tart
 
       # No input event is ever pushed: the run ends as soon as the boot
       # render appears (pi renders on start; tui.ts start() requestRender).
-      event_loop.run { wait_until { !session.drawn.empty? } }
+      # I103 (B): the drawn surface's gate — cooperative, the reactor runs
+      # this fiber.
+      event_loop.run do
+        await(session, "the boot frame") { !session.drawn.empty? }
+      end
 
       assert_operator event_loop.stats[:draws], :>=, 1,
         "the first frame must render at boot, before any input event"
@@ -25,9 +29,10 @@ module Tart
       event_loop = Core::Loop.new(session:, renderer: -> { "frame" })
 
       event_loop.run do
-        wait_until { !session.drawn.empty? } # the boot frame
+        await(session, "the boot frame") { !session.drawn.empty? }
         event_loop.async { event_loop.request_draw }
-        wait_until { event_loop.stats[:draws] > 1 }
+        # I103 (A): the kernel's stat accounting broadcast.
+        await(event_loop, "the second draw") { event_loop.stats[:draws] > 1 }
       end
 
       assert_equal 2, event_loop.stats[:draws],
@@ -37,10 +42,16 @@ module Tart
     def test_native_events_round_trip_through_poller_and_queue
       session = ScriptedSession.new
       received = Queue.new
-      event_loop = Core::Loop.new(session:, on_event: ->(event, source) { received << [event, source] })
+      received_gate = Gate.new
+      event_loop = Core::Loop.new(session:, on_event: lambda do |event, source|
+        received << [event, source]
+        received_gate.ping # I103 — the dispatch event
+      end)
       session.push_native(KeyEvent.new("q", []))
 
-      event_loop.run { wait_until { !received.empty? } }
+      event_loop.run do
+        await(received_gate, "the native event to dispatch") { !received.empty? }
+      end
 
       event, source = received.pop(timeout: 0)
       assert_equal "q", event.code
@@ -56,11 +67,15 @@ module Tart
       # poll fails without a tty.)
       session = ScriptedSession.new
       received = Queue.new
-      event_loop = Core::Loop.new(session:, on_event: ->(event, source) { received << [event, source] })
+      received_gate = Gate.new
+      event_loop = Core::Loop.new(session:, on_event: lambda do |event, source|
+        received << [event, source]
+        received_gate.ping
+      end)
 
       event_loop.run do
         Thread.new { session.push_event(SyncEvent.new) }
-        wait_until { !received.empty? }
+        await(received_gate, "the synthetic event to dispatch") { !received.empty? }
       end
 
       event, source = received.pop(timeout: 0)
@@ -84,10 +99,16 @@ module Tart
     def test_mouse_events_route_to_the_surface
       session = ScriptedSession.new
       received = Queue.new
-      event_loop = Core::Loop.new(session:, on_event: ->(event, source) { received << [event, source] })
+      received_gate = Gate.new
+      event_loop = Core::Loop.new(session:, on_event: lambda do |event, source|
+        received << [event, source]
+        received_gate.ping
+      end)
       session.push_event(MouseEvent.new("scroll_up"))
 
-      event_loop.run { wait_until { !received.empty? } }
+      event_loop.run do
+        await(received_gate, "the mouse event to dispatch") { !received.empty? }
+      end
 
       event, source = received.pop(timeout: 0)
       assert event.mouse?
@@ -102,12 +123,16 @@ module Tart
     def test_bare_pointer_motion_does_not_redraw
       session = ScriptedSession.new
       received = Queue.new
-      event_loop = Core::Loop.new(session:, renderer: -> { "frame" }, on_event: ->(event, _s) { received << event })
+      received_gate = Gate.new
+      event_loop = Core::Loop.new(session:, renderer: -> { "frame" }, on_event: lambda do |event, _s|
+        received << event
+        received_gate.ping
+      end)
 
       event_loop.run do
-        wait_until { !session.drawn.empty? } # the boot frame
+        await(session, "the boot frame") { !session.drawn.empty? } # the boot frame
         session.push_event(MouseEvent.new("moved"))
-        wait_until { !received.empty? }
+        await(received_gate, "the motion event to dispatch") { !received.empty? }
       end
 
       assert_equal 1, event_loop.stats[:draws], "the boot frame is the only draw; motion must not redraw"
@@ -118,9 +143,9 @@ module Tart
       event_loop = Core::Loop.new(session:, renderer: -> { "frame" })
 
       event_loop.run do
-        wait_until { !session.drawn.empty? } # the boot frame
+        await(session, "the boot frame") { !session.drawn.empty? } # the boot frame
         session.push_event(MouseEvent.new("drag"))
-        wait_until { event_loop.stats[:draws] > 1 }
+        await(event_loop, "the second draw") { event_loop.stats[:draws] > 1 }
       end
 
       assert_operator event_loop.stats[:draws], :>, 1, "press/drag/wheel events redraw"
@@ -211,7 +236,8 @@ module Tart
       event_loop = Core::Loop.new(session:)
       work = ->(_task) do
         event_loop.every(0.02, ticks: 10) { |i| ticks << i }
-        wait_until { ticks.size >= 10 }
+        # I103 (A): the kernel's tick-fire broadcast (one per fire).
+        await(event_loop, "all 10 ticks to fire") { ticks.size >= 10 }
       end
 
       event_loop.run(&work)
@@ -231,14 +257,21 @@ module Tart
       observed = {}
 
       event_loop.run do
-        wait_until { !session.drawn.empty? } # the boot frame
+        await(session, "the boot frame") { !session.drawn.empty? } # the boot frame
         boot_draws = event_loop.stats[:draws]
         task = event_loop.tick(0.02)
-        wait_until { event_loop.stats[:draws] >= boot_draws + 3 } # ≥3 fires at 20 ms
+        # I103 (A): the kernel's draw accounting broadcast.
+        await(event_loop, "3 tick-driven draws") { event_loop.stats[:draws] >= boot_draws + 3 }
         task.stop
-        sleep 0.1 # five intervals' worth: a live tick would fire ~5 more
+        # I103 (D — was the 0.1 s grace sleeps): the cancel-quiet proof.
+        # Task#stop takes effect at the tick fiber's next suspension, and
+        # the reactor is single-threaded — a fire could only land while we
+        # yield. These cooperative yield windows ARE the quiescence proof:
+        # after the first window the tick fiber has certainly suspended
+        # (cancelled), so the second window cannot fire anything.
+        10.times { Async::Task.current.sleep(0.02) }
         observed[:after_cancel] = event_loop.stats[:draws]
-        sleep 0.1
+        10.times { Async::Task.current.sleep(0.02) }
         observed[:quiet] = event_loop.stats[:draws]
       end
 
@@ -259,7 +292,7 @@ module Tart
       event_loop = Core::Loop.new(session:, renderer: -> { render_clock.call; "frame" })
 
       event_loop.run do
-        wait_until { !session.drawn.empty? } # the boot frame's render
+        await(session, "the boot frame's render") { !session.drawn.empty? } # the boot frame's render
         times = []
         begin
           loop { times << fire_times.pop(true) } # drain the boot renders
@@ -267,7 +300,8 @@ module Tart
           nil
         end
         task = event_loop.tick(0.02)
-        wait_until { fire_times.size >= 4 } # the boot + ≥3 tick fires
+        # I103 (A): the kernel's draw accounting broadcast.
+        await(event_loop, "3 tick-driven fires") { fire_times.size >= 4 } # the boot + ≥3 tick fires
         task.stop
       end
 
@@ -288,29 +322,20 @@ module Tart
     def test_stop_from_another_thread_ends_run
       session = ScriptedSession.new
       event_loop = Core::Loop.new(session:)
+      boot_version = event_loop.state_version # read before the run arms
       thread = Thread.new do
-        sleep 0.1
+        # I103 (A — was the 0.1 s delay bet): park on the kernel's
+        # poller-lifecycle boot broadcast, then stop. The stop lands on a
+        # provably-live loop, deterministically.
+        booted = event_loop.wait_state_change(boot_version, belt: 60)
+        raise "the loop never booted" unless booted
+
         event_loop.stop!
       end
 
       event_loop.run { sleep 5 }
 
       thread.join
-    end
-
-    private
-
-    # Runs inside the work task until the block is satisfied, then returns
-    # (letting the work subtree finish normally and the supervisor stop the
-    # loop). Fails the run after 5 s rather than hanging.
-    def wait_until
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      until yield
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          raise "work condition never satisfied"
-        end
-        sleep 0.005
-      end
     end
   end
 end

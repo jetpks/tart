@@ -47,32 +47,36 @@ module Tart
     # --- pin 1 (S1): the spawn stamp ---
 
     def test_spawn_stamps_session_id_last_and_the_stamp_survives_the_terminal_flip
-      @server.script([{type: :stream, content: "async stamped"},
-                      {type: :stream, content: "foreground stamped"}])
-      manager = new_manager
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "async stamped"},
+                        {type: :stream, content: "foreground stamped"}])
+        manager = new_manager
 
-      # The ASYNC arm: the spawn-time status.json carries the stamp as the
-      # LAST key over the exact base key set.
-      run = manager.spawn_run(agent: "worker", task: "stamp me", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      initial = JSON.parse(File.read(File.join(run[:dir], "status.json")))
-      assert_equal "running", initial["state"], "the spawn-time bytes (the child has not settled)"
-      assert_equal manager.session_owner_id, initial["sessionId"]
-      assert_equal %w[id agent task taskChars mode state pid cwd asyncDir sessionRoot startedAt
-                      lastUpdate toolCallId context sessionId], initial.keys,
-                   "the base keys, order byte-kept, sessionId appended LAST"
+        # The ASYNC arm: the spawn-time status.json carries the stamp as the
+        # LAST key over the exact base key set.
+        run = manager.spawn_run(agent: "worker", task: "stamp me", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        initial = JSON.parse(File.read(File.join(run[:dir], "status.json")))
+        assert_equal "running", initial["state"], "the spawn-time bytes (the child has not settled)"
+        assert_equal manager.session_owner_id, initial["sessionId"]
+        assert_equal %w[id agent task taskChars mode state pid cwd asyncDir sessionRoot startedAt
+                        lastUpdate toolCallId context sessionId], initial.keys,
+                     "the base keys, order byte-kept, sessionId appended LAST"
 
-      wait_owned_terminal(manager, run[:id])
-      settled = JSON.parse(File.read(File.join(run[:dir], "status.json")))
-      assert_equal "completed", settled["state"]
-      assert_equal manager.session_owner_id, settled["sessionId"], "the async flip preserves the stamp"
+        wait_owned_terminal(manager, run[:id])
+        settled = JSON.parse(File.read(File.join(run[:dir], "status.json")))
+        assert_equal "completed", settled["state"]
+        assert_equal manager.session_owner_id, settled["sessionId"], "the async flip preserves the stamp"
 
-      # The FOREGROUND arm: the settle flip's final status.json still
-      # carries it.
-      fg = manager.spawn_run(agent: "worker", task: "stamp me too", async: false,
-                             timeout_ms: 0, tool_timeout_ms: 0)
-      final = JSON.parse(File.read(File.join(fg[:dir], "status.json")))
-      assert_equal :completed, fg[:state]
-      assert_equal manager.session_owner_id, final["sessionId"], "the foreground settle preserves the stamp"
+        # The FOREGROUND arm: the settle flip's final status.json still
+        # carries it.
+        fg = manager.spawn_run(agent: "worker", task: "stamp me too", async: false,
+                               timeout_ms: 0, tool_timeout_ms: 0)
+        final = JSON.parse(File.read(File.join(fg[:dir], "status.json")))
+        assert_equal :completed, fg[:state]
+        assert_equal manager.session_owner_id, final["sessionId"], "the foreground settle preserves the stamp"
+      end
     end
 
     # --- pin 2 (S2): the session owner id ---
@@ -175,34 +179,38 @@ module Tart
     # --- pin 5 (AC6): two live managers, one home ---
 
     def test_two_live_managers_sharing_one_home_cannot_see_or_control_each_others_runs
-      @server.script([{type: :stream, content: "A's answer"}])
-      manager_a = new_manager
-      run = manager_a.spawn_run(agent: "worker", task: "A's run", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      manager_b = new_manager
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "A's answer"}])
+        manager_a = new_manager
+        run = manager_a.spawn_run(agent: "worker", task: "A's run", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        manager_b = new_manager
 
-      # B is blind: fleet, box, registry.
-      assert_equal Subagents::Manager::FLEET_EMPTY_LINE, manager_b.status(id: nil)
-      assert_empty manager_b.box_snapshot.fetch(:rows)
-      assert_empty manager_b.runs
-      # B cannot control A's run — the unknown-id path, no steer file.
-      assert_raises(ArgumentError) { manager_b.status(id: run[:id]) }
-      assert_raises(ArgumentError) { manager_b.steer(id: run[:id], message: "B steers", ack_timeout_ms: 50) }
-      assert_raises(ArgumentError) { manager_b.stop(id: run[:id]) }
-      assert_nil manager_b.result(id: run[:id])
-      assert_empty Dir.children(File.join(run[:dir], "control", "steer-requests")),
-                   "B's refused steer wrote nothing into A's dir"
+        # B is blind: fleet, box, registry.
+        assert_equal Subagents::Manager::FLEET_EMPTY_LINE, manager_b.status(id: nil)
+        assert_empty manager_b.box_snapshot.fetch(:rows)
+        assert_empty manager_b.runs
+        # B cannot control A's run — the unknown-id path, no steer file.
+        assert_raises(ArgumentError) { manager_b.status(id: run[:id]) }
+        assert_raises(ArgumentError) { manager_b.steer(id: run[:id], message: "B steers", ack_timeout_ms: 50) }
+        assert_raises(ArgumentError) { manager_b.stop(id: run[:id]) }
+        assert_nil manager_b.result(id: run[:id])
+        assert_empty Dir.children(File.join(run[:dir], "control", "steer-requests")),
+                     "B's refused steer wrote nothing into A's dir"
 
-      # A sees and controls its own run normally.
-      assert_includes manager_a.status(id: nil), "- #{run[:id]} | running | single | worker"
-      receipt = manager_a.steer(id: run[:id], message: "A steers", ack_timeout_ms: 300)
-      assert_includes %i[delivered queued], receipt[:state]
-      assert_equal "Stop requested for async run #{run[:id]}.", manager_a.stop(id: run[:id])
-      wait_owned_terminal(manager_a, run[:id])
-      settled = JSON.parse(File.read(File.join(run[:dir], "status.json")))
-      assert_equal "stopped", settled["state"]
-      assert_equal manager_a.session_owner_id, settled["sessionId"], "the stop settle preserves the stamp"
-      # B stays blind after the terminal flip (terminal dirs are never adopted).
-      assert_equal Subagents::Manager::FLEET_EMPTY_LINE, manager_b.status(id: nil)
+        # A sees and controls its own run normally.
+        assert_includes manager_a.status(id: nil), "- #{run[:id]} | running | single | worker"
+        receipt = manager_a.steer(id: run[:id], message: "A steers", ack_timeout_ms: 300)
+        assert_includes %i[delivered queued], receipt[:state]
+        assert_equal "Stop requested for async run #{run[:id]}.", manager_a.stop(id: run[:id])
+        wait_owned_terminal(manager_a, run[:id])
+        settled = JSON.parse(File.read(File.join(run[:dir], "status.json")))
+        assert_equal "stopped", settled["state"]
+        assert_equal manager_a.session_owner_id, settled["sessionId"], "the stop settle preserves the stamp"
+        # B stays blind after the terminal flip (terminal dirs are never adopted).
+        assert_equal Subagents::Manager::FLEET_EMPTY_LINE, manager_b.status(id: nil)
+      end
     end
 
     # --- pin 6 (S6/AC5): the owned complementary arm (the I78 legs) ---
@@ -238,62 +246,71 @@ module Tart
     # --- pin 7 (S5/AC4): the scoped supervisor channel ---
 
     def test_channel_owner_resolver_registers_and_surfaces_only_owned_asks
-      owned_rid = "11111111-1111-4111-8111-111111111111"
-      foreign_rid = "22222222-2222-4222-8222-222222222222"
-      owner_id = "01owne000-0000-7000-8000-0000000000ff"
-      odir = stage_run("01ccc333-0000-7000-8000-000000000005", pid: live_pid, session_id: owner_id)
-      fdir = stage_run("01ccc333-0000-7000-8000-000000000006", pid: live_pid, session_id: FOREIGN_STAMP)
-      stage_ask(odir, owned_rid, run_id: "01ccc333-0000-7000-8000-000000000005")
-      stage_ask(fdir, foreign_rid, run_id: "01ccc333-0000-7000-8000-000000000006")
-      foreign_path = File.join(fdir, "control", "supervisor-requests", "#{foreign_rid}.json")
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        owned_rid = "11111111-1111-4111-8111-111111111111"
+        foreign_rid = "22222222-2222-4222-8222-222222222222"
+        owner_id = "01owne000-0000-7000-8000-0000000000ff"
+        odir = stage_run("01ccc333-0000-7000-8000-000000000005", pid: live_pid, session_id: owner_id)
+        fdir = stage_run("01ccc333-0000-7000-8000-000000000006", pid: live_pid, session_id: FOREIGN_STAMP)
+        stage_ask(odir, owned_rid, run_id: "01ccc333-0000-7000-8000-000000000005")
+        stage_ask(fdir, foreign_rid, run_id: "01ccc333-0000-7000-8000-000000000006")
+        foreign_path = File.join(fdir, "control", "supervisor-requests", "#{foreign_rid}.json")
 
-      channel = Subagents::SupervisorChannel.new(home: File.join(@home, "subagents"), hooks: @hooks,
-                                                 kernel: nil, agent: nil, owner_id: -> { owner_id })
-      @channels << channel
-      channel.start
-      wait_until { !channel.pending.empty? }
+        channel = Subagents::SupervisorChannel.new(home: File.join(@home, "subagents"), hooks: @hooks,
+                                                   kernel: nil, agent: nil, owner_id: -> { owner_id })
+        @channels << channel
+        channel.start
+        # The pending add is the channel's broadcast event (I103).
+        await(channel, "the owned ask to register") { !channel.pending.empty? }
 
-      # The owned ask registered + surfaced, EXACTLY once; the foreign ask
-      # never.
-      assert_equal [owned_rid], channel.pending.map { |request| request[:id] }
-      drained = @hooks.pending_next_turn
-      assert_equal 1, drained.size
-      assert_equal Subagents::Supervisor::REQUEST_CUSTOM_TYPE, drained.first[:custom_type]
-      assert_equal true, drained.first[:display]
-      assert_includes drained.first[:content], owned_rid
+        # The owned ask registered + surfaced, EXACTLY once; the foreign ask
+        # never.
+        assert_equal [owned_rid], channel.pending.map { |request| request[:id] }
+        drained = @hooks.pending_next_turn
+        assert_equal 1, drained.size
+        assert_equal Subagents::Supervisor::REQUEST_CUSTOM_TYPE, drained.first[:custom_type]
+        assert_equal true, drained.first[:display]
+        assert_includes drained.first[:content], owned_rid
 
-      # The foreign file is still on disk (never registered, surfaced, or
-      # unlinked) and the reply fallback refuses its id.
-      assert File.file?(foreign_path), "the foreign ask was never unlinked"
-      error = assert_raises(ArgumentError) { channel.reply(reply_to: foreign_rid, message: "hello") }
-      assert_includes error.message, "No pending supervisor request found for reply_to '#{foreign_rid}'"
-      assert File.file?(foreign_path), "the refused reply never removed the foreign file"
+        # The foreign file is still on disk (never registered, surfaced, or
+        # unlinked) and the reply fallback refuses its id.
+        assert File.file?(foreign_path), "the foreign ask was never unlinked"
+        error = assert_raises(ArgumentError) { channel.reply(reply_to: foreign_rid, message: "hello") }
+        assert_includes error.message, "No pending supervisor request found for reply_to '#{foreign_rid}'"
+        assert File.file?(foreign_path), "the refused reply never removed the foreign file"
 
-      # The owned ask is fully serviceable: reply lands, the file unlinks.
-      assert_equal "Replied to supervisor request #{owned_rid}.",
-                   channel.reply(reply_to: owned_rid, message: "owned answer")
-      refute File.file?(File.join(odir, "control", "supervisor-requests", "#{owned_rid}.json"))
-      assert File.file?(File.join(odir, "control", "supervisor-replies", "#{owned_rid}.json"))
+        # The owned ask is fully serviceable: reply lands, the file unlinks.
+        assert_equal "Replied to supervisor request #{owned_rid}.",
+                     channel.reply(reply_to: owned_rid, message: "owned answer")
+        refute File.file?(File.join(odir, "control", "supervisor-requests", "#{owned_rid}.json"))
+        assert File.file?(File.join(odir, "control", "supervisor-replies", "#{owned_rid}.json"))
+      end
     end
 
     # --- pin 8 (S6): the owned umbrella ---
 
     def test_owned_async_run_end_to_end_umbrella_is_byte_identical_to_base
-      @server.script([{type: :stream, content: "umbrella answer"}])
-      manager = new_manager
-      run = manager.spawn_run(agent: "worker", task: "umbrella", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "umbrella answer"}])
+        manager = new_manager
+        run = manager.spawn_run(agent: "worker", task: "umbrella", async: true, timeout_ms: 0, tool_timeout_ms: 0)
 
-      assert_equal true, manager.outstanding?, "the owned in-flight run gates outstanding?"
-      row = manager.box_snapshot.fetch(:rows).find { |candidate| candidate[:id] == run[:id] }
-      assert row, "the box carries the owned run"
-      assert_equal "running", row[:state]
+        assert_equal true, manager.outstanding?, "the owned in-flight run gates outstanding?"
+        row = manager.box_snapshot.fetch(:rows).find { |candidate| candidate[:id] == run[:id] }
+        assert row, "the box carries the owned run"
+        assert_equal "running", row[:state]
 
-      wait_owned_terminal(manager, run[:id])
-      assert_includes manager.status(id: nil), "- #{run[:id]} | completed | single | worker"
-      pending = @hooks.pending_next_turn
-      assert_equal 1, pending.size, "exactly one completion notification"
-      assert_equal Subagents::NOTIFY_CUSTOM_TYPE, pending.first[:custom_type]
-      assert_equal "umbrella answer", manager.result(id: run[:id])["output"]
+        wait_owned_terminal(manager, run[:id])
+        assert_includes manager.status(id: nil), "- #{run[:id]} | completed | single | worker"
+        pending = @hooks.pending_next_turn
+        assert_equal 1, pending.size, "exactly one completion notification"
+        assert_equal Subagents::NOTIFY_CUSTOM_TYPE, pending.first[:custom_type]
+        assert_equal "umbrella answer", manager.result(id: run[:id])["output"]
+      end
     end
 
     # --- helpers (the health/box families' discipline) ---
@@ -340,21 +357,11 @@ module Tart
       JSON.parse(File.read(File.join(dir, "status.json")))["pid"]
     end
 
-    # A REAL reaped pid (the health idiom): spawn, detach, wait for ESRCH.
+    # A REAL dead pid (the health idiom): the test owns the spawn, so a
+    # blocking waitpid reaps it — kill(0) then raises ESRCH (I103 class C).
     def dead_pid
       pid = Process.spawn("sleep", "0.05")
-      Process.detach(pid)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      begin
-        loop do
-          Process.kill(0, pid)
-          raise "reaped pid never died" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-
-          sleep 0.05
-        end
-      rescue Errno::ESRCH
-        nil
-      end
+      Process.waitpid(pid)
       pid
     end
 
@@ -363,19 +370,23 @@ module Tart
       pid = Process.spawn("sleep", "60", pgroup: true)
       Process.detach(pid)
       @spawns << pid
-      sleep 0.05 # let it exec
+      # The exec handshake (I103 class C): the child was spawned with
+      # pgroup: true, so this setpgid succeeds only until its exec —
+      # EACCES proves it is past exec; ESRCH that it is gone.
+      begin
+        Process.setpgid(pid, pid)
+      rescue Errno::EACCES, Errno::ESRCH
+        nil
+      end
       pid
     end
 
-    def wait_owned_terminal(manager, id, timeout = 25)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      record = manager.runs.find { |candidate| candidate[:id] == id }
-      until record && record[:state] != :running
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          flunk "owned run #{id} never settled"
-        end
-        sleep 0.1
+    # The run's terminal flip IS the manager's settle broadcast (I103):
+    # park on the manager's seam until the record leaves :running.
+    def wait_owned_terminal(manager, id)
+      await(manager, "owned run #{id} to settle", belt: CHILD_BELT_S) do
         record = manager.runs.find { |candidate| candidate[:id] == id }
+        record && record[:state] != :running
       end
     end
   end

@@ -475,9 +475,9 @@ module Tart
       transcript = File.join(doubled, "2026-10-18T07-44-19-606Z_#{id}.jsonl")
       File.write(transcript, "{\"type\":\"session_start\"}\n")
       pid = Process.spawn("sleep", "0.05")
-      Process.detach(pid)
-      # Poll the sleeper's exit (and reap) instead of a fixed 0.5 s window.
-      wait_until { !system("ps -p #{pid} >/dev/null 2>&1") }
+      # Block on the sleeper's exit (and reap) instead of a fixed 0.5 s
+      # window — a blocking waitpid (the test owns the spawn, I103 class C).
+      Process.waitpid(pid)
       File.write(File.join(dir, "status.json"), JSON.generate(
         {"id" => id, "agent" => "worker", "task" => nil, "taskChars" => 5, "mode" => "single",
          "state" => "running", "pid" => pid, "cwd" => @cwd, "asyncDir" => dir,
@@ -598,212 +598,242 @@ module Tart
     end
 
     def test_async_run_start_message_watcher_notification_and_wake_kick
-      @server.script([{type: :stream, content: "async answer"}])
-      kernel = fake_kernel
-      manager = new_manager(kernel:, agent: nil)
-      tool = Tools::Subagent.new(manager:)
-      start = tool.execute(agent: "worker", task: "async task", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      run = manager.runs.first
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "async answer"}])
+        kernel = fake_kernel
+        manager = new_manager(kernel:, agent: nil)
+        tool = Tools::Subagent.new(manager:)
+        start = tool.execute(agent: "worker", task: "async task", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        run = manager.runs.first
 
-      # The §7 start message, byte-pinned headline + the OQ-5 guidance.
-      assert_equal "Async: worker [#{run[:id]}]\n\nDetached. Return control now: native completion wakes you, " \
-                   'so do not sleep or poll for it.' "\n" \
-                   'One-shot check: subagent({ action: "status", id: "' + run[:id] + '" }).', start
-      assert_equal :running, run[:state]
+        # The §7 start message, byte-pinned headline + the OQ-5 guidance.
+        assert_equal "Async: worker [#{run[:id]}]\n\nDetached. Return control now: native completion wakes you, " \
+                     'so do not sleep or poll for it.' "\n" \
+                     'One-shot check: subagent({ action: "status", id: "' + run[:id] + '" }).', start
+        assert_equal :running, run[:state]
 
-      wait_terminal(manager, run[:id])
-      assert_equal :completed, manager.runs.first[:state]
+        wait_terminal(manager, run[:id])
+        assert_equal :completed, manager.runs.first[:state]
 
-      # The notification: pi's header bytes, the Run dir + Session file
-      # tail, display false for completed (model-visible only).
-      pend = @hooks.pending_next_turn
-      notify = pend.find { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
-      refute_nil notify, "the watcher queued the completion notification"
-      assert notify[:content].start_with?("Background task completed: **worker**")
-      assert_includes notify[:content], "\n\nasync answer\n\n"
-      assert_includes notify[:content], "Run dir: #{run[:dir]}"
-      assert_includes notify[:content], "Session file: "
-      assert_equal false, notify[:display]
+        # The notification: pi's header bytes, the Run dir + Session file
+        # tail, display false for completed (model-visible only).
+        pend = @hooks.pending_next_turn
+        notify = pend.find { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
+        refute_nil notify, "the watcher queued the completion notification"
+        assert notify[:content].start_with?("Background task completed: **worker**")
+        assert_includes notify[:content], "\n\nasync answer\n\n"
+        assert_includes notify[:content], "Run dir: #{run[:dir]}"
+        assert_includes notify[:content], "Session file: "
+        assert_equal false, notify[:display]
 
-      # The interactive wake kick rode the kernel bridge (captured, the
-      # agent here is nil so the block no-ops).
-      assert kernel.calls.size >= 1, "the completion kick went through kernel.async"
+        # The interactive wake kick rode the kernel bridge (captured, the
+        # agent here is nil so the block no-ops).
+        assert kernel.calls.size >= 1, "the completion kick went through kernel.async"
+      end
     end
 
     def test_terminal_state_implies_the_notification_is_queued
-      # JUDGE PIN (post-merge fix, recorded in the verdict): the drain
-      # contract leg B rides on — the moment a run is observably terminal
-      # (`outstanding?` false), its completion notification is ALREADY on
-      # the hooks queue. Before the fix, settle_run flipped the state
-      # inside its mutex but queued the notification after releasing it,
-      # so a drain poll landing in that window flushed an empty queue
-      # (the parent exited without recording the custom_message — leg B
-      # flaked 1-in-3 under the loaded rake suite). The notify now runs
-      # under the same mutex as the flip, making the invariant atomic.
-      @server.script([{type: :stream, content: "invariant answer"}])
-      manager = new_manager
-      manager.spawn_run(agent: "worker", task: "invariant", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        # JUDGE PIN (post-merge fix, recorded in the verdict): the drain
+        # contract leg B rides on — the moment a run is observably terminal
+        # (`outstanding?` false), its completion notification is ALREADY on
+        # the hooks queue. Before the fix, settle_run flipped the state
+        # inside its mutex but queued the notification after releasing it,
+        # so a drain poll landing in that window flushed an empty queue
+        # (the parent exited without recording the custom_message — leg B
+        # flaked 1-in-3 under the loaded rake suite). The notify now runs
+        # under the same mutex as the flip, making the invariant atomic.
+        @server.script([{type: :stream, content: "invariant answer"}])
+        manager = new_manager
+        manager.spawn_run(agent: "worker", task: "invariant", async: true, timeout_ms: 0, tool_timeout_ms: 0)
 
-      # Hammer outstanding? until the run is observably terminal; at THAT
-      # first observation the queue must already carry the notification
-      # (atomic under the fix; any hit on the unfixed code is the race).
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
-      settled = false
-      until settled || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        next if manager.outstanding?
-
-        settled = true
+        # The settle broadcast IS the terminal event (I103); at THAT first
+        # observation the queue must already carry the notification (atomic
+        # under the fix — the notify queues inside the settle's mutex, before
+        # the broadcast).
+        await(manager, "the run to settle", belt: CHILD_BELT_S) { !manager.outstanding? }
         pend = @hooks.pending_next_turn
         refute_empty pend, "terminal observed but the notification was not yet queued (the settle/notify window)"
         assert pend.any? { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
+        wait_terminal(manager, manager.runs.first[:id])
+        assert_equal :completed, manager.runs.first[:state]
       end
-      assert settled, "the run never settled within the window"
-      wait_terminal(manager, manager.runs.first[:id])
-      assert_equal :completed, manager.runs.first[:state]
     end
 
     def test_failed_run_notification_display_true_with_error_line
-      @server.script([{type: :error, status: 400, message: "nope"}])
-      manager = new_manager
-      run = manager.spawn_run(agent: "worker", task: "fail task", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :error, status: 400, message: "nope"}])
+        manager = new_manager
+        run = manager.spawn_run(agent: "worker", task: "fail task", async: true, timeout_ms: 0, tool_timeout_ms: 0)
 
-      wait_terminal(manager, run[:id])
-      assert_equal :failed, manager.runs.first[:state]
-      notify = @hooks.pending_next_turn.find { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
-      refute_nil notify
-      assert notify[:content].start_with?("Background task failed: **worker**")
-      assert_includes notify[:content], "Error: "
-      assert_equal true, notify[:display], "non-completed notices display"
+        wait_terminal(manager, run[:id])
+        assert_equal :failed, manager.runs.first[:state]
+        notify = @hooks.pending_next_turn.find { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
+        refute_nil notify
+        assert notify[:content].start_with?("Background task failed: **worker**")
+        assert_includes notify[:content], "Error: "
+        assert_equal true, notify[:display], "non-completed notices display"
+      end
     end
 
     def test_steer_receipts_and_the_correlated_consumption_log
-      # A 20-char slow stream ≈ 2 s (the mock pauses 0.1s per char) — the
-      # minimum that still outlasts the steer action by ≥3× margin.
-      @server.script([
-        {type: :slow_stream, content: "x" * 20, chunk_every: 0.3},
-        {type: :stream, content: "steered answer"}
-      ])
-      manager = new_manager
-      run = manager.spawn_run(agent: "worker", task: "steer me", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      # The child is mid-stream — its first captured request is the marker
-      # (boot-time tolerant: the poll waits out the real child boot).
-      wait_until { @server.request_count >= 1 }
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        # A 20-char slow stream ≈ 2 s (the mock pauses 0.1s per char) — the
+        # minimum that still outlasts the steer action by ≥3× margin.
+        @server.script([
+          {type: :slow_stream, content: "x" * 20, chunk_every: 0.3},
+          {type: :stream, content: "steered answer"}
+        ])
+        manager = new_manager
+        run = manager.spawn_run(agent: "worker", task: "steer me", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        # The child is mid-stream — its first captured request is the marker
+        # (boot-time tolerant: the server's arrival seam waits out the real
+        # child boot).
+        await(@server, "the child's first wire request", belt: CHILD_BELT_S) { @server.request_count >= 1 }
 
-      # The request file format — the follow_up write waits in the inbox
-      # while the child streams (no boundary until the stream ends).
-      manager.steer(id: run[:id], message: "second", mode: "follow_up")
-      files = Dir.glob(File.join(run[:dir], "control", "steer-requests", "*.json"))
-      refute_empty files, "an unconsumed request file waits in the inbox"
-      name = File.basename(files.first)
-      assert_match(/\A\d{13}-[0-9a-f-]{36}\.json\z/, name, "the ts-13-padded request file name")
-      body = JSON.parse(File.read(files.first))
-      assert_equal "steer", body["type"]
-      assert_equal "second", body["message"]
-      assert_equal "follow_up", body["mode"]
-      assert_equal "tool", body["source"]
-      assert body["ts"].is_a?(Integer)
+        # The request file format — the follow_up write waits in the inbox
+        # while the child streams (no boundary until the stream ends).
+        manager.steer(id: run[:id], message: "second", mode: "follow_up")
+        files = Dir.glob(File.join(run[:dir], "control", "steer-requests", "*.json"))
+        refute_empty files, "an unconsumed request file waits in the inbox"
+        name = File.basename(files.first)
+        assert_match(/\A\d{13}-[0-9a-f-]{36}\.json\z/, name, "the ts-13-padded request file name")
+        body = JSON.parse(File.read(files.first))
+        assert_equal "steer", body["type"]
+        assert_equal "second", body["message"]
+        assert_equal "follow_up", body["mode"]
+        assert_equal "tool", body["source"]
+        assert body["ts"].is_a?(Integer)
 
-      receipt = manager.steer(id: run[:id], message: "STEER-FOCUS-MARKER", mode: "steer", ack_timeout_ms: 30_000)
-      assert_equal :delivered, receipt[:state], "delivered ONLY on the child's consumption of THAT request id"
-      assert_equal 36, receipt[:request_id].to_s.length
-      assert_equal "Steering delivered to async run #{run[:id]} (request #{receipt[:request_id]}).", receipt[:text]
+        receipt = manager.steer(id: run[:id], message: "STEER-FOCUS-MARKER", mode: "steer", ack_timeout_ms: 30_000)
+        assert_equal :delivered, receipt[:state], "delivered ONLY on the child's consumption of THAT request id"
+        assert_equal 36, receipt[:request_id].to_s.length
+        assert_equal "Steering delivered to async run #{run[:id]} (request #{receipt[:request_id]}).", receipt[:text]
 
-      # T1: the CHILD's log names the request id ({requestId, consumedAt}).
-      log = File.readlines(File.join(run[:dir], "control", "steer-log.jsonl")).map { |l| JSON.parse(l) }
-      entry = log.find { |e| e["requestId"] == receipt[:request_id] }
-      refute_nil entry, "the consumption log correlates by request id"
-      assert entry["consumedAt"].is_a?(Integer)
+        # T1: the CHILD's log names the request id ({requestId, consumedAt}).
+        log = File.readlines(File.join(run[:dir], "control", "steer-log.jsonl")).map { |l| JSON.parse(l) }
+        entry = log.find { |e| e["requestId"] == receipt[:request_id] }
+        refute_nil entry, "the consumption log correlates by request id"
+        assert entry["consumedAt"].is_a?(Integer)
 
-      # The mid-run reach: the child's NEXT request carries the steer as
-      # a user message (the turn-boundary drain).
-      wait_terminal(manager, run[:id])
-      steered = @server.captured_requests.any? do |request|
-        request["messages"].any? { |m| m["role"] == "user" && m["content"].to_s.include?("STEER-FOCUS-MARKER") }
+        # The mid-run reach: the child's NEXT request carries the steer as
+        # a user message (the turn-boundary drain).
+        wait_terminal(manager, run[:id])
+        steered = @server.captured_requests.any? do |request|
+          request["messages"].any? { |m| m["role"] == "user" && m["content"].to_s.include?("STEER-FOCUS-MARKER") }
+        end
+        assert steered, "the steer reached the child wire as a user message"
       end
-      assert steered, "the steer reached the child wire as a user message"
     end
 
     def test_steer_receipt_vocabulary
-      @server.script([{type: :slow_stream, content: "x" * 20, chunk_every: 0.3}, {type: :stream, content: "done"}])
-      manager = new_manager
-      run = manager.spawn_run(agent: "worker", task: "t", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :slow_stream, content: "x" * 20, chunk_every: 0.3}, {type: :stream, content: "done"}])
+        manager = new_manager
+        run = manager.spawn_run(agent: "worker", task: "t", async: true, timeout_ms: 0, tool_timeout_ms: 0)
 
-      # follow_up queues immediately.
-      queued = manager.steer(id: run[:id], message: "later", mode: "follow_up")
-      assert_equal :queued, queued[:state]
-      assert_equal "Steering queued for async run #{run[:id]} (request #{queued[:request_id]}).", queued[:text]
+        # follow_up queues immediately.
+        queued = manager.steer(id: run[:id], message: "later", mode: "follow_up")
+        assert_equal :queued, queued[:state]
+        assert_equal "Steering queued for async run #{run[:id]} (request #{queued[:request_id]}).", queued[:text]
 
-      # A tiny ack window expires → queued (written, unconsumed).
-      pending_receipt = manager.steer(id: run[:id], message: "fast", mode: "steer", ack_timeout_ms: 1)
-      assert_equal :queued, pending_receipt[:state]
+        # A tiny ack window expires → queued (written, unconsumed).
+        pending_receipt = manager.steer(id: run[:id], message: "fast", mode: "steer", ack_timeout_ms: 1)
+        assert_equal :queued, pending_receipt[:state]
 
-      # The 128KB cap fails.
-      big = manager.steer(id: run[:id], message: "x" * (128 * 1024 + 1), mode: "follow_up")
-      assert_equal :failed, big[:state]
-      assert_equal "Failed to queue steering for async run #{run[:id]}: " \
-                   "steer message exceeds #{Subagents::Manager::STEER_MESSAGE_CAP_BYTES} UTF-8 bytes.", big[:text]
+        # The 128KB cap fails.
+        big = manager.steer(id: run[:id], message: "x" * (128 * 1024 + 1), mode: "follow_up")
+        assert_equal :failed, big[:state]
+        assert_equal "Failed to queue steering for async run #{run[:id]}: " \
+                     "steer message exceeds #{Subagents::Manager::STEER_MESSAGE_CAP_BYTES} UTF-8 bytes.", big[:text]
 
-      wait_terminal(manager, run[:id], 40)
+        wait_terminal(manager, run[:id])
 
-      # A terminal run misses.
-      missed = manager.steer(id: run[:id], message: "late", mode: "steer", ack_timeout_ms: 100)
-      assert_equal :missed, missed[:state]
-      assert_equal "Steering missed async run #{run[:id]} (request #{missed[:request_id]}): " \
-                   "the run ended before consumption.", missed[:text]
+        # A terminal run misses.
+        missed = manager.steer(id: run[:id], message: "late", mode: "steer", ack_timeout_ms: 100)
+        assert_equal :missed, missed[:state]
+        assert_equal "Steering missed async run #{run[:id]} (request #{missed[:request_id]}): " \
+                     "the run ended before consumption.", missed[:text]
+      end
     end
 
     def test_stop_flow_escalates_and_leaves_no_zombie
       @server.script([{type: :slow_stream, content: "s" * 200, chunk_every: 0.5}, {type: :stream, content: "never"}])
       manager = new_manager
       run = manager.spawn_run(agent: "worker", task: "stop target", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      wait_until { manager.runs.first[:state] == :running } # the child is in flight
+      await(manager, "the child to be in flight", belt: CHILD_BELT_S) { manager.runs.first[:state] == :running }
       assert_equal :running, manager.runs.first[:state]
 
       receipt = manager.stop(id: run[:id])
       assert_equal "Stop requested for async run #{run[:id]}.", receipt
 
-      wait_terminal(manager, run[:id], 15)
+      wait_terminal(manager, run[:id])
       settled = manager.runs.first
       assert_equal :stopped, settled[:state]
       refute settled[:timed_out], "a user stop never sets timedOut"
       status = JSON.parse(File.read(File.join(settled[:dir], "status.json")))
       assert_equal "stopped", status["state"]
       assert_equal false, status["timedOut"]
-      # Poll the zombie's absence instead of a fixed 0.5 s window.
-      wait_until { `ps -o stat= -p #{settled[:pid]} 2>/dev/null`.strip.empty? }
+      # Block on the reap instead of polling the zombie's absence — the
+      # manager's spawn-time Process.detach owns it; this second detach+
+      # join returns exactly when the zombie is gone (ECHILD: the manager's
+      # detach thread already reaped it).
+      begin
+        Process.detach(settled[:pid]).join
+      rescue Errno::ECHILD, Errno::ESRCH
+        nil
+      end
       assert_empty `ps -o stat= -p #{settled[:pid]} 2>/dev/null`.strip,
                    "no zombie — Process.detach owns the reap"
     end
 
     def test_run_deadline_ends_stopped_with_timed_out
-      @server.script([{type: :slow_stream, content: "d" * 200, chunk_every: 0.5}, {type: :stream, content: "never"}])
-      manager = new_manager
-      run = manager.spawn_run(agent: "worker", task: "deadline target", async: true,
-                              timeout_ms: 1500, tool_timeout_ms: 0)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :slow_stream, content: "d" * 200, chunk_every: 0.5}, {type: :stream, content: "never"}])
+        manager = new_manager
+        run = manager.spawn_run(agent: "worker", task: "deadline target", async: true,
+                                timeout_ms: 1500, tool_timeout_ms: 0)
 
-      wait_terminal(manager, run[:id], 15)
-      settled = manager.runs.first
-      assert_equal :stopped, settled[:state]
-      assert settled[:timed_out]
-      status = JSON.parse(File.read(File.join(settled[:dir], "status.json")))
-      assert_equal true, status["timedOut"]
-      # The child self-deadline env rode the spawn (T2 both-sides).
-      _, env = manager.spawn_argv_and_env(run)
-      assert env.key?("PI_RUN_DEADLINE_MS")
+        wait_terminal(manager, run[:id])
+        settled = manager.runs.first
+        assert_equal :stopped, settled[:state]
+        assert settled[:timed_out]
+        status = JSON.parse(File.read(File.join(settled[:dir], "status.json")))
+        assert_equal true, status["timedOut"]
+        # The child self-deadline env rode the spawn (T2 both-sides).
+        _, env = manager.spawn_argv_and_env(run)
+        assert env.key?("PI_RUN_DEADLINE_MS")
+      end
     end
 
     def test_child_self_deadline_holds_without_the_parent_supervisor
-      # T2 both-sides: the parent-side supervisor thread DISARMED — the
-      # child's own RUN_DEADLINE_MS env still ends the run.
-      @server.script([{type: :slow_stream, content: "d" * 200, chunk_every: 0.5}, {type: :stream, content: "never"}])
-      manager = new_manager(arm_deadline_supervisor: false)
-      run = manager.spawn_run(agent: "worker", task: "self deadline", async: true,
-                              timeout_ms: 1500, tool_timeout_ms: 0)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        # T2 both-sides: the parent-side supervisor thread DISARMED — the
+        # child's own RUN_DEADLINE_MS env still ends the run.
+        @server.script([{type: :slow_stream, content: "d" * 200, chunk_every: 0.5}, {type: :stream, content: "never"}])
+        manager = new_manager(arm_deadline_supervisor: false)
+        run = manager.spawn_run(agent: "worker", task: "self deadline", async: true,
+                                timeout_ms: 1500, tool_timeout_ms: 0)
 
-      wait_terminal(manager, run[:id], 15)
-      settled = manager.runs.first
-      assert_equal :stopped, settled[:state]
-      assert settled[:timed_out], "the child self-deadline enforced the run deadline"
+        wait_terminal(manager, run[:id])
+        settled = manager.runs.first
+        assert_equal :stopped, settled[:state]
+        assert settled[:timed_out], "the child self-deadline enforced the run deadline"
+      end
     end
 
     def test_tool_timeout_rides_the_bash_default
@@ -842,61 +872,69 @@ module Tart
     end
 
     def test_status_reconciles_from_disk
-      # T3: a manager that never saw the watcher reports the terminal run
-      # from disk (registry miss → status.json + result.json synthesis).
-      @server.script([{type: :stream, content: "reconciled"}])
-      first = new_manager
-      run = first.spawn_run(agent: "worker", task: "reconcile me", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      wait_terminal(first, run[:id])
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        # T3: a manager that never saw the watcher reports the terminal run
+        # from disk (registry miss → status.json + result.json synthesis).
+        @server.script([{type: :stream, content: "reconciled"}])
+        first = new_manager
+        run = first.spawn_run(agent: "worker", task: "reconcile me", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        wait_terminal(first, run[:id])
 
-      second = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"), env: default_env,
-                                      identity: "pi", hooks: Hooks.new)
-      @managers << second
+        second = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"), env: default_env,
+                                        identity: "pi", hooks: Hooks.new)
+        @managers << second
 
-      # I99 refused arm (the ownership law): the run is stamped with the
-      # FIRST manager's id — a targeted read from the SECOND manager takes
-      # the existing unknown-id path, before any write, and result is nil.
-      error = assert_raises(ArgumentError) { second.status(id: run[:id]) }
-      assert_includes error.message, "unknown subagent run"
-      assert_includes error.message, "Active runs: (none)"
-      assert_nil second.result(id: run[:id])
+        # I99 refused arm (the ownership law): the run is stamped with the
+        # FIRST manager's id — a targeted read from the SECOND manager takes
+        # the existing unknown-id path, before any write, and result is nil.
+        error = assert_raises(ArgumentError) { second.status(id: run[:id]) }
+        assert_includes error.message, "unknown subagent run"
+        assert_includes error.message, "Active runs: (none)"
+        assert_nil second.result(id: run[:id])
 
-      # I99 restage: the disk-first arm keeps its intent by moving the
-      # run's stamp to the SECOND manager's id (the owned shape).
-      status = JSON.parse(File.read(File.join(run[:dir], "status.json")))
-      status["sessionId"] = second.session_owner_id
-      File.write(File.join(run[:dir], "status.json"), JSON.generate(status))
+        # I99 restage: the disk-first arm keeps its intent by moving the
+        # run's stamp to the SECOND manager's id (the owned shape).
+        status = JSON.parse(File.read(File.join(run[:dir], "status.json")))
+        status["sessionId"] = second.session_owner_id
+        File.write(File.join(run[:dir], "status.json"), JSON.generate(status))
 
-      lines = second.status(id: run[:id])
-      assert_includes lines, "State: completed", "disk-first: terminal even though this watcher never saw it"
-      assert_includes lines, "Output: "
-      assert_equal "reconciled", second.result(id: run[:id])["output"]
+        lines = second.status(id: run[:id])
+        assert_includes lines, "State: completed", "disk-first: terminal even though this watcher never saw it"
+        assert_includes lines, "Output: "
+        assert_equal "reconciled", second.result(id: run[:id])["output"]
 
-      # The fleet list: pi's byte-exact empty line.
-      fresh = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "other"), env: default_env,
-                                     identity: "pi", hooks: Hooks.new)
-      @managers << fresh
-      assert_equal "No active subagent fleet. Background runs that already finished are available through " \
-                   'completion notifications or subagent({ action: "status", id: "..." }).',
-                   fresh.status(id: nil)
+        # The fleet list: pi's byte-exact empty line.
+        fresh = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "other"), env: default_env,
+                                       identity: "pi", hooks: Hooks.new)
+        @managers << fresh
+        assert_equal "No active subagent fleet. Background runs that already finished are available through " \
+                     'completion notifications or subagent({ action: "status", id: "..." }).',
+                     fresh.status(id: nil)
+      end
     end
 
     def test_status_list_shape_and_unknown_id_error
-      @server.script([{type: :stream, content: "one"}, {type: :stream, content: "two"}])
-      manager = new_manager
-      run1 = manager.spawn_run(agent: "worker", task: "a", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      run2 = manager.spawn_run(agent: "oracle", task: "b", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      wait_terminal(manager, run1[:id])
-      wait_terminal(manager, run2[:id])
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "one"}, {type: :stream, content: "two"}])
+        manager = new_manager
+        run1 = manager.spawn_run(agent: "worker", task: "a", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        run2 = manager.spawn_run(agent: "oracle", task: "b", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        wait_terminal(manager, run1[:id])
+        wait_terminal(manager, run2[:id])
 
-      list = manager.status(id: nil)
-      assert list.start_with?("Active async runs: 2\n\n"), list[0, 40]
-      assert_includes list, "- #{run1[:id]} | completed | single | worker"
-      assert_includes list, "- #{run2[:id]} | completed | single | oracle"
+        list = manager.status(id: nil)
+        assert list.start_with?("Active async runs: 2\n\n"), list[0, 40]
+        assert_includes list, "- #{run1[:id]} | completed | single | worker"
+        assert_includes list, "- #{run2[:id]} | completed | single | oracle"
 
-      error = assert_raises(ArgumentError) { manager.status(id: "01ffffffffffffffffffffffffffff") }
-      assert_includes error.message, "Active runs:"
-      assert_includes error.message, run1[:id], "the unknown-id error names the active ids"
+        error = assert_raises(ArgumentError) { manager.status(id: "01ffffffffffffffffffffffffffff") }
+        assert_includes error.message, "Active runs:"
+        assert_includes error.message, run1[:id], "the unknown-id error names the active ids"
+      end
     end
 
     def test_hermeticity_everything_under_the_staged_home
@@ -913,20 +951,24 @@ module Tart
     end
 
     def test_runs_outstanding_and_shutdown_surface
-      @server.script([{type: :stream, content: "s"}])
-      manager = new_manager
-      assert_equal false, manager.outstanding?
-      assert_equal [], manager.runs
-      run = manager.spawn_run(agent: "worker", task: "surface", async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      assert_equal true, manager.outstanding?
-      assert_equal 1, manager.runs.size
-      assert_equal run[:id], manager.runs.first[:id]
-      assert_equal(%i[id agent state dir pid pgid async timed_out started_at tool_call_id],
-                   %i[id agent state dir pid pgid async timed_out started_at tool_call_id])
-      wait_terminal(manager, run[:id])
-      assert_equal false, manager.outstanding?
-      manager.shutdown
-      assert_nil manager.shutdown, "shutdown is idempotent"
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "s"}])
+        manager = new_manager
+        assert_equal false, manager.outstanding?
+        assert_equal [], manager.runs
+        run = manager.spawn_run(agent: "worker", task: "surface", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        assert_equal true, manager.outstanding?
+        assert_equal 1, manager.runs.size
+        assert_equal run[:id], manager.runs.first[:id]
+        assert_equal(%i[id agent state dir pid pgid async timed_out started_at tool_call_id],
+                     %i[id agent state dir pid pgid async timed_out started_at tool_call_id])
+        wait_terminal(manager, run[:id])
+        assert_equal false, manager.outstanding?
+        manager.shutdown
+        assert_nil manager.shutdown, "shutdown is idempotent"
+      end
     end
 
     def test_subagent_tool_dispatch_and_safe_next_steps
@@ -957,14 +999,18 @@ module Tart
     end
 
     def test_subagent_tool_async_default_is_true
-      @server.script([{type: :stream, content: "answer"}])
-      manager = new_manager
-      tool = Tools::Subagent.new(manager:)
-      result = tool.execute(agent: "worker", task: "default async")
-      run = manager.runs.first
-      assert run[:async], "async defaults TRUE (pi's default-on)"
-      assert result.start_with?("Async: worker [#{run[:id]}]")
-      wait_terminal(manager, run[:id])
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "answer"}])
+        manager = new_manager
+        tool = Tools::Subagent.new(manager:)
+        result = tool.execute(agent: "worker", task: "default async")
+        run = manager.runs.first
+        assert run[:async], "async defaults TRUE (pi's default-on)"
+        assert result.start_with?("Async: worker [#{run[:id]}]")
+        wait_terminal(manager, run[:id])
+      end
     end
 
     # --- helpers ---
@@ -982,22 +1028,13 @@ module Tart
       {"PATH" => ENV["PATH"], "HOME" => @home, "PI_API_KEY" => "test-key", "PI_API_BASE" => @server.url}
     end
 
-    def wait_terminal(manager, id, timeout = 25)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      until manager.runs.find { |r| r[:id] == id } && manager.runs.find { |r| r[:id] == id }[:state] != :running
-        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-          record = manager.runs.find { |r| r[:id] == id } || {}
-          flunk "run #{id} never settled: #{record[:state].inspect} (stderr: #{stderr_head(record)})"
-        end
-        sleep 0.1
+    # The run's terminal flip IS the manager's settle broadcast (I103):
+    # park on the manager's seam until the record leaves :running.
+    def wait_terminal(manager, id)
+      await(manager, "run #{id} to settle", belt: CHILD_BELT_S) do
+        record = manager.runs.find { |r| r[:id] == id }
+        record && record[:state] != :running
       end
-    end
-
-    def stderr_head(record)
-      return "(no dir)" unless record[:dir]
-
-      path = File.join(record[:dir], "runner.stderr.log")
-      File.file?(path) ? File.read(path)[0, 400] : "(no log)"
     end
 
     def result_path(run)

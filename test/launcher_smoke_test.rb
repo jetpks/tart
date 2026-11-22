@@ -206,45 +206,54 @@ module Tart
     # into the surface — a staged catalog + a mock listing server through
     # build_surface, and the menu merges the listed rows.
     def test_build_surface_threads_the_listing_endpoint
-      server = MockLLMServer.new.start
-      server.script([{type: :models, ids: ["mock-3"]}])
-      launcher
-      home = Dir.mktmpdir("tart-surface-home-")
-      FileUtils.mkdir_p(File.join(home, ".tart"))
-      File.write(File.join(home, ".tart", "models.json"), JSON.generate({"default" => "mock/mock-1",
-        "providers" => {"mock" => {"baseUrl" => server.url, "apiKey" => "k",
-          "models" => [{"id" => "mock-1"}]}}}))
-      models = Models.load(root: File.join(home, ".tart"))
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = MockLLMServer.new.start
+        server.script([{type: :models, ids: ["mock-3"]}])
+        launcher
+        home = Dir.mktmpdir("tart-surface-home-")
+        FileUtils.mkdir_p(File.join(home, ".tart"))
+        File.write(File.join(home, ".tart", "models.json"), JSON.generate({"default" => "mock/mock-1",
+          "providers" => {"mock" => {"baseUrl" => server.url, "apiKey" => "k",
+            "models" => [{"id" => "mock-1"}]}}}))
+        models = Models.load(root: File.join(home, ".tart"))
 
-      TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 24) do |session|
-        resolved = Shapes::ResolvedSettings.from_load(Settings.load(cwd: home), identity: Identity::DEFAULT)
-        boot = Models.resolve_boot_model(models, {}, identity: Identity::DEFAULT)
-        surface = Executable.build_surface(session:, kernel: idle_kernel,
-          skills: [], prompts: [], mcp_servers: {}, resume: nil,
-          identity: Identity::DEFAULT, models: models,
-          endpoint: Executable.endpoint_facts(models, boot, identity: Identity::DEFAULT, resolved:))
-        # The launcher threads the footer facts right after construction
-        # (the boot pair drives the menu's ✓ marker AND the listing's
-        # provider resolution) — the build_surface seam under test is the
-        # endpoint tier.
-        surface.footer_data = {cwd: home, model: boot.id, default_provider: boot.provider}
+        TUI.run(headless: true, viewport: :fullscreen, width: 40, screen_height: 24) do |session|
+          resolved = Shapes::ResolvedSettings.from_load(Settings.load(cwd: home), identity: Identity::DEFAULT)
+          boot = Models.resolve_boot_model(models, {}, identity: Identity::DEFAULT)
+          surface = Executable.build_surface(session:, kernel: idle_kernel,
+            skills: [], prompts: [], mcp_servers: {}, resume: nil,
+            identity: Identity::DEFAULT, models: models,
+            endpoint: Executable.endpoint_facts(models, boot, identity: Identity::DEFAULT, resolved:))
+          # The launcher threads the footer facts right after construction
+          # (the boot pair drives the menu's ✓ marker AND the listing's
+          # provider resolution) — the build_surface seam under test is the
+          # endpoint tier.
+          surface.footer_data = {cwd: home, model: boot.id, default_provider: boot.provider}
 
-        surface.open_model_menu
-        wait_until { server.request_count == 1 }
-        # The merge lands on the listing thread — wait for it.
-        menu = surface.instance_variable_get(:@menu)
-        wait_until do
-          menu.instance_variable_get(:@filtered).map { |item| item[:id] }.include?("mock-3")
+          surface.open_model_menu
+          # The fetch fires on the listing thread — await the arrival (B:
+          # the MockLLMServer request gate; was the 5 s wall #1).
+          await(server, "the listing fetch to arrive") { server.request_count == 1 }
+          # The merge lands on the listing thread — await the merge event
+          # (A: the L1 broadcast at merge_listing; was the 5 s wall #2 —
+          # the F1 load-flake's race dies with the wall).
+          await(surface, "the listing merge into the menu") do
+            menu = surface.instance_variable_get(:@menu)
+            menu && menu.instance_variable_get(:@filtered).map { |item| item[:id] }.include?("mock-3")
+          end
+
+          menu = surface.instance_variable_get(:@menu)
+          ids = menu.instance_variable_get(:@filtered).map { |item| item[:id] }
+          assert_includes ids, "mock-1", "the staged catalog entry renders immediately"
+          assert_includes ids, "mock-3", "the listed id merged in — the endpoint threaded through build_surface"
+          assert_equal 1, server.request_count, "ONE fetch per menu open"
         end
-
-        ids = menu.instance_variable_get(:@filtered).map { |item| item[:id] }
-        assert_includes ids, "mock-1", "the staged catalog entry renders immediately"
-        assert_includes ids, "mock-3", "the listed id merged in — the endpoint threaded through build_surface"
-        assert_equal 1, server.request_count, "ONE fetch per menu open"
+      ensure
+        server.stop
+        FileUtils.rm_rf(home)
       end
-    ensure
-      server.stop
-      FileUtils.rm_rf(home)
     end
 
     # A render-idle kernel double (the menu assertions read state; the

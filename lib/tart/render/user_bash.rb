@@ -18,6 +18,9 @@ module Tart
     # frame-loop fiber, and the whole execution — tool run, chunk drainer,
     # terminal render — runs on the ONE kernel task's reactor fibers.
     class UserBash
+      # The scheduler-ready rider (Notification::Signal's mechanism — async
+      # clone lib/async/notification.rb): the selector processes its ready
+      # list by calling #transfer, which pushes the same queue.
       # pi handleSubmit :3347-3356 — "!" runs whole-line bash, "!!" runs it
       # excluded from the model context; the bare prefix (no command) is
       # plain text. Returns [command, excluded] or nil.
@@ -108,18 +111,21 @@ module Tart
         @stream_start_sink&.call(command, excluded)
         @cancel_flag = false
         @slot = {}
-        # Chunks cross from the tool's pipe-drain reader threads via a plain
-        # ::Queue (probe5: the pops are cooperative on a reactor fiber, and
-        # the cross-thread pushes wake the drainer); the drainer — a sibling
-        # task on THIS kernel task — is the only fiber that touches render
-        # state. ONE finish path renders every terminal: the outcome arm
+        # Chunks cross from the tool's pipe-drain tasks via an Async::Queue
+        # (I107/Q2 — the sanctioned seam; the pops are cooperative on a
+        # reactor fiber, and the same-reactor pushes wake the drainer; the
+        # completion sentinel rides the full dual-path wake per V1 — direct
+        # push + the scheduler-ready rider — honoring the standing
+        # same-thread lost-wakeup claim). The drainer — a sibling task on
+        # THIS kernel task — is the only fiber that touches render state.
+        # ONE finish path renders every terminal: the outcome arm
         # (including the escape-cancelled partial outcome — the Cancel lands
         # inside run_user's waits and its dual-class rescue produces the
         # cancelled outcome), the worker-error arm (a StandardError that
         # escapes run_user, e.g. the ENOENT cwd raise), and the rare
         # terminal-without-outcome shape (the clear alone).
         @task = @kernel.async do
-          chunks = Queue.new
+          chunks = Async::Queue.new
           drainer = Async::Task.current.async do
             while (item = chunks.pop) != :done
               @stream_chunk_sink&.call(item)
@@ -154,6 +160,10 @@ module Tart
             @slot[:error] = e unless e.is_a?(Fast::Completions::CancelledError)
           ensure
             chunks << :done
+            # The completion sentinel's dual-path wake (V1): the direct
+            # push above is the proven same-reactor path; the scheduler-
+            # ready rider honors the standing lost-wakeup claim.
+            Fiber.scheduler&.push(::Tart::Wake.new(chunks, :done))
             begin
               drainer.wait
             rescue Async::Cancel

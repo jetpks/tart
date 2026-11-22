@@ -29,14 +29,17 @@ module Tart
   #   String serialization would lose the text), `tool_execution_end`
   #   for every tool call; the session record opens EVERY body.
   # - engine: herdr's discipline (Grounds §"The seams") — enqueue-only
-  #   handlers, ONE flusher thread (≤ 1 in-flight POST by construction),
-  #   coalescing debounce, FIFO order end to end, every failure caught,
-  #   nothing thrown into the host; loss lines on stderr, the token
-  #   NEVER in any URL or error text. NO MOTD row (the ruling — silent
-  #   ambient capture; herdr got one because it is owner-visible pane
-  #   state).
-  # - the ONE new sanctioned `Thread.new` site in lib/ (the flusher; the
-  #   threads-budget gate carries the exclusion for this path).
+  #   handlers, ONE flusher task on the host reactor (I107 T3/V2 — the
+  #   concurrency law; TRANSIENT, so it never holds the reactor open and
+  #   the reactor's teardown cancel is its unwind path), coalescing
+  #   debounce, FIFO order end to end, every failure caught, nothing
+  #   thrown into the host; loss lines on stderr, the token NEVER in any
+  #   URL or error text. NO MOTD row (the ruling — silent ambient
+  #   capture; herdr got one because it is owner-visible pane state).
+  # - an OFF-REACTOR seat (the bare hygiene probe, the post-reactor
+  #   shutdown tail) spawns no flusher: enqueues accumulate, and the
+  #   terminal flush posts synchronously on the caller thread — today's
+  #   bounded tail, unchanged.
   module SessionSink
     # The frozen tuning (session-sink.ts :29-40), pinned by the config
     # gate; `register(tuning:)` is the test seam ONLY (production callers
@@ -400,11 +403,19 @@ module Tart
       (Time.now.to_f * 1000).round
     end
 
-    # The engine (herdr's discipline): ONE flusher thread, Mutex +
-    # ConditionVariable, enqueue-only handlers, every failure swallowed.
-    # Per-boot object — `register` builds it, the boot wiring drops the
-    # reference (the handlers close over it).
+    # The engine (herdr's discipline): ONE flusher task on the host
+    # reactor, enqueue-only handlers, every failure swallowed. Per-boot
+    # object — `register` builds it, the boot wiring drops the reference
+    # (the handlers close over it). I107 (V4/M6): the guard Mutex + both
+    # CondVars die — every mutation funnel (bind/registry, the queue
+    # push/splice, the due-window arm/reset, the capture close/unbind,
+    # the POST-completion flip, the stop flip) is a same-reactor
+    # operation with no scheduler-visible suspension, and the bare-seat
+    # callers (the shutdown tail) cannot interleave with fibers.
     class Engine
+      # The scheduler-ready rider (Notification::Signal's mechanism — async
+      # clone lib/async/notification.rb): the selector processes its ready
+      # list by calling #transfer, which pushes the same queue.
       attr_reader :identity, :env, :config_path, :system_prompt
 
       # @param tuning [Hash] register-time test seam — may shrink the
@@ -422,12 +433,15 @@ module Tart
           shutdown_wait_ms: tuning[:shutdown_wait_ms] || SHUTDOWN_WAIT_MS,
           shutdown_post_timeout_ms: tuning[:shutdown_post_timeout_ms] || SHUTDOWN_POST_TIMEOUT_MS
         }.freeze
-        @mutex = Mutex.new
-        @cond = ConditionVariable.new
+        # I107 (V4/M6 + the V1 seam): bare same-reactor state + the wake
+        # queue (a plain Thread::Queue timed pop parks a reactor FIBER;
+        # blocks a plain thread) + the plain-Integer version.
+        @ready = Async::Queue.new
+        @state_version = 0
         @captures = []
         @counters = {}
         @due = nil
-        @thread = nil
+        @flusher = nil
         @stop = false
         @posting = false
       end
@@ -439,13 +453,43 @@ module Tart
 
       # The bound captures (the test seam's readback; inert = empty).
       def captures
-        @mutex.synchronize { @captures.dup }
+        @captures.dup
       end
 
       # The in-process counter registry: n is monotonic per session id
       # ACROSS rebinds — a rebind seeds max(process counter, file seed).
       def counter_for(session_id)
-        @mutex.synchronize { @counters[session_id] || 0 }
+        @counters[session_id] || 0
+      end
+
+      # Structural quiescence reader (I103 additive — the D-family's
+      # non-event predicate): queue-empty ∧ no due-window ∧ no in-flight
+      # POST across every capture. False mid-POST would break the
+      # then-assert-zero/one proofs (the queue is spliced before the POST
+      # runs, so queue-empty alone is not quiescence).
+      def idle?
+        @due.nil? && !@posting && @captures.all? { |capture| capture.queue.empty? }
+      end
+
+      # --- I103 state-signal seam (I107 V1 mechanics) ---------------------
+      # The await-loop's version read + the test-only park, riding the V1
+      # wake: a plain-Integer version and a Thread::Queue timed-pop park
+      # (parks a reactor FIBER; blocks a plain thread). The footprint is
+      # these two methods, idle?, signal_state_change, and its call
+      # sites: deleting them restores base behavior byte-for-byte (a
+      # ping with no waiter is a no-op; production never waits).
+      def state_version
+        @state_version
+      end
+
+      # Parks until the version moves past from_version, belt-bounded (nil
+      # on belt expiry with no change). Production never calls this.
+      def wait_state_change(from_version, belt: 60)
+        loop do
+          return @state_version if @state_version > from_version
+
+          return nil if @ready.pop(timeout: belt).nil?
+        end
       end
 
       def handle_session_start(event, context)
@@ -462,12 +506,11 @@ module Tart
         capture = Capture.new(session_id:, session_path: ref["agent_session_path"],
                               cwd: context[:cwd], mode: context[:mode], identity: bind_identity,
                               config: config, engine: self)
-        @mutex.synchronize do
-          @captures << capture unless @captures.include?(capture)
-          @counters[capture.session_id] = capture.counter
-          ensure_thread
-          @cond.signal
-        end
+        @captures << capture unless @captures.include?(capture)
+        @counters[capture.session_id] = capture.counter
+        ensure_flusher
+        ping
+        signal_state_change
       rescue StandardError
         nil # swallowed — nothing thrown into the host, ever
       end
@@ -505,77 +548,102 @@ module Tart
         nil
       end
 
-      # The flusher's stop (the test seam AND the terminal path: the
-      # thread must not hold the process at interpreter exit — ruby 4.0
-      # has no daemon threads).
+      # The flusher's stop (the test seam AND the terminal path): the
+      # V1 ping wakes the parked drain; the bounded stop is Task#stop (the
+      # Cancel lands at the pop park — the D2 unwind). A dead task (the
+      # post-reactor seat) is a no-op. The transient task never holds the
+      # reactor open regardless.
       def stop
-        @mutex.synchronize do
-          @stop = true
-          @cond.broadcast
+        @stop = true
+        ping
+        signal_state_change
+        if (flusher = @flusher) && flusher.alive?
+          flusher.stop
+          begin
+            flusher.wait
+          rescue Async::Cancel, StandardError
+            nil # the unwind is the point; the parks are bounded
+          end
         end
-        @thread&.join(2)
-        @thread = nil
+        @flusher = nil
         nil
       end
 
       private
 
+      # The V1 ping (the wake's producer side): the direct queue push
+      # plus the scheduler-ready rider when a scheduler is present on the
+      # producer's thread (Notification::Signal's mechanism) — both paths
+      # honor the standing same-thread lost-wakeup claim.
+      def ping
+        @ready.push(:wake)
+        Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
+        nil
+      end
+
+      # I103 — the state-signal broadcast (additive observability): the
+      # tail of every observed flusher mutation funnel (bind/registry,
+      # queue push/pop, due-window arm/reset, capture close/unbind, POST
+      # completion, the stop flip). A ping with no waiter is a no-op.
+      def signal_state_change
+        @state_version += 1
+        ping
+        nil
+      end
+
       # The last-bound capture (the one live events project into); a
       # closed capture is never re-projected.
       def current_capture
-        @mutex.synchronize { @captures.reverse.find { |capture| !capture.closed? } }
+        @captures.reverse.find { |capture| !capture.closed? }
       end
 
       # Rebind: flush the previous captures NON-terminally (best-effort
       # splice + POST — the due-now signal hands the pending queue to the
       # flusher) and mark them closed; the flusher drops them drained.
       def flush_previous_captures
-        @mutex.synchronize do
-          previous = @captures.select { |capture| !capture.closed? }
-          previous.each { |capture| capture.close }
-          unless previous.empty?
-            @due = now_ms
-            @cond.signal
-          end
+        previous = @captures.select { |capture| !capture.closed? }
+        previous.each { |capture| capture.close }
+        unless previous.empty?
+          @due = now_ms
+          ping
         end
+        signal_state_change
       end
 
       def unbind(capture)
-        @mutex.synchronize do
-          capture.close
-          @due = now_ms if @captures.any? { |c| !c.closed? && !c.queue.empty? }
-          @cond.signal
-        end
+        capture.close
+        @due = now_ms if @captures.any? { |c| !c.closed? && !c.queue.empty? }
+        ping
+        signal_state_change
       end
 
       def enqueue(capture, record, n)
         dropped = 0
-        @mutex.synchronize do
-          capture.counter = n
-          @counters[capture.session_id] = n
-          capture.queue << record
-          dropped = capture.queue.size - @tuning[:queue_cap]
-          dropped.times { capture.queue.shift } if dropped.positive?
-          @due ||= now_ms + @tuning[:debounce_ms]
-          ensure_thread
-          @cond.signal
-        end
+        capture.counter = n
+        @counters[capture.session_id] = n
+        capture.queue << record
+        dropped = capture.queue.size - @tuning[:queue_cap]
+        dropped.times { capture.queue.shift } if dropped.positive?
+        @due ||= now_ms + @tuning[:debounce_ms]
+        ensure_flusher
+        ping
+        signal_state_change
         report_loss(capture, "queue overflow: dropped #{dropped} oldest record(s) for session #{capture.session_id}") if dropped.positive?
       end
 
       def terminal_flush(capture)
         # Bounded wait for an in-flight POST (the flusher's), then the
-        # capture is gone from the registry — pending content splices
-        # under the mutex, order preserved.
+        # capture is gone from the registry — pending content splices,
+        # order preserved. The wait parks on the V1 wake (the POST-
+        # completion ping); the belt is the shutdown bound itself.
         deadline = now_ms + @tuning[:shutdown_wait_ms]
         records = nil
-        @mutex.synchronize do
-          @cond.wait(@mutex, remaining_ms(deadline) / 1000.0) while @posting && remaining_ms(deadline).positive?
-          capture.close
-          @captures.delete(capture)
-          @due = nil
-          records = capture.splice
-        end
+        @ready.pop(timeout: remaining_ms(deadline) / 1000.0) while @posting && remaining_ms(deadline).positive?
+        capture.close
+        @captures.delete(capture)
+        @due = nil
+        records = capture.splice
+        signal_state_change
         with_post_lock { post_batch(capture, records, terminal: true) }
         stop
       end
@@ -584,39 +652,26 @@ module Tart
       # never splices under one, and the terminal handler holds the lock
       # across its own one-shot POST.
       def with_post_lock
-        @mutex.synchronize { @posting = true }
+        @posting = true
         begin
           yield
         ensure
-          @mutex.synchronize do
-            @posting = false
-            @cond.broadcast
-          end
+          @posting = false
+          ping
+          signal_state_change # I103 — the POST completed
         end
       end
 
-      # ONE flusher thread: waits to due, splices the WHOLE queue (per
-      # capture), posts FIFO — ≤ 1 in-flight POST by construction.
+      # ONE flusher task (TRANSIENT on the host reactor — it never holds
+      # the reactor open; the teardown cancel is its unwind path): waits
+      # to due on the V1 wake (the debounce window is the pop's timeout —
+      # a task TIMER shape, never a wall-clock poll loop), splices the
+      # WHOLE queue (per capture), posts FIFO — ≤ 1 in-flight POST by
+      # construction (the @posting flag + the wake ping; same-reactor
+      # funnels cannot interleave).
       def drain_loop
         loop do
-          work = nil
-          @mutex.synchronize do
-            until @stop
-              if @posting
-                @cond.wait(@mutex, 0.05) # never splice under an in-flight POST
-              elsif @due.nil?
-                @cond.wait(@mutex)
-              else
-                remaining = remaining_ms(@due)
-                if remaining <= 0
-                  @due = nil
-                  work = splice_all
-                  break
-                end
-                @cond.wait(@mutex, remaining / 1000.0)
-              end
-            end
-          end
+          work = wait_for_work
           break if @stop || work.nil?
 
           work.each do |capture, records|
@@ -625,6 +680,34 @@ module Tart
         end
       rescue StandardError
         nil # swallowed — the harness NEVER crashes on the sink
+      end
+
+      # The flusher's park: the V1 timed pop. Nil due → park on the wake
+      # (the belt bounds the park purely as the wedge guard — a lost wake
+      # re-checks after IDLE_BELT_S); a due window → park until the wake
+      # or the due TIMER fires; @posting → park until the POST-completion
+      # ping (never splice under an in-flight POST).
+      IDLE_BELT_S = 30
+
+      def wait_for_work
+        loop do
+          return nil if @stop
+
+          if @posting
+            @ready.pop(timeout: IDLE_BELT_S)
+          elsif @due.nil?
+            @ready.pop(timeout: IDLE_BELT_S)
+          else
+            remaining = remaining_ms(@due)
+            if remaining <= 0
+              @due = nil
+              work = splice_all
+              signal_state_change # I103 — the queue pop
+              return work
+            end
+            @ready.pop(timeout: remaining / 1000.0)
+          end
+        end
       end
 
       def splice_all
@@ -696,11 +779,15 @@ module Tart
         nil
       end
 
-      def ensure_thread
+      # The flusher task spawns on the HOST REACTOR (the handler seats);
+      # TRANSIENT — never holds the reactor open. An off-reactor seat
+      # spawns nothing (the terminal flush covers the bare tail).
+      def ensure_flusher
         @stop = false
-        return if @thread&.alive?
+        return if @flusher&.alive?
 
-        @thread = Thread.new { drain_loop }
+        task = Async::Task.current? or return
+        @flusher = task.async(transient: true) { drain_loop }
       end
 
       def remaining_ms(due)

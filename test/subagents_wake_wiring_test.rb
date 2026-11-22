@@ -70,100 +70,106 @@ module Tart
     # --- W3: a completion notify opens a parent turn, ZERO keypress ---
 
     def test_a_completion_notify_opens_a_parent_turn_with_zero_keypress
-      @server.script([
-        # The child's single turn, then the parent's wake turn — arrival
-        # order is causal (the notify derives from the child's settle),
-        # so the blind script shift is deterministic here.
-        {type: :stream, content: "CHILD DONE"},
-        {type: :stream, content: "WAKE ACK"}
-      ])
-      hooks = Hooks.new
-      session = Test::ScriptedSession.new
-      kernel, kernel_thread, rail_else = wake_kernel(session)
-      parent = Agent::Loop.new(chat: Test::TestChat.build(@server, system_prompt: "test prompt"),
-                               tools: {}, hooks:)
-      manager = new_manager(hooks:, kernel: Subagents.wake_bridge(session), agent: -> { parent })
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([
+          # The child's single turn, then the parent's wake turn — arrival
+          # order is causal (the notify derives from the child's settle),
+          # so the blind script shift is deterministic here.
+          {type: :stream, content: "CHILD DONE"},
+          {type: :stream, content: "WAKE ACK"}
+        ])
+        hooks = Hooks.new
+        session = Test::ScriptedSession.new
+        kernel, kernel_thread, rail_else = wake_kernel(session)
+        parent = Agent::Loop.new(chat: Test::TestChat.build(@server, system_prompt: "test prompt"),
+                                 tools: {}, hooks:)
+        manager = new_manager(hooks:, kernel: Subagents.wake_bridge(session), agent: -> { parent })
 
-      run = manager.spawn_run(agent: "worker", task: "one quick turn for the wake pin",
-                             async: true, timeout_ms: 0, tool_timeout_ms: 0)
-      assert_equal :running, run[:state], "the child started detached"
+        run = manager.spawn_run(agent: "worker", task: "one quick turn for the wake pin",
+                               async: true, timeout_ms: 0, tool_timeout_ms: 0)
+        assert_equal :running, run[:state], "the child started detached"
 
-      wait_terminal(manager, run[:id])
-      assert_equal :completed, run[:state], "the child completed cleanly"
+        wait_terminal(manager, run[:id])
+        assert_equal :completed, run[:state], "the child completed cleanly"
 
-      # The watcher's settle queued the notify + kicked the wake; the
-      # ferry pushed the kick onto the session's synthetic channel; the
-      # running kernel drained it through the frozen rail onto the
-      # parent's wake — a NEW model request, zero keypress.
-      seen = []
-      wake_request = nil
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
-      while wake_request.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        seen.concat(@server.captured_requests)
-        wake_request = seen.find do |request|
-          request["messages"].any? do |message|
-            message["role"] == "user" && message["content"].to_s.include?("Background task completed: **worker**")
+        # The watcher's settle queued the notify + kicked the wake; the
+        # ferry pushed the kick onto the session's synthetic channel; the
+        # running kernel drained it through the frozen rail onto the
+        # parent's wake — a NEW model request, zero keypress.
+        seen = []
+        wake_request = nil
+        await(@server, "the completion notify to open a parent turn") do
+          seen.concat(@server.captured_requests)
+          wake_request = seen.find do |request|
+            request["messages"].any? do |message|
+              message["role"] == "user" && message["content"].to_s.include?("Background task completed: **worker**")
+            end
           end
+          !wake_request.nil?
         end
-        sleep 0.05 unless wake_request
-      end
 
-      refute_nil wake_request, "the completion notify never opened a parent turn"
-      preview_rode = wake_request["messages"].any? do |message|
-        message["role"] == "user" && message["content"].to_s.include?("CHILD DONE")
+        refute_nil wake_request, "the completion notify never opened a parent turn"
+        preview_rode = wake_request["messages"].any? do |message|
+          message["role"] == "user" && message["content"].to_s.include?("CHILD DONE")
+        end
+        assert preview_rode, "the notify body (the child's output preview) rides the same user-role message"
+        assert_empty session.events, "ZERO native events pushed — the kick rode the synthetic channel"
+        refute session.synthetic_pending?, "the ferry's block was drained by the running kernel"
+        assert_empty rail_else, "the rail's non-wake arm never fired"
+      ensure
+        stop_kernel(kernel, kernel_thread)
+        manager&.shutdown
       end
-      assert preview_rode, "the notify body (the child's output preview) rides the same user-role message"
-      assert_empty session.events, "ZERO native events pushed — the kick rode the synthetic channel"
-      refute session.synthetic_pending?, "the ferry's block was drained by the running kernel"
-      assert_empty rail_else, "the rail's non-wake arm never fired"
-    ensure
-      stop_kernel(kernel, kernel_thread)
-      manager&.shutdown
     end
 
     # --- W4: a supervisor ask opens a parent turn, ZERO keypress ---
 
     def test_a_supervisor_ask_opens_a_parent_turn_with_zero_keypress
-      hooks = Hooks.new
-      session = Test::ScriptedSession.new
-      kernel, kernel_thread, rail_else = wake_kernel(session)
-      parent = Agent::Loop.new(chat: Test::TestChat.build(@server, system_prompt: "test prompt"),
-                               tools: {}, hooks:)
-      bridge = Subagents.wake_bridge(session)
-      channel = new_channel(home: File.join(@home, "subagents"), hooks:, kernel: bridge,
-                            agent: -> { parent })
-      run = fake_run("worker")
-      message = "WIRE-PIN-ASK: proceed with the wake wiring?"
-      rid = stage_request(run, reason: "need_decision", message:)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        hooks = Hooks.new
+        session = Test::ScriptedSession.new
+        kernel, kernel_thread, rail_else = wake_kernel(session)
+        parent = Agent::Loop.new(chat: Test::TestChat.build(@server, system_prompt: "test prompt"),
+                                 tools: {}, hooks:)
+        bridge = Subagents.wake_bridge(session)
+        channel = new_channel(home: File.join(@home, "subagents"), hooks:, kernel: bridge,
+                              agent: -> { parent })
+        run = fake_run("worker")
+        message = "WIRE-PIN-ASK: proceed with the wake wiring?"
+        rid = stage_request(run, reason: "need_decision", message:)
 
-      # The channel's scan surfaces the staged ask; the wake opens the
-      # parent turn carrying it as user-role wire text (the intercom
-      # round-trip assertions shape).
-      seen = []
-      ask_request = nil
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
-      while ask_request.nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        seen.concat(@server.captured_requests)
-        ask_request = seen.find do |request|
-          request["messages"].any? { |m| m["role"] == "user" && m["content"].to_s.include?(message) }
+        # The channel's scan surfaces the staged ask; the wake opens the
+        # parent turn carrying it as user-role wire text (the intercom
+        # round-trip assertions shape).
+        seen = []
+        ask_request = nil
+        await(@server, "the supervisor ask to open a parent turn") do
+          seen.concat(@server.captured_requests)
+          ask_request = seen.find do |request|
+            request["messages"].any? { |m| m["role"] == "user" && m["content"].to_s.include?(message) }
+          end
+          !ask_request.nil?
         end
-        sleep 0.05 unless ask_request
-      end
 
-      refute_nil ask_request, "the supervisor ask never opened a parent turn"
-      ask_message = ask_request["messages"].find do |m|
-        m["role"] == "user" && m["content"].to_s.include?(message)
+        refute_nil ask_request, "the supervisor ask never opened a parent turn"
+        ask_message = ask_request["messages"].find do |m|
+          m["role"] == "user" && m["content"].to_s.include?(message)
+        end
+        refute_nil ask_message, "the ask rides as user-role wire text"
+        assert_includes ask_message["content"], "Subagent needs a supervisor decision."
+        assert_includes ask_message["content"], "Reply with: subagent({ action: \"reply\", reply_to: \""
+        assert_includes ask_message["content"], "(Reply to the pending request first.)"
+        assert_equal rid, channel.pending.first[:id], "the ask stays registered for the reply path"
+        assert_empty session.events, "ZERO native events pushed"
+        refute session.synthetic_pending?, "the ferry's block was drained by the running kernel"
+        assert_empty rail_else, "the rail's non-wake arm never fired"
+      ensure
+        stop_kernel(kernel, kernel_thread)
       end
-      refute_nil ask_message, "the ask rides as user-role wire text"
-      assert_includes ask_message["content"], "Subagent needs a supervisor decision."
-      assert_includes ask_message["content"], "Reply with: subagent({ action: \"reply\", reply_to: \""
-      assert_includes ask_message["content"], "(Reply to the pending request first.)"
-      assert_equal rid, channel.pending.first[:id], "the ask stays registered for the reply path"
-      assert_empty session.events, "ZERO native events pushed"
-      refute session.synthetic_pending?, "the ferry's block was drained by the running kernel"
-      assert_empty rail_else, "the rail's non-wake arm never fired"
-    ensure
-      stop_kernel(kernel, kernel_thread)
     end
 
     # --- W5: the wake failure is loud; the ask survives (the ONE
@@ -202,37 +208,68 @@ module Tart
     # design; the ask/notify rides pending_next_turn only ---
 
     def test_print_mode_nil_kernel_never_wakes_and_never_warns
-      @server.script([{type: :stream, content: "PRINT MODE CHILD DONE"}])
-      hooks = Hooks.new
-      manager = new_manager(hooks:, kernel: nil, agent: nil)
-      channel = Subagents::SupervisorChannel.new(home: manager.home, hooks:, kernel: nil, agent: nil)
-      @channels << channel
-      channel.start
-      run = fake_run("worker")
-      stage_request(run, reason: "need_decision", message: "PRINT-MODE ASK")
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        @server.script([{type: :stream, content: "PRINT MODE CHILD DONE"}])
+        hooks = PingedHooks.new
+        manager = new_manager(hooks:, kernel: nil, agent: nil)
+        channel = Subagents::SupervisorChannel.new(home: manager.home, hooks:, kernel: nil, agent: nil)
+        @channels << channel
+        channel.start
+        run = fake_run("worker")
+        stage_request(run, reason: "need_decision", message: "PRINT-MODE ASK")
 
-      drained = []
-      out = err = nil
-      out, err = capture_io do
-        child = manager.spawn_run(agent: "worker", task: "print mode wake pin", async: true,
-                                  timeout_ms: 0, tool_timeout_ms: 0)
-        wait_terminal(manager, child[:id])
-        assert_equal :completed, child[:state]
-        # Terminal ⇒ queued (the settle atomicity pin); accumulate BOTH
-        # queue riders across the poll — pending_next_turn is a drain.
-        wait_until { drained.concat(hooks.pending_next_turn); drained.size >= 2 }
-        manager.send(:kick_wake) # the nil arm: silent return, no raise
+        drained = []
+        out = err = nil
+        out, err = capture_io do
+          child = manager.spawn_run(agent: "worker", task: "print mode wake pin", async: true,
+                                    timeout_ms: 0, tool_timeout_ms: 0)
+          wait_terminal(manager, child[:id])
+          assert_equal :completed, child[:state]
+          # Terminal ⇒ queued (the settle atomicity pin); accumulate BOTH
+          # queue riders across the drain — pending_next_turn is a drain.
+          await(hooks, "the ask + the notify to ride the queue") do
+            drained.concat(hooks.pending_next_turn)
+            drained.size >= 2
+          end
+          manager.send(:kick_wake) # the nil arm: silent return, no raise
+        end
+
+        assert_equal "", out, "print mode prints nothing on stdout"
+        assert_equal "", err, "print mode warns nothing on stderr"
+        types = drained.map { |p| p[:custom_type] }
+        assert_includes types, Subagents::Supervisor::REQUEST_CUSTOM_TYPE, "the ask rode the queue"
+        assert_includes types, Subagents::NOTIFY_CUSTOM_TYPE, "the notify rode the queue"
+        ask = drained.find { |p| p[:custom_type] == Subagents::Supervisor::REQUEST_CUSTOM_TYPE }
+        assert_includes ask[:content], "PRINT-MODE ASK"
+        notify = drained.find { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
+        assert notify[:content].start_with?("Background task completed: **worker**")
+      end
+    end
+
+    # The hooks double's Gate (I103 B): send_next_turn's append is the
+    # surfaced/notify mutation — a subclass pings a Gate right after it so
+    # queue drains park on the event, not a poll.
+    class PingedHooks < Hooks
+      def initialize
+        super
+        @queue_gate = Tart::Test::Gate.new
       end
 
-      assert_equal "", out, "print mode prints nothing on stdout"
-      assert_equal "", err, "print mode warns nothing on stderr"
-      types = drained.map { |p| p[:custom_type] }
-      assert_includes types, Subagents::Supervisor::REQUEST_CUSTOM_TYPE, "the ask rode the queue"
-      assert_includes types, Subagents::NOTIFY_CUSTOM_TYPE, "the notify rode the queue"
-      ask = drained.find { |p| p[:custom_type] == Subagents::Supervisor::REQUEST_CUSTOM_TYPE }
-      assert_includes ask[:content], "PRINT-MODE ASK"
-      notify = drained.find { |p| p[:custom_type] == Subagents::NOTIFY_CUSTOM_TYPE }
-      assert notify[:content].start_with?("Background task completed: **worker**")
+      def send_next_turn(custom_type:, content:, display: false)
+        result = super
+        @queue_gate.ping
+        result
+      end
+
+      def state_version
+        @queue_gate.state_version
+      end
+
+      def wait_state_change(from_version, belt: WEDGE_BELT_S)
+        @queue_gate.wait_state_change(from_version, belt: belt)
+      end
     end
 
     # --- harness (self-contained; the intercom/box idioms restated) ---
@@ -286,16 +323,12 @@ module Tart
       id
     end
 
-    def wait_terminal(manager, id, timeout = 40)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    def wait_terminal(manager, id)
       record = nil
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      await(manager, "run #{id} to settle") do
         record = manager.runs.find { |r| r[:id] == id }
-        break if record && record[:state] != :running
-
-        sleep 0.1
+        record && record[:state] != :running
       end
-      flunk "run #{id} never settled: #{record && record[:state]}" unless record && record[:state] != :running
       record[:state]
     end
 
@@ -323,17 +356,13 @@ module Tart
       [kernel, thread, rail_else]
     end
 
-    # The bounded teardown: a wedged kernel fails the pin instead of
-    # hanging the suite.
+    # The teardown: stop! requests the terminal event synchronously; the
+    # blocking join is the C primitive after it (a bare join is not a
+    # sleep).
     def stop_kernel(kernel, thread)
       return unless thread
 
       kernel&.stop!
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
-      until !thread.alive? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        sleep 0.02
-      end
-      flunk "the wake kernel never stopped" if thread.alive?
       thread.join
     end
   end

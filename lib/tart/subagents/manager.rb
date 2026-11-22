@@ -54,6 +54,9 @@ module Tart
     # polls at POLL_INTERVAL (pi POLL_INTERVAL_MS 250) and on terminal
     # delivers the I47 notification + the interactive wake.
     class Manager
+      # The scheduler-ready rider (Notification::Signal's mechanism — async
+      # clone lib/async/notification.rb): the selector processes its ready
+      # list by calling #transfer, which pushes the same queue.
       # pi's 30-minute single-run default (DEFAULT_ASYNC_TIMEOUT_MS);
       # 0/nil = unbounded (T2's first kind, settable per call).
       DEFAULT_TIMEOUT_MS = 1_800_000
@@ -154,11 +157,19 @@ module Tart
         # fresh startup inherits nothing (I99 D7 stands).
         @session_chains = {}
         @kept_work = []
-        @mutex = Mutex.new
+        # I107 (V4/M4): the registry guard Mutex dies — every funnel is a
+        # same-reactor Array/Hash operation with no scheduler-visible
+        # suspension (spawn/settle/stop/reconcile ride the host reactor's
+        # fibers; the bare-seat callers — the print tail — cannot
+        # interleave with fibers).
         @runs = []
         @supervisors = []
         @watcher = nil
         @shutdown = false
+        # The I103 state-signal seam's V1 wake (I107): the plain-Integer
+        # version + the Thread::Queue timed-pop park.
+        @ready = Async::Queue.new
+        @state_version = 0
         FileUtils.mkdir_p(@home)
       end
 
@@ -271,12 +282,12 @@ module Tart
           # T3: the detach thread owns the reap — the parent never
           # waitpids, so there is no early reap and no zombie.
           Process.detach(pid)
-          @mutex.synchronize do
-            record[:pid] = pid
-            record[:pgid] = pid
-          end
+          record[:pid] = pid
+          record[:pgid] = pid
+          signal_state_change
           write_status(record)
-          @mutex.synchronize { @runs << record }
+          @runs << record
+          signal_state_change
         rescue StandardError
           close_exit_pipe(record)
           raise
@@ -286,6 +297,13 @@ module Tart
           exit_wr.close rescue nil
         end
 
+        # The channel poller's deferred arm (I107): the boot register runs
+        # at the bare seat (it can only MARK the arm), so the first
+        # on-reactor seat — every spawn_run is one — starts the poll task.
+        # No owned ask can exist before the first local run dir is minted,
+        # so the deferred start is observably equivalent to base's
+        # boot-time poller thread.
+        @supervisor_channel&.ensure_poller
         arm_deadline_supervisor(record)
         unless record[:async]
           wait_for_exit(record)
@@ -352,7 +370,8 @@ module Tart
         atomic_write_json(File.join(stop_requests_dir(record[:dir]),
                                     "#{ts.to_s.rjust(13, "0")}-#{Fast::UUID.uuid_v4}.json"),
                           {"type" => "stop", "ts" => ts})
-        @mutex.synchronize { record[:stopped] = true }
+        record[:stopped] = true
+        signal_state_change
         await_exit(record, STOP_GRACE_SECONDS)
         escalate(record, "TERM", TERM_GRACE_SECONDS)
         escalate(record, "KILL", POLL_INTERVAL)
@@ -366,7 +385,7 @@ module Tart
         return render_status(reconcile_run(find_run!(id.to_s))) if id
 
         sweep_home
-        list = @mutex.synchronize { @runs.dup }
+        list = @runs.dup
         list.each { |record| reconcile_run(record) }
         ordered = list.sort_by { |record| [record[:state] == :running ? 0 : 1, -(record[:started_at] || 0)] }
         return FLEET_EMPTY_LINE if ordered.empty?
@@ -385,36 +404,79 @@ module Tart
 
       # The registry snapshot (the §2.2 record hashes, spawn order).
       def runs
-        @mutex.synchronize { @runs.map(&:dup) }
+        @runs.map(&:dup)
       end
 
       # Any non-terminal OWNED run — the print drain's predicate (I78
       # Law 3: a foreign run adopted from disk never gates the adopter's
       # drain).
       def outstanding?
-        @mutex.synchronize { @runs.any? { |record| record[:owned] && record[:state] == :running } }
+        @runs.any? { |record| record[:owned] && record[:state] == :running }
+      end
+
+      # --- I103 state-signal seam (I107 V1 mechanics) ---------------------
+      # The await-loop's version read + the test-only park, riding the V1
+      # wake: a plain-Integer version and a Thread::Queue timed-pop park
+      # (parks a reactor FIBER; blocks a plain thread). The footprint is
+      # these two methods, signal_state_change, and its call sites:
+      # deleting them restores base behavior byte-for-byte (a ping with
+      # no waiter is a no-op; production never waits).
+      def state_version
+        @state_version
+      end
+
+      # Parks until the version moves past from_version, belt-bounded (nil
+      # on belt expiry with no change). Production never calls this.
+      def wait_state_change(from_version, belt: 60)
+        loop do
+          return @state_version if @state_version > from_version
+
+          return nil if @ready.pop(timeout: belt).nil?
+        end
       end
 
       # §5.4 — the print agent-end drain: waits for every outstanding run
       # (each bounded by its own deadline — the supervisors enforce it),
       # the watcher recording each completion notification on the hooks
-      # queue as it settles. Returns when nothing is outstanding.
+      # queue as it settles. Returns when nothing is outstanding. The
+      # reconcile pass runs every sweep: at the BARE post-reactor seat
+      # (bin/tart's print tail) the watcher task no longer exists (its
+      # host reactor completed — I107/V2), so the drain drives settlement
+      # itself through the disk-first reconcile (the dead-child leg
+      # settles through the FULL processor — the notification queues
+      # exactly as the watcher's live settle does).
       def drain
         ensure_watcher
-        sleep POLL_INTERVAL / 5 while outstanding?
+        until !outstanding?
+          reconcile_outstanding
+          # The bare-tail scan carrier (I107): the drain runs
+          # off-reactor (bin/tart's print tail), so its passes tick the
+          # channel directly — the ask file pending on a still-running
+          # child surfaces here when the watcher already exited.
+          @supervisor_channel&.poll_once
+          sleep(POLL_INTERVAL / 5.0) if outstanding?
+        end
         nil
+      end
+
+      # One reconcile sweep over the still-running records (the drain's
+      # settlement engine at every seat).
+      def reconcile_outstanding
+        @runs.select { |record| record[:owned] && record[:state] == :running }
+             .each { |record| reconcile_run(record) }
+      rescue StandardError
+        nil # a transient read/probe error never kills the drain
       end
 
       # Test teardown: stop every running run (the full graceful ladder),
       # then join the watcher + supervisor threads; the I49 supervisor
       # channel stops LAST (its terminal sweep sees the settled runs).
       def shutdown
-        @mutex.synchronize { @shutdown = true }
+        @shutdown = true
+        signal_state_change
         # I78 Law 3: the stop ladder arms ONLY owned runs — stopping a
         # foreign child from teardown would signal another session's run.
-        ids = @mutex.synchronize do
-          @runs.select { |record| record[:owned] && record[:state] == :running }.map { |record| record[:id] }
-        end
+        ids = @runs.select { |record| record[:owned] && record[:state] == :running }.map { |record| record[:id] }
         ids.each do |id|
           begin
             stop(id:)
@@ -422,10 +484,11 @@ module Tart
             nil
           end
         end
-        watcher = @mutex.synchronize { @watcher }
-        watcher&.join(POLL_INTERVAL * 8)
-        threads = @mutex.synchronize { supervisors = @supervisors; @supervisors = []; supervisors }
-        threads.each { |thread| thread.join(1) rescue nil }
+        watcher = @watcher
+        stop_task_quietly(watcher) # in-reactor seat: bounded cancel at the watcher's park
+        timers = @supervisors
+        @supervisors = []
+        timers.each { |timer| stop_task_quietly(timer) }
         begin
           @supervisor_channel&.stop
         rescue StandardError
@@ -494,43 +557,42 @@ module Tart
       # parent_session_id rescues) is NEVER a replacement: the memoized
       # id when one exists, else the per-boot mint, unchanged. No agent
       # threaded (print boots, bare test Managers): the boot mint
-      # byte-held (the I99 fast path). The resolution itself stays
-      # outside @mutex (the standing discipline: arbitrary callable code
-      # never runs under the registry lock).
+      # byte-held (the I99 fast path). The resolution itself takes no
+      # lock (the standing discipline: arbitrary callable code never runs
+      # under a registry lock).
       def session_owner_id
         return @boot_session_id unless @agent
 
         resolved = parent_session_id
-        memo = @mutex.synchronize { @session_owner_id }
+        memo = @session_owner_id
         return memo || @boot_session_id unless resolved
         return memo if memo == resolved
 
         pruned_ids = nil
-        @mutex.synchronize do
-          # Re-read the memo first: concurrent consults of one swap record
-          # exactly once (the loser finds the memo already moved).
-          previous = @session_owner_id
-          next previous if previous == resolved
+        # Re-read the memo first: consults of one swap record exactly once
+        # (the loser finds the memo already moved).
+        previous = @session_owner_id
+        return previous if previous == resolved
 
-          if previous
-            record_session_replacement_locked(resolved, previous)
-            # L4 — the prune: forget every run the new owner set does not
-            # own (a normal replacement prunes nothing — the chain owns
-            # the predecessors; a keep-marked replacement prunes the
-            # declared session's records). The set reads the just-recorded
-            # chain directly — owner_session_ids would re-enter the mutex.
-            owner_set = [resolved, *@session_chains.fetch(resolved, [])]
-            pruned_ids = @runs.reject { |record| owner_set.include?(record[:session_id]) }
-              .map { |record| record[:id] }
-            @runs.delete_if { |record| !owner_set.include?(record[:session_id]) }
-          else
-            # First-ever resolution arms the registry (pi's startup arm —
-            # on a fresh registry this is a no-op). No prune: L4 rides
-            # replacements only, and pi's start arm never prunes.
-            record_session_start_locked(resolved, startup: true)
-          end
-          @session_owner_id = resolved
+        if previous
+          record_session_replacement_locked(resolved, previous)
+          # L4 — the prune: forget every run the new owner set does not
+          # own (a normal replacement prunes nothing — the chain owns
+          # the predecessors; a keep-marked replacement prunes the
+          # declared session's records). The set reads the just-recorded
+          # chain directly — owner_session_ids would re-enter the mutex.
+          owner_set = [resolved, *@session_chains.fetch(resolved, [])]
+          pruned_ids = @runs.reject { |record| owner_set.include?(record[:session_id]) }
+            .map { |record| record[:id] }
+          @runs.delete_if { |record| !owner_set.include?(record[:session_id]) }
+        else
+          # First-ever resolution arms the registry (pi's startup arm —
+          # on a fresh registry this is a no-op). No prune: L4 rides
+          # replacements only, and pi's start arm never prunes.
+          record_session_start_locked(resolved, startup: true)
         end
+        @session_owner_id = resolved
+        signal_state_change
         # The channel drop runs STRICTLY AFTER the manager mutex is
         # released (the standing ordering law — no manager→channel
         # nesting ever exists under the manager lock). NO files are
@@ -553,7 +615,7 @@ module Tart
       # predecessors. Recency + FIFO at pi's bounds; then the mark on
       # previous_id is released — the mark is spent (D4).
       def record_session_replacement(new_id, previous_id)
-        @mutex.synchronize { record_session_replacement_locked(new_id, previous_id) }
+        record_session_replacement_locked(new_id, previous_id)
       end
 
       # Records a session start: with startup, the session drops its own
@@ -562,7 +624,7 @@ module Tart
       # from every chain — a session live in this process is inherited by
       # no one (pi recordSessionStart, verbatim).
       def record_session_start(id, startup:)
-        @mutex.synchronize { record_session_start_locked(id, startup:) }
+        record_session_start_locked(id, startup:)
       end
 
       # The operator leaves THIS session's work behind (/leave-work, D4):
@@ -570,25 +632,25 @@ module Tart
       # chain when it is reopened. The mark lasts until it is released (a
       # replacement spends it).
       def keep_session_work(id)
-        @mutex.synchronize do
-          @kept_work.delete(id)
-          @kept_work << id
-          @kept_work.shift while @kept_work.size > MAX_RECORDED_SESSIONS
-        end
+        @kept_work.delete(id)
+        @kept_work << id
+        @kept_work.shift while @kept_work.size > MAX_RECORDED_SESSIONS
+        signal_state_change
         nil
       end
 
       # The not-left arm (pi releaseSessionWork): whoever replaces this
       # session next inherits as usual.
       def release_session_work(id)
-        @mutex.synchronize { @kept_work.delete(id) }
+        @kept_work.delete(id)
+        signal_state_change
         nil
       end
 
       # The sessions this process replaced on the way to id, newest first
       # (pi inheritedSessionIds); their runs belong to id.
       def inherited_session_ids(id)
-        @mutex.synchronize { @session_chains.fetch(id, []).dup }
+        @session_chains.fetch(id, []).dup
       end
 
       # The owner SET (pi run-ownership.js): the session itself, then its
@@ -605,21 +667,38 @@ module Tart
       # :running IS the parent's blocked await — exactly for that window
       # (spawn_run appends the record then blocks in wait_for_exit;
       # interrupts settle the record stopped inside the wait's rescue).
-      # The registry read rides @mutex; the CALLER (the channel's poll
-      # thread, via register's predicate) invokes it OUTSIDE every lock.
+      # The registry read is a plain no-lock read since I107; the CALLER
+      # (the channel's poll task, via register's predicate) invokes it
+      # OUTSIDE every lock.
       def foreground_run_awaited?(run_id)
         id = run_id.to_s
-        @mutex.synchronize do
-          @runs.any? { |record| record[:id] == id && record[:async] == false && record[:state] == :running }
-        end
+        @runs.any? { |record| record[:id] == id && record[:async] == false && record[:state] == :running }
       end
 
       private
 
-      # --- I101 — the registry's locked internals (the public API and
-      # --- the identity consult drive these under ONE @mutex
-      # --- synchronize; no public method is ever called under the lock
-      # --- — the no-nesting law) ---
+      # I103 — the state-signal broadcast (additive observability): the
+      # tail of every observed run-record mutation funnel (the spawn
+      # registrations, the pid/pgid stamp, stopped/signaled flags, the
+      # settle's terminal flip + notification, every reap leg, the
+      # deadline flags, the watcher/shutdown lifecycle, the succession
+      # registry writes). The V1 wake: bump the plain-Integer version,
+      # then ping BOTH paths — the direct queue push (the proven
+      # cross-thread wake) and, when a scheduler is present on the
+      # producer's thread, the scheduler-ready rider (Notification::Signal
+      # 's mechanism) — honoring the standing same-thread lost-wakeup
+      # claim. A ping with no waiter is a no-op.
+      def signal_state_change
+        @state_version += 1
+        @ready.push(:wake)
+        Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
+        nil
+      end
+
+      # --- I101 — the registry's internals (the public API and
+      # --- the identity consult drive these as same-reactor funnels —
+      # --- no scheduler-visible suspension inside any funnel, the V4
+      # --- no-yield law; no public method nests a funnel)
 
       def record_session_replacement_locked(new_id, previous_id)
         inherited = kept_work?(previous_id) ? [] : [previous_id, *@session_chains.fetch(previous_id, [])]
@@ -634,6 +713,7 @@ module Tart
         @session_chains[new_id] = chain
         @session_chains.shift while @session_chains.size > MAX_RECORDED_SESSIONS
         @kept_work.delete(previous_id) # the mark is spent (D4)
+        signal_state_change
       end
 
       def record_session_start_locked(id, startup:)
@@ -645,6 +725,7 @@ module Tart
           chain = @session_chains[key]
           @session_chains[key] = chain - [id] if chain.include?(id)
         end
+        signal_state_change
       end
 
       def kept_work?(id)
@@ -801,7 +882,7 @@ module Tart
         # pgroup, settle the run stopped, and propagate (the bash tool's
         # cancellation discipline).
         kill_process_group(record[:pid], "KILL")
-        @mutex.synchronize { record[:stopped] = true }
+        record[:stopped] = true
         begin
           await_exit(record, TERM_GRACE_SECONDS)
           settle_run(record)
@@ -820,7 +901,8 @@ module Tart
         return if exited?(record) || terminal?(record[:state])
 
         kill_process_group(record[:pid], signal)
-        @mutex.synchronize { record[:signaled] = signal == "TERM" ? 15 : 9 }
+        record[:signaled] = signal == "TERM" ? 15 : 9
+        signal_state_change
         await_exit(record, grace)
       end
 
@@ -858,62 +940,63 @@ module Tart
       # the flip so `outstanding? == false` implies the notification is
       # queued (no observation window between the two).
       def settle_run(record)
-        @mutex.synchronize do
-          return record if terminal?(record[:state])
+        return record if terminal?(record[:state])
 
-          output = read_output(record)
-          error_line = first_error_line(record)
-          # The deadline flag rides BOTH sides (T2): the parent supervisor
-          # sets it explicitly; when only the CHILD self-deadline fired,
-          # the settle observes it from the clock (the child may die by
-          # its own TERM a hair before the parent flags).
-          timed_out = record[:deadline_due] == true || deadline_expired?(record)
-          if timed_out && !record[:deadline_due]
-            record[:deadline_due] = true
-            record[:timed_out] = true
-          end
-          parent_killed = record[:stopped] == true || timed_out || record[:signaled]
-          # The print-mode invariant stands in for the unreadable exit
-          # status (the detach owns the reap — no waitpid): the final
-          # response reaches stdout only on a clean run; errors go to
-          # stderr and stdout stays empty.
-          success = !parent_killed && !output.empty?
-          state = parent_killed ? :stopped : (success ? :completed : :failed)
-
-          result = {"output" => output, "success" => success, "timedOut" => timed_out}
-          result["error"] = error_line if !success && error_line
-          result["signal"] = record[:signaled] if record[:signaled]
-          atomic_write_json(result_path(record), result) # BEFORE the flip
-
-          payload = base_status(record).merge(
-            "state" => state.to_s,
-            "lastUpdate" => now_ms,
-            "endedAt" => now_ms,
-            "timedOut" => timed_out,
-            "outputFile" => result_path(record)
-          )
-          payload["error"] = error_line if !success && error_line
-          payload["signal"] = record[:signaled] if record[:signaled]
-          atomic_write_json(status_path(record), payload)
-
-          record[:state] = state
-          record[:timed_out] = timed_out
-          # Law 3 — the box snapshot's flip facts, recorded at the settle.
-          now = now_ms
-          record[:last_update] = now
-          record[:ended_at] = now
-          record[:error] = error_line
-          # JUDGE FIX (post-merge, recorded in the verdict): the notification
-          # must queue INSIDE this mutex — the state flip above was observable
-          # before send_next_turn ran, so `drain`'s outstanding? poll could
-          # return in that window and the print flush would see an empty
-          # queue (leg B flaked 1-in-3 under the loaded rake suite exactly
-          # here). Hooks#send_next_turn is a leaf queue-append (own mutex, no
-          # callbacks) — safe under this lock. With this, `outstanding? ==
-          # false` REALLY implies the notification is queued, as the comment
-          # below always claimed.
-          notify_completion(record) if record[:owned] && record[:async]
+        output = read_output(record)
+        error_line = first_error_line(record)
+        # The deadline flag rides BOTH sides (T2): the parent supervisor
+        # sets it explicitly; when only the CHILD self-deadline fired,
+        # the settle observes it from the clock (the child may die by
+        # its own TERM a hair before the parent flags).
+        timed_out = record[:deadline_due] == true || deadline_expired?(record)
+        if timed_out && !record[:deadline_due]
+          record[:deadline_due] = true
+          record[:timed_out] = true
         end
+        parent_killed = record[:stopped] == true || timed_out || record[:signaled]
+        # The print-mode invariant stands in for the unreadable exit
+        # status (the detach owns the reap — no waitpid): the final
+        # response reaches stdout only on a clean run; errors go to
+        # stderr and stdout stays empty.
+        success = !parent_killed && !output.empty?
+        state = parent_killed ? :stopped : (success ? :completed : :failed)
+
+        result = {"output" => output, "success" => success, "timedOut" => timed_out}
+        result["error"] = error_line if !success && error_line
+        result["signal"] = record[:signaled] if record[:signaled]
+        atomic_write_json(result_path(record), result) # BEFORE the flip
+
+        payload = base_status(record).merge(
+          "state" => state.to_s,
+          "lastUpdate" => now_ms,
+          "endedAt" => now_ms,
+          "timedOut" => timed_out,
+          "outputFile" => result_path(record)
+        )
+        payload["error"] = error_line if !success && error_line
+        payload["signal"] = record[:signaled] if record[:signaled]
+        atomic_write_json(status_path(record), payload)
+
+        record[:state] = state
+        record[:timed_out] = timed_out
+        # Law 3 — the box snapshot's flip facts, recorded at the settle.
+        now = now_ms
+        record[:last_update] = now
+        record[:ended_at] = now
+        record[:error] = error_line
+        # JUDGE FIX (post-merge, recorded in the verdict): the notification
+        # must queue INSIDE this mutex — the state flip above was observable
+        # before send_next_turn ran, so `drain`'s outstanding? poll could
+        # return in that window and the print flush would see an empty
+        # queue (leg B flaked 1-in-3 under the loaded rake suite exactly
+        # here). Hooks#send_next_turn is a leaf queue-append (own mutex, no
+        # callbacks) — safe under this lock. With this, `outstanding? ==
+        # false` REALLY implies the notification is queued, as the comment
+        # below always claimed.
+        notify_completion(record) if record[:owned] && record[:async]
+        # I103 — the settle's broadcast (the terminal flip + the
+        # notification are both visible; THE reap/terminal event).
+        signal_state_change
         close_exit_pipe(record)
         kick_box_draw
         record
@@ -932,10 +1015,9 @@ module Tart
 
         disk = read_json(status_path(record))
         if disk.is_a?(Hash) && TERMINAL_STATES.include?(disk["state"]) && File.file?(result_path(record))
-          @mutex.synchronize do
-            record[:state] = disk["state"].to_sym
-            record[:timed_out] = disk["timedOut"] == true
-          end
+          record[:state] = disk["state"].to_sym
+          record[:timed_out] = disk["timedOut"] == true
+          signal_state_change
           adopt_box_facts(record, disk)
           close_exit_pipe(record)
         elsif exited?(record)
@@ -951,32 +1033,76 @@ module Tart
 
       # --- the watcher (§2.6) ---
 
+      # I107 (T8/V2): the watcher is a TRANSIENT task on the host reactor
+      # (never holds the reactor open; the teardown cancel is its unwind).
+      # The per-running-run exit-pipe reads park the fiber evented (the
+      # I78 exit-pipe wake — the child's death EOFs the pipe) on sibling
+      # read tasks; the deadline backstop rides the same loop's sweep
+      # (the deadline supervisors arm their own timer tasks below). An
+      # off-reactor seat (the bare print tail) spawns nothing — the
+      # drain's reconcile pass covers settlement there.
       def ensure_watcher
-        @mutex.synchronize do
-          return if @shutdown || @watcher&.alive?
+        return if @shutdown || @watcher&.alive?
 
-          @watcher = Thread.new { watch_loop }
-        end
+        task = Async::Task.current? or return
+        @watcher = task.async(transient: true) { watch_loop }
+        signal_state_change
       end
 
       def watch_loop
         loop do
-          records = @mutex.synchronize { @runs.select { |record| record[:state] == :running } }
+          records = @runs.select { |record| record[:state] == :running }
           break if records.empty?
 
-          pipes = records.filter_map { |record| record[:exit_pipe] }
-          ready = pipes.empty? ? [] : IO.select(pipes, nil, nil, POLL_INTERVAL)&.fetch(0, []) || []
-          ready.each do |pipe|
-            record = records.find { |candidate| candidate[:exit_pipe] == pipe }
-            settle_run(record) if record
-          end
-          records.each do |record|
-            next if record[:state] != :running
+          # One evented read per running run's exit pipe: the read parks
+          # the fiber until the child's death EOFs it (the I78 wake),
+          # replacing the IO.select poll. The waits are bounded by the
+          # sweep cadence (POLL_INTERVAL — the deadline backstop + the
+          # belt-and-braces exit sweep ride the re-scan below, exactly
+          # today's cadence).
+          read_tasks = records.filter_map do |record|
+            pipe = record[:exit_pipe]
+            next unless pipe
 
+            task = Async::Task.current.async(transient: true) do
+              begin
+                pipe.readpartial(1)
+              rescue EOFError, Errno::EIO, IOError
+                nil
+              end
+            end
+            [record, task]
+          end
+          if read_tasks.empty?
+            sleep(POLL_INTERVAL) # the sweep cadence (a task timer)
+          else
+            begin
+              Async::Task.current.with_timeout(POLL_INTERVAL) do
+                read_tasks.each { |_record, task| wait_task_quietly(task) }
+              end
+            rescue Async::TimeoutError
+              nil # the sweep cadence: fall through to the re-scan
+            ensure
+              # No parked read task leaks across passes (each would hold a
+              # pipe read; the next pass re-arms fresh reads).
+              read_tasks.each { |_record, task| stop_task_quietly(task) }
+            end
+          end
+          # Re-scan: the settled pipes' records settle through the full
+          # processor; the sweep covers exits the pipe read missed and
+          # the deadline backstop (both-sides T2). The channel's scan
+          # rides every pass too (the I107 drain-phase carrier): the
+          # loop reactor's poll task is reaped at the root's completion,
+          # so the watcher's cadence is what scans a child's ask file
+          # through the run's remaining life (pending asks surface —
+          # a terminal run's ask never does, pi's lifecycle).
+          @supervisor_channel&.poll_once
+          records = @runs.select { |record| record[:state] == :running }
+          records.each do |record|
             # Deadline backstop (arms here too when the §2.2 supervisor
-            # thread is absent/disarmed — both-sides T2) + the belt-and-
-            # braces exit sweep. I78 Law 2/3: a non-owned record routes
-            # through the reaper — disk-only convergence, no notification.
+            # task is absent/disarmed — both-sides T2). I78 Law 2/3: a
+            # non-owned record routes through the reaper — disk-only
+            # convergence, no notification.
             enforce_deadline(record) if deadline_due?(record)
             next unless record[:state] == :running && exited?(record)
 
@@ -986,6 +1112,29 @@ module Tart
       rescue StandardError
         sleep 0.05 # a transient IO error never kills the watcher
         retry
+      end
+
+      # Wait on a sibling read task; a failed/cancelled sibling never
+      # kills the watcher (its StandardError rescue stays the discipline).
+      def wait_task_quietly(task)
+        task.wait
+      rescue Async::Cancel, StandardError
+        nil
+      end
+
+      # Bounded stop of a still-parked sibling: the Cancel lands at the
+      # pipe read park (the D2 unwind discipline).
+      def stop_task_quietly(task)
+        return unless task&.alive?
+        # A cross-thread Task#stop is structurally impossible (async raises
+        # through Fiber.scheduler, which is nil at the bare seat): the task
+        # belongs to a foreign host reactor, and that reactor's own
+        # teardown cancel is its unwind (the D2 discipline). Only the
+        # on-reactor seat stops.
+        return unless Fiber.scheduler
+
+        task.stop
+        wait_task_quietly(task)
       end
 
       def deadline_due?(record)
@@ -999,10 +1148,9 @@ module Tart
       # The deadline path (§2.2): stop request → 5s → TERM → 2s → KILL;
       # state stopped + timedOut (pi's terminal vocabulary — OQ-6).
       def enforce_deadline(record)
-        @mutex.synchronize do
-          record[:deadline_due] = true
-          record[:timed_out] = true
-        end
+        record[:deadline_due] = true
+        record[:timed_out] = true
+        signal_state_change
         write_stop_request(record)
         await_exit(record, STOP_GRACE_SECONDS)
         escalate(record, "TERM", TERM_GRACE_SECONDS)
@@ -1010,18 +1158,24 @@ module Tart
         settle_run(record)
       end
 
+      # The bounded ladder's cooperative waits: the checkpoint sleeps park
+      # the fiber (cooperative under the reactor; the bare seat blocks its
+      # own thread exactly as today's tail does — bin/tart:366). Kept as
+      # the seat-portable ladder: task timers cannot run at the bare
+      # manager.shutdown seat, and the ladder's observable (grace → TERM
+      # → grace → KILL timings) is frozen behavior.
       def arm_deadline_supervisor(record)
         return unless @arm_deadline_supervisor && record[:timeout_ms]
 
-        thread = Thread.new do
+        task = Async::Task.current? or return # off-reactor: the watcher's sweep is the backstop
+        timer = task.async(transient: true) do
           remaining = record[:started_at] + record[:timeout_ms] - now_ms
           sleep(remaining / 1000.0) if remaining.positive?
           next if terminal?(record[:state]) || exited?(record)
 
           enforce_deadline(record)
         end
-        thread.name = "tart-subagent-deadline" if thread.respond_to?(:name=)
-        @mutex.synchronize { @supervisors << thread }
+        @supervisors << timer
       end
 
       def write_stop_request(record)
@@ -1102,10 +1256,9 @@ module Tart
       # Leg (d): the existing reconcile_run first leg, unchanged — adopt
       # the terminal disk state, write nothing.
       def adopt_terminal_disk(record, disk)
-        @mutex.synchronize do
-          record[:state] = disk["state"].to_sym
-          record[:timed_out] = disk["timedOut"] == true
-        end
+        record[:state] = disk["state"].to_sym
+        record[:timed_out] = disk["timedOut"] == true
+        signal_state_change
         adopt_box_facts(record, disk)
         close_exit_pipe(record)
         kick_box_draw
@@ -1117,13 +1270,11 @@ module Tart
       # historical dir without the fields renders no badge/model, never
       # raises). Read-path only; the on-disk vocabulary is untouched.
       def adopt_box_facts(record, disk)
-        @mutex.synchronize do
-          record[:model] = disk["model"] if disk["model"]
-          record[:context] = disk["context"] if disk["context"]
-          record[:last_update] = disk["lastUpdate"] if disk["lastUpdate"]
-          record[:ended_at] = disk["endedAt"] if disk["endedAt"]
-          record[:error] = disk["error"] if disk["error"]
-        end
+        record[:model] = disk["model"] if disk["model"]
+        record[:context] = disk["context"] if disk["context"]
+        record[:last_update] = disk["lastUpdate"] if disk["lastUpdate"]
+        record[:ended_at] = disk["endedAt"] if disk["endedAt"]
+        record[:error] = disk["error"] if disk["error"]
         record
       end
 
@@ -1145,13 +1296,12 @@ module Tart
                              "timedOut" => result["timedOut"] == true)
         payload["error"] = result["error"] if result["error"]
         atomic_write_json(status_path(record), payload)
-        @mutex.synchronize do
-          record[:state] = state.to_sym
-          record[:timed_out] = result["timedOut"] == true
-          record[:last_update] = now
-          record[:ended_at] = now
-          record[:error] = result["error"]
-        end
+        record[:state] = state.to_sym
+        record[:timed_out] = result["timedOut"] == true
+        record[:last_update] = now
+        record[:ended_at] = now
+        record[:error] = result["error"]
+        signal_state_change
         kick_box_draw
         record
       end
@@ -1184,13 +1334,12 @@ module Tart
           "error" => message
         )
         atomic_write_json(status_path(record), payload)
-        @mutex.synchronize do
-          record[:state] = :failed
-          record[:timed_out] = false
-          record[:last_update] = now
-          record[:ended_at] = now
-          record[:error] = message
-        end
+        record[:state] = :failed
+        record[:timed_out] = false
+        record[:last_update] = now
+        record[:ended_at] = now
+        record[:error] = message
+        signal_state_change
         kick_box_draw
         record
       end
@@ -1224,7 +1373,7 @@ module Tart
       # --- registry lookup ---
 
       def find_run(id)
-        hit = @mutex.synchronize { @runs.find { |record| record[:id] == id } }
+        hit = @runs.find { |record| record[:id] == id }
         return hit if hit
 
         disk_find(id)
@@ -1232,7 +1381,7 @@ module Tart
 
       def find_run!(id)
         find_run(id) || begin
-          known = @mutex.synchronize { @runs.map { |record| record[:id] } }
+          known = @runs.map { |record| record[:id] }
           raise ArgumentError,
                 "unknown subagent run #{id.inspect}. Active runs: #{known.empty? ? "(none)" : known.join(", ")}."
         end
@@ -1278,12 +1427,10 @@ module Tart
           session_id: status["sessionId"],
           last_update: status["lastUpdate"], ended_at: status["endedAt"], error: status["error"]
         }
-        @mutex.synchronize do
-          existing = @runs.find { |candidate| candidate[:id] == record[:id] }
-          return existing if existing
+        existing = @runs.find { |candidate| candidate[:id] == record[:id] }
+        return existing if existing
 
-          @runs << record
-        end
+        @runs << record
         record
       end
 
@@ -1333,16 +1480,13 @@ module Tart
       # the frozen empty rows without touching the supervisor channel — the
       # absent box allocates nothing.
       def box_snapshot
-        rows = nil
-        @mutex.synchronize do
-          next rows = [] if @runs.empty?
+        return { rows: [] } if @runs.empty?
 
-          rows = @runs.map do |record|
-            { id: record[:id], agent: record[:agent], state: record[:state].to_s,
-              started_at: record[:started_at], last_update: record[:last_update],
-              ended_at: record[:ended_at], model: record[:model], context: record[:context],
-              dir: record[:dir], error: record[:error] }
-          end
+        rows = @runs.map do |record|
+          { id: record[:id], agent: record[:agent], state: record[:state].to_s,
+            started_at: record[:started_at], last_update: record[:last_update],
+            ended_at: record[:ended_at], model: record[:model], context: record[:context],
+            dir: record[:dir], error: record[:error] }
         end
         attention_ids = @supervisor_channel&.pending&.filter_map { |request| request[:run_id] }
         marks = @supervisor_channel&.foreground_attention || {}
@@ -1369,7 +1513,7 @@ module Tart
       def box_sweep
         before = box_observation_key
         sweep_home
-        records = @mutex.synchronize { @runs.dup }
+        records = @runs.dup
         records.each { |record| reconcile_run(record) if record[:state] == :running }
         box_observation_key != before
       end
@@ -1533,7 +1677,10 @@ module Tart
       # Atomic temp+rename (the control-channel idiom; rename over an
       # existing path is atomic on POSIX).
       def atomic_write_json(path, payload)
-        temp = "#{path}.#{Process.pid}.#{Thread.current.object_id}.tmp"
+        # I107 (I1): the temp name's uniqueness source is the Fast::UUID
+        # uuid_v7 (the old thread-identity source died with the reader
+        # threads).
+        temp = "#{path}.#{Process.pid}.#{Fast::UUID.uuid_v7}.tmp"
         File.write(temp, JSON.generate(payload))
         File.rename(temp, path)
       ensure

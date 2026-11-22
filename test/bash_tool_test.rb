@@ -92,6 +92,11 @@ module Tart
 
     def test_cancellation_kills_process_group_and_propagates
       marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
+      # I103 (C): the started handshake is the child's first output byte —
+      # the payload's echo opens the fifo and the blocking read unblocks, so
+      # the cancel lands mid-command (no start-delay bet).
+      started = File.join(@dir, "started")
+      File.mkfifo(started)
       error = nil
       watcher = Thread.new do
         begin
@@ -102,13 +107,13 @@ module Tart
             # through the tool's group-kill rescue.
             child = Async::Task.current.async do
               begin
-                tool.execute(command: "echo #{marker}; sleep 30")
+                tool.execute(command: "echo #{marker} > #{started}; sleep 30")
               rescue Async::Cancel => e
                 error = e
                 raise
               end
             end
-            sleep 0.3 # let the command start
+            File.open(started, "rb") { |f| f.readpartial(1) } # the command is running
             child.cancel # the interrupt
             begin
               child.wait
@@ -159,10 +164,15 @@ module Tart
 
     def test_run_user_cancellation_returns_partial_output_and_kills_the_group
       marker = "tart-probe-#{Process.pid}-#{rand(1_000_000)}"
+      # I103 (C): the started handshake is a fifo the payload's second act
+      # writes; the blocking read unblocks only once the command is running
+      # (the first echo's marker is already captured by then).
+      started = File.join(@dir, "started")
+      File.mkfifo(started)
       outcome = nil
       Async do |root|
-        task = root.async { outcome = tool.run_user("echo #{marker}; sleep 30") }
-        sleep 0.3 # the command is running
+        task = root.async { outcome = tool.run_user("echo #{marker}; echo started > #{started}; sleep 30") }
+        File.open(started, "rb") { |f| f.readpartial(1) } # the command is running
         task.stop # the escape-cancel path (@user_bash_task.stop)
       end
 
@@ -180,10 +190,15 @@ module Tart
     # the process table after the unwind: reaped, not zombie.
     def test_cancelled_bash_run_leaves_no_zombie
       pid_file = File.join(@dir, "child-pid")
+      # I103 (C): the started handshake rides a fifo the payload's second
+      # act writes (after the pid file lands); the reap is a BLOCKING
+      # waitpid — no poll loop.
+      started = File.join(@dir, "started")
+      File.mkfifo(started)
       outcome = nil
       Async do |root|
-        task = root.async { tool.execute(command: "echo $$ > #{pid_file}; sleep 5") }
-        wait_until { File.exist?(pid_file) } # the command is running
+        task = root.async { tool.execute(command: "echo $$ > #{pid_file}; echo ready > #{started}; sleep 5") }
+        File.open(started, "rb") { |f| f.readpartial(1) } # the command is running; the pid file is on disk
         task.stop # the escape-cancel path
         begin
           outcome = task.wait
@@ -193,16 +208,16 @@ module Tart
       end
 
       pid = File.read(pid_file).strip
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      state = nil
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        state = `ps -o stat= -p #{pid} 2>/dev/null`.to_s.strip
-        break if state.empty?
-
-        refute state.start_with?("Z"), "the killed child is a ZOMBIE (stat=#{state.inspect})"
-        sleep 0.05
+      begin
+        # The tool's own reaper may have won the race (ECHILD); either way
+        # the pid is out of the process table when the wait returns —
+        # reaped, not a zombie.
+        Process.waitpid(Integer(pid))
+      rescue Errno::ECHILD
+        nil
       end
-      assert_empty state, "the killed child must be reaped (gone from the process table)"
+      assert_empty `ps -o stat= -p #{pid} 2>/dev/null`.to_s.strip,
+        "the killed child must be reaped (gone from the process table)"
     end
 
     # ---- the chunk seam (I38 — pi executeBashWithOperations' onChunk,
@@ -487,19 +502,17 @@ module Tart
     def assert_no_probe(marker)
       # Linux pgrep -f matches the invoking `sh -c` wrapper of this very
       # backtick (the marker rides in the wrapper's argv; BSD pgrep on macOS
-      # does not) — so every poll would "find" the wrapper and flunk.
+      # does not) — so a naive pattern would "find" the wrapper and flunk.
       # Bracket the first character: the pattern [t]art-probe… cannot match
       # the wrapper's literal "[t]art-probe…" argv, but still matches the
       # real probe's plain command line.
+      #
+      # I103 (C): no poll — the kill path is synchronous inside the tool
+      # (group -TERM/-KILL, then the direct child reaped before the tool
+      # returns), so a single pgrep after the call is the assertion.
       pattern = marker.sub(/\A(.)/, "[\1]")
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-      while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        output = `pgrep -fl #{pattern} 2>/dev/null`
-        return if output.strip.empty?
-
-        sleep 0.1
-      end
-      flunk "probe processes still alive after kill: #{output}"
+      output = `pgrep -fl #{pattern} 2>/dev/null`
+      assert_empty output.strip, "probe processes still alive after kill: #{output}"
     end
   end
 end
