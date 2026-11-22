@@ -192,13 +192,21 @@ module Tart
 
     def test_child_tool_raises_the_error_reply_verbatim
       ctrl = new_ctrl
-      tool = tool_for(ctrl)
+      # A bounded ask (30s, not the 600s default): on a starved CI worker
+      # a pathology must fail in bounded time, not stall the leg ten
+      # minutes before reporting a timeout taxonomy that masks the cause.
+      tool = tool_for(ctrl, timeout_ms: "30000")
       landing = stub_write_gate
+      answerer_error = nil
       answerer = Thread.new do
         Thread.current.report_on_exception = false
-        landing.await("the child's ask to land") do
-          !Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.empty?
-        end
+        begin
+          # belt: 90 — an oversubscribed 2-core runner can starve a
+          # worker past the default belt; the landing is guaranteed by
+          # the tool's own write inside execute below.
+          landing.await("the child's ask to land", belt: 90) do
+            !Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.empty?
+          end
         # The request file cannot vanish under this read: the tool unlinks
         # its consumed request only AFTER the reply exists, and the reply
         # is written below, after this read.
@@ -209,9 +217,16 @@ module Tart
           {type: Subagents::Supervisor::REPLY_TYPE, requestId: id,
            createdAt: Subagents::Supervisor.now_ms, message: "",
            error: Subagents::Supervisor::BLOCKED_PARENT_ERROR})
+        rescue StandardError => e
+          answerer_error = e
+        end
       end
 
       result = tool.execute(reason: "need_decision", message: "blocked parent ask?")
+      # The answerer's death must surface with its cause (report_on_exception
+      # is off to keep stderr clean; without this the child stalls the ask's
+      # full timeout and the failure misreports as a timeout taxonomy).
+      flunk "the answerer thread died: #{answerer_error.full_message}" if answerer_error
 
       assert_equal({error: Subagents::Supervisor::BLOCKED_PARENT_ERROR}, result,
                    "SafeExecute keeps the ArgumentError verbatim in the {error:} result")
