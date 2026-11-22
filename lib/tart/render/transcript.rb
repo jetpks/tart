@@ -24,16 +24,18 @@ module Tart
     # the fibers/threads that touched the state at base (the agent fiber
     # enqueues, the frame loop drains and toggles).
     class Transcript
-      # An expandable block riding the scrollback queue: the rows built at
-      # the CURRENT toggle state + the builder (re-invoked with the new
-      # state at the ctrl+o toggle; the drain records the transcript
-      # range). pi's expandable tool children — and, since I33, the MOTD
-      # header block + the loaded-resource sections. I56: +resize_live+
-      # marks the blocks the SIGWINCH rebuild sweeps (the header only —
-      # tool blocks / the compaction panel / custom blocks stay
-      # boot-width; the whole-transcript re-wrap is the PARKED
-      # divergence, Grounds §6).
-      MarkedRegion = Struct.new(:rows, :builder, :resize_live)
+      # A builder-carrying region riding the scrollback queue: the rows
+      # built at the CURRENT toggle state + width, and the builder
+      # re-invoked at the CURRENT toggle state by BOTH sweeps (the drain
+      # records the transcript range). pi's expandable tool children —
+      # and, since I33, the MOTD header block + the loaded-resource
+      # sections. I105: +expands+ marks the ctrl+o-participating blocks
+      # ({push_expandable} callers — the header/sections/skill/bash/
+      # tool-builder/compaction families); plain families ride
+      # +expands: false+ (the flip walk skips them, the winch sweep
+      # re-invokes them like every registration — the whole-transcript
+      # re-wrap, the PARKED I56 divergence closed).
+      MarkedRegion = Struct.new(:rows, :builder, :expands)
 
       # A persistent status waiting for the flush (pi showStatus,
       # interactive-mode.ts:3824-3842): a Spacer(1) + dim one-pad text row
@@ -100,8 +102,12 @@ module Tart
         # The tail status pair's Line objects (the replace-in-place check
         # — pi's lastStatusSpacer/lastStatusText comparison; identity
         # survives expandable rebuilds above the pair, which shift indexes
-        # but never row objects).
+        # but never row objects). I105: the pair's registry entry
+        # ({@status_registration} — expands: false, the builder re-wraps
+        # the retained text) joins the winch sweep, which re-points the
+        # pair at the rebuilt rows.
         @status_pair = nil
+        @status_registration = nil
         # The live pending tool calls, keyed by the tool call id (I65 D2 —
         # the I34 single slot's registry successor; empty = none mid-flight).
         @pending_tools = {}
@@ -125,7 +131,9 @@ module Tart
       # A pre-built region pushed raw (the compaction line's blank, the
       # flushed reasoning rows): no container gate — none of the base call
       # sites rides one. (The MOTD blocks ride {push_expandable} since
-      # I33 — they flip.)
+      # I33 — they flip.) The drain registers the rows under an IDENTITY
+      # builder (I105 — every scrollback item joins the registry; the
+      # rows re-derive byte-identically at any width, the sweep no-ops).
       def enqueue_region(lines)
         @scrollback << lines
       end
@@ -133,12 +141,15 @@ module Tart
       # Verbatim completed text (tool output, status): wrapped to
       # the transcript width, one line-level fg. Everything routed here is
       # a chat-container child in pi (tool blocks, chat lines, compaction
-      # and status lines), so it arms the leading-spacer gate.
+      # and status lines), so it arms the leading-spacer gate. I105: the
+      # rows close over (text, fg) and re-wrap at the builder's invoked
+      # width — the winch sweep re-derives them (the arming stays an
+      # enqueue-time side effect).
       def enqueue_scrollback(text, fg:)
         return if text.nil? || text.empty?
 
         @chat_started = true
-        @scrollback << Text.wrap(text, viewport_width).map { |line| TUI.line(line, fg:) }
+        push_plain_region(->(_expanded) { Text.wrap(text, viewport_width).map { |line| TUI.line(line, fg:) } })
       end
 
       # A completed assistant message as transcript rows (pi
@@ -155,18 +166,24 @@ module Tart
         return unless has_reasoning || has_content
 
         @chat_started = true
-        @scrollback << [Panel.blank_line]
-        # The joined thinking renders as a dim block BEFORE the content
-        # (pi assistant-message.ts:99-175 render order). The live
-        # reasoning buffer is the text source, not Message#thinking —
-        # the loop strips the latter before this event (itemized
-        # deviation from the spec's message.thinking.text letter).
-        @scrollback << Transcript.reasoning_lines(reasoning, viewport_width) if has_reasoning
-        if has_content
+        # ENQUEUE-TIME DECISIONS ARE CAPTURED (I105): the arithmetics
+        # below are decided HERE — the between-blank rides has_content
+        # (nil-ness), the markdown rows ride the non-empty gate the
+        # enqueue path carried — never re-derived at rebuild.
+        renders_content = has_content && !content.empty?
+        push_plain_region(->(_expanded) do
+          rows = [Panel.blank_line]
+          # The joined thinking renders as a dim block BEFORE the content
+          # (pi assistant-message.ts:99-175 render order). The live
+          # reasoning buffer is the text source, not Message#thinking —
+          # the loop strips the latter before this event (itemized
+          # deviation from the spec's message.thinking.text letter).
+          rows.concat(Transcript.reasoning_lines(reasoning, viewport_width)) if has_reasoning
+          rows << Panel.blank_line if has_reasoning && has_content
           # Assistant completions render as markdown (AC5).
-          @scrollback << [Panel.blank_line] if has_reasoning
-          enqueue_markdown(content)
-        end
+          rows.concat(Transcript.markdown_lines(content, viewport_width)) if renders_content
+          rows
+        end)
       end
 
       # The submitted prompt's display dispatcher (the skill half of pi's
@@ -229,7 +246,10 @@ module Tart
           # Every tool block opens with a leading blank (pi
           # tool-execution.ts:85 — the constructor's Spacer), then the
           # bg'd contentText panel (the Box shape over ToolBlock.tool_line).
-          @scrollback << [Panel.blank_line, *ToolBlock.generic_panel_rows(name, result, viewport_width)]
+          # The bg default derivation stays enqueue-time (I105 — it is
+          # result-derived, not width-derived; captured, never re-derived).
+          bg = Panel.tool_panel_bg(result)
+          push_plain_region(->(_expanded) { generic_tool_rows(name, result, bg: bg) })
         end
       end
 
@@ -252,7 +272,11 @@ module Tart
       def enqueue_pending_tool_block(id, name, args)
         args = {} unless args.is_a?(Hash)
         @chat_started = true
-        region = MarkedRegion.new(pending_tool_rows(name, args), ->(_expanded) { pending_tool_rows(name, args) })
+        # expands: false — the pending shape reads no toggle state (a
+        # mid-flight ctrl+o rebuilds it identically at base too); the
+        # finalize re-points the registration to the final builder
+        # ({replace_flushed_pending}), which joins the flip walk.
+        region = MarkedRegion.new(pending_tool_rows(name, args), ->(_expanded) { pending_tool_rows(name, args) }, false)
         @scrollback << region
         @pending_tools[id] = PendingTool.new(name, args, region)
       end
@@ -324,14 +348,16 @@ module Tart
         content = "" unless content.is_a?(String) # malformed-entry tolerance
         @chat_started = true
         bg = Theme[:custom_message_bg]
-        label = TUI.span("[#{custom_type}]", fg: Theme[:custom_message_label], modifiers: [:bold], bg: bg)
-        rows = [Panel.panel_blank_line(viewport_width, bg), # Box paddingY top
-                Panel.padded_spans_row([label], viewport_width, bg),
-                Panel.panel_blank_line(viewport_width, bg)] # the Box's inner Spacer(1)
-        rows.concat(Transcript.markdown_lines(content, viewport_width,
-          prose_fg: Theme[:custom_message_text], bg: bg))
-        rows << Panel.panel_blank_line(viewport_width, bg) # Box paddingY bottom
-        @scrollback << [Panel.blank_line, *rows]
+        push_plain_region(->(_expanded) do
+          label = TUI.span("[#{custom_type}]", fg: Theme[:custom_message_label], modifiers: [:bold], bg: bg)
+          rows = [Panel.panel_blank_line(viewport_width, bg), # Box paddingY top
+                  Panel.padded_spans_row([label], viewport_width, bg),
+                  Panel.panel_blank_line(viewport_width, bg)] # the Box's inner Spacer(1)
+          rows.concat(Transcript.markdown_lines(content, viewport_width,
+            prose_fg: Theme[:custom_message_text], bg: bg))
+          rows << Panel.panel_blank_line(viewport_width, bg) # Box paddingY bottom
+          [Panel.blank_line, *rows]
+        end)
       end
 
       # The resume replay (item 3, pi renderSessionEntries, interactive-
@@ -374,7 +400,7 @@ module Tart
           case item
           when MarkedRegion
             registered = {start: @transcript.size, size: item.rows.length,
-                          builder: item.builder, resize_live: item.resize_live}
+                          builder: item.builder, expands: item.expands}
             @expandable_blocks << registered
             @transcript.concat(item.rows)
             # The pending blocks' drain links EVERY registry entry's
@@ -387,7 +413,17 @@ module Tart
           when StatusEntry
             flush_status(item.text)
           else
-            @transcript.concat(item)
+            # Raw rows (the {enqueue_region} legacy callers, the tests'
+            # direct pushes — I105): an IDENTITY builder registers with
+            # the sweep like every scrollback item; the rows re-derive
+            # byte-identically at any width (the sweep's no-op). Bound
+            # PER ITEM — the builder must close over this item's rows,
+            # not the drain loop's variable.
+            rows = item
+            registered = {start: @transcript.size, size: rows.length,
+                          builder: ->(_expanded) { rows }, expands: false}
+            @expandable_blocks << registered
+            @transcript.concat(rows)
           end
         end
       end
@@ -402,54 +438,64 @@ module Tart
       end
 
       # The ctrl+o toggle's state half (pi setToolsExpanded's child sweep):
-      # every registered block rebuilds collapsed↔expanded in place.
-      # Blocks register in ascending start order (the drain appends at the
-      # tail), so the walk carries the row DELTA: an earlier block's size
-      # change shifts every later block's start (the boot header +
-      # sections flip exposed the stale-start latent). Returns whether the
-      # state changed — the coordinator reports the status row and
-      # requests the draw only then (the base gate).
+      # every EXPANDING block rebuilds collapsed↔expanded in place (I105 —
+      # the plain families' builders ignore the toggle state; their ranges
+      # still shift with the delta). Blocks register in ascending start
+      # order (the drain appends at the tail), so the walk carries the row
+      # DELTA: an earlier block's size change shifts every later block's
+      # start (the boot header + sections flip exposed the stale-start
+      # latent). Returns whether the state changed — the coordinator
+      # reports the status row and requests the draw only then (the base
+      # gate).
       def set_tool_output_expanded(expanded)
         return false if expanded == @tool_output_expanded
 
         @tool_output_expanded = expanded
         delta = 0
         @expandable_blocks.each do |registered|
-          start = registered[:start] + delta
-          rows = registered[:builder].call(expanded)
-          @transcript[start, registered[:size]] = rows
-          delta += rows.length - registered[:size]
-          registered[:start] = start
-          registered[:size] = rows.length
-        end
-        true
-      end
-
-      # The resize rebuild's state half (I56): re-invoke every
-      # resize_live-registered builder at the CURRENT toggle state and
-      # splice in place — exactly {set_tool_output_expanded}'s arithmetic
-      # (the ascending-start walk carrying the row DELTA) WITHOUT the
-      # state flip and WITHOUT touching non-live registrations. Tool
-      # blocks / the compaction panel / the resource sections stay
-      # boot-width (Grounds §6: a full sweep would re-wrap the expandable
-      # tool rows while their neighbors stay boot-width — an inconsistent
-      # half-state). Returns whether anything rebuilt.
-      def rebuild_live_expandables
-        delta = 0
-        rebuilt = false
-        @expandable_blocks.each do |registered|
-          if registered[:resize_live]
+          if registered[:expands]
             start = registered[:start] + delta
-            rows = registered[:builder].call(@tool_output_expanded)
+            rows = registered[:builder].call(expanded)
             @transcript[start, registered[:size]] = rows
             delta += rows.length - registered[:size]
             registered[:start] = start
             registered[:size] = rows.length
-            rebuilt = true
           else
             registered[:start] += delta # the rows stay; the range moves
           end
         end
+        true
+      end
+
+      # The winch sweep (I105 — replaces I56's rebuild_live_expandables):
+      # re-invoke EVERY registration's builder at the CURRENT toggle state
+      # and splice in place — {set_tool_output_expanded}'s arithmetic (the
+      # ascending-start walk carrying the row DELTA) without the state
+      # flip. The builders' viewport_width reads resolve through the seam
+      # (the latch during the resize arm — no width plumbing here). The
+      # status pair re-wraps with the sweep and {@status_pair} re-points
+      # at the rebuilt rows (the replace-in-place identity check keeps
+      # working). Returns whether anything rebuilt — once per winch, never
+      # per frame (builders run only at push, drain-materialize, toggle,
+      # and winch).
+      def rebuild_scrollback
+        delta = 0
+        rebuilt = false
+        @expandable_blocks.each do |registered|
+          start = registered[:start] + delta
+          rows = registered[:builder].call(@tool_output_expanded)
+          @transcript[start, registered[:size]] = rows
+          delta += rows.length - registered[:size]
+          registered[:start] = start
+          registered[:size] = rows.length
+          rebuilt = true
+        end
+        return rebuilt unless @status_registration
+
+        # The walk rebuilt the pair's range too (expands: false — swept,
+        # never flipped): re-point at the rebuilt Line objects (identity —
+        # the {status_at_tail?} comparison survives).
+        @status_pair = @transcript[@status_registration[:start], @status_registration[:size]]
         rebuilt
       end
 
@@ -466,6 +512,7 @@ module Tart
         @expandable_blocks.clear
         @pending_tools.clear
         @status_pair = nil
+        @status_registration = nil
         @chat_started = false
       end
 
@@ -550,16 +597,40 @@ module Tart
       # the tail — REPLACED in place while that pair is still the tail
       # (the lastStatusSpacer/lastStatusText comparison), else appended.
       # The pair arms the leading-spacer gate: pi's gate reads the chat
-      # container's children, and the status children count.
+      # container's children, and the status children count. I105: the
+      # TEXT is retained behind the registration's builder — the winch
+      # sweep re-wraps the pair at the new width (replace-or-append
+      # semantics unchanged; the rebuilt pair becomes {@status_pair}).
       def flush_status(text)
+        builder = ->(_expanded) { status_rows(text) }
+        if @status_registration && status_at_tail?
+          registration = @status_registration # replaced in place
+          @transcript.pop(@status_pair.size)
+        else
+          # Content followed the pair (no longer the tail): the old rows
+          # stay, the fresh pair appends with its own registration.
+          registration = {start: 0, size: 0, builder: builder, expands: false}
+          @expandable_blocks << registration
+        end
+        rows = status_rows(text)
+        registration[:start] = @transcript.size
+        registration[:size] = rows.length
+        registration[:builder] = builder
+        @transcript.concat(rows)
+        @status_pair = rows
+        @status_registration = registration
+        @chat_started = true
+      end
+
+      # The status pair's rows at the invoked width (a Spacer(1) + the
+      # dim one-pad wrapped text — pure function of (text, width), the
+      # sweep's re-derivation seam).
+      def status_rows(text)
         rows = [Panel.blank_line]
         rows.concat(Text.wrap(text, viewport_width - Panel::OUTPUT_PAD.length * 2).map do |row|
           TUI.line([TUI.span(Panel::OUTPUT_PAD), TUI.span(row, fg: Theme[:dim])])
         end)
-        @transcript.pop(@status_pair.size) if status_at_tail?
-        @transcript.concat(rows)
-        @status_pair = rows
-        @chat_started = true
+        rows
       end
 
       # Whether the recorded status pair is still the transcript's tail
@@ -584,18 +655,20 @@ module Tart
       # paddingY blanks all carry the panel bg).
       def enqueue_user_echo(text)
         bg = Theme[:user_message_bg]
-        rows = Text.wrap(text, viewport_width - Panel::OUTPUT_PAD.length * 2).map do |row|
-          TUI.line([TUI.span(Panel::OUTPUT_PAD, bg: bg),
-                    TUI.span(row, fg: Theme[:user_message_text], bg: bg),
-                    Panel.panel_tail(TUI.text_width(row), viewport_width, bg)])
-        end
-        region = []
-        region << Panel.blank_line if @chat_started # the container's non-empty gate
-        region << Panel.panel_blank_line(viewport_width, bg) # paddingY top (user-message.ts:23)
-        region.concat(rows)
-        region << Panel.panel_blank_line(viewport_width, bg) # paddingY bottom
+        leading_blank = @chat_started # enqueue-time capture (the container's non-empty gate)
+        push_plain_region(->(_expanded) do
+          region = []
+          region << Panel.blank_line if leading_blank
+          region << Panel.panel_blank_line(viewport_width, bg) # paddingY top (user-message.ts:23)
+          region.concat(Text.wrap(text, viewport_width - Panel::OUTPUT_PAD.length * 2).map do |row|
+            TUI.line([TUI.span(Panel::OUTPUT_PAD, bg: bg),
+                      TUI.span(row, fg: Theme[:user_message_text], bg: bg),
+                      Panel.panel_tail(TUI.text_width(row), viewport_width, bg)])
+          end)
+          region << Panel.panel_blank_line(viewport_width, bg) # paddingY bottom
+          region
+        end)
         @chat_started = true
-        @scrollback << region
       end
 
       # The compaction panel rows (pi compaction-summary-message.ts — the
@@ -739,21 +812,30 @@ module Tart
         @reseed_sink.call(message) if update_footer
         # pi assistant-message.ts:103-105 — the spacer rides VISIBLE
         # content only (a tool-call-only assistant entry renders no blank
-        # of its own; its tool block brings one).
-        @scrollback << [Panel.blank_line] if has_content || has_reasoning
-        if has_reasoning
-          @scrollback << Transcript.reasoning_lines(reasoning, viewport_width)
-          @scrollback << [Panel.blank_line] if has_content # pi :172-174
+        # of its own; its tool block brings one). I105: the whole prefix
+        # region closes over the replay-local decisions (has_content =
+        # recorded-String arithmetic, NOT the live path's nil-check —
+        # captured, never re-derived) and re-wraps with the sweep (the
+        # /resume screens re-wrap).
+        if has_content || has_reasoning
+          renders_content = has_content && !content.empty?
+          push_plain_region(->(_expanded) do
+            rows = [Panel.blank_line]
+            rows.concat(Transcript.reasoning_lines(reasoning, viewport_width)) if has_reasoning
+            rows << Panel.blank_line if has_reasoning && has_content # pi :172-174
+            rows.concat(Transcript.markdown_lines(content, viewport_width)) if renders_content
+            rows
+          end)
         end
-        enqueue_markdown(content) if has_content
         if has_error
           # pi :184-198 — the same component serves live AND replay (the
           # resume renders through renderSessionEntries): Spacer(1), then
           # the pad-led wrapped error-fg row AFTER any partial content —
           # the same region shape the live :message_end arm enqueues (D3).
-          @scrollback << [Panel.blank_line,
-                          *Panel.padded_fg_rows("Error: #{error_message}", viewport_width,
-                            fg: Theme[:error])]
+          fg = Theme[:error]
+          push_plain_region(->(_expanded) do
+            [Panel.blank_line, *Panel.padded_fg_rows("Error: #{error_message}", viewport_width, fg: fg)]
+          end)
         end
         tool_calls.each_value do |call|
           next unless call.is_a?(Hash) && call["name"].is_a?(String)
@@ -766,15 +848,6 @@ module Tart
           enqueue_tool_block(call["name"], call["arguments"], results[call["id"]], nil,
                              details: recorded_details[call["id"]])
         end
-      end
-
-      # Assistant completions render through the markdown converter (AC5):
-      # styled rows wrapped to the transcript width, every span's fg routed
-      # through the theme (AC3), then converted row → Line at the TUI seam.
-      def enqueue_markdown(text)
-        return if text.nil? || text.empty?
-
-        @scrollback << Transcript.markdown_lines(text, viewport_width)
       end
 
       # The per-tool final-block BUILDER (pi's per-tool renderers — the
@@ -849,6 +922,7 @@ module Tart
           registration[:start] = start
           registration[:size] = final_rows.length
           registration[:builder] = builder
+          registration[:expands] = true # the final family reads the toggle
         else
           @expandable_blocks.delete_at(index)
         end
@@ -860,7 +934,7 @@ module Tart
       # replaces the MarkedRegion; the registry never sees either —
       # matching the append path's generic arm).
       def swap_queued_pending(region, final_rows, builder)
-        replacement = builder ? MarkedRegion.new(final_rows, builder) : final_rows
+        replacement = builder ? MarkedRegion.new(final_rows, builder, true) : final_rows
         requeue = []
         until @scrollback.empty?
           item = @scrollback.shift
@@ -869,18 +943,28 @@ module Tart
         requeue.each { |item| @scrollback << item }
       end
 
+      # The plain-region enqueue (I105): the builder-carrying region whose
+      # builder ignores the toggle state — expands: false, the ctrl+o walk
+      # skips it while its range still shifts with the delta; the winch
+      # sweep re-invokes it like every registration. Public — the
+      # coordinator's error-row arm rides it (chat.rb's :message_end
+      # family); the plain enqueue families route through it too.
+      def push_plain_region(builder)
+        @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder, false)
+      end
+
       # The expandable-block enqueue: the block rides the scrollback as a
       # {MarkedRegion} (the drain records its transcript range for the
       # ctrl+o toggle's in-place rebuild). Public — the coordinator's MOTD
       # header + resource-section blocks ride the same registry (I33, pi
-      # BuiltInHeader/setToolsExpanded's container sweep). +resize_live+
-      # defaults false — every pre-I56 caller byte-identical (I56: only
-      # the header registers live).
-      def push_expandable(builder, resize_live: false)
-        @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder, resize_live)
+      # BuiltInHeader/setToolsExpanded's container sweep). I105: the
+      # resize_live flag is RETIRED (Grounds S1) — every block sweeps; the
+      # expands distinction lives in the registration.
+      def push_expandable(builder)
+        @scrollback << MarkedRegion.new(builder.(@tool_output_expanded), builder, true)
       end
 
-      public :push_expandable
+      public :push_expandable, :push_plain_region
     end
   end
 end

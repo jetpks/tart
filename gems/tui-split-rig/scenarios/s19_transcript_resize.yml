@@ -1,0 +1,15 @@
+# S19 — the post-turn SIGWINCH transcript re-wrap (resize-reweave): one
+# text turn at the boot geometry whose echo AND reply both fit 120's
+# content width (118) but wrap at 80's (78), then the pane is resized
+# 120->80 AFTER the reply settles (resize_after). pi re-renders every
+# component from raw content at the current width every frame, so both
+# rows re-wrap; a tree that freezes scrollback rows at the enqueue-time
+# width keeps the boot-width wrap and clips. RED at the pre-fix base BY
+# DESIGN (the candidate list IS the work list — the s16 precedent).
+name: s19_transcript_resize
+prompt: "please answer with the fixed sentence then stop; this prompt is deliberately long so its echo wraps"
+expected_requests: 1
+resize_after: [80, 40]
+responses:
+  - type: stream
+    content: "The mock reply is fixed and short for the spike but deliberately long enough to wrap here."

@@ -236,6 +236,18 @@ module TuiSplitRig
       # scenario).
       alive &&= send_mid_run_keys(session, mock) if alive && @scenario.mid_run_keys
       reply = alive ? settle(session, "reply") : {ms: nil, timed_out: true}
+      # The scenario's resize_after knob (the s19 instrument, I105): after
+      # the reply settle, BEFORE the post-settle keys — the content
+      # enqueued BEFORE this resize is the owner-complaint target (the
+      # boot-width residue). Mirrors the resize knob's mechanics
+      # (resize-window moves a manual-size session), then a re-settle. The
+      # no-knob path stays byte-frozen (every pre-I105 scenario's flow
+      # identical).
+      if alive && @scenario.resize_after
+        width, height = @scenario.resize_after
+        tmux("resize-window", "-t", session, "-x", width.to_s, "-y", height.to_s)
+        reply = settle(session, "resize_after")
+      end
       # The scenario's post-settle keys (the s9 instrument): each token
       # sent after the reply settles, then a re-settle, so the capture
       # shows the flow's SETTLED screen. A dead pane sends nothing.

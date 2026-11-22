@@ -2072,6 +2072,145 @@ module Tart
       end
     end
 
+    # --- I105: the winch sweep end-to-end (the owner complaint) ---
+
+    # The owner complaint, end-to-end: content enqueued at the BOOT width
+    # (echo, completed markdown+reasoning message, settled tool block)
+    # stays boot-width while the composer reflows. One resize event at 50
+    # re-derives EVERY content row at 50; the second frame keeps the
+    # rebuilt rows (one sweep per winch, never per frame).
+    def test_sigwinch_reweaves_the_whole_transcript_content
+      with_chat(width: 120, screen_height: 40) do |chat, session|
+        send_message(chat, "the user echo rides the submission path and must re-wrap when the window narrows")
+        chat.on_agent_event({type: :message_start, message: ChunkDouble.new})
+        chat.on_agent_event({type: :message_update, chunk: thinking_chunk("answer", "reasoning prose that certainly wraps at the narrower fifty cell width")})
+        chat.on_agent_event({type: :message_update, chunk: ChunkDouble.new("the completed answer is **bold** prose long enough to wrap across several rows at fifty")})
+        finish_message(chat, "the completed answer is **bold** prose long enough to wrap across several rows at fifty")
+        tool_start(chat, "bash", arguments: {"command" => "echo settled"})
+        tool_end(chat, "bash", "settled bash output that wraps at fifty too", duration: 1.0,
+          arguments: {"command" => "echo settled"})
+        draw(chat, session)
+
+        boot = transcript_lines(session, chat)
+        assert_includes boot.join("\n"), "the user echo rides the submission path and must re-wrap when the window narrows",
+          "the echo renders single-row at 120"
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 50, height: 40))
+        draw(chat, session)
+        rows = transcript_lines(session, chat)
+        joined = rows.join("\n")
+        rows.each do |row|
+          assert_operator row.length, :<=, 50, "every content row fits 50 cells: #{row.inspect}"
+        end
+        assert_includes joined, "re-wrap when the window narrows", "the echo's word-led continuation landed"
+        assert_includes joined, "narrower fifty cell width", "the reasoning block re-wrapped"
+        assert_includes joined, "several rows at fifty", "the markdown content re-wrapped"
+        assert_includes joined, "wraps at fifty too", "the settled tool block re-wrapped"
+
+        draw(chat, session)
+        assert_equal rows, transcript_lines(session, chat), "the second frame keeps the rebuilt rows"
+      end
+    end
+
+    # The purity law end-to-end (AC4): the resource sections re-wrap on
+    # resize from the BOOT-GATHERED inputs — a context source DELETED
+    # after boot keeps its row set (no File.file? re-stat in the rebuild
+    # path; the filter hoisted boot-side, Motd.build_sections never
+    # re-stats).
+    def test_resource_sections_survive_resize_without_rediscovery
+      File.write(File.join(@dir, "settings.json"), "{}")
+      long_dir = File.join(@dir, "long-context-path")
+      FileUtils.mkdir_p(long_dir)
+      second = File.join(long_dir, "AGENTS-notes.md")
+      File.write(second, "x")
+      TUI.run(headless: true, viewport: :fullscreen, width: 120, screen_height: 40) do |session|
+        chat = Render::Chat.new(session:, kernel: IdleKernel.new, motd: true, settings_root: @dir,
+          footer_data: {cwd: @dir}, context_files: [{path: second}])
+        draw(chat, session)
+        boot = transcript_lines(session, chat)
+        assert_includes boot.join("\n"), "settings.json", "the [Context] section lists the staged source"
+        assert_includes boot.join("\n"), "AGENTS-notes.md", "the threaded context file listed too"
+        boot_rows = boot.size
+
+        FileUtils.rm(File.join(@dir, "settings.json")) # DELETED after boot
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 50, height: 40))
+        draw(chat, session)
+        rows = transcript_lines(session, chat)
+        # Wrap-normalized join: at 50 cells the context lines wrap wherever
+        # the STAGED PATH length puts the boundary — a seat whose tmpdir
+        # length straddles it splits the filename itself (settings.jso|n).
+        # The pin's property is the no-rediscovery row set, not the boundary
+        # luck; continuation rows are space-led, so splicing them out
+        # reconstructs the wrapped words.
+        joined = rows.join("\n").gsub("\n ", "")
+        assert_includes joined, "settings.json",
+          "the DELETED source's row set is unchanged — no re-discovery in the sweep"
+        assert_includes joined, "AGENTS-notes.md", "the second source survives the sweep too"
+        assert_operator rows.size, :>, boot_rows, "the sections re-wrapped at 50 (the compact lists wrap)"
+      end
+    end
+
+    # AC3's viewport half: a detached (scrolled-up) offset survives a
+    # shrink — the rendered window clamps into the new max offset, every
+    # row valid, and follow re-arms at the tail (Viewport#window's
+    # existing clamp — the pin proves the property, no viewport change).
+    def test_viewport_offset_clamps_on_shrink
+      with_chat(width: 40, screen_height: 20) do |chat, session|
+        8.times { |i| finish_message(chat, "filler message number #{i + 1} with some length") }
+        draw(chat, session)
+        wheel_to_top(chat)
+        assert_equal 0, chat.scroll_offset, "detached at the top"
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 20, height: 14))
+        draw(chat, session)
+        offset = chat.scroll_offset
+        view = transcript_view(session, chat)
+        refute_empty view, "the window renders rows"
+        assert_operator offset, :>=, 0
+        assert_operator offset, :<=, session.buffer_content.size - 6,
+          "the offset clamped into the new geometry's range"
+        assert_includes view.join("\n"), "filler message", "the rows are real content"
+
+        wheel_to_end(chat)
+        draw(chat, session)
+        view = transcript_view(session, chat)
+        assert_equal "length", view.last.strip,
+          "follow re-arms — the tail is the last content row again (message 8's wrapped tail)"
+      end
+    end
+
+    # AC3's status half: the tail status pair re-wraps at the new width
+    # and the NEXT status still replaces it in place (the identity check
+    # survives the sweep's re-point).
+    def test_status_row_rewraps_on_resize
+      with_chat(width: 40, screen_height: 40) do |chat, session|
+        send_message(chat, "hello there")
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"])) # the flip reports a status
+        draw(chat, session)
+        boot = transcript_lines(session, chat)
+        assert boot.any? { |row| row.include?("Tool output: expanded") },
+          "the status pair renders single-row at 40 (content 38)"
+        boot_rows = boot.size
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 12, height: 40))
+        draw(chat, session)
+        rows = transcript_lines(session, chat)
+        joined = rows.join("\n")
+        assert rows.any? { |row| row.strip == "Tool" } && rows.any? { |row| row.strip == "expanded" },
+          "the status pair re-wrapped at 12 (content 10): one word per row"
+        refute_includes joined, "Tool output: expanded", "no single-row status survived"
+
+        chat.on_event(TUI.key_event("o", modifiers: ["ctrl"])) # the flip back reports the next status
+        draw(chat, session)
+        rows = transcript_lines(session, chat)
+        joined = rows.join("\n")
+        assert_includes joined, "collapsed", "the NEXT status landed"
+        refute_includes joined, "expanded", "the old pair was replaced, not appended"
+        assert_equal rows.size, rows.uniq.size, "no duplicated rows from the replace"
+        assert_operator rows.size, :<=, boot_rows + 4, "the replace kept the tail's shape (in place)"
+      end
+    end
+
     # The boot header's art rows (the ladder pick rendered with its pad;
     # the block sits between the leading Spacer and the version row).
     def boot_art(lines)

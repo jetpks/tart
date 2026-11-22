@@ -213,6 +213,36 @@ module TuiSplitRig
       assert_equal [{type: :stream, content: "The mock reply is fixed and short for the spike."}], scenario.responses
     end
 
+    # The resize_after knob (I105, s19): EXACTLY the resize knob's shape —
+    # a positive-integer pair, absent → nil (the no-knob path byte-frozen),
+    # everything else a loud rig error at load. Applied post-reply by the
+    # runner; the parse is the contract pinned here.
+    def test_resize_after_knob
+      path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(path, "name: s\nprompt: p\nexpected_requests: 1\nresize_after: [80, 40]\nresponses:\n  - type: stream\n    content: x\n")
+      assert_equal [80, 40], Scenario.load(path).resize_after
+
+      plain = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+      File.write(plain, "name: s\nprompt: p\nexpected_requests: 1\nresponses:\n  - type: stream\n    content: x\n")
+      assert_nil Scenario.load(plain).resize_after, "absent by default — the no-knob path is byte-frozen"
+
+      bad_shapes = [
+        "resize_after: 80\n",           # not a pair
+        "resize_after: [80]\n",          # one element
+        "resize_after: [80, 40, 20]\n",  # three elements
+        "resize_after: [0, 40]\n",       # non-positive width
+        "resize_after: [80, -1]\n",      # non-positive height
+        "resize_after: [\"80\", 40]\n",  # non-integer width
+        "resize_after: [80, 40.5]\n",    # non-integer height
+      ]
+      bad_shapes.each do |resize_line|
+        path = File.join(Dir.mktmpdir("tui-split-rig-scenario-"), "s.yml")
+        File.write(path, "name: s\nprompt: p\nexpected_requests: 1\n#{resize_line}responses:\n  - type: stream\n    content: x\n")
+        error = assert_raises(Error) { Scenario.load(path) }
+        assert_match(/resize_after must be a \[width, height\] pair of positive integers/, error.message)
+      end
+    end
+
     def test_absent_scenario_file_raises_a_rig_error
       assert_raises(Error) { Scenario.load("/nonexistent/scenario.yml") }
     end
