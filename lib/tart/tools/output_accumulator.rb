@@ -30,77 +30,72 @@ module Tart
         @has_open_line = false
         @finished = false
         @temp_file_path = nil
-        @mutex = Mutex.new
+        # I107 (the concurrency law, V4): the guard Mutex is deleted, not
+        # replaced — every mutation funnel here is a same-reactor string/
+        # Array/Hash operation plus regular-file IO (which never parks a
+        # fiber on this platform), so no yield can interleave funnels.
       end
 
       def append(data)
         raise "Cannot append to a finished output accumulator" if @finished
 
-        @mutex.synchronize do
-          @total_raw_bytes += data.bytesize
-          append_decoded_text(data.force_encoding(Encoding::UTF_8).scrub)
+        @total_raw_bytes += data.bytesize
+        append_decoded_text(data.force_encoding(Encoding::UTF_8).scrub)
 
-          if @temp_file_path
-            File.open(@temp_file_path, "ab") { |f| f.write(data) }
-          elsif should_use_temp_file?
-            ensure_temp_file
-            File.open(@temp_file_path, "ab") { |f| f.write(data) }
-          elsif !data.empty?
-            @raw_chunks << data
-          end
+        if @temp_file_path
+          File.open(@temp_file_path, "ab") { |f| f.write(data) }
+        elsif should_use_temp_file?
+          ensure_temp_file
+          File.open(@temp_file_path, "ab") { |f| f.write(data) }
+        elsif !data.empty?
+          @raw_chunks << data
         end
       end
 
       def finish
-        @mutex.synchronize do
-          @finished = true
-          ensure_temp_file if should_use_temp_file?
-        end
+        @finished = true
+        ensure_temp_file if should_use_temp_file?
       end
 
       def snapshot(persist_if_truncated: false)
-        @mutex.synchronize do
-          tail_truncation = Truncate.truncate_tail(snapshot_text, max_lines: @max_lines, max_bytes: @max_bytes)
-          truncated = @total_lines > @max_lines || @total_decoded_bytes > @max_bytes
-          truncated_by = if truncated
-            tail_truncation.truncated_by || (@total_decoded_bytes > @max_bytes ? "bytes" : "lines")
-          end
-          truncation = tail_truncation.dup.tap do |t|
-            t.truncated = truncated
-            t.truncated_by = truncated_by
-            t.total_lines = @total_lines
-            t.total_bytes = @total_decoded_bytes
-            t.max_lines = @max_lines
-            t.max_bytes = @max_bytes
-          end
-
-          ensure_temp_file if persist_if_truncated && truncation.truncated
-          Snapshot.new(content: truncation.content, truncation:, full_output_path: @temp_file_path)
+        tail_truncation = Truncate.truncate_tail(snapshot_text, max_lines: @max_lines, max_bytes: @max_bytes)
+        truncated = @total_lines > @max_lines || @total_decoded_bytes > @max_bytes
+        truncated_by = if truncated
+          tail_truncation.truncated_by || (@total_decoded_bytes > @max_bytes ? "bytes" : "lines")
         end
+        truncation = tail_truncation.dup.tap do |t|
+          t.truncated = truncated
+          t.truncated_by = truncated_by
+          t.total_lines = @total_lines
+          t.total_bytes = @total_decoded_bytes
+          t.max_lines = @max_lines
+          t.max_bytes = @max_bytes
+        end
+
+        ensure_temp_file if persist_if_truncated && truncation.truncated
+        Snapshot.new(content: truncation.content, truncation:, full_output_path: @temp_file_path)
       end
 
       # The complete output. Call after #finish. Output longer than max_bytes
       # keeps its first and last max_bytes/2 around an omission marker.
       def read_full_output(max_bytes)
-        @mutex.synchronize do
-          unless @temp_file_path
-            return FullOutput.new(content: @raw_chunks.join.force_encoding(Encoding::UTF_8), truncated: false)
-          end
-
-          size = File.size(@temp_file_path)
-          content = File.binread(@temp_file_path).force_encoding(Encoding::UTF_8)
-          return FullOutput.new(content:, truncated: false) if size <= max_bytes
-
-          head_bytes = max_bytes / 2
-          tail_bytes = max_bytes - head_bytes
-          head = content.byteslice(0, head_bytes).scrub
-          tail_byteslice = content.byteslice(size - tail_bytes, tail_bytes)
-          tail_start = 0
-          tail_start += 1 while tail_start < tail_byteslice.bytesize && continuation_byte?(tail_byteslice, tail_start)
-          tail = tail_byteslice.byteslice(tail_start, tail_byteslice.bytesize - tail_start).scrub
-          omitted = size - head_bytes - tail_bytes
-          FullOutput.new(content: "#{head}\n\n[... #{omitted} bytes omitted ...]\n\n#{tail}", truncated: true)
+        unless @temp_file_path
+          return FullOutput.new(content: @raw_chunks.join.force_encoding(Encoding::UTF_8), truncated: false)
         end
+
+        size = File.size(@temp_file_path)
+        content = File.binread(@temp_file_path).force_encoding(Encoding::UTF_8)
+        return FullOutput.new(content:, truncated: false) if size <= max_bytes
+
+        head_bytes = max_bytes / 2
+        tail_bytes = max_bytes - head_bytes
+        head = content.byteslice(0, head_bytes).scrub
+        tail_byteslice = content.byteslice(size - tail_bytes, tail_bytes)
+        tail_start = 0
+        tail_start += 1 while tail_start < tail_byteslice.bytesize && continuation_byte?(tail_byteslice, tail_start)
+        tail = tail_byteslice.byteslice(tail_start, tail_byteslice.bytesize - tail_start).scrub
+        omitted = size - head_bytes - tail_bytes
+        FullOutput.new(content: "#{head}\n\n[... #{omitted} bytes omitted ...]\n\n#{tail}", truncated: true)
       end
 
       def last_line_bytes
@@ -113,15 +108,13 @@ module Tart
 
       # Removes the spill file if one was never needed by the caller.
       def close_temp_file
-        @mutex.synchronize do
-          return unless @temp_file_path
+        return unless @temp_file_path
 
-          File.delete(@temp_file_path)
-        rescue StandardError
-          nil
-        ensure
-          @temp_file_path = nil
-        end
+        File.delete(@temp_file_path)
+      rescue StandardError
+        nil
+      ensure
+        @temp_file_path = nil
       end
 
       private
@@ -142,13 +135,13 @@ module Tart
         newlines = text.count("\n")
         last_newline = text.rindex("\n")
         if newlines.zero?
-          @current_line_bytes += bytes
-          @has_open_line = true
+        @current_line_bytes += bytes
+        @has_open_line = true
         else
-          @completed_lines += newlines
-          tail = text[(last_newline + 1)..]
-          @current_line_bytes = tail.bytesize
-          @has_open_line = !tail.empty?
+        @completed_lines += newlines
+        tail = text[(last_newline + 1)..]
+        @current_line_bytes = tail.bytesize
+        @has_open_line = !tail.empty?
         end
         @total_lines = @completed_lines + (@has_open_line ? 1 : 0)
       end

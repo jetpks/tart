@@ -133,7 +133,7 @@ module Tart
         # I103 (A): the guard's pending_exit_code record broadcast (the
         # delivery runs in trap context) — the run parks cooperatively on
         # the seam.
-        await(guard, "the delivered HUP's recorded exit code", cooperative: true) do
+        await(guard, "the delivered HUP's recorded exit code") do
           guard.pending_exit_code
         end
       end
@@ -197,8 +197,8 @@ module Tart
       # shape (deterministic: the run cannot wind down before it observed the
       # park, then the recorded exit code).
       event_loop.run do
-        await(session, "the poller parked inside its poll", cooperative: true) { session.polling? }
-        await(guard, "the delivered HUP's recorded exit code", cooperative: true) { guard.pending_exit_code }
+        await(session, "the poller parked inside its poll") { session.polling? }
+        await(guard, "the delivered HUP's recorded exit code") { guard.pending_exit_code }
       end
       assert_predicate event_loop.poller.thread, :alive?,
         "the wedged poller was abandoned, not joined to death (the hard exit owns it)"

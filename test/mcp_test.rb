@@ -32,59 +32,75 @@ module Tart
     # -- AC3: the client round trip over real stdio pipes ------------------
 
     def test_client_initialize_list_and_call_round_trip
-      client = connected_client
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        client = connected_client
 
-      assert_equal "connected", client.connection_state
-      assert_equal "2025-06-18", client.protocol_version
-      assert_equal "echo", client.server_info["name"]
-      assert_equal "1.0.0", client.server_info["version"]
+        assert_equal "connected", client.connection_state
+        assert_equal "2025-06-18", client.protocol_version
+        assert_equal "echo", client.server_info["name"]
+        assert_equal "1.0.0", client.server_info["version"]
 
-      tools = client.list_tools
-      assert tools.success?, "list_tools must return a Result"
-      assert_equal %w[echo sleep], tools.value!.map { |t| t["name"] }
-      assert tools.value!.all? { |t| t["inputSchema"].is_a?(Hash) }
+        tools = client.list_tools
+        assert tools.success?, "list_tools must return a Result"
+        assert_equal %w[echo sleep], tools.value!.map { |t| t["name"] }
+        assert tools.value!.all? { |t| t["inputSchema"].is_a?(Hash) }
 
-      result = client.call_tool("echo", {"message" => "hello"})
-      assert_equal "echo: hello", result.value!["content"][0]["text"]
+        result = client.call_tool("echo", {"message" => "hello"})
+        assert_equal "echo: hello", result.value!["content"][0]["text"]
+      end
     end
 
     def test_close_reaps_the_child_process
-      client = Mcp::Client.new
-      transport = echo_transport
-      client.connect(transport)
-      pid = transport.pid
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        client = Mcp::Client.new
+        transport = echo_transport
+        client.connect(transport)
+        pid = transport.pid
 
-      client.close
+        client.close
 
-      assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
-      assert_equal "closed", client.connection_state
+        assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
+        assert_equal "closed", client.connection_state
+      end
     end
 
     def test_request_timeout_is_a_failure_typed_by_the_timeout_error
-      client = connected_client(request_timeout_ms: 250)
-      result = client.call_tool("sleep", {"ms" => 5000})
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        client = connected_client(request_timeout_ms: 250)
+        result = client.call_tool("sleep", {"ms" => 5000})
 
-      assert result.failure?, "the timeout taxonomy must arrive as a Failure value"
-      error = result.failure
-      assert_kind_of Mcp::TimeoutError, error
-      assert_equal "MCP request timed out after 250ms", error.message
-      assert_equal 250, error.timeout_ms
+        assert result.failure?, "the timeout taxonomy must arrive as a Failure value"
+        error = result.failure
+        assert_kind_of Mcp::TimeoutError, error
+        assert_equal "MCP request timed out after 250ms", error.message
+        assert_equal 250, error.timeout_ms
+      end
     end
 
     def test_invalid_initialize_result_fails_the_handshake_and_closes_the_transport
-      client = Mcp::Client.new
-      transport = echo_transport(env: {"MCP_ECHO_FAIL_INITIALIZE" => "1"})
-      result = client.connect(transport)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        client = Mcp::Client.new
+        transport = echo_transport(env: {"MCP_ECHO_FAIL_INITIALIZE" => "1"})
+        result = client.connect(transport)
 
-      assert result.failure?, "the invalid handshake must arrive as a Failure value"
-      assert_kind_of Mcp::Error, result.failure
-      assert_equal "Invalid MCP initialize result", result.failure.message
-      assert_equal "closed", client.connection_state
-      # pi: a failed connect closes the transport (client.ts catch -> close).
-      # I103 (C): Stdio#close reaps the child synchronously before it returns,
-      # so the reap is provable here without a wall — the pid is no longer a
-      # live child of this process (the same proof test_close_reaps pins).
-      assert_raises(Errno::ECHILD) { Process.waitpid(transport.pid, Process::WNOHANG) }
+        assert result.failure?, "the invalid handshake must arrive as a Failure value"
+        assert_kind_of Mcp::Error, result.failure
+        assert_equal "Invalid MCP initialize result", result.failure.message
+        assert_equal "closed", client.connection_state
+        # pi: a failed connect closes the transport (client.ts catch -> close).
+        # I103 (C): Stdio#close reaps the child synchronously before it returns,
+        # so the reap is provable here without a wall — the pid is no longer a
+        # live child of this process (the same proof test_close_reaps pins).
+        assert_raises(Errno::ECHILD) { Process.waitpid(transport.pid, Process::WNOHANG) }
+      end
     end
 
     def test_unsupported_protocol_version_is_rejected
@@ -101,54 +117,66 @@ module Tart
     # on top, config wins. The env-dumping child is the echo-server
     # fixture pattern (pure Ruby over real pipes, no gems).
     def test_child_env_stdio_child_gets_the_scrubbed_base_and_config_wins
-      dump = File.join(@dir, "env_dump_child.rb")
-      File.write(dump, <<~RUBY)
-        require "json"
-        warn JSON.generate(ENV.to_h)
-        sleep
-      RUBY
-      saved = %w[BUNDLE_GEMFILE BUNDLER_ORIG_BUNDLE_GEMFILE RUBYOPT BUNDLER_ORIG_RUBYOPT
-                 TART_MCP_TEST_MARKER].to_h { |key| [key, ENV[key]] }
-      transport = nil
-      begin
-        ENV["BUNDLE_GEMFILE"] = "/t/Gemfile"
-        ENV["BUNDLER_ORIG_BUNDLE_GEMFILE"] = ChildEnv::INTENTIONALLY_NIL
-        # Hand-exported poison: NO record covers RUBYOPT (the pre-existing
-        # bundle-exec record is lifted for the pin) — the belt must strip
-        # bundler's token on its own.
-        ENV.delete("BUNDLER_ORIG_RUBYOPT")
-        ENV["RUBYOPT"] = "-r/x/y/bundler/setup -EUTF-8"
-        ENV["TART_MCP_TEST_MARKER"] = "parent-value"
-        chunks = []
-        chunks_gate = Gate.new
-        transport = Mcp::Stdio.new(command: RUBY, args: [dump],
-                                   env: {"TART_MCP_TEST_MARKER" => "config-value"})
-        transport.on_stderr = ->(chunk) { chunks << chunk; chunks_gate.ping }
-        transport.start
-        chunks_gate.await("the child's env dump on stderr") { !chunks.join.empty? }
-        child = JSON.parse(chunks.join)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        dump = File.join(@dir, "env_dump_child.rb")
+        File.write(dump, <<~RUBY)
+          require "json"
+          warn JSON.generate(ENV.to_h)
+          sleep
+        RUBY
+        saved = %w[BUNDLE_GEMFILE BUNDLER_ORIG_BUNDLE_GEMFILE RUBYOPT BUNDLER_ORIG_RUBYOPT
+                   TART_MCP_TEST_MARKER].to_h { |key| [key, ENV[key]] }
+        transport = nil
+        begin
+          ENV["BUNDLE_GEMFILE"] = "/t/Gemfile"
+          ENV["BUNDLER_ORIG_BUNDLE_GEMFILE"] = ChildEnv::INTENTIONALLY_NIL
+          # Hand-exported poison: NO record covers RUBYOPT (the pre-existing
+          # bundle-exec record is lifted for the pin) — the belt must strip
+          # bundler's token on its own.
+          ENV.delete("BUNDLER_ORIG_RUBYOPT")
+          ENV["RUBYOPT"] = "-r/x/y/bundler/setup -EUTF-8"
+          ENV["TART_MCP_TEST_MARKER"] = "parent-value"
+          chunks = []
+          chunks_gate = Gate.new
+          transport = Mcp::Stdio.new(command: RUBY, args: [dump],
+                                     env: {"TART_MCP_TEST_MARKER" => "config-value"})
+          transport.on_stderr = ->(chunk) { chunks << chunk; chunks_gate.ping }
+          transport.start
+          # I107 (the frozen predicate fix): the env-dump line spans
+          # multiple 4096-byte pipe chunks — await the FULL
+          # newline-terminated line, parse the first complete line only.
+          # Same assertions.
+          chunks_gate.await("the child's env dump on stderr") { chunks.join.include?("\n") }
+          child = JSON.parse(chunks.join.lines.first)
 
-        refute child.key?("BUNDLE_GEMFILE"), "the NIL record deleted the bundler key in the stdio child"
-        assert_equal "-EUTF-8", child["RUBYOPT"],
-                     "the belt stripped bundler's token, the user token rode through"
-        assert_equal "config-value", child["TART_MCP_TEST_MARKER"], "the config env wins over the base"
-        assert_equal ChildEnv.scrub(ENV.to_h)["PATH"], child["PATH"],
-                     "the child PATH is the scrubbed parent PATH (the user shell PATH under bundle exec)"
-        assert_empty child.keys.grep(/\ABUNDLER_ORIG_/), "zero ORIG residue in the stdio child"
-      ensure
-        saved.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
-        transport&.close
+          refute child.key?("BUNDLE_GEMFILE"), "the NIL record deleted the bundler key in the stdio child"
+          assert_equal "-EUTF-8", child["RUBYOPT"],
+                       "the belt stripped bundler's token, the user token rode through"
+          assert_equal "config-value", child["TART_MCP_TEST_MARKER"], "the config env wins over the base"
+          assert_equal ChildEnv.scrub(ENV.to_h)["PATH"], child["PATH"],
+                       "the child PATH is the scrubbed parent PATH (the user shell PATH under bundle exec)"
+          assert_empty child.keys.grep(/\ABUNDLER_ORIG_/), "zero ORIG residue in the stdio child"
+        ensure
+          saved.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
+          transport&.close
+        end
       end
     end
 
     def test_server_method_not_found_surfaces_as_a_failure_typed_by_mcp_error
-      client = connected_client
-      result = client.send(:request, "resources/list", nil, timeout_ms: nil)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        client = connected_client
+        result = client.send(:request, "resources/list", nil, timeout_ms: nil)
 
-      assert result.failure?
-      assert_kind_of Mcp::Error, result.failure
-      assert_equal(-32_601, result.failure.code)
-      assert_equal "Method not found: resources/list", result.failure.message
+        assert result.failure?
+        assert_kind_of Mcp::Error, result.failure
+        assert_equal(-32_601, result.failure.code)
+        assert_equal "Method not found: resources/list", result.failure.message
+      end
     end
 
     def test_jsonrpc_validation_matches_pis_predicates_and_codes
@@ -173,15 +201,19 @@ module Tart
     end
 
     def test_transport_passes_child_stderr_through
-      chunks = []
-      chunks_gate = Gate.new
-      transport = echo_transport(env: {"MCP_ECHO_STDERR" => "echo-server: ready\n"},
-                                 on_stderr: ->(chunk) { chunks << chunk; chunks_gate.ping })
-      client = Mcp::Client.new
-      client.connect(transport)
-      chunks_gate.await("the child's ready line on stderr") { chunks.join.include?("echo-server: ready") }
-      client.close
-      assert_includes chunks.join, "echo-server: ready"
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        chunks = []
+        chunks_gate = Gate.new
+        transport = echo_transport(env: {"MCP_ECHO_STDERR" => "echo-server: ready\n"},
+                                   on_stderr: ->(chunk) { chunks << chunk; chunks_gate.ping })
+        client = Mcp::Client.new
+        client.connect(transport)
+        chunks_gate.await("the child's ready line on stderr") { chunks.join.include?("echo-server: ready") }
+        client.close
+        assert_includes chunks.join, "echo-server: ready"
+      end
     end
 
     # -- AC4: config validation with pi's exact error strings --------------
@@ -245,39 +277,51 @@ module Tart
     # -- AC4: registry integration -----------------------------------------
 
     def test_registry_registers_mcp_tools_behind_the_schema_gate
-      tools = Tools::Registry.build(selected: %w[read], cwd: @dir, mcp_servers: {"echo" => echo_config})
-      track_mcp(tools)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        tools = Tools::Registry.build(selected: %w[read], cwd: @dir, mcp_servers: {"echo" => echo_config})
+        track_mcp(tools)
 
-      assert_equal %w[mcp__echo__echo mcp__echo__sleep read], tools.keys.sort
-      tool = tools["mcp__echo__echo"]
-      assert_kind_of Fast::Completions::Tool, tool
-      assert_equal "mcp__echo__echo", tool.name
-      assert_equal "Echo the message back", tool.description
-      assert_equal "echo", tool.remote_name
-      assert_equal(
-        {"type" => "object", "properties" => {"message" => {"type" => "string", "description" => "the message"}},
-         "required" => ["message"]},
-        tool.parameters_schema
-      )
-      assert_equal "echo: direct", tool.execute(message: "direct")
+        assert_equal %w[mcp__echo__echo mcp__echo__sleep read], tools.keys.sort
+        tool = tools["mcp__echo__echo"]
+        assert_kind_of Fast::Completions::Tool, tool
+        assert_equal "mcp__echo__echo", tool.name
+        assert_equal "Echo the message back", tool.description
+        assert_equal "echo", tool.remote_name
+        assert_equal(
+          {"type" => "object", "properties" => {"message" => {"type" => "string", "description" => "the message"}},
+           "required" => ["message"]},
+          tool.parameters_schema
+        )
+        assert_equal "echo: direct", tool.execute(message: "direct")
+      end
     end
 
     def test_registry_without_mcp_servers_never_connects_anything
-      tools = Tools::Registry.build(selected: %w[read], cwd: @dir)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        tools = Tools::Registry.build(selected: %w[read], cwd: @dir)
 
-      assert_equal %w[read], tools.keys
-      assert_empty tools.values.select { |t| t.is_a?(Mcp::Tool) }
+        assert_equal %w[read], tools.keys
+        assert_empty tools.values.select { |t| t.is_a?(Mcp::Tool) }
+      end
     end
 
     def test_registry_skips_a_server_that_fails_to_connect
-      _, path = temp_config_file("mcpServers" => {"broken" => {"command" => RUBY, "args" => ["-e", "exit 1"]}})
-      servers = Mcp::Config.load(path)
-      tools = capture_stderr do
-        Tools::Registry.build(selected: %w[read], cwd: @dir, mcp_servers: servers)
-      end
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        _, path = temp_config_file("mcpServers" => {"broken" => {"command" => RUBY, "args" => ["-e", "exit 1"]}})
+        servers = Mcp::Config.load(path)
+        tools = capture_stderr do
+          Tools::Registry.build(selected: %w[read], cwd: @dir, mcp_servers: servers)
+        end
 
-      assert_equal %w[read], tools.keys
-      assert_match(/mcp server "broken" failed to connect/, @captured_stderr)
+        assert_equal %w[read], tools.keys
+        assert_match(/mcp server "broken" failed to connect/, @captured_stderr)
+      end
     end
 
     def test_tool_name_sanitizes_and_hashes_like_pi
@@ -293,23 +337,27 @@ module Tart
     # -- AC4: the agent-level round trip -----------------------------------
 
     def test_agent_round_trip_model_calls_mcp_tool_result_returns_to_the_model
-      server = MockLLMServer.new.start
-      @server_to_stop = server
-      server.script([
-        {type: :stream, tool_calls: [{id: "call_1", name: "mcp__echo__echo", arguments: {message: "ping"}}]},
-        {type: :message, content: "the echo came back"},
-      ])
-      tools = Tools::Registry.build(selected: %w[read], cwd: @dir, mcp_servers: {"echo" => echo_config})
-      track_mcp(tools)
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = MockLLMServer.new.start
+        @server_to_stop = server
+        server.script([
+          {type: :stream, tool_calls: [{id: "call_1", name: "mcp__echo__echo", arguments: {message: "ping"}}]},
+          {type: :message, content: "the echo came back"},
+        ])
+        tools = Tools::Registry.build(selected: %w[read], cwd: @dir, mcp_servers: {"echo" => echo_config})
+        track_mcp(tools)
 
-      result = run_agent(server, tools)
+        result = run_agent(server, tools)
 
-      # The model's tool call reached the echo server over real stdio, and the
-      # echo result returned to the model as the tool result.
-      tool_message = server.captured_requests.last["messages"].find { |m| m["role"] == "tool" }
-      assert_equal "call_1", tool_message["tool_call_id"]
-      assert_includes tool_message["content"], "echo: ping"
-      assert_equal "the echo came back", result.last.content
+        # The model's tool call reached the echo server over real stdio, and the
+        # echo result returned to the model as the tool result.
+        tool_message = server.captured_requests.last["messages"].find { |m| m["role"] == "tool" }
+        assert_equal "call_1", tool_message["tool_call_id"]
+        assert_includes tool_message["content"], "echo: ping"
+        assert_equal "the echo came back", result.last.content
+      end
     end
 
     private
@@ -359,10 +407,12 @@ module Tart
     def run_agent(server, tools)
       chat = TestChat.build(server, tools: tools.values, system_prompt: "test prompt")
       agent = Agent::Loop.new(chat:, tools:, on_event: nil)
-      result = nil
-      kernel = Core::Loop.new(session: ScriptedSession.new)
-      kernel.run { result = agent.run("call the echo tool") }
-      result
+      # I107 seat note: inside the scenario's Sync reactor the kernel.run
+      # shape DETACHES (async's Kernel#Async spawns the block as a task and
+      # returns when a scheduler already exists), so the round trip drives
+      # the agent directly on the same reactor the MCP transport tasks run
+      # on. Same surface, same assertions.
+      agent.run("call the echo tool")
     end
   end
 end

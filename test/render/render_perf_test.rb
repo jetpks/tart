@@ -250,10 +250,10 @@ module Tart
 
         event_loop.run do
           # I103 (B): the drawn surface's gate — the boot render.
-          await(session, "the boot render", cooperative: true) { !session.drawn.empty? }
+          await(session, "the boot render") { !session.drawn.empty? }
           task = event_loop.tick(Chat::SPINNER_INTERVAL_SECONDS)
           # I103 (B): the fire gate — the boot + ≥4 fires at 80 ms.
-          await(fire_gate, "the boot + ≥4 tick fires", cooperative: true) { fire_times.size >= 5 }
+          await(fire_gate, "the boot + ≥4 tick fires") { fire_times.size >= 5 }
           task.stop
         end
 

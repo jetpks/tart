@@ -13,13 +13,16 @@ module Tart
     # strictly demand-driven (menu open, user-initiated — never at boot,
     # never a runtime pi.dev fetch).
     #
-    # Thread discipline (the lib/tart/herdr.rb sender discipline): the
-    # one-off Async::HTTP client runs inside ONE dedicated background
-    # thread — off the reactor, the UI never blocks. This module is the
-    # ONE sanctioned background-thread site in the tree (the
-    # threads-budget gate excludes exactly this file; the
-    # listing-thread-law gate pins exactly one site here and none
-    # elsewhere in the models family).
+    # Thread discipline (I107 T5/V3 — the concurrency law): the one-off
+    # fetch is a TASK self-gated through Kernel#Sync (the I106 D1 gateway,
+    # grep.rb's landed shape) — a bare-thread caller gets a transient
+    # reactor on its own thread, a reactor caller runs inline on the host
+    # reactor. The callback form (the menu merge) fires +on_result+ ON A
+    # REACTOR FIBER of the caller's host reactor (the merge lands
+    # on-reactor — the cross-thread surface burden is gone); the sync form
+    # awaits the task (#wait, bounded by the same timeout + margin).
+    # Async::HTTP + with_timeout are unchanged (the client already IS
+    # async-native).
     #
     # Failure surface: connect refused, timeout, non-200, malformed body —
     # EVERY failure class returns nil, NOTHING is raised into the caller,
@@ -36,28 +39,42 @@ module Tart
 
       module_function
 
-      # Fetches the model ids. Two delivery forms over the ONE background
-      # thread:
+      # Fetches the model ids. Two delivery forms over the ONE Sync-gated
+      # task:
       # - callback form (the menu-merge path, R4): +on_result+ receives the
-      #   result (Array<String> of ids, or nil) ON the worker thread and
-      #   {fetch} returns immediately — the menu renders the user entries
-      #   right away and merges when the fetch lands;
+      #   result (Array<String> of ids, or nil) ON A REACTOR FIBER of the
+      #   CALLER'S host reactor and the returned task is still running when
+      #   {fetch} gives it back — the menu renders the user entries right
+      #   away and merges when the fetch lands;
       # - synchronous form (tests, simple callers): omit +on_result+ and
-      #   {fetch} joins the worker (bounded) and returns the result itself.
+      #   {fetch} awaits the task (bounded by the request's own timeout +
+      #   the teardown margin) and returns the result itself.
       def fetch(base_url:, api_key:, timeout: TIMEOUT, on_result: nil)
-        result = nil
-        worker = Thread.new do
-          begin
+        if on_result
+          # The callback form needs the CALLER's reactor alive (the task
+          # fires the callback when the fetch lands): a reactor seat is
+          # required (the menu opens on the surface's reactor fiber).
+          task = Async::Task.current? or raise ArgumentError,
+            "the listing callback form runs on the caller's reactor (Sync)"
+          task.async(transient: true) do
             result = request_ids(base_url: base_url, api_key: api_key, timeout: timeout)
+            on_result.call(result)
+            result
           rescue StandardError
-            result = nil # every failure class degrades to nil — never raises into the caller
+            on_result.call(nil) # every failure class degrades to nil — never raises into the caller
           end
-          on_result&.call(result)
+        else
+          # The sync form: the transient Sync reactor bounds on the
+          # caller's own thread; #wait re-raises only the bounded timeout
+          # family, degraded to nil like every failure class.
+          Sync do
+            Async::Task.current.async do
+              request_ids(base_url: base_url, api_key: api_key, timeout: timeout)
+            rescue StandardError
+              nil
+            end.wait
+          end
         end
-        return worker if on_result
-
-        worker.join(timeout + JOIN_MARGIN)
-        result
       end
 
       # The one attempt: GET <base_url>/models with the Bearer

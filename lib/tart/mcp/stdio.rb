@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "async"
 require "json"
 
 require_relative "../child_env"
@@ -15,6 +16,19 @@ module Tart
     #   (default: $stderr);
     # - close: close stdin and let the server exit, then SIGTERM the group,
     #   then SIGKILL; the child is reaped before close returns.
+    #
+    # I107 (T6/V2 — the concurrency law): the reader, the stderr drainer,
+    # and the stdin writer run as tasks on the HOST REACTOR (TRANSIENT —
+    # they never hold the reactor open; the teardown cancel is their
+    # unwind path, and close() stops them explicitly). The stdin write
+    # serializes through a single-writer mailbox (an Async::Queue + one
+    # writer task — the @write_mutex replacement): a payload larger than
+    # PIPE_BUF parks mid-write, so two concurrent writer fibers could
+    # interleave bytes; the mailbox FIFO makes the ordering exact. A write
+    # failure is recorded and the NEXT send fails fast with the same
+    # ConnectionClosedError class (an in-flight request fails through the
+    # transport-close path, as before). start/close run on a reactor seat
+    # (production: the tool-call tasks; tests: Sync-wrapped scenarios).
     class Stdio
       DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
       DEFAULT_MAX_STDERR_BYTES = 64 * 1024
@@ -49,7 +63,12 @@ module Tart
         @on_message = @on_error = @on_close = @on_stderr = nil
         @started = false
         @closed = false
-        @write_mutex = Mutex.new
+        # The single-writer mailbox (I107 T6): send() enqueues; the writer
+        # task writes FIFO. The first write failure lands here (bare flag)
+        # and the next send fails fast.
+        @mailbox = Async::Queue.new
+        @writer_error = nil
+        @reader = @stderr_task = @writer = nil
       end
 
       # @raise [Errno::ENOENT, Errno::EACCES] when the command cannot spawn
@@ -57,42 +76,40 @@ module Tart
       def start
         raise "MCP stdio transport already started" if @started
         raise ConnectionClosedError if @closed
+        task = Async::Task.current? or raise ArgumentError,
+          "MCP stdio start runs on the host reactor (Sync-wrapped scenario or tool task)"
 
         @started = true
         spawn_child
-        @reader = Thread.new do
-          Thread.current.report_on_exception = false
+        @writer = task.async(transient: true) { write_loop }
+        @reader = task.async(transient: true) do
           read_loop
         rescue StandardError => e
           emit_error(e)
         end
-        @stderr_thread = Thread.new do
-          Thread.current.report_on_exception = false
-          stderr_loop
-        end
+        @stderr_task = task.async(transient: true) { stderr_loop }
       end
 
       def send(message)
         raise ConnectionClosedError if @closed || !@stdin_w || @stdin_w.closed?
+        raise ConnectionClosedError.new(@writer_error.message) if @writer_error
 
-        payload = "#{JSON.generate(message)}\n"
-        @write_mutex.synchronize do
-          @stdin_w.write(payload)
-          @stdin_w.flush
-        end
-      rescue Errno::EPIPE, IOError
-        raise ConnectionClosedError
+        @mailbox << "#{JSON.generate(message)}\n"
+        nil
       end
 
       # Shutdown per the spec: close stdin and let the server exit, then
-      # SIGTERM, then SIGKILL (stdio.ts close()). Reaps the child.
+      # SIGTERM, then SIGKILL (stdio.ts close()). The transport tasks are
+      # stopped first (Cancel lands at their parks — bounded); the child
+      # ladder is unchanged and the child is reaped before close returns.
       def close
         return if @closed
 
         @closed = true
+        stop_transport_tasks
         @stdin_w&.close unless @stdin_w.nil? || @stdin_w.closed?
         reap_child
-        reap_threads
+        close_pipes
         emit_close
       end
 
@@ -214,10 +231,51 @@ module Tart
       end
 
       def reap_threads
-        @reader&.join(5)
-        @stderr_thread&.join(1)
+        close_pipes
+      end
+
+      # The transport tasks' unwind (D2 — bounded reap before the drain
+      # waits): Task#stop cancels each at its park (the mailbox pop, the
+      # stdout/stderr readpartial); a dead task is a no-op (the post-
+      # reactor close seat). The cancelled reader's ensure fires
+      # emit_close, same as the EOF path.
+      def stop_transport_tasks
+        [@writer, @reader, @stderr_task].each do |task|
+          next unless task&.alive?
+
+          task.stop
+          begin
+            task.wait
+          rescue Async::Cancel, StandardError
+            nil # the unwind is the point; the parks are bounded
+          end
+        end
+      end
+
+      def close_pipes
         @stdout_r&.close
         @stderr_r&.close
+      rescue IOError
+        nil
+      end
+
+      # The single writer: FIFO over the mailbox (the @write_mutex
+      # replacement). A write failure is recorded — send() fails fast on
+      # the next call with the same ConnectionClosedError class — and the
+      # task ends (the transport is dying either way).
+      def write_loop
+        while (payload = @mailbox.pop)
+          @stdin_w.write(payload)
+          @stdin_w.flush
+        end
+      rescue Errno::EPIPE, IOError, SystemCallError => e
+        @writer_error = e
+      ensure
+        begin
+          @mailbox.close
+        rescue StandardError
+          nil
+        end
       end
 
       def kill_group(signal)

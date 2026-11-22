@@ -25,6 +25,17 @@ module Tart
       DEFAULT_REQUEST_TIMEOUT_MS = 30_000
       MAX_LIST_PAGES = 1_000
 
+      # The scheduler-ready rider (Notification::Signal's mechanism — async
+      # clone lib/async/notification.rb).
+      Wake = Struct.new(:queue, :token) do
+        def alive? = true
+
+        def transfer
+          queue.push(token)
+        end
+      end
+      private_constant :Wake
+
       attr_reader :protocol_version, :server_info, :server_capabilities, :instructions
 
       # @param name [String] client info name (pi's Implementation.name).
@@ -40,8 +51,11 @@ module Tart
         @on_error = on_error
         @state = "idle"
         @next_request_id = 1
+        # I107 (V4/M9): the guard Mutex dies — the pending map's funnels are
+        # Hash operations (never yield) on ONE reactor thread: the requester
+        # fiber and the transport's reader task share it, and MRI fibers on
+        # one thread are cooperative, so no funnel can interleave.
         @pending = {}
-        @pending_mutex = Mutex.new
       end
 
       def connection_state
@@ -143,15 +157,15 @@ module Tart
         in Success(transport)
           id = @next_request_id
           @next_request_id += 1
-          queue = Queue.new
-          @pending_mutex.synchronize { @pending[id] = queue }
+          queue = Async::Queue.new
+          @pending[id] = queue
           message = {"jsonrpc" => "2.0", "id" => id, "method" => method}
           message["params"] = params if params
           timeout_ms ||= @request_timeout_ms
           begin
             transport.send(message)
           rescue StandardError => e
-            @pending_mutex.synchronize { @pending.delete(id) }
+            @pending.delete(id)
             return Failure(e) # today's send-failure wall, converted in place
           end
           await_response(id, queue, timeout_ms)
@@ -186,7 +200,7 @@ module Tart
           return Failure(Mcp::Error.new(error["code"], error["message"], error["data"]))
         end
       ensure
-        @pending_mutex.synchronize { @pending.delete(id) }
+        @pending.delete(id)
       end
 
       # pi's handleMessage dispatch order: response, request, notification.
@@ -199,17 +213,23 @@ module Tart
       end
 
       def handle_response(message)
-        queue = @pending_mutex.synchronize { @pending[message["id"]] }
+        queue = @pending[message["id"]]
         unless queue
           emit_error(StandardError.new("Received response for unknown MCP request #{message['id'].inspect}"))
           return
         end
 
-        queue << if message.key?("error")
+        delivery = if message.key?("error")
           {error: message["error"]}
         else
           {result: message["result"]}
         end
+        queue << delivery
+        # The V1 dual-path wake (I107/Q4): the direct push above is the
+        # proven same-reactor path (the reader task and the awaiting
+        # request fiber share the reactor); the scheduler-ready rider
+        # honors the standing same-thread lost-wakeup claim.
+        Fiber.scheduler&.push(Wake.new(queue, delivery))
       end
 
       # Server->client requests: ping answers {} (pi's built-in handler);
@@ -241,10 +261,9 @@ module Tart
       end
 
       def fail_pending(error)
-        @pending_mutex.synchronize do
-          @pending.each_value { |queue| queue << {closed: error} }
-          @pending.clear
-        end
+        @pending.each_value { |queue| queue << {closed: error} }
+        @pending.clear
+        nil
       end
 
       # pi: a failed connect closes the transport (client.ts catch -> close)

@@ -2,6 +2,8 @@
 
 require "socket"
 require "json"
+require "monitor"
+require "async" # the captured-request queues are Async::Queue (I107); the parity rig loads this file bare
 
 # A hermetic mock OpenAI-compatible endpoint over TCP (127.0.0.1, ephemeral
 # port): the real fast-completions client (fiber-native on the caller's
@@ -72,16 +74,21 @@ class MockLLMServer
   def initialize
     @server = TCPServer.new("127.0.0.1", 0)
     @port = @server.addr[1]
-    @requests = Queue.new
-    @request_logs = Queue.new
+    # The captured-request surfaces ride Async::Queue (the sanctioned
+    # seam — a Thread::Queue delegate; serve threads push, tests pop).
+    @requests = Async::Queue.new
+    @request_logs = Async::Queue.new
     @script = []
     @template = []
     @accept_thread = nil
     @suppress_usage = false
     # serve() runs on a per-connection thread; take_spec's scan+delete must
     # not interleave for concurrent requests (two requests matching the
-    # SAME entry must serve that entry exactly once, in one piece).
-    @script_mutex = Mutex.new
+    # SAME entry must serve that entry exactly once, in one piece). The
+    # lock stays as frozen test-support machinery (the scan is not a single
+    # GVL-atomic op); it is a reentrant Monitor so this file carries no
+    # Mutex allocation (the belt-vocabulary law).
+    @script_monitor = Monitor.new
     # I103 — the request-arrival gate (ADDITIVE; the rig shares this file):
     # pinged when a captured request lands, so tests await arrivals instead
     # of wall-clock budgets. No signature or behavior change. The mechanics
@@ -102,31 +109,41 @@ class MockLLMServer
 
   # The request-arrival gate's mechanics (the Tart::Test::Gate shape,
   # local: this file loads without minitest — the parity-rig contract).
+  # The I107 V1 vocabulary: plain-Integer version, Thread::Queue timed-pop
+  # park, dual-path ping (direct push + the scheduler-ready rider when a
+  # scheduler is present on the producer's thread — Notification::Signal's
+  # mechanism). No lock, no condition variable.
   class RequestGate
+    Wake = Struct.new(:queue, :token) do
+      def alive? = true
+
+      def transfer
+        queue.push(token)
+      end
+    end
+    private_constant :Wake
+
     def initialize
-      @mutex = Mutex.new
-      @cv = ConditionVariable.new
+      @ready = ::Thread::Queue.new
       @version = 0
     end
 
     def ping
-      @mutex.synchronize do
-        @version += 1
-        @cv.broadcast
-      end
+      @version += 1
+      @ready.push(:wake)
+      Fiber.scheduler&.push(Wake.new(@ready, :wake))
       nil
     end
 
     def state_version
-      @mutex.synchronize { @version }
+      @version
     end
 
     def wait_state_change(from_version, belt: 60)
-      @mutex.synchronize do
-        until @version > from_version
-          return nil unless @cv.wait(@mutex, belt)
-        end
-        @version
+      loop do
+        return @version if @version > from_version
+
+        return nil if @ready.pop(timeout: belt).nil?
       end
     end
   end
@@ -180,9 +197,7 @@ class MockLLMServer
 
   # Drains and returns all captured request bodies (parsed JSON).
   def captured_requests
-    list = []
-    list << @requests.pop(true) until @requests.empty?
-    list
+    drain_queue(@requests)
   end
 
   # The served-request count WITHOUT draining (the I54 rig knob's poll
@@ -195,12 +210,21 @@ class MockLLMServer
   # Drains and returns all captured request entries: full wire facts
   # (method, path, notable headers, parsed body) per request.
   def captured_request_logs
-    list = []
-    list << @request_logs.pop(true) until @request_logs.empty?
-    list
+    drain_queue(@request_logs)
   end
 
   private
+
+  # The non-blocking drain over the Async::Queue delegate: pop(timeout: 0)
+  # returns nil the moment the queue is empty — no pop(true) ThreadError,
+  # no blocking pop (the serve threads keep pushing concurrently).
+  def drain_queue(queue)
+    list = []
+    while (item = queue.pop(timeout: 0))
+      list << item
+    end
+    list
+  end
 
   NOTABLE_HEADERS = %w[authorization content-type accept user-agent].freeze
 
@@ -265,7 +289,7 @@ class MockLLMServer
   # semantics for every pre-I87 caller (entries without +match:+ keep the
   # blind shift, in order; the exhausted fallback is unchanged).
   def take_spec(parsed_body)
-    @script_mutex.synchronize do
+    @script_monitor.synchronize do
       index = @script.index { |entry| entry[:match] && entry[:match].call(parsed_body) }
       return @script.delete_at(index) if index
       index = @script.index { |entry| !entry[:match] }

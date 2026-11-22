@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "async"
 require_relative "../lib/tart"
 
 module Tart
@@ -15,43 +16,25 @@ module Tart
     WEDGE_BELT_S = 60
     CHILD_BELT_S = 300
 
-    # The deterministic event wait (I103): read the subject's state
-    # version, evaluate the predicate OUTSIDE the object lock (the public
-    # readers take it; MRI Mutexes are non-reentrant), on false park in
-    # wait_state_change until the version moves, re-evaluate, repeat. Belt
-    # expiry raises a loud assertion naming +what+. The subject is any
-    # object carrying the state-signal seam (state_version /
-    # wait_state_change) — a lib seamed surface or a Gate.
-    #
-    # cooperative: (REQUIRED at reactor-fiber call sites) — CV#wait parks
-    # the THREAD, which would stall the whole reactor; the cooperative
-    # variant re-checks the predicate after each cooperative yield
-    # (async's Kernel#sleep patch) instead. On this same thread every
-    # producer must run between yields, so a bounded cooperative re-check
-    # after every suspension misses no event — the belt caps it purely as
-    # the wedge guard. No clock lines either way.
-    COOPERATIVE_STEP_S = 0.005
-
-    def await(subject, what, belt: WEDGE_BELT_S, cooperative: false, &predicate)
-      Test.await_event(subject, what, belt: belt, cooperative: cooperative, &predicate)
+    # The deterministic event wait (I103, re-rooted onto the I107 V1 belt):
+    # read the subject's state version, evaluate the predicate OUTSIDE the
+    # subject, on false park in wait_state_change until the version moves,
+    # re-evaluate, repeat. Belt expiry raises a loud assertion naming
+    # +what+. The subject is any object carrying the state-signal seam
+    # (state_version / wait_state_change) — a lib seamed surface or a Gate.
+    # The park is fiber-safe by construction (a Thread::Queue timed pop
+    # parks a reactor FIBER; a sibling timer runs during the park — probe
+    # P1b), so the cooperative variant (and its step constant) are gone: no
+    # call site needs a special park anymore. No clock lines.
+    def await(subject, what, belt: WEDGE_BELT_S, &predicate)
+      Test.await_event(subject, what, belt: belt, &predicate)
     end
 
     # The shared version-loop (the Gate's #await delegates here too).
-    def self.await_event(subject, what, belt:, cooperative: false)
+    def self.await_event(subject, what, belt:)
       unless subject.respond_to?(:state_version) && subject.respond_to?(:wait_state_change)
         raise ArgumentError,
               "await needs a state-signal subject (got #{subject.class} — seamed surface or Gate)"
-      end
-
-      if cooperative
-        steps = [(belt / COOPERATIVE_STEP_S).round, 1].max
-        steps.times do
-          return if yield
-          task = (defined?(Async) && Async::Task.current?)
-          task ? task.sleep(COOPERATIVE_STEP_S) : sleep(COOPERATIVE_STEP_S)
-        end
-        return if yield
-        raise Minitest::Assertion, "event never arrived: #{what} (belt #{belt}s expired)"
       end
 
       loop do
@@ -106,45 +89,67 @@ module Tart
     end
 
     # The test-owned observable's side of the state-signal mechanics
-    # (I103): a double / support server / test-local callback array pings
-    # at its mutation points; consumers await on predicates over its
-    # state. Zero lib involvement.
+    # (I103, re-rooted onto the I107 V1 vocabulary): a double / support
+    # server / test-local callback array pings at its mutation points;
+    # consumers await on predicates over its state. Zero lib involvement.
+    # The mechanics (OQ3, the frozen belt bridge): the version is a plain
+    # Integer (GVL-atomic reads; a concurrent bump still moves the version,
+    # which is all any consumer observes), the park is a Thread::Queue
+    # timed pop (parks a reactor FIBER; blocks a plain thread — one park
+    # vocabulary at every seat), and the ping is the dual-path wake: the
+    # direct queue push (the proven cross-thread path) PLUS, when a
+    # scheduler is present on the producer's thread, one scheduler-ready
+    # rider whose #transfer pushes the same queue (Async::Notification
+    # ::Signal's mechanism, async clone lib/async/notification.rb) — both
+    # paths honor the standing same-thread lost-wakeup claim. Tokens are
+    # idempotent: a stale token only makes the version-loop re-check.
     class Gate
+      # The scheduler-ready rider: the selector processes its ready list by
+      # calling #transfer (the Notification::Signal shape).
+      Wake = Struct.new(:queue, :token) do
+        def alive? = true
+
+        def transfer
+          queue.push(token)
+        end
+      end
+      private_constant :Wake
+
       def initialize
-        @mutex = Mutex.new
-        @cv = ConditionVariable.new
+        @ready = ::Thread::Queue.new
         @version = 0
       end
 
       # Producer side: call at every mutation point of the observable
-      # (any thread; trap-free).
+      # (any thread; trap context safe — no lock is ever taken, the I75
+      # law; the belt-matrix probe drives this seat).
       def ping
-        @mutex.synchronize do
-          @version += 1
-          @cv.broadcast
-        end
+        @version += 1
+        @ready.push(:wake)
+        Fiber.scheduler&.push(Wake.new(@ready, :wake))
         nil
       end
 
-      # The await-loop's version read (under the lock).
+      # The await-loop's version read.
       def state_version
-        @mutex.synchronize { @version }
+        @version
       end
 
       # The consumer-side park: until the version moves past from_version,
-      # belt-bounded — nil on belt expiry with no change.
+      # belt-bounded — nil on belt expiry with no change. From a reactor
+      # fiber the pop parks the FIBER (a sibling timer runs during the
+      # park); from a plain thread it blocks the thread.
       def wait_state_change(from_version, belt: WEDGE_BELT_S)
-        @mutex.synchronize do
-          until @version > from_version
-            return nil unless @cv.wait(@mutex, belt)
-          end
-          @version
+        loop do
+          return @version if @version > from_version
+
+          return nil if @ready.pop(timeout: belt).nil?
         end
       end
 
       # Consumer side: the version-loop over this gate's state.
-      def await(what, belt: WEDGE_BELT_S, cooperative: false, &predicate)
-        Test.await_event(self, what, belt: belt, cooperative: cooperative, &predicate)
+      def await(what, belt: WEDGE_BELT_S, &predicate)
+        Test.await_event(self, what, belt: belt, &predicate)
       end
     end
     # A scripted session double at the TUI seam: lets kernel tests drive the
@@ -167,11 +172,15 @@ module Tart
         @poll_timeout = poll_timeout
         @width = width
         @height = height
-        @events = Queue.new
-        @synthetic = Queue.new
+        # The sanctioned Async::Queue seam (the poller bridge's double:
+        # the frame loop's fibers pop; tests push from any seat).
+        @events = Async::Queue.new
+        @synthetic = Async::Queue.new
         @drawn = []
         @scrollback = []
-        @draw_mutex = Mutex.new
+        # draw/insert_before are same-reactor mutation points (the frame
+        # loop's fibers; MRI fibers on one thread are cooperative) — no
+        # draw mutex since I107 (the V4 collapse).
         # The drawn surface's Gate (I103): pinged at BOTH drawn-state
         # mutation points (draw + insert_before — one version covers the
         # session surface; a draw-only predicate merely re-checks on a
@@ -193,7 +202,7 @@ module Tart
       end
 
       def draw(widget)
-        @draw_mutex.synchronize { @drawn << widget }
+        @drawn << widget
         @draw_gate.ping
       end
 
@@ -201,7 +210,7 @@ module Tart
       # recorded, not rendered, like draw. Lines inserted above the viewport,
       # in order (test assertions).
       def insert_before(height, widget)
-        @draw_mutex.synchronize { @scrollback << [height, widget] }
+        @scrollback << [height, widget]
         @draw_gate.ping
       end
 

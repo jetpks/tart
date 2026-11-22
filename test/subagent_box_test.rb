@@ -253,10 +253,11 @@ module Tart
         chat.instance_variable_set(:@box_running, false)
         chat.send(:arm_box_ticks)
         assert handle.stopped, "the glyph tick cancels when no visible row runs"
-        # no NEW thread anywhere in the box's files (the threads-budget
-        # law): the Manager's two Thread.new sites (the watcher + the
-        # deadline supervisor) are the frozen I48/I78 baseline.
-        assert_equal 2, File.read(File.expand_path("../lib/tart/subagents/manager.rb", __dir__)).scan("Thread.new").size
+        # no NEW thread anywhere in the box's files (the I107 census law):
+        # the manager's watcher + deadline supervisor are reactor tasks now,
+        # so manager.rb carries ZERO Thread.new sites — the tree's ONE
+        # spawn site is the named-exempt poller (lib/tart/core/poller.rb).
+        assert_equal 0, File.read(File.expand_path("../lib/tart/subagents/manager.rb", __dir__)).scan("Thread.new").size
         ["lib/tart/render/subagent_box.rb", "lib/tart/subagents.rb"].each do |rel|
           refute File.read(File.expand_path("../#{rel}", __dir__)).include?("Thread.new"),
                  "#{rel} adds no thread"
@@ -338,27 +339,31 @@ module Tart
     end
 
     def test_attention_maps_from_a_staged_supervisor_ask_file
-      manager = new_manager(with_channel: true)
-      dir = File.join(manager.home, "03attention-000")
-      FileUtils.mkdir_p(File.join(dir, "control", "supervisor-requests"))
-      write_status(dir, "running", pid: live_pid, model: "mock/mock-1", context: "fresh",
-                   session_id: manager.session_owner_id)
-      manager.status(id: nil) # the sweep adopts the staged dir
-      File.write(File.join(dir, "control", "supervisor-requests", "ask-1.json"),
-                 JSON.generate({"type" => "subagent.supervisor.request", "id" => "ask-1",
-                                "runId" => "03attention-000", "agent" => "worker",
-                                "reason" => "need_decision", "message" => "which way?",
-                                "expectsReply" => true,
-                                "createdAt" => (Time.now.to_f * 1000).to_i}))
-      channel = manager.supervisor_channel
-      await(channel, "the staged ask's pending registration") { channel.pending.any? } # the poll's scan
-      row = manager.box_snapshot[:rows].find { |r| r[:id] == "03attention-000" }
-      assert row[:attention], "a pending ask names the run id"
-      lines = Render::SubagentBox.render(rows: [row], now: row[:last_update], frame: 0,
-                                         width: 120, main_level: "off")
-      assert lines.map { |l| l.spans.map(&:content).join }.any? { |l| l.include?("no activity for") },
-             "the attention label renders"
-      channel.stop
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        manager = new_manager(with_channel: true)
+        dir = File.join(manager.home, "03attention-000")
+        FileUtils.mkdir_p(File.join(dir, "control", "supervisor-requests"))
+        write_status(dir, "running", pid: live_pid, model: "mock/mock-1", context: "fresh",
+                     session_id: manager.session_owner_id)
+        manager.status(id: nil) # the sweep adopts the staged dir
+        File.write(File.join(dir, "control", "supervisor-requests", "ask-1.json"),
+                   JSON.generate({"type" => "subagent.supervisor.request", "id" => "ask-1",
+                                  "runId" => "03attention-000", "agent" => "worker",
+                                  "reason" => "need_decision", "message" => "which way?",
+                                  "expectsReply" => true,
+                                  "createdAt" => (Time.now.to_f * 1000).to_i}))
+        channel = manager.supervisor_channel
+        await(channel, "the staged ask's pending registration") { channel.pending.any? } # the poll's scan
+        row = manager.box_snapshot[:rows].find { |r| r[:id] == "03attention-000" }
+        assert row[:attention], "a pending ask names the run id"
+        lines = Render::SubagentBox.render(rows: [row], now: row[:last_update], frame: 0,
+                                           width: 120, main_level: "off")
+        assert lines.map { |l| l.spans.map(&:content).join }.any? { |l| l.include?("no activity for") },
+               "the attention label renders"
+        channel.stop
+      end
     end
 
     def test_box_snapshot_is_a_thread_safe_bounded_copy

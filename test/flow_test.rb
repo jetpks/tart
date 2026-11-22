@@ -179,17 +179,21 @@ module Tart
     # The send-failure wall (today's `raise e` after pending cleanup): the
     # transport's exception instance arrives as the Failure payload.
     def test_transport_send_failure_is_the_failure_payload
-      broken = Class.new(Mcp::Stdio) do
-        def send(message)
-          raise Errno::EPIPE, "Broken pipe"
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        broken = Class.new(Mcp::Stdio) do
+          def send(message)
+            raise Errno::EPIPE, "Broken pipe"
+          end
         end
-      end
-      client = Mcp::Client.new
-      result = client.connect(broken.new(command: RUBY, args: [ECHO_SERVER]))
+        client = Mcp::Client.new
+        result = client.connect(broken.new(command: RUBY, args: [ECHO_SERVER]))
 
-      assert result.failure?
-      assert_instance_of Errno::EPIPE, result.failure
-      assert_equal "closed", client.connection_state
+        assert result.failure?
+        assert_instance_of Errno::EPIPE, result.failure
+        assert_equal "closed", client.connection_state
+      end
     end
 
     def test_tools_for_skips_a_failed_server_with_the_frozen_warn_bytes
@@ -293,7 +297,12 @@ module Tart
       client = Mcp::Client.new(request_timeout_ms: timeout_ms)
       @mcp_clients << client
       transport = Mcp::Stdio.new(command: RUBY, args: [ECHO_SERVER], env: env)
-      yield client, transport
+      # I107 (OQ5): the stdio call-surface scenarios ride a Sync-wrapped
+      # host reactor — the transport's reader/writer tasks are reactor
+      # tasks (T6/V2). Same names, same assertions.
+      Sync do
+        yield client, transport
+      end
     end
   end
 end

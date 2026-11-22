@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **The tree's remaining Thread/Mutex/ConditionVariable concurrency is migrated to async/fiber primitives per the owner's concurrency law (2026-11-21, PR-#28 review).** Every long-lived worker (the sink flusher, the herdr sender, the manager watcher, the supervisor channel poller, the MCP stdio readers/writer, the print deadline) now runs as a task on the host reactor; one-shot bounded work self-gates through `Kernel#Sync`; cross-thread wakes use the dual-path queue ping (direct push + scheduler-ready rider); the kernel's per-signal disposable thread, the test belt's ConditionVariable park, and all guard Mutexes whose funnels became same-reactor are deleted — zero behavior change beyond synchronization mechanics. Two sites survive as named, owner-ratified exemptions: the TUI poller thread (ratatui's FFI poll has no unblock function, so a fiber cannot stand in) and `FileMutationQueue`'s two Mutexes (same-file mutation serialization across the bare off-reactor call seats, where every async wait primitive would crash).
+
 ### Fixed
 
 - **`grep`'s process management is now async/fiber native per the concurrency law.** The deadline, the stderr drain, and the reap all run as reactor fibers: `Kernel#Sync` gates the call (the live tool task runs inline; bare callers get a fresh reactor on their own fiber), pipe reads and `Process.waitpid2` park evented in the scheduler, the deadline is a `with_timeout` fiber timer with time-based TERM→KILL escalation, and the match limit TERMs the whole process group — no threads anywhere. Behavior is unchanged: the `TOOL_TIMEOUT_S` deadline (default 120 s), the teaching-refusal bytes, limit-hit results, and normal greps.

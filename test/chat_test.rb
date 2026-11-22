@@ -3307,112 +3307,128 @@ module Tart
     end
 
     def test_live_list_menu_merges_the_listed_ids_with_vendored_enrichment
-      server = MockLLMServer.new.start
-      server.script([{type: :models, ids: ["glm-5.2", "glm-5.3", "glm-4.7"]}])
-      with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
-        endpoint: {api_key: "k", api_base: server.url},
-        footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
-        chat.open_model_menu
-        # I103 (A): the merge_listing broadcast on the listing thread.
-        await(chat, "the live rows to merge") { live_menu_ids(chat).include?("glm-5.2") }
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = MockLLMServer.new.start
+        server.script([{type: :models, ids: ["glm-5.2", "glm-5.3", "glm-4.7"]}])
+        with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
+          endpoint: {api_key: "k", api_base: server.url},
+          footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
+          chat.open_model_menu
+          # I103 (A): the merge_listing broadcast on the listing thread.
+          await(chat, "the live rows to merge") { live_menu_ids(chat).include?("glm-5.2") }
 
-        assert_includes live_menu_ids(chat), "glm-4.7", "every listed id merges in"
-        assert_equal 1, live_menu_ids(chat).count("glm-5.3"), "the user entry is NOT duplicated"
+          assert_includes live_menu_ids(chat), "glm-4.7", "every listed id merges in"
+          assert_equal 1, live_menu_ids(chat).count("glm-5.3"), "the user entry is NOT duplicated"
 
-        merged = live_item(chat, "glm-5.3")
-        assert_equal "Mine", merged.fetch(:name), "the USER entry wins the provider+id collision"
-        assert merged.fetch(:entry).is_a?(Shapes::Model), "the user entry rides verbatim"
+          merged = live_item(chat, "glm-5.3")
+          assert_equal "Mine", merged.fetch(:name), "the USER entry wins the provider+id collision"
+          assert merged.fetch(:entry).is_a?(Shapes::Model), "the user entry rides verbatim"
 
-        live = live_item(chat, "glm-5.2").fetch(:entry)
-        assert_equal "GLM-5.2", live.name, "the vendored name fills the bare live entry"
-        assert_equal true, live.reasoning, "the vendored reasoning fills"
-        assert_equal "high", live.thinking_level_map.fetch(:high), "the vendored map fills"
-        assert_equal "zai", live.compat.thinking_format, "the vendored compat fills (six-key pick)"
-        assert_nil live.context_window, "the window stays nil — the entry-fact seams resolve it"
+          live = live_item(chat, "glm-5.2").fetch(:entry)
+          assert_equal "GLM-5.2", live.name, "the vendored name fills the bare live entry"
+          assert_equal true, live.reasoning, "the vendored reasoning fills"
+          assert_equal "high", live.thinking_level_map.fetch(:high), "the vendored map fills"
+          assert_equal "zai", live.compat.thinking_format, "the vendored compat fills (six-key pick)"
+          assert_nil live.context_window, "the window stays nil — the entry-fact seams resolve it"
+        end
+      ensure
+        server.stop
       end
-    ensure
-      server.stop
     end
 
     def test_live_list_selecting_a_live_entry_threads_the_vendored_facts
-      server = MockLLMServer.new.start
-      server.script([{type: :models, ids: ["glm-5.2"]}])
-      with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
-        endpoint: {api_key: "k", api_base: server.url},
-        footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
-        switched = []
-        chat.agent = Object.new.tap do |agent|
-          agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil,
-                                                           max_tokens: nil, model_reasoning: nil,
-                                                           thinking_level_map: nil, compat: nil|
-            switched << {model_id:, provider:, max_tokens:, model_reasoning:, thinking_level_map:, compat:}
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = MockLLMServer.new.start
+        server.script([{type: :models, ids: ["glm-5.2"]}])
+        with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
+          endpoint: {api_key: "k", api_base: server.url},
+          footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
+          switched = []
+          chat.agent = Object.new.tap do |agent|
+            agent.define_singleton_method(:switch_model) do |model_id, provider:, context_window: nil,
+                                                             max_tokens: nil, model_reasoning: nil,
+                                                             thinking_level_map: nil, compat: nil|
+              switched << {model_id:, provider:, max_tokens:, model_reasoning:, thinking_level_map:, compat:}
+            end
+            agent.define_singleton_method(:set_thinking_level) do |_level| end
           end
-          agent.define_singleton_method(:set_thinking_level) do |_level| end
+
+          chat.open_model_menu
+          # I103 (A): the merge_listing broadcast on the listing thread.
+          await(chat, "the live rows to merge") { live_menu_ids(chat).include?("glm-5.2") }
+          "glm-5.2".each_char { |char| chat.on_event(TUI.key_event(char)) }
+          chat.on_event(TUI.key_event("enter"))
+
+          vendored = Models::Vendored.facts_for("zai", nil, "glm-5.2")
+          assert_equal [{model_id: "glm-5.2", provider: "zai", max_tokens: vendored.fetch("maxTokens"),
+                         model_reasoning: true, thinking_level_map: vendored.fetch("thinkingLevelMap").transform_keys(&:to_sym),
+                         compat: Models.build_compat(vendored.fetch("compat"))}],
+            switched,
+            "selecting a live entry rides apply_model_selection UNCHANGED — the vendored facts " \
+            "thread exactly like a catalog entry's (the cap via entry_max_tokens, the map/compat filled)"
         end
-
-        chat.open_model_menu
-        # I103 (A): the merge_listing broadcast on the listing thread.
-        await(chat, "the live rows to merge") { live_menu_ids(chat).include?("glm-5.2") }
-        "glm-5.2".each_char { |char| chat.on_event(TUI.key_event(char)) }
-        chat.on_event(TUI.key_event("enter"))
-
-        vendored = Models::Vendored.facts_for("zai", nil, "glm-5.2")
-        assert_equal [{model_id: "glm-5.2", provider: "zai", max_tokens: vendored.fetch("maxTokens"),
-                       model_reasoning: true, thinking_level_map: vendored.fetch("thinkingLevelMap").transform_keys(&:to_sym),
-                       compat: Models.build_compat(vendored.fetch("compat"))}],
-          switched,
-          "selecting a live entry rides apply_model_selection UNCHANGED — the vendored facts " \
-          "thread exactly like a catalog entry's (the cap via entry_max_tokens, the map/compat filled)"
+      ensure
+        server.stop
       end
-    ensure
-      server.stop
     end
 
     def test_live_list_failure_row_renders_once_without_a_crash_and_single_attempt
-      server = MockLLMServer.new.start
-      server.script([{type: :models, raw: "{not json"}])
-      with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
-        endpoint: {api_key: "k", api_base: server.url},
-        footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat, session|
-        chat.open_model_menu
-        # I103 (A): the failure lands on the listing thread (the
-        # merge_listing broadcast fires on the failed-fetch arm too); each
-        # predicate pass composes one frame, so the row appears at the
-        # first draw after the broadcast.
-        await(chat, "the live-listing failure to land") do
-          draw(chat, session)
-          session.buffer_content.any? { |row| row.include?("(live listing unavailable)") }
-        end
-        assert_equal 1, server.request_count, "the failed fetch is ONE attempt — no retries"
-        assert_equal ["glm-5.3"], live_menu_ids(chat), "the menu keeps the user entries"
-        assert_equal 1, session.buffer_content.count { |row| row.include?("(live listing unavailable)") },
-          "exactly ONE muted failure row after the list"
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = MockLLMServer.new.start
+        server.script([{type: :models, raw: "{not json"}])
+        with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
+          endpoint: {api_key: "k", api_base: server.url},
+          footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat, session|
+          chat.open_model_menu
+          # I103 (A): the failure lands on the listing thread (the
+          # merge_listing broadcast fires on the failed-fetch arm too); each
+          # predicate pass composes one frame, so the row appears at the
+          # first draw after the broadcast.
+          await(chat, "the live-listing failure to land") do
+            draw(chat, session)
+            session.buffer_content.any? { |row| row.include?("(live listing unavailable)") }
+          end
+          assert_equal 1, server.request_count, "the failed fetch is ONE attempt — no retries"
+          assert_equal ["glm-5.3"], live_menu_ids(chat), "the menu keeps the user entries"
+          assert_equal 1, session.buffer_content.count { |row| row.include?("(live listing unavailable)") },
+            "exactly ONE muted failure row after the list"
 
-        # The menu stays functional: enter still selects the user entry.
-        chat.on_event(TUI.key_event("enter"))
-        refute chat.menu_open?, "no crash — the failure never raises into the surface"
+          # The menu stays functional: enter still selects the user entry.
+          chat.on_event(TUI.key_event("enter"))
+          refute chat.menu_open?, "no crash — the failure never raises into the surface"
+        end
+      ensure
+        server.stop
       end
-    ensure
-      server.stop
     end
 
     def test_live_list_never_fires_at_boot_or_on_the_direct_switch_path
-      server = MockLLMServer.new.start
-      with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
-        endpoint: {api_key: "k", api_base: server.url},
-        footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
-        # Boot (construction + footer facts): zero requests — pinned in
-        # models_listing_test too; here: the DIRECT-SWITCH path.
-        chat.switch_model(provider: "zai", id: "glm-5.3", name: "Mine", reasoning: true,
-          context_window: 100_000, max_tokens: nil, thinking_level_map: nil)
-        assert_equal 0, server.request_count, "the /model <ref> direct switch never fetches"
+      # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
+      # the migrated workers are reactor tasks. Same name, same assertions.
+      Sync do
+        server = MockLLMServer.new.start
+        with_chat(width: 40, screen_height: 16, models: stage_live_list_catalog,
+          endpoint: {api_key: "k", api_base: server.url},
+          footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
+          # Boot (construction + footer facts): zero requests — pinned in
+          # models_listing_test too; here: the DIRECT-SWITCH path.
+          chat.switch_model(provider: "zai", id: "glm-5.3", name: "Mine", reasoning: true,
+            context_window: 100_000, max_tokens: nil, thinking_level_map: nil)
+          assert_equal 0, server.request_count, "the /model <ref> direct switch never fetches"
 
-        chat.open_model_menu("glm") # the seeded open fires ONE fetch, same as the plain one
-        await(server, "the seeded open's fetch to arrive") { server.request_count == 1 }
-        assert_equal 1, server.request_count, "ONE fetch per (seeded) menu open"
+          chat.open_model_menu("glm") # the seeded open fires ONE fetch, same as the plain one
+          await(server, "the seeded open's fetch to arrive") { server.request_count == 1 }
+          assert_equal 1, server.request_count, "ONE fetch per (seeded) menu open"
+        end
+      ensure
+        server.stop
       end
-    ensure
-      server.stop
     end
 
     # The footer's pwd line renders the dim token (pi footer.ts:282 —
@@ -4056,7 +4072,7 @@ module Tart
           # streaming wait — the escape then cancels mid-run and the
           # partial output is kept. I103 (A, cooperative): the append
           # broadcast; the producers run on the side-reactor thread.
-          await(chat, "the kept chunk to land", cooperative: true) { row_texts(chat.display_lines).any? { |row| row == " kept" } }
+          await(chat, "the kept chunk to land") { row_texts(chat.display_lines).any? { |row| row == " kept" } }
           draw(chat, session)
           assert chat.user_bash_streaming?, "the run is mid-flight"
 
