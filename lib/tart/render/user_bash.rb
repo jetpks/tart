@@ -21,14 +21,6 @@ module Tart
       # The scheduler-ready rider (Notification::Signal's mechanism — async
       # clone lib/async/notification.rb): the selector processes its ready
       # list by calling #transfer, which pushes the same queue.
-      Wake = Struct.new(:queue, :token) do
-        def alive? = true
-
-        def transfer
-          queue.push(token)
-        end
-      end
-      private_constant :Wake
       # pi handleSubmit :3347-3356 — "!" runs whole-line bash, "!!" runs it
       # excluded from the model context; the bare prefix (no command) is
       # plain text. Returns [command, excluded] or nil.
@@ -171,7 +163,7 @@ module Tart
             # The completion sentinel's dual-path wake (V1): the direct
             # push above is the proven same-reactor path; the scheduler-
             # ready rider honors the standing lost-wakeup claim.
-            Fiber.scheduler&.push(Wake.new(chunks, :done))
+            Fiber.scheduler&.push(::Tart::Wake.new(chunks, :done))
             begin
               drainer.wait
             rescue Async::Cancel

@@ -416,14 +416,6 @@ module Tart
       # The scheduler-ready rider (Notification::Signal's mechanism — async
       # clone lib/async/notification.rb): the selector processes its ready
       # list by calling #transfer, which pushes the same queue.
-      Wake = Struct.new(:queue, :token) do
-        def alive? = true
-
-        def transfer
-          queue.push(token)
-        end
-      end
-      private_constant :Wake
       attr_reader :identity, :env, :config_path, :system_prompt
 
       # @param tuning [Hash] register-time test seam — may shrink the
@@ -585,7 +577,7 @@ module Tart
       # honor the standing same-thread lost-wakeup claim.
       def ping
         @ready.push(:wake)
-        Fiber.scheduler&.push(Wake.new(@ready, :wake))
+        Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
         nil
       end
 

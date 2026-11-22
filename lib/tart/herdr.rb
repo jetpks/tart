@@ -148,14 +148,6 @@ module Tart
 
       # The scheduler-ready rider (Notification::Signal's mechanism — async
       # clone lib/async/notification.rb).
-      Wake = Struct.new(:queue, :token) do
-        def alive? = true
-
-        def transfer
-          queue.push(token)
-        end
-      end
-      private_constant :Wake
 
       # @param socket_path [String] the UNIX socket path.
       # @param timeouts [Array(Integer, Integer)] attempt/retry budgets in
@@ -244,7 +236,7 @@ module Tart
       # honor the standing same-thread lost-wakeup claim.
       def ping
         @ready.push(:wake)
-        Fiber.scheduler&.push(Wake.new(@ready, :wake))
+        Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
         nil
       end
 

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "tart/version"
+require_relative "tart/wake"
 require_relative "tart/identity"
 require_relative "tart/schemas"
 require_relative "tart/shapes"

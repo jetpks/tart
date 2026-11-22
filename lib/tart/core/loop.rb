@@ -41,14 +41,6 @@ module Tart
       # The scheduler-ready rider (Notification::Signal's mechanism — async
       # clone lib/async/notification.rb): the selector processes its ready
       # list by calling #transfer, which pushes the same queue.
-      Wake = Struct.new(:queue, :token) do
-        def alive? = true
-
-        def transfer
-          queue.push(token)
-        end
-      end
-      private_constant :Wake
 
       # Wake this long before a frame deadline; the remainder is spun out
       # cooperatively because a reactor sleep overshoots by ~2ms.
@@ -367,7 +359,7 @@ module Tart
       def signal_state_change
         @state_version += 1
         @ready.push(:wake)
-        Fiber.scheduler&.push(Wake.new(@ready, :wake))
+        Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
         nil
       end
 
@@ -383,7 +375,7 @@ module Tart
       # never carries a real event.
       def signal(item)
         @events << item
-        Fiber.scheduler&.push(Wake.new(@events, item))
+        Fiber.scheduler&.push(::Tart::Wake.new(@events, item))
         self
       end
 

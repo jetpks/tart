@@ -27,14 +27,6 @@ module Tart
 
       # The scheduler-ready rider (Notification::Signal's mechanism — async
       # clone lib/async/notification.rb).
-      Wake = Struct.new(:queue, :token) do
-        def alive? = true
-
-        def transfer
-          queue.push(token)
-        end
-      end
-      private_constant :Wake
 
       attr_reader :protocol_version, :server_info, :server_capabilities, :instructions
 
@@ -229,7 +221,7 @@ module Tart
         # proven same-reactor path (the reader task and the awaiting
         # request fiber share the reactor); the scheduler-ready rider
         # honors the standing same-thread lost-wakeup claim.
-        Fiber.scheduler&.push(Wake.new(queue, delivery))
+        Fiber.scheduler&.push(::Tart::Wake.new(queue, delivery))
       end
 
       # Server->client requests: ping answers {} (pi's built-in handler);

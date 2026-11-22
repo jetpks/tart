@@ -114,14 +114,6 @@ class MockLLMServer
   # scheduler is present on the producer's thread — Notification::Signal's
   # mechanism). No lock, no condition variable.
   class RequestGate
-    Wake = Struct.new(:queue, :token) do
-      def alive? = true
-
-      def transfer
-        queue.push(token)
-      end
-    end
-    private_constant :Wake
 
     def initialize
       @ready = ::Thread::Queue.new
@@ -131,7 +123,7 @@ class MockLLMServer
     def ping
       @version += 1
       @ready.push(:wake)
-      Fiber.scheduler&.push(Wake.new(@ready, :wake))
+      Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
       nil
     end
 

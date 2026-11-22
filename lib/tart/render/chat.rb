@@ -54,14 +54,6 @@ module Tart
       # The scheduler-ready rider (Notification::Signal's mechanism — async
       # clone lib/async/notification.rb): the selector processes its ready
       # list by calling #transfer, which pushes the same queue.
-      Wake = Struct.new(:queue, :token) do
-        def alive? = true
-
-        def transfer
-          queue.push(token)
-        end
-      end
-      private_constant :Wake
       SPINNER = %w[⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏].freeze
 
       # pi loader.ts:17 DEFAULT_INTERVAL_MS — the spinner's frame dwell: the
@@ -916,7 +908,7 @@ module Tart
       def signal_state_change
         @state_version += 1
         @ready.push(:wake)
-        Fiber.scheduler&.push(Wake.new(@ready, :wake))
+        Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
         nil
       end
 
