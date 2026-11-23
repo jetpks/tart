@@ -455,8 +455,13 @@ module Tart
     end
 
     # Pin 8 — compat nil zero-change, the loop path (the wire-bodies
-    # digests pin the rig path): no thinking, no tool_stream, developer
-    # role, and the summarization one-shot keeps TODAY'S exact shapes —
+    # digests pin the rig path): no thinking, no tool_stream, system
+    # role (fast-completions 0.10.0 — pi v1.6.0 #10741: the dialect
+    # vocabulary default flips supports_developer_role to false,
+    # openai-completions.js:890 instructionRole + :1259-1265
+    # supportsDeveloperRole = isOpenAI; the default arm is non-OpenAI,
+    # so it gets system), and the summarization one-shot keeps TODAY'S exact
+    # shapes —
     # max_completion_tokens, no reasoning_effort (the gem's per-chat
     # callbacks mean the construction hook never ran there; the I36 arm
     # stays off it).
@@ -480,10 +485,10 @@ module Tart
       main_request, summary_request = requests[0], requests[1]
       refute main_request.key?("thinking")
       refute main_request.key?("tool_stream")
-      assert_equal "developer", main_request["messages"].first["role"]
+      assert_equal "system", main_request["messages"].first["role"]
       refute summary_request.key?("thinking"), "no thinking object on the one-shot"
       refute summary_request.key?("tool_stream")
-      assert_equal "developer", summary_request["messages"].first["role"]
+      assert_equal "system", summary_request["messages"].first["role"]
       assert summary_request.key?("max_completion_tokens"), "today's max-token key unchanged"
       refute summary_request.key?("max_tokens")
       assert_equal "medium", summary_request["reasoning_effort"],
@@ -491,9 +496,50 @@ module Tart
         "the no-hook premise died with the seam)"
     end
 
+    # The #9512 pin (v1.6.0 compaction.ts:603-605 — createSummarizationOptions
+    # sets NO maxTokens; :647/:699 reserveTokens is UNUSED for the cap): the
+    # summarize one-shot's output cap is INDEPENDENT of reserve_tokens — two
+    # compaction runs over the SAME scripted turns at reserve 1 and 100 carry
+    # the SAME max-token value (the wire model's own cap, clamped by the
+    # gem's clamp_max_tokens). The summarize request is selected by the
+    # SUMMARIZATION_SYSTEM_PROMPT leading system message, never by index.
+    # reserveTokens' surviving job is the START-TIME trigger, which stays
+    # untouched — this pin varies ONLY the cap.
+    def test_summarization_cap_ignores_reserve_tokens
+      caps = [1, 100].map do |reserve|
+        @server.script([
+          {type: :stream, content: "first answer"},
+          {type: :message, content: "a summary of the first turn"},
+          {type: :stream, content: "second answer"},
+          {type: :message, content: "a summary of the second turn"},
+        ])
+        agent, _events = agent_on_kernel(
+          compaction: {reserve_tokens: reserve, keep_recent_tokens: 1}, context_window: 14)
+        agent.push_message("second question")
+        run_agent(agent, "first question")
+
+        summary = @server.captured_requests.find do |request|
+          request["messages"].first["content"].to_s
+            .start_with?("You are a context summarization assistant.")
+        end
+        assert summary, "no summarize request found at reserve #{reserve}"
+        summary["max_completion_tokens"] || summary["max_tokens"]
+      end
+
+      assert caps[0].is_a?(Integer),
+        "the summarize request must carry the model's output cap, got #{caps[0].inspect}"
+      assert_equal caps[0], caps[1],
+        "reserve_tokens still shapes the summarize cap: #{caps.inspect} (pi #9512 — " \
+        "summaries use the model's output limit)"
+    end
+
     # Pin 9 — the switch seam: switch_model(compat:) swaps the dialect
     # mid-session and compat: nil restores the default arm (the wholesale
     # re-resolve idiom — nil IS "the switched model declares none").
+    # The default-arm role is system since fast-completions 0.10.0 (pi
+    # v1.6.0 #10741 — openai-completions.js:890 instructionRole +
+    # :1259-1265 supportsDeveloperRole = isOpenAI; the default arm is
+    # non-OpenAI); the zai explicit-true arm below still opts in.
     def test_switch_model_swaps_the_compat_dialect_and_restores
       @server.script([
         {type: :message, content: "one"},
@@ -514,7 +560,7 @@ module Tart
 
       first, second, third = @server.captured_requests
       refute first.key?("thinking"), "compat-nil boot: today's arm"
-      assert_equal "developer", first["messages"].first["role"]
+      assert_equal "system", first["messages"].first["role"]
 
       assert_equal({"type" => "enabled", "clear_thinking" => false}, second["thinking"],
         "the swapped dialect governs the next request")
@@ -522,7 +568,7 @@ module Tart
       assert_equal "system", second["messages"].first["role"]
 
       refute third.key?("thinking"), "compat nil restores the default arm"
-      assert_equal "developer", third["messages"].first["role"]
+      assert_equal "system", third["messages"].first["role"]
       assert_equal "high", third["reasoning_effort"], "the I36 effort wiring re-resolves wholesale"
     end
 
@@ -692,7 +738,7 @@ module Tart
       assert events.find { |e| e[:type] == :agent_end }[:interrupted],
         "interrupt must be observable through the agent_end event"
       assert agent.interrupted?
-      refute kernel.poller&.thread&.alive?, "no orphan poller after interrupt"
+      assert_predicate kernel.input_seam, :stopped?, "no orphan input-seam producer after interrupt"
     end
 
     # ---- the de-bridge pins (I50 — the gate's -n anchors; names EXACT) -----

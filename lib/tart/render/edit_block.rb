@@ -113,12 +113,14 @@ module Tart
       # pi formatEditCall (edit.ts:99-102) over the write family's exact
       # primitives: the bold toolTitle `edit` + the tool-path display
       # (accent token, the ~ contraction, "..." when the path is absent),
-      # wrapped through the call-row family. The OSC8 hyperlink stays cut
-      # (the recorded I18 cut — the TUI carries no link capability).
+      # wrapped through the call-row family. The OSC-8 file URL rides the
+      # tool-path span when capable (I111 — the I18 cut un-cut; the
+      # display is untouched).
       def header_rows(args, width, bg: nil)
         FileBlocks.wrapped_call_rows(
           [FileBlocks.tool_title_span("edit"), Markdown::Span.new(text: " "),
-           Markdown::Span.new(text: FileBlocks.tool_path_display(args), fg: Theme[:accent])],
+           Markdown::Span.new(text: FileBlocks.tool_path_display(args), fg: Theme[:accent],
+             href: FileBlocks.tool_path_href(args))],
           width, bg: bg
         )
       end

@@ -39,7 +39,11 @@ module Tart
         "request_draw = one dirty frame, then the loop is event-driven again"
     end
 
-    def test_native_events_round_trip_through_poller_and_queue
+    # The fd seam's native rail (I109): push_native writes the wake byte on
+    # ScriptedSession's pipe-backed :tty fd, the input producer's selector
+    # reports readiness, poll_event(0) pops the event, dispatch is :native.
+    # Deterministic end to end — no timer, no wall.
+    def test_native_events_round_trip_through_the_fd_input_seam
       session = ScriptedSession.new
       received = Queue.new
       received_gate = Gate.new
@@ -56,6 +60,31 @@ module Tart
       event, source = received.pop(timeout: 0)
       assert_equal "q", event.code
       assert_equal :native, source
+      assert_predicate event_loop.input_seam, :stopped?, "teardown stopped the input seam"
+    end
+
+    # The §1d law (I109): a foreign-thread synthetic push surfaces WITHOUT
+    # any timer — the wake byte on the pipe-backed :wake fd wakes the input
+    # producer, the producer pushes the :wake sentinel (synthetic events
+    # pending), and the idle loop's in-loop drain dispatches.
+    def test_synthetic_push_wakes_the_idle_loop_over_the_wake_fd
+      session = ScriptedSession.new
+      received = Queue.new
+      received_gate = Gate.new
+      event_loop = Core::Loop.new(session:, on_event: lambda do |event, source|
+        received << [event, source]
+        received_gate.ping
+      end)
+
+      event_loop.run do
+        Thread.new { session.push_event(SyncEvent.new) }
+        await(received_gate, "the synthetic event to dispatch") { !received.empty? }
+      end
+
+      event, source = received.pop(timeout: 0)
+      assert event.sync?
+      assert_equal :synthetic, source
+      assert_predicate event_loop.input_seam, :stopped?, "teardown stopped the input seam"
     end
 
     def test_synthetic_events_round_trip_from_another_thread

@@ -74,8 +74,10 @@ module Tart
                               env namespace follow it
           --steer-inbox DIR   print mode only: consume steering/stop request
                               files from DIR at this run's turn boundaries
-          --tools A,B,C       print mode only: the exact tool allowlist for
-                              this run (replaces the settings selection)
+          --tools A,B,C       the tool loadout: plain names = the exact
+                              allowlist for this run; +name/-name entries
+                              compose on the default — and, on --resume, on
+                              the session's restored tools (pi #10785)
           --system-prompt-file PATH
                               print mode only: replace the composed system
                               prompt with PATH's bytes
@@ -211,7 +213,9 @@ module Tart
           options[:steer_inbox] = dir
         end
         parser.on("--tools A,B,C",
-          "print mode only: the exact tool allowlist for this run") do |tools|
+          "the tool loadout: plain names = the exact allowlist for this run; " \
+          "+name/-name entries compose on the default selection — and, on " \
+          "--resume, on the session's restored tools (pi #10785)") do |tools|
           options[:tools] = tools
         end
         parser.on("--system-prompt-file PATH",
@@ -239,11 +243,20 @@ module Tart
       # warning onto the terminal.
       Warning.extend(QuietIOBufferWarning)
       options = parse(argv)
+      # --tools validates at boot with pi's literals (pi #10785's
+      # getToolListError): a mixed plain/modifier list or a `*` inside a
+      # modifier aborts cleanly here — both modes share the flag's
+      # vocabulary, print mode keeps its exact-allowlist letter.
+      begin
+        Settings.parse_tool_selection(options[:tools])
+      rescue ArgumentError => e
+        abort "tart: #{e.message} (see --help)."
+      end
       workdir = argv.shift || Dir.pwd
       # The I48 child-harness flags are print-mode only (the interactive
       # parent steers through its editor, never a file inbox).
-      if %i[steer_inbox tools system_prompt_file session_root].any? { |key| options[key] } && !options[:print]
-        abort "tart: --steer-inbox/--tools/--system-prompt-file/--session-root are print mode only (see --help)."
+      if %i[steer_inbox system_prompt_file session_root].any? { |key| options[key] } && !options[:print]
+        abort "tart: --steer-inbox/--system-prompt-file/--session-root are print mode only (see --help)."
       end
       return print_mode(options, workdir) if options[:print]
 
@@ -486,6 +499,19 @@ module Tart
           identity:, session_env: session_env_readers(surface), hooks:)
         prompt = system_prompt(workdir, settings, skills.skills, identity, context_files:,
           prompt_guidelines: memory_on ? Memory::PROMPT_GUIDELINES : [])
+        # --tools (pi #10785): the interactive flag's parsed shape — nil
+        # (absent), {explicit:} (plain names: exact allowlist, restore
+        # skipped), or {modifiers:} (+name/-name: compose on the default
+        # selection, and on a resumed session's RESTORED loadout).
+        # Print mode keeps the I48 §5.2 exact-allowlist letter (parse_tools_flag).
+        cli_tools = Settings.parse_tool_selection(options[:tools])
+        # The boot default names are the BOOT-BUILT loadout's names (the I117
+        # PHASE-0 ruling): selected_tools alone misses the hooks-registered
+        # merge (subagent, I70 default-on), so the selected_tools reading made
+        # `effective == boot_tools.keys` false on EVERY default boot and the
+        # rebuild arm silently dropped the merged tool — the byte-identity
+        # invariant governs the letter.
+        default_tool_names = tools.keys
 
         # /new's reset seam: a fresh session is a new recorder (new session
         # file, no parent) plus a fresh Agent::Loop on the same settings,
@@ -495,6 +521,39 @@ module Tart
           recorder = Agent::Session::Recorder.new(cwd: workdir, parent_session: resume_target)
           current_recorder = recorder
           seed_messages = resume_target ? Agent::Session.context_messages(resume_target) : []
+          # pi #10785 (agent-session.ts :562/:1907-1948): a resumed session
+          # RESTORES its recorded tool loadout, with the --tools +name/-name
+          # entries applied on top; a session that records no loadout keeps
+          # the current tools; an EXPLICIT --tools list selects exactly and
+          # skips the restore (the changelog letter). The effective names
+          # drive BOTH the session's tool instances and its <tools> prompt
+          # section (pi _setActiveTools rebuilds the system prompt).
+          recorded_decls = resume_target ?
+            Agent::Session.recorded_tool_decls(Agent::Session.load_entries(resume_target)) : {}
+          effective_tool_names = Settings.resolve_session_tool_names(
+            cli_tools:, default_tools: default_tool_names, recorded: recorded_decls.keys
+          )
+          session_tools = session_tools_for(tools, effective_tool_names, workdir, settings,
+            mcp_servers:, identity:, hooks:, session_env: session_env_readers(surface))
+          session_prompt = if effective_tool_names == default_tool_names
+            prompt
+          else
+            system_prompt(workdir, settings, skills.skills, identity, context_files:,
+              prompt_guidelines: memory_on ? Memory::PROMPT_GUIDELINES : [],
+              selected_tools: effective_tool_names)
+          end
+          # The loadout record (pi's system-message tool deltas): the entry
+          # carries the DELTA between the replayed recorded state and this
+          # session's effective loadout, so replaying the new file yields
+          # exactly the effective loadout (pi agent-loop.ts declareToolChanges:
+          # the difference between the committed transcript and the
+          # executable set). No record when the replay already matches.
+          added = session_tools.values.filter_map do |tool|
+            {name: tool.name, description: tool.description, parameters: tool.parameters} unless
+              recorded_decls.key?(tool.name)
+          end
+          removed = recorded_decls.reject { |name, _| session_tools.key?(name) }.values
+          recorder.append_tool_loadout(added:, removed:) unless added.empty? && removed.empty?
           # The boot model resolves per session (identity-namespaced env >
           # models.json "default" > Settings — I27), so a ctrl+s persisted
           # default is honored by the next /new too.
@@ -509,8 +568,8 @@ module Tart
           entry = resolve_boot_entry(models, boot)
           surface.agent = Agent::Loop.new(
             chat:,
-            tools:,
-            system_prompt: prompt,
+            tools: session_tools,
+            system_prompt: session_prompt,
             hooks:,
             # The emission context re-reads per event — /new swaps the
             # recorder, the lambda re-resolves the current one.
@@ -800,9 +859,10 @@ module Tart
     # [Context] section, I33). +prompt_guidelines+ (I47) threads the
     # memory module's two bullets when its gate is on (pi
     # system-prompt.ts:121).
-    def system_prompt(workdir, settings, skills, identity, context_files:, prompt_guidelines: [])
+    def system_prompt(workdir, settings, skills, identity, context_files:, prompt_guidelines: [],
+                      selected_tools: nil)
       Agent::SystemPrompt.build(
-        selected_tools: Settings.selected_tools(settings),
+        selected_tools: selected_tools || Settings.selected_tools(settings),
         cwd: workdir,
         context_files: context_files,
         docs_paths: Agent::SystemPrompt.pi_docs_paths,
@@ -912,11 +972,30 @@ module Tart
     end
 
     def build_tools(workdir, settings, mcp_servers: Mcp::Config.load(mcp_config_path),
-                    identity: Identity::DEFAULT, session_env: {}, hooks: nil)
-      Tools::Registry.build(selected: Settings.selected_tools(settings), cwd: workdir,
+                    identity: Identity::DEFAULT, session_env: {}, hooks: nil, selected: nil)
+      Tools::Registry.build(selected: selected || Settings.selected_tools(settings), cwd: workdir,
         mcp_servers:, identity:, session_env:, hooks:)
     rescue Mcp::Config::ConfigError => e
       abort "tart: #{e.message}"
+    end
+
+    # pi #10785's restore resolution over the BOOT-built loadout: the
+    # built-in union of the default and the effective names instantiates
+    # (Registry.build validates its selected list, so MCP/registered names
+    # never pass through it — they merge inside build_tools); the effective
+    # list then slices IN ITS OWN ORDER (pi _applyToolLoadout iterates the
+    # active-name list — the restored order is the wire order; names the
+    # current boot cannot build — a gone MCP server, an off extension —
+    # are ignored, pi's "Unknown and hidden tool names are ignored").
+    def session_tools_for(boot_tools, effective, workdir, settings, mcp_servers:,
+                          identity:, hooks:, session_env: {})
+      return boot_tools if effective == boot_tools.keys
+
+      builtins = (Settings.selected_tools(settings) | effective).select do |name|
+        Tools::Registry::TOOL_CLASSES.key?(name) || Tools::Registry::SELECTABLE_SUBAGENT.include?(name)
+      end
+      full = build_tools(workdir, settings, mcp_servers:, identity:, hooks:, session_env:, selected: builtins)
+      effective.each_with_object({}) { |name, loadout| loadout[name] = full[name] if full[name] }
     end
 
     def mcp_config_path

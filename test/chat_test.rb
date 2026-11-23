@@ -1655,7 +1655,7 @@ module Tart
 
       refute kernel.interrupted?, "the escape interrupt never stops the loop (I15)"
       assert chat.agent.interrupted?
-      refute kernel.poller&.thread&.alive?, "no orphan poller"
+      assert_predicate kernel.input_seam, :stopped?, "no orphan input-seam producer"
       assert_includes chat.transcript_lines.join, "interrupted",
         "the interrupted turn renders coherently"
     end
@@ -6310,6 +6310,75 @@ module Tart
     def line_fg(session, y, glyph)
       x = session.buffer_content[y].index(glyph)
       session.cell_fg(x, y)
+    end
+
+    # --- I111 — the OSC-8 carrier's full-frame submission ---
+
+    # The headless chat frame submits the FINAL transcript window rows to
+    # the session's overlay when capable: the drawn writer carries the
+    # link entries at their exact (y, x) — including the carrier crossing
+    # the frozen Transcript.markdown_lines rebuild (the array-identity
+    # channel) and TWO links resolving independently (no aliasing). The
+    # theme mode is pinned (COLORTERM=truecolor) so the emission literal
+    # is seat-independent (the md_link hex → 38;2;105;173;208).
+    def test_osc8_chat_frame_submits_transcript_link_rows
+      saved_color = ENV["COLORTERM"]
+      ENV["COLORTERM"] = "truecolor"
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        with_hyperlinks("1") do
+          captured = StringIO.new
+          session.writer = captured
+          finish_message(chat, "see [pi](https://pi.dev) and [docs](https://docs.dev) end")
+          draw(chat, session)
+
+          y = session.buffer_content.index { |row| row.include?("see pi and docs end") }
+          refute_nil y, "the link row rendered"
+          # The transcript row: pad(1) + "see "(4) → "pi" at 0-based x=5;
+          # + "pi"(2) + " and "(5) → "docs" at 0-based x=12.
+          expected = "\e[#{y + 1};6H\e[4m\e[38;2;105;173;208m\e]8;;https://pi.dev\e\\pi\e]8;;\e\\\e[0m" \
+            "\e[#{y + 1};13H\e[4m\e[38;2;105;173;208m\e]8;;https://docs.dev\e\\docs\e]8;;\e\\\e[0m"
+          assert_equal expected, captured.string,
+            "both links emit, in (y, x) order, each through its own carrier"
+
+          second = StringIO.new
+          session.writer = second
+          draw(chat, session)
+          assert_equal "", second.string, "the identity-stable frame re-submits but emits nothing"
+        end
+      end
+    ensure
+      if saved_color.nil?
+        ENV.delete("COLORTERM")
+      else
+        ENV["COLORTERM"] = saved_color
+      end
+    end
+
+    # --- I112 — the image carrier's full-frame submission --------------
+
+    # The headless chat frame submits the FINAL transcript window rows to
+    # the session's IMAGE overlay when capable: a markdown image-escape
+    # line rides the passthrough as an anchor row and the drawn writer
+    # carries the transmission at its row — the pi markdown.ts:328 letter
+    # end to end. Capability-off (the rail's force-off default) → the
+    # second with_chat frame proves no submission, no bytes.
+    def test_termimg_chat_frame_submits_image_rows_when_capable
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        with_images("kitty") do
+          captured = StringIO.new
+          session.writer = captured
+          finish_message(chat, "before\n\e_Ga=T,f=100,q=2;AAAA\e\\\nafter")
+          draw(chat, session)
+          assert_includes captured.string, "\e_Ga=T,f=100,q=2;AAAA\e\\",
+            "the passthrough transmission rides the chat frame's window"
+          assert_includes captured.string, "\e_Ga=d,d=a,q=2\e\\",
+            "the frame clear rides the first image-bearing frame"
+          second = StringIO.new
+          session.writer = second
+          draw(chat, session)
+          assert_equal "", second.string, "the identity-stable frame re-submits but emits nothing"
+        end
+      end
     end
 
     private

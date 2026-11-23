@@ -1,5 +1,15 @@
 # frozen_string_literal: true
 
+# The OSC-8 capability seam + overlay (I111) load with the TUI seam —
+# lib/tart.rb is byte-held (out of the touch set), so the requires live
+# here: capabilities first (standalone), then the overlay (nests in TUI).
+# I112 adds the image seam: the transmission module (pure functions) and
+# the per-session image overlay (Tart::ImageOverlay, per its letter).
+require_relative "capabilities"
+require_relative "link_overlay"
+require_relative "terminal_images"
+require_relative "image_overlay"
+
 require "ratatui_ruby"
 
 module Tart
@@ -315,7 +325,7 @@ module Tart
     # A live terminal session. The loop kernel and the bench hold one of
     # these; tests may substitute any object answering the same instance
     # methods (+draw+, +poll_event+, +push_event+, +drain_synthetic+,
-    # +synthetic_pending?+, +cell_symbol+, +insert_before+,
+    # +synthetic_pending?+, +input_wait_fds+, +cell_symbol+, +insert_before+,
     # +buffer_content+, +viewport_area+).
     class Session
       # @return [Boolean] whether a real terminal session is active.
@@ -323,22 +333,137 @@ module Tart
         RatatuiRuby.terminal_active?
       end
 
-      # Draws a widget tree to the terminal.
-      def draw(widget)
-        RatatuiRuby.draw(widget)
+      def initialize
+        @link_overlay = LinkOverlay.new
+        # The image overlay (I112): the erase/redraw delta state + the
+        # transmission cache ride this per-session instance; the anchor
+        # registry is the class-level carrier (ImageOverlay).
+        @image_overlay = ImageOverlay.new
+        @images_ever_capable = false
       end
 
+      # The OSC-8 overlay's byte writer (the osc52_copy idiom: default
+      # $stdout, flushed after the write). Injectable for the pins (the
+      # $stdout-swap precedent tui_test.rb:242-250).
+      attr_accessor :writer
+
+      # Draws a widget tree to the terminal. After +RatatuiRuby.draw+
+      # returns, the post-flush OSC-8 overlay (Grounds §1 ruling A) writes
+      # this frame's fresh link entries to the writer — ordered after the
+      # gem's flush on the same fd; the next flush re-positions the cursor
+      # (the backend always MoveTo's its first cell). The image overlay
+      # (I112) flushes right after, through the same writer — the
+      # erase/redraw ruling's sibling emission, ordered after the links.
+      def draw(widget)
+        RatatuiRuby.draw(widget)
+        emit_link_overlay
+        emit_image_overlay
+      end
+
+      # The image surface's per-frame submission (I112 — the
+      # chat.rb transcript_widget sibling): the SAME final window rows the
+      # link overlay receives, with the transcript area's screen origin.
+      # Capability-off → never called (the submission and the overlay
+      # never run: zero cost, zero bytes).
+      def submit_image_rows(rows, y0:, x0:)
+        @image_frame = [rows, y0, x0]
+      end
+
+      # The exit cleanup (I112 — pi beforeTerminalStop :396-401): best-
+      # effort `delete_all_kitty_images` when images were ever capable
+      # this session. Never raises; the caller runs it in the ensure path
+      # BEFORE the terminal restore.
+      def image_exit_cleanup
+        return unless @images_ever_capable
+
+        out = writer || $stdout
+        out.write(TerminalImages.delete_all_kitty_images)
+        out.flush
+      rescue StandardError
+        nil
+      end
+
+      # The chat surface's per-frame submission (chat.rb transcript_widget):
+      # the FINAL transcript window rows (post selection/rail/flash/pill
+      # composition) in order, with the transcript area's screen origin
+      # (0-based). Capability-off → never called (the submission and the
+      # overlay never run: zero cost, zero bytes).
+      def submit_link_rows(rows, y0:, x0:)
+        @link_frame = [rows, y0, x0]
+      end
+
+      private
+
+      # The overlay flush: capability-gated, submission-gated; the epoch is
+      # the session viewport's (width, height) — the resize belt re-bases
+      # the emitted set (Grounds §5).
+      def emit_link_overlay
+        return unless Capabilities.hyperlinks?
+
+        frame = @link_frame
+        return unless frame
+
+        @link_frame = nil
+        area = viewport_area
+        epoch = area ? [area.width, area.height] : [80, 24]
+        bytes = @link_overlay.emissions(frame[0], y0: frame[1], x0: frame[2], epoch: epoch)
+        return if bytes.empty?
+
+        out = writer || $stdout
+        out.write(bytes)
+        out.flush
+      end
+
+      # The image overlay's flush (I112): the same gates — capability,
+      # submission — and the same epoch law; capability-on marks the
+      # session for the exit cleanup (images were ever capable). Emission
+      # runs AFTER the link overlay (the draw order).
+      def emit_image_overlay
+        return unless Capabilities.images?
+
+        @images_ever_capable = true
+        frame = @image_frame
+        return unless frame
+
+        @image_frame = nil
+        area = viewport_area
+        epoch = area ? [area.width, area.height] : [80, 24]
+        bytes = @image_overlay.emissions(frame[0], y0: frame[1], x0: frame[2], epoch: epoch)
+        return if bytes.empty?
+
+        out = writer || $stdout
+        out.write(bytes)
+        out.flush
+      end
+
+      public
+
       # Blocks up to +timeout+ seconds waiting for the next native event.
-      # Returns an event object; +none?+ is true on timeout. Releases the GVL
-      # while blocked (crossterm), which is what makes the poller-thread
-      # design viable. In headless (test-terminal) sessions this returns
-      # immediately with a None event.
+      # Returns an event object; +none?+ is true on timeout. The fd seam
+      # (I109) means the kernel only ever calls this with timeout 0 — the
+      # non-blocking ready-read, invoked when the input producer's selector
+      # reported readiness. In headless (test-terminal) sessions this
+      # returns immediately with a None event.
       def poll_event(timeout:)
         RatatuiRuby.poll_event(timeout:)
       end
 
+      # The input-wait fds for the kernel's fd-driven input producer (I109):
+      # forwards to the gem's fd seam. EMPTY when no real terminal is behind
+      # this session — the producer then no-ops and synthetic events remain
+      # the test rail (there is NO polling timer in that shape). The gem
+      # exposes its wake pipe at every seat; the tty fd only when stdin is a
+      # tty (the same file description crossterm's source polls).
+      # @return [Hash] <tt>{wake: Integer, tty: Integer}</tt>, or {}.
+      def input_wait_fds
+        fds = RatatuiRuby.input_wait_fds
+        fds.key?(:tty) ? fds : {}
+      end
+
       # Pushes a synthetic event from any thread. Thread-safe (Mutex-guarded
       # queue inside ratatui_ruby); drained by the loop kernel each frame.
+      # The push also writes the gem's wake byte (the seam's self-waking
+      # rail — the input producer unblocks the idle loop over the wake fd).
       # Deliberately NOT +inject_test_event+, whose queue is thread-local.
       def push_event(event)
         RatatuiRuby::SyntheticEvents.push(event)
@@ -447,13 +572,29 @@ module Tart
           begin
             yield session
           ensure
+            # The image exit cleanup (I112) runs BEFORE the terminal
+            # restore, both arms (pi beforeTerminalStop :396-401).
+            begin
+              session.image_exit_cleanup
+            rescue StandardError
+              nil
+            end
             RatatuiRuby.restore_terminal
           end
         end
       else
         SignalGuard.arm_and_complete do
           RatatuiRuby.run(viewport:, height:, focus_events:, bracketed_paste:) do |_tui|
-            yield session
+            begin
+              yield session
+            ensure
+              # The image exit cleanup (I112), real-terminal arm.
+              begin
+                session.image_exit_cleanup
+              rescue StandardError
+                nil
+              end
+            end
           end
         end
       end
@@ -572,7 +713,28 @@ module Tart
     #   color symbol or nil, +modifiers+ modifier symbols). An empty row is
     #   a blank line.
     def markdown_line(row)
-      line(row.map { |s| span(s.text, fg: s.fg, bg: s.respond_to?(:bg) ? s.bg : nil, modifiers: s.modifiers) })
+      spans = row.map do |s|
+        # The OSC-8 carrier (I111, PHASE 0 ruling D1/D2): the href field
+        # wins; the array-identity registry is the fallback that crosses
+        # the frozen markdown_lines rebuild (which copies the modifiers
+        # array by reference). The resolution lands on the produced span
+        # object — the gem's Rust render never reads the registry.
+        href = s.respond_to?(:href) ? s.href : nil
+        mods = s.modifiers
+        href ||= LinkOverlay.array_href(mods) if mods.is_a?(Array)
+        produced = span(s.text, fg: s.fg, bg: s.respond_to?(:bg) ? s.bg : nil, modifiers: mods)
+        LinkOverlay.record_span_href(produced, href) if href
+        produced
+      end
+      built = line(spans)
+      # The image carrier (I112): a source span carrying the raw escape
+      # line registers (produced Line → passthrough anchor spec) — ONE
+      # reserved row, unpadded, x offset 0 (pi markdown.ts:328/:344).
+      # Registration only when a carrier exists: every ordinary row pays
+      # one respond_to? per span, nothing more.
+      carrier = row.find { |s| s.respond_to?(:image) && s.image }
+      ImageOverlay.record_anchor(built, sequence: carrier.image, rows: 1, x_offset: 0) if carrier
+      built
     end
 
     # @return [Integer] the display width of +string+ in terminal cells
