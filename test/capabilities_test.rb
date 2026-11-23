@@ -15,7 +15,7 @@ module Tart
       TERM TERM_PROGRAM TERMINAL_EMULATOR COLORTERM TMUX
       KITTY_WINDOW_ID GHOSTTY_RESOURCES_DIR WEZTERM_PANE
       WARP_SESSION_ID WARP_TERMINAL_SESSION_UUID ITERM_SESSION_ID
-      WT_SESSION TART_HYPERLINKS
+      WT_SESSION TART_HYPERLINKS TART_IMAGE_PROTOCOL
     ].freeze
 
     def with_detection_env(overrides, probe: nil)
@@ -131,6 +131,116 @@ module Tart
       with_detection_env({"TMUX" => "1"},
         probe: -> { Capabilities.features_list_hyperlinks?("hyperlinks") }) do
         assert_equal true, Capabilities.hyperlinks?, "reset! re-detects under the new probe"
+      end
+    end
+
+    # --- I112 — the capability seam's images arm (ENTRY 9) ------------
+
+    # pi terminal-image.ts:91-139 — the images values ride the SAME arm
+    # order: tmux/screen/herdr/WT_SESSION/alacritty-vscode-zed/jediterm/
+    # Windows-console/unknown → nil (byte-held); kitty/ghostty/wezterm/
+    # Warp → "kitty"; iterm → "iterm2".
+    def test_termimg_capability_matrix_images_kitty_family_iterm2_null
+      with_detection_env({"TMUX" => "1"}, probe: -> { true }) do
+        assert_nil Capabilities.images?, "tmux → nil (image protocols unreliable, pi :74-77)"
+      end
+      nil_arms = [
+        [{"TERM" => "screen-256color"}], [{"TERM_PROGRAM" => "herdr"}],
+        [{"WT_SESSION" => "wt"}], [{"TERM_PROGRAM" => "alacritty"}],
+        [{"TERM_PROGRAM" => "vscode"}], [{"TERM_PROGRAM" => "zed"}],
+        [{"TERMINAL_EMULATOR" => "jetbrains-jediterm"}], [{}]
+      ]
+      nil_arms.each do |(overrides)|
+        with_detection_env(overrides) do
+          assert_nil Capabilities.images?, "arm #{overrides.inspect} stays nil"
+        end
+      end
+      kitty_arms = [
+        [{"KITTY_WINDOW_ID" => "1"}], [{"TERM_PROGRAM" => "kitty"}],
+        [{"TERM_PROGRAM" => "ghostty"}], [{"GHOSTTY_RESOURCES_DIR" => "/g"}],
+        [{"WEZTERM_PANE" => "0"}], [{"TERM_PROGRAM" => "wezterm"}],
+        [{"TERM_PROGRAM" => "warpterminal"}], [{"WARP_SESSION_ID" => "w"}],
+        [{"WARP_TERMINAL_SESSION_UUID" => "w"}]
+      ]
+      kitty_arms.each do |(overrides)|
+        with_detection_env(overrides) do
+          assert_equal "kitty", Capabilities.images?, "arm #{overrides.inspect} → kitty"
+        end
+      end
+      [{"ITERM_SESSION_ID" => "i"}, {"TERM_PROGRAM" => "iterm.app"}].each do |overrides|
+        with_detection_env(overrides) do
+          assert_equal "iterm2", Capabilities.images?, "arm #{overrides.inspect} → iterm2"
+        end
+      end
+    end
+
+    # pi PI_IMAGE_PROTOCOL (:151-156): "kitty"/"iterm2" (case-insensitive)
+    # force the protocol; "none"/"0" force nil; anything else falls through
+    # to detection — and it composes independently of TART_HYPERLINKS.
+    def test_termimg_capability_override_env_forces_protocol_and_none
+      [%w[kitty kitty], ["KITTY", "kitty"], ["iTerm2", "iterm2"], ["ITERM2", "iterm2"]].each do |value, want|
+        with_detection_env({"TART_IMAGE_PROTOCOL" => value}) do
+          assert_equal want, Capabilities.images?, "override #{value.inspect} forces #{want}"
+        end
+      end
+      %w[none NONE 0].each do |value|
+        with_detection_env({"KITTY_WINDOW_ID" => "1", "TART_IMAGE_PROTOCOL" => value}) do
+          assert_nil Capabilities.images?, "override #{value.inspect} beats the detecting arm"
+        end
+      end
+      with_detection_env({"KITTY_WINDOW_ID" => "1", "TART_IMAGE_PROTOCOL" => "junk"}) do
+        assert_equal "kitty", Capabilities.images?, "a junk value falls through to detection"
+      end
+      # Composition: the image override rides alone; hyperlinks stay off.
+      with_detection_env({"TART_IMAGE_PROTOCOL" => "kitty", "TART_HYPERLINKS" => "0"}) do
+        assert_equal "kitty", Capabilities.images?
+        assert_equal false, Capabilities.hyperlinks?, "the rails compose independently"
+      end
+    end
+
+    # The ONE cached hash answers both arms (the ENTRY-9 contract, now
+    # discharged): the images consult never re-detects, and reset! drops
+    # the whole table so both arms re-read.
+    def test_termimg_capability_images_share_cached_hash_and_reset
+      consults = 0
+      with_detection_env({"TMUX" => "1"},
+        probe: -> { consults += 1; true }) do
+        table = Capabilities.capabilities
+        assert_same table, Capabilities.capabilities, "the cache answers the second read"
+        assert_same table, Capabilities.capabilities, "the images arm reads the same hash"
+        assert_nil Capabilities.images?
+        assert_equal 1, consults, "the probe ran once for BOTH arms"
+      end
+      with_detection_env({"KITTY_WINDOW_ID" => "1"}) do
+        assert_equal "kitty", Capabilities.images?, "reset! re-detects the images arm"
+        assert_equal true, Capabilities.hyperlinks?, "reset! re-detects the hyperlink arm too"
+      end
+    end
+
+    # pi :92-:130 — the family/jediterm/Windows arms hardcode trueColor
+    # true; the tmux/screen/herdr/unknown arms keep hasTrueColorHint.
+    def test_termimg_capability_true_color_family_hardcodes
+      [{"KITTY_WINDOW_ID" => "1"}, {"TERM_PROGRAM" => "kitty"}, {"TERM_PROGRAM" => "ghostty"},
+       {"GHOSTTY_RESOURCES_DIR" => "/g"}, {"WEZTERM_PANE" => "0"}, {"TERM_PROGRAM" => "warpterminal"},
+       {"ITERM_SESSION_ID" => "i"}, {"WT_SESSION" => "wt"}, {"TERM_PROGRAM" => "alacritty"},
+       {"TERM_PROGRAM" => "vscode"}, {"TERM_PROGRAM" => "zed"},
+       {"TERMINAL_EMULATOR" => "jetbrains-jediterm"}].each do |overrides|
+        # COLORTERM stays deleted (the hint's false value) — a hardcoded
+        # true must not depend on it.
+        with_detection_env(overrides) do
+          assert_equal true, Capabilities.capabilities[:true_color],
+            "arm #{overrides.inspect} hardcodes true (pi :92-:130)"
+        end
+      end
+      [{"TMUX" => "1"}, {"TERM" => "screen-256color"}, {"TERM_PROGRAM" => "herdr"}, {}].each do |overrides|
+        with_detection_env(overrides) do
+          assert_equal false, Capabilities.capabilities[:true_color],
+            "arm #{overrides.inspect} keeps the hint (unset COLORTERM → false, pi :79)"
+        end
+        with_detection_env(overrides.merge("COLORTERM" => "truecolor")) do
+          assert_equal true, Capabilities.capabilities[:true_color],
+            "arm #{overrides.inspect} keeps the hint (truecolor → true)"
+        end
       end
     end
   end

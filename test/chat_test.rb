@@ -6243,6 +6243,33 @@ module Tart
       end
     end
 
+    # --- I112 — the image carrier's full-frame submission --------------
+
+    # The headless chat frame submits the FINAL transcript window rows to
+    # the session's IMAGE overlay when capable: a markdown image-escape
+    # line rides the passthrough as an anchor row and the drawn writer
+    # carries the transmission at its row — the pi markdown.ts:328 letter
+    # end to end. Capability-off (the rail's force-off default) → the
+    # second with_chat frame proves no submission, no bytes.
+    def test_termimg_chat_frame_submits_image_rows_when_capable
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        with_images("kitty") do
+          captured = StringIO.new
+          session.writer = captured
+          finish_message(chat, "before\n\e_Ga=T,f=100,q=2;AAAA\e\\\nafter")
+          draw(chat, session)
+          assert_includes captured.string, "\e_Ga=T,f=100,q=2;AAAA\e\\",
+            "the passthrough transmission rides the chat frame's window"
+          assert_includes captured.string, "\e_Ga=d,d=a,q=2\e\\",
+            "the frame clear rides the first image-bearing frame"
+          second = StringIO.new
+          session.writer = second
+          draw(chat, session)
+          assert_equal "", second.string, "the identity-stable frame re-submits but emits nothing"
+        end
+      end
+    end
+
     private
 
     # A chat surface on the headless fullscreen test terminal for key-surface

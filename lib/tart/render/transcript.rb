@@ -541,6 +541,15 @@ module Tart
         content_width = width - Panel::OUTPUT_PAD.length * 2
         rows = Render::Markdown.rows(text, width: content_width).flat_map { |row| Text.wrap_row(row, content_width) }
         rows.map do |row|
+          # The image passthrough (I112, pi markdown.ts:328/:344): a row
+          # carrying an image-escape span is the ANCHOR row — it bypasses
+          # the themed re-span map (which would drop the carrier field)
+          # and the pad/bg margins entirely; TUI.markdown_line builds the
+          # zero-width line and records (produced Line → sequence) in the
+          # image anchor registry. The anchor reserves exactly ONE row.
+          carrier = row.find { |span| span.respond_to?(:image) && span.image }
+          next TUI.markdown_line(row) if carrier
+
           themed = row.map do |span|
             fg = Theme.md_fg(span.fg)
             modifiers = span.modifiers
@@ -871,7 +880,10 @@ module Tart
         when WRITE_TOOL
           ->(expanded) { FileBlocks.write_block_rows(args, result, viewport_width, expanded:) }
         when READ_TOOL
-          ->(expanded) { FileBlocks.read_block_rows(args, result, viewport_width, expanded:) }
+          # The details side channel rides the READ arm (I112 — the image
+          # preview placement; the replay path already carries it, and
+          # absent details render today's block exactly).
+          ->(expanded) { FileBlocks.read_block_rows(args, result, viewport_width, expanded:, details:) }
         when EDIT_TOOL
           ->(_expanded) { EditBlock.edit_block_rows(args, result, details, viewport_width) }
         end

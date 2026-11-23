@@ -43,9 +43,14 @@ module Tart
       # panel bg the tool-block call rows ride — nil off-panel), +href+
       # (the OSC-8 URL a capable terminal links the run to — nil when the
       # run is not a link or the capability is off; the converter itself
-      # never emits an escape — the emission lives in the TUI seam).
-      Span = Struct.new(:text, :fg, :modifiers, :bg, :href, keyword_init: true) do
-        def initialize(text:, fg: nil, modifiers: [], bg: nil, href: nil)
+      # never emits an escape — the emission lives in the TUI seam), and
+      # +image+ (I112 — the RAW image-escape line the span CARRIES for the
+      # post-flush overlay; the converter never emits an escape, the
+      # field is the carrier the anchor registry reads, and the span's
+      # visible text is empty so the row renders zero-width). Additive,
+      # the +href+ precedent.
+      Span = Struct.new(:text, :fg, :modifiers, :bg, :href, :image, keyword_init: true) do
+        def initialize(text:, fg: nil, modifiers: [], bg: nil, href: nil, image: nil)
           super
         end
       end
@@ -634,6 +639,17 @@ module Tart
             quote_block(line, lines)
           elsif (m = LIST_ITEM.match(line))
             list_block(m, lines)
+          # The image passthrough (I112, D-PASSTHROUGH-GATED): a source
+          # line carrying a kitty/iterm2 escape rides through as ONE block
+          # — ONLY when the images capability is on. OFF (the rail's
+          # force-off and every battery/golden seat) the line parses
+          # exactly as today, byte-identical (the paragraph fallback).
+          # The arm rides AFTER the structural matches (an escape line
+          # matches none of them — the ESC byte is no fence/heading/quote/
+          # list/table opener) and INSTEAD OF the paragraph fallback that
+          # would inline the escape as visible text.
+          elsif TerminalImages.image_escape_line?(line) && Capabilities.images?
+            [:image_line, line]
           else
             table_block(line, lines) || paragraph_block(line, lines)
           end
@@ -717,6 +733,13 @@ module Tart
           # degrades to paragraph text (oracle-verified: the 2-vs-1 pair
           # after a paragraph splits into two paragraphs).
           break if table_shape?(nxt, lines[1])
+          # The image passthrough interrupts a paragraph (I112): pi checks
+          # the RENDERED lines (markdown.ts:328 — isImageLine per line), so
+          # an escape line rides through wherever it lands; here an escape
+          # line ends the paragraph and becomes its own [:image_line]
+          # block (the next lines resume as a fresh paragraph). Only when
+          # images are capable — OFF parses byte-identically.
+          break if TerminalImages.image_escape_line?(nxt) && Capabilities.images?
           src << lines.shift
         end
         [:paragraph, src.join("\n")]
@@ -842,6 +865,11 @@ module Tart
         when :quote then quote_rows(block)
         when :hr then [[Span.new(text: "─" * hr_length, fg: FG[:hr])]]
         when :list then list_rows(block)
+        # The image passthrough (I112): one row whose single span carries
+        # the RAW escape line in the +image+ field — zero visible width,
+        # so Text.wrap_row passes the row through UNCHANGED (the fits arm;
+        # no text.rb change) and the escape never enters a buffer cell.
+        when :image_line then [[Span.new(text: "", image: block[1])]]
         end
       end
 

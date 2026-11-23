@@ -2116,6 +2116,13 @@ module Tart
         if Capabilities.hyperlinks? && @session.respond_to?(:submit_link_rows)
           @session.submit_link_rows(window, y0: 0, x0: 0)
         end
+        # The image carrier's submission (I112 — the additive sibling): the
+        # SAME final window rows ride to the image overlay when images are
+        # capable. Capability-off → never submitted (zero cost, zero
+        # bytes); the guard is the duck-typed seam.
+        if Capabilities.images? && @session.respond_to?(:submit_image_rows)
+          @session.submit_image_rows(window, y0: 0, x0: 0)
+        end
         TUI.paragraph(text: window, wrap: false)
       end
 
