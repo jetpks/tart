@@ -42,11 +42,17 @@ module Tart
       #   provider — same-model replay comparison only).
       # @param endpoint [Hash, nil] {api_key:, api_base:} — the parent
       #   endpoint facts the subagents Manager threads to its children.
-      def initialize(client:, model_id:, provider_key: nil, endpoint: nil)
+      # @param request_error [Exception, nil] I119: a key failure resolved at
+      #   boot (an unresolvable `$ENV` template or a `!command` apiKey in the
+      #   provider block) that the FIRST request raises — the loop's existing
+      #   error terminal (I60) carries it instead of crashing boot (the
+      #   never-raise boot law; pi resolves at use and fails the request).
+      def initialize(client:, model_id:, provider_key: nil, endpoint: nil, request_error: nil)
         @client = client
         @model_id = model_id
         @provider_key = provider_key
         @endpoint = endpoint
+        @request_error = request_error
         @instructions = nil
         @messages = []
         @tools = []
@@ -191,7 +197,7 @@ module Tart
       # compaction.ts:605-607 — the dialect branch carries it).
       def summary_chat(instructions:, max_output_tokens: nil)
         chat = Chat.new(client: @client, model_id: @model_id, provider_key: @provider_key,
-                        endpoint: @endpoint)
+                        endpoint: @endpoint, request_error: @request_error)
         chat.apply_facts(model_reasoning: @model_reasoning, thinking_level_map: @thinking_level_map,
           compat: @compat, context_window: @facts.context_window, max_tokens: @facts.max_tokens)
         chat.with_instructions(instructions)
@@ -211,6 +217,10 @@ module Tart
       # re-raises as Async::Cancel (D3: the loop's ladder owns the shape).
       def step
         return nil if complete?
+        # I119: the key failure resolved at boot fails THIS request by name —
+        # nothing reaches the wire (the client was built keyless); the loop's
+        # rescue records it through the I60 failure trace.
+        raise @request_error if @request_error
 
         reason = nil
         assistant = @client.stream(model: @model, messages: gem_messages,

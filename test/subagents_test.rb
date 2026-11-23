@@ -530,6 +530,31 @@ module Tart
       assert_equal @home, env["HOME"]
     end
 
+    # I119 env-templates (ruling A): the parent's RESOLVED endpoint key —
+    # what the launcher's endpoint_facts threaded onto the Manager, with a
+    # templated catalog key already resolved — is what a child inherits when
+    # the env tier is unset: the child's <IDENTITY>_API_KEY carries it and
+    # the child's OWN request reaches the mock with `Authorization: Bearer <resolved>`
+    # (the mock sees the resolved key; the raw template never crosses to a child).
+    def test_env_template_children_inherit_the_parent_resolved_endpoint_key
+      @server.script([{type: :stream, content: "ok"}])
+      inherited = default_env.reject { |key, _| key == "PI_API_KEY" || key == "PI_API_BASE" }
+      manager = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"), env: inherited,
+                                       identity: "pi", hooks: @hooks)
+      @managers << manager
+      manager.endpoint = {api_key: "boot-resolved-key", api_base: @server.url}
+      run = manager.spawn_run(agent: "worker", task: "t", async: false, timeout_ms: 0, tool_timeout_ms: 0)
+
+      assert_equal :completed, run[:state], "the child boots on the inherited endpoint"
+      _, env = manager.spawn_argv_and_env(run)
+      assert_equal "boot-resolved-key", env["PI_API_KEY"], "the resolved endpoint key rides the child env"
+      assert_equal @server.url, env["PI_API_BASE"]
+      count = @server.request_count
+      log = @server.captured_request_logs.find { |entry| entry[:path].to_s.end_with?("chat/completions") }
+      assert_equal "Bearer boot-resolved-key", log.fetch(:headers)["authorization"],
+        "the child's wire carries the RESOLVED key (#{count} requests seen)"
+    end
+
     # I74 session-sink child capture (AC4): the five identity-namespaced
     # sink picks — HOST/TOKEN/DISABLED pass through from the scrubbed
     # source env, AGENT_NAME is the run label (unconditional),

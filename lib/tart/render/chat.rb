@@ -20,6 +20,7 @@ require_relative "subagent_box"
 require_relative "slash_source"
 require_relative "transcript"
 require_relative "../models"
+require_relative "../config_value"
 # Law 3 — the box's data seam: the Chat surface reaches the boot-wired
 # Manager through {Subagents.current_manager} (bin/tart is hard-frozen).
 require_relative "../subagents"
@@ -174,11 +175,15 @@ module Tart
       #   time source for the spinner ({spinner_glyph}; the viewport.rb
       #   monotonic precedent, the UserBash constructor-seam idiom).
       #   Tests pin fake time with zero sleeps.
+      # @param env [Hash] I119: the environment the /model live listing
+      #   resolves a provider block's templated apiKey against (default the
+      #   process ENV; tests inject a hash). The render layer reads no other
+      #   env.
       def initialize(session:, kernel:, footer_data: nil, branch_reader: Footer::DEFAULT_BRANCH_READER, autocomplete: nil,
         motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
         prompts: [], skills: [], context_files: [], extensions: [], models: nil,
         clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }, endpoint: nil,
-        sweep_slice_budget: nil)
+        sweep_slice_budget: nil, env: ENV)
         @session = session
         @kernel = kernel
         @footer_data = footer_data
@@ -188,6 +193,9 @@ module Tart
         # speaks: {api_key:, api_base:}); the live-listing fallback tier.
         # nil = no listing fallback (every existing test construction).
         @endpoint = endpoint
+        # The I119 listing key-resolution env (injected; never ENV elsewhere
+        # in the render layer).
+        @env = env
         # The live listing's open generation (I71 R4): bumped per menu
         # open; a landed fetch merges only when its open is still the
         # latest — a closed/superseded menu never merges stale rows.
@@ -2792,6 +2800,15 @@ module Tart
         seq = @listing_seq += 1
         Models::Listing.fetch(base_url: fetch_base, api_key: fetch_key,
           on_result: ->(ids) { merge_listing(seq, ids, block_base, &live_facts_for) })
+      rescue ConfigValue::Error
+        # I119: a block apiKey that does not resolve (an unset/empty variable
+        # or a `!command` value) is the listing's failure — the same muted
+        # row a failed fetch draws; the literal never reaches the wire and
+        # the boot endpoint's key never substitutes. Same landing as
+        # merge_listing's failure arm (the I103 broadcast + redraw).
+        @menu&.listing_failed!
+        signal_state_change
+        @kernel.request_draw
       end
 
       # The endpoint resolution (I71 R3 — frozen): the current model
@@ -2809,7 +2826,16 @@ module Tart
         block_base = provider.respond_to?(:base_url) ? provider.base_url : provider[:baseUrl]
         block_key = provider.respond_to?(:api_key) ? provider.api_key : provider[:apiKey]
         base = block_base || @endpoint&.fetch(:api_base, nil)
-        key = block_key || @endpoint&.fetch(:api_key, nil)
+        # I119: the BLOCK's apiKey resolves at this use (pi's grammar; a
+        # template naming an unset/empty variable or a `!command` value
+        # raises — the caller's failure row). The threaded boot endpoint key
+        # is reached ONLY when the block declares none, and is already
+        # resolved (never re-resolved — a resolved secret may hold `$`).
+        key = if block_key.nil?
+          @endpoint&.fetch(:api_key, nil)
+        else
+          ConfigValue.resolve!(block_key, "API key for provider \"#{current_model_ref.provider}\"", env: @env)
+        end
         return nil unless base.is_a?(String) && !base.empty? && key.is_a?(String) && !key.empty?
 
         [base, key, block_base,

@@ -7,6 +7,7 @@ require_relative "mcp/stdio"
 require_relative "mcp/client"
 require_relative "mcp/config"
 require_relative "mcp/tool"
+require_relative "config_value"
 
 module Tart
   # MCP server support (BRIEF §7.3): hand-rolled stdio JSON-RPC client,
@@ -55,10 +56,24 @@ module Tart
     #   server, or Failure(the client's payload). The cleanup guard closes
     #   the client on EVERY failure path (today's rescue Exception shape,
     #   explicit in the branches).
-    def server_tools(name, config, used:)
+    def server_tools(name, config, used:, env: ENV)
       client = Client.new
-      connected = client.connect(Stdio.new(command: config[:command], args: config[:args],
-                                           env: config[:env], cwd: config[:cwd]))
+      # I119: the server's env VALUES resolve at connect (pi
+      # extensions/mcp/runtime.ts:112-113 — `resolveConfigValueOrThrow(value,
+      # `MCP server "<name>" env "<KEY>"`)`); an unresolvable value (or a
+      # `!command` value) is THIS server's connect failure — the named
+      # message on the existing warn surface, no child spawned. The scrub
+      # composition in Stdio#spawn_child (I73) is untouched: the resolved
+      # hash rides where the raw one did, config still winning over the base.
+      connected = begin
+        resolved_env = config[:env]&.to_h do |key, value|
+          [key, ConfigValue.resolve!(value, "MCP server \"#{name}\" env \"#{key}\"", env:)]
+        end
+        client.connect(Stdio.new(command: config[:command], args: config[:args],
+                                 env: resolved_env, cwd: config[:cwd]))
+      rescue ConfigValue::Error => e
+        Failure(e)
+      end
       if connected.failure?
         client.close
         return connected
