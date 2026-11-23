@@ -276,6 +276,23 @@ module Tart
           assert_kind_of Integer, color, "the 256-color downgrade path"
         end
       end
+
+      # I111 — the I18 cut un-cut: the header's tool-path span carries the
+      # file:// href when capable (display untouched), nil when off.
+      def test_osc8_edit_header_path_span_carries_file_url
+        with_hyperlinks("1") do
+          header = EditBlock.header_rows({"file_path" => "/tmp/osc8 dir/x.md"}, WIDTH)
+          span = header.flat_map(&:spans).find { |sp| TUI::LinkOverlay.span_href(sp) }
+          refute_nil span, "the capable header records the path span"
+          assert_equal "file:///tmp/osc8%20dir/x.md", TUI::LinkOverlay.span_href(span)
+          assert_equal "/tmp/osc8 dir/x.md", span.content, "the display keeps today's form"
+        end
+        with_hyperlinks("0") do
+          header = EditBlock.header_rows({"file_path" => "/tmp/x.md"}, WIDTH)
+          assert header.flat_map(&:spans).none? { |sp| TUI::LinkOverlay.span_href(sp) },
+            "capability-off records no carrier"
+        end
+      end
     end
   end
 end

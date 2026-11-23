@@ -107,5 +107,20 @@ module Tart
       assert_equal "~/sub/dir", Render::Text.format_cwd(File.join(home, "sub", "dir"), home)
       assert_equal "/elsewhere", Render::Text.format_cwd("/elsewhere", home), "outside home renders absolute"
     end
+
+    # I111 — the href rides the regrouping: a wrapped link fragment keeps
+    # its URL (Grounds §4's drop-today fact), a non-link span keeps nil.
+    def test_osc8_wrap_row_propagates_href_through_regrouping
+      link = Render::Markdown::Span.new(text: "aaaa bbbb", fg: :light_blue,
+        modifiers: [:underlined], href: "https://pi.dev")
+      rows = Render::Text.wrap_row([Render::Markdown::Span.new(text: "see "), link], 9)
+      assert_equal ["see aaaa", "bbbb"], rows.map { |r| r.map(&:text).join.strip },
+        "the link wraps into two fragment rows"
+      assert_equal "https://pi.dev", rows[0].last.href, "row 1's fragment keeps the href"
+      assert_equal "https://pi.dev", rows[1].first.href, "row 2's fragment keeps the href"
+      plain = Render::Markdown::Span.new(text: "plain")
+      assert_nil Render::Text.wrap_row([plain], 20).first.first.href,
+        "a non-link span's regrouped span stays href-nil"
+    end
   end
 end

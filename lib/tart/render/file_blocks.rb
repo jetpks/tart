@@ -111,7 +111,8 @@ module Tart
       # call-row family ({wrapped_call_rows}).
       def write_call_rows(args, width, bg: nil)
         wrapped_call_rows([tool_title_span("write"), Markdown::Span.new(text: " "),
-                           Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent])], width, bg:)
+                           Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent],
+                             href: tool_path_href(args))], width, bg:)
       end
 
       # The styled call-row family (pi's per-tool renderCall Texts inside
@@ -170,7 +171,8 @@ module Tart
                              Markdown::Span.new(text: " (ctrl+o to expand)", fg: Theme[:dim])], width, bg:)
         else
           wrapped_call_rows([tool_title_span("read"), Markdown::Span.new(text: " "),
-                             Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent]),
+                             Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent],
+                               href: tool_path_href(args)),
                              *line_range_spans(args)], width, bg:)
         end
       end
@@ -186,14 +188,27 @@ module Tart
       # pi render-utils.ts:102-110 renderToolPath over :10-18 shortenPath
       # — the display path: the ~ contraction under home, verbatim
       # otherwise; the empty/absent path renders the toolOutput "..."
-      # (write.ts:105 / read.ts:104 fallback). linkPath's OSC8 hyperlink
-      # is capability-gated — the port's TUI carries none (recorded).
+      # (write.ts:105 / read.ts:104 fallback).
       def tool_path_display(args)
         raw_path = args["file_path"] || args["path"]
         return "..." if raw_path.nil? || raw_path.empty?
 
         home = Dir.home
         raw_path.start_with?(home) ? "~#{raw_path[home.length..]}" : raw_path
+      end
+
+      # pi linkPath (render-utils.ts:19-23): the tool-path span's OSC-8
+      # href, capability-gated — nil when off (the display is untouched
+      # either way; the ~ contraction is display-only, the URL uses the
+      # RAW path). The session cwd is the launcher's cwd (pi's cwd
+      # semantic); the frozen tool-block builders never thread one, so
+      # the pins pass +cwd:+ and real runs resolve against Dir.pwd.
+      def tool_path_href(args, cwd: Dir.pwd)
+        raw_path = args["file_path"] || args["path"]
+        return nil if raw_path.nil? || raw_path.empty?
+        return nil unless Capabilities.hyperlinks?
+
+        TUI::LinkOverlay.file_url(raw_path, cwd: cwd)
       end
 
       # pi read.ts:35-42 formatReadLineRange — the warning-colored

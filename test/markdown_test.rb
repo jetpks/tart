@@ -187,6 +187,56 @@ Keep it tight. No code changes needed. This is a "what's going on" question — 
         Render::Markdown.rows("[https://pi.dev](https://pi.dev)"), "markdown.ts:712-714"
     end
 
+    # --- I111 OSC-8: the converter arm (href field; the emission lives
+    # in the TUI seam — markdown.rb never emits an escape) ---
+
+    # markdown.ts:703-706 — when capable the URL fallback is NOT appended;
+    # every link child span carries href (nested styling splits it into
+    # fragments, each carrying its own href). Two links in one row resolve
+    # independently (the NO-ALIASING law).
+    def test_osc8_link_span_carries_href_and_drops_url_suffix_when_capable
+      with_hyperlinks("1") do
+        assert_equal [[S.new(text: "see "),
+                       S.new(text: "pi", fg: :light_blue, modifiers: [:underlined], href: "https://pi.dev"),
+                       S.new(text: " now")]],
+          Render::Markdown.rows("see [pi](https://pi.dev) now"),
+          "no ' (href)' fallback when capable (markdown.ts:703-706)"
+        assert_equal [[S.new(text: "one", fg: :light_blue, modifiers: [:underlined], href: "https://one.dev"),
+                       S.new(text: " mid "),
+                       S.new(text: "two", fg: :light_blue, modifiers: [:underlined], href: "https://two.dev")]],
+          Render::Markdown.rows("[one](https://one.dev) mid [two](https://two.dev)"),
+          "two links never alias through a shared carrier"
+      end
+    end
+
+    # The OFF arm is byte-identical to today — the fallback span rides,
+    # href stays nil, the mailto comparison is unchanged.
+    def test_osc8_link_fallback_bytes_held_when_capability_off
+      with_hyperlinks("0") do
+        assert_equal [[S.new(text: "pi", fg: :light_blue, modifiers: [:underlined]),
+                       S.new(text: " (https://pi.dev)", fg: :gray)]],
+          Render::Markdown.rows("[pi](https://pi.dev)"), "the fallback bytes held"
+        assert_equal [[S.new(text: "foo@bar.com", fg: :light_blue, modifiers: [:underlined])]],
+          Render::Markdown.rows("<foo@bar.com>"), "the mailto comparison unchanged"
+      end
+    end
+
+    # Autolinks and titled links carry href when capable (the marked
+    # oracle: autolink text==href; the title is dropped from the URL).
+    def test_osc8_autolinks_and_titled_links_carry_href_when_capable
+      with_hyperlinks("1") do
+        assert_equal [[S.new(text: "https://pi.dev", fg: :light_blue, modifiers: [:underlined],
+                           href: "https://pi.dev")]],
+          Render::Markdown.rows("<https://pi.dev>"), "the uri autolink"
+        assert_equal [[S.new(text: "foo@bar.com", fg: :light_blue, modifiers: [:underlined],
+                           href: "mailto:foo@bar.com")]],
+          Render::Markdown.rows("<foo@bar.com>"), "the email autolink's mailto href"
+        assert_equal [[S.new(text: "docs", fg: :light_blue, modifiers: [:underlined],
+                           href: "https://d.dev")]],
+          Render::Markdown.rows("[docs](https://d.dev \"the docs\")"), "the titled link"
+      end
+    end
+
     def test_escaped_delimiters_are_literal
       assert_equal [[S.new(text: "*not em*")]], Render::Markdown.rows("\\*not em\\*")
     end

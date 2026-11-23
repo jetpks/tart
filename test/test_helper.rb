@@ -4,6 +4,12 @@ require "minitest/autorun"
 require "async"
 require_relative "../lib/tart"
 
+# The OSC-8 capability rail (I111): the default-safe posture made
+# ambient-proof — every non-injecting test renders the OFF arm regardless
+# of the seat's terminal (the detection matrix never reads ambient env
+# here; ||= keeps an explicit seat override usable).
+ENV["TART_HYPERLINKS"] ||= "0"
+
 module Tart
   # Shared base class for the minitest suite.
   class Test < Minitest::Test
@@ -28,6 +34,24 @@ module Tart
     # call site needs a special park anymore. No clock lines.
     def await(subject, what, belt: WEDGE_BELT_S, &predicate)
       Test.await_event(subject, what, belt: belt, &predicate)
+    end
+
+    # The OSC-8 capability inject seam (I111): forces the +TART_HYPERLINKS+
+    # arm for the block ("1"/"0"), drops the cached capability consult,
+    # and restores both after — the ON-arm pins' only door (the detection
+    # matrix and the tmux probe are never driven by ambient env here).
+    def with_hyperlinks(value)
+      previous = ENV["TART_HYPERLINKS"]
+      ENV["TART_HYPERLINKS"] = value
+      Capabilities.reset!
+      yield
+    ensure
+      if previous.nil?
+        ENV.delete("TART_HYPERLINKS")
+      else
+        ENV["TART_HYPERLINKS"] = previous
+      end
+      Capabilities.reset!
     end
 
     # The shared version-loop (the Gate's #await delegates here too).
