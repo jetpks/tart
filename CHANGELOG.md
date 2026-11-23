@@ -4,6 +4,23 @@
 
 ### Changed
 
+- **grep context lines come from ripgrep's own events, and a resumed session restores its
+  recorded tool loadout (I117 — the last two pi v1.6.0 parity ports, the REPIN plan's ENTRY 4;
+  closes the eleven-item mapped-surface ledger).** grep (#9276, pi `grep.ts:168` + `:231`):
+  `--context` rides the rg invocation and the surrounding lines come from rg's `context`
+  events — NO matched file is ever read for context (the pre-fix `File.read` OOM-on-large-files
+  exposure is dead, pinned with a hostile-large-file probe); rows past the 50KB byte cap are
+  counted but never stored; at the match limit the notice waits for proof of one more match
+  and the last allowed match's trailing context window is shown. Resume (#10785, pi
+  `agent-session.ts:284` + `:1600-1640`): interactive sessions record their active tool
+  loadout as a system-message entry (pi's toolsAdded/toolsRemoved declaration deltas), and
+  a resumed session RESTORES exactly that loadout — `--tools +name/-name` composes on top
+  (both directions), plain `--tools` names still select exactly, and a session that records
+  no loadout keeps the current tools. The restored loadout drives both the wire
+  declarations and the `<tools>` prompt section (pi `_setActiveTools` rebuilds the system
+  prompt). Print mode is unchanged end to end (its `--tools` stays the exact-allowlist
+  harness flag).
+
 - **The compat-nil default-arm instruction role changes developer → system (I115 — the
   fast-completions 0.10.0 re-pin; the wire-parity half of the REPIN).** The gem absorbs the
   three pi v1.6.0 wire fixes (the vocabulary default #10741, the cross-model thinking drop
