@@ -248,5 +248,49 @@ module Tart
       $stdout = previous
       assert_equal "\e]52;c;#{["hi"].pack("m0")}\a", captured.string
     end
+
+    # --- I111 — the post-flush OSC-8 overlay through Session#draw ---
+
+    # Capability-off: a submitted frame emits NOTHING (zero cost, zero
+    # bytes) — the rail's default-safe posture at the draw site.
+    def test_osc8_session_draw_emits_nothing_when_capability_off
+      TUI.run(headless: true, width: 40, screen_height: 8) do |session|
+        captured = StringIO.new
+        session.writer = captured
+        line = TUI.markdown_line([
+          Render::Markdown::Span.new(text: "see "),
+          Render::Markdown::Span.new(text: "pi", fg: :light_blue, modifiers: [:underlined], href: "https://pi.dev")
+        ])
+        session.submit_link_rows([line], y0: 0, x0: 0)
+        session.draw(TUI.paragraph(text: [line], wrap: false))
+        assert_equal "", captured.string, "capability-off: the pending frame never emits"
+        assert_equal "p", session.cell_symbol(4, 0),
+          "the buffer stays PLAIN — the link row renders as ordinary text cells"
+      end
+    end
+
+    # Capability-on: the draw writes the fresh link entries to the
+    # injected writer AFTER RatatuiRuby.draw returns (the osc52_copy
+    # idiom), and the identity-stable second frame emits zero bytes.
+    def test_osc8_session_draw_overlays_visible_link_post_flush
+      TUI.run(headless: true, width: 40, screen_height: 8) do |session|
+        with_hyperlinks("1") do
+          captured = StringIO.new
+          session.writer = captured
+          line = TUI.markdown_line([
+            Render::Markdown::Span.new(text: "see "),
+            Render::Markdown::Span.new(text: "pi", fg: :light_blue, modifiers: [:underlined], href: "https://pi.dev")
+          ])
+          session.submit_link_rows([line], y0: 0, x0: 0)
+          session.draw(TUI.paragraph(text: [line], wrap: false))
+          assert_equal "\e[1;5H\e[4m\e[38;5;12m\e]8;;https://pi.dev\e\\pi\e]8;;\e\\\e[0m", captured.string,
+            "the exact post-flush emission literal"
+          second = StringIO.new
+          session.writer = second
+          session.draw(TUI.paragraph(text: [line], wrap: false))
+          assert_equal "", second.string, "the identity-stable frame re-emits nothing"
+        end
+      end
+    end
   end
 end

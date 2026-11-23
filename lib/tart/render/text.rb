@@ -52,11 +52,14 @@ module Tart
       end
 
       # Wrapped cells re-grouped into spans (consecutive chars of one
-      # source span coalesce back into a single run).
+      # source span coalesce back into a single run). +href+ rides the
+      # regrouping (I111 — a wrapped link fragment keeps its URL, Grounds
+      # §4's drop-today fact).
       def styled_row(cells)
         cells.chunk_while { |(_, a), (_, b)| a.equal?(b) }.map do |group|
           span = group.first[1]
-          Render::Markdown::Span.new(text: group.map(&:first).join, fg: span.fg, modifiers: span.modifiers)
+          Render::Markdown::Span.new(text: group.map(&:first).join, fg: span.fg,
+            modifiers: span.modifiers, href: span.respond_to?(:href) ? span.href : nil)
         end
       end
 
@@ -169,12 +172,16 @@ module Tart
 
       # One wrapped row's cells regrouped into spans (contiguous source
       # spans coalesce; trailing whitespace trimmed — pi's final
-      # `wrapped.map(line => line.trimEnd())`, :1006-1008).
+      # `wrapped.map(line => line.trimEnd())`, :1006-1008). A source
+      # span's recorded OSC-8 href (I111's identity registry — the gem
+      # spans are frozen Data, no ivar channel) rides the regrouping.
       def span_row(cells, row)
         cells.pop while !cells.empty? && cells.last.first =~ /\s/
         cells.chunk_while { |(_, a), (_, b)| a == b }.map do |group|
           source = row[group.first[1]]
-          RatatuiRuby::Text::Span.new(content: group.map(&:first).join, style: source.style)
+          rebuilt = RatatuiRuby::Text::Span.new(content: group.map(&:first).join, style: source.style)
+          TUI::LinkOverlay.copy_span_href(source, rebuilt)
+          rebuilt
         end
       end
 

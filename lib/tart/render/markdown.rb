@@ -40,9 +40,12 @@ module Tart
     class Markdown
       # One styled run within a row: +text+, +fg+ (+TUI.style+ color symbol
       # or nil), +modifiers+ (+TUI.style+ modifier symbols), +bg+ (the
-      # panel bg the tool-block call rows ride — nil off-panel).
-      Span = Struct.new(:text, :fg, :modifiers, :bg, keyword_init: true) do
-        def initialize(text:, fg: nil, modifiers: [], bg: nil)
+      # panel bg the tool-block call rows ride — nil off-panel), +href+
+      # (the OSC-8 URL a capable terminal links the run to — nil when the
+      # run is not a link or the capability is off; the converter itself
+      # never emits an escape — the emission lives in the TUI seam).
+      Span = Struct.new(:text, :fg, :modifiers, :bg, :href, keyword_init: true) do
+        def initialize(text:, fg: nil, modifiers: [], bg: nil, href: nil)
           super
         end
       end
@@ -869,7 +872,8 @@ module Tart
       def quote_rows(block)
         block[1].flat_map { |inner| render_block(inner) }.map do |row|
           [Span.new(text: "│ ", fg: FG[:quote_border])] + row.map do |span|
-            Span.new(text: span.text, fg: span.fg || FG[:quote], modifiers: span.modifiers | [:italic])
+            Span.new(text: span.text, fg: span.fg || FG[:quote], modifiers: span.modifiers | [:italic],
+              href: span.href)
           end
         end
       end
@@ -1011,7 +1015,7 @@ module Tart
       # cell text, markdown.ts:975-982).
       def table_cell_lines(cell, width, bold)
         Text.wrap_row(cell, width).map do |line|
-          line = line.map { |s| Span.new(text: s.text, fg: s.fg, modifiers: bold ? s.modifiers | [:bold] : s.modifiers) }
+          line = line.map { |s| Span.new(text: s.text, fg: s.fg, modifiers: bold ? s.modifiers | [:bold] : s.modifiers, href: s.href) }
           pad = width - TUI.text_width(line.map(&:text).join)
           line << Span.new(text: " " * pad, modifiers: bold ? [:bold] : []) if pad.positive?
           line
@@ -1078,11 +1082,28 @@ module Tart
           when :code
             spans << Span.new(text: node.text, fg: FG[:code]) # raw, no nesting (:695-697)
           when :link
-            spans.concat(render_nodes(node.children, FG[:link], modifiers + [:underlined])) # :701
-            # OSC-8 out of scope: the linkUrl fallback — URL appended in
-            # parens unless text already is the href (:711-719).
-            unless node.text == node.href || node.text == node.href.delete_prefix("mailto:")
-              spans << Span.new(text: " (#{node.href})", fg: FG[:link_url])
+            # The fresh child-modifiers array is the link's carrier
+            # identity (NO ALIASING — created per :link case; nested
+            # em/strong own further fresh arrays, each registered below).
+            child_modifiers = modifiers + [:underlined] # :701
+            children = render_nodes(node.children, FG[:link], child_modifiers)
+            spans.concat(children)
+            if Capabilities.hyperlinks?
+              # OSC-8: render as the link alone — NO inline URL fallback
+              # (markdown.ts:703-706). The href rides the +href+ field and
+              # the modifiers-array identity (the carrier that crosses the
+              # frozen Transcript.markdown_lines rebuild); markdown.rb
+              # emits NO escape sequence — the emission lives in TUI.
+              children.each do |child|
+                child.href = node.href
+                TUI::LinkOverlay.record_href_carrier(child.modifiers, node.href)
+              end
+            else
+              # The linkUrl fallback — URL appended in parens unless text
+              # already is the href (:711-719). BYTE-IDENTICAL to base.
+              unless node.text == node.href || node.text == node.href.delete_prefix("mailto:")
+                spans << Span.new(text: " (#{node.href})", fg: FG[:link_url])
+              end
             end
           when :em
             spans.concat(render_nodes(node.children, fg, modifiers + [:italic])) # :689-693
@@ -1104,10 +1125,14 @@ module Tart
       end
 
       # Adjacent same-style spans coalesce (one text run per style, as pi's
-      # flat ANSI output renders).
+      # flat ANSI output renders). The href joins the style equality (I111
+      # — a link run never coalesces into an identically-styled plain run:
+      # different hrefs must not alias under one span). OFF-arm bytes are
+      # untouched (every href is nil there).
       def merge_adjacent(spans)
-        spans.chunk_while { |a, b| a.fg == b.fg && a.modifiers == b.modifiers }.map do |group|
-          Span.new(text: group.map(&:text).join, fg: group.first.fg, modifiers: group.first.modifiers)
+        spans.chunk_while { |a, b| a.fg == b.fg && a.modifiers == b.modifiers && a.href == b.href }.map do |group|
+          Span.new(text: group.map(&:text).join, fg: group.first.fg, modifiers: group.first.modifiers,
+            href: group.first.href)
         end
       end
 
@@ -1118,7 +1143,7 @@ module Tart
         spans.each do |span|
           span.text.split("\n", -1).each_with_index do |part, i|
             rows << [] if i.positive?
-            rows.last << Span.new(text: part, fg: span.fg, modifiers: span.modifiers) unless part.empty?
+            rows.last << Span.new(text: part, fg: span.fg, modifiers: span.modifiers, href: span.href) unless part.empty?
           end
         end
         rows
