@@ -455,8 +455,13 @@ module Tart
     end
 
     # Pin 8 — compat nil zero-change, the loop path (the wire-bodies
-    # digests pin the rig path): no thinking, no tool_stream, developer
-    # role, and the summarization one-shot keeps TODAY'S exact shapes —
+    # digests pin the rig path): no thinking, no tool_stream, system
+    # role (fast-completions 0.10.0 — pi v1.6.0 #10741: the dialect
+    # vocabulary default flips supports_developer_role to false,
+    # openai-completions.js:890 instructionRole + :1259-1265
+    # supportsDeveloperRole = isOpenAI; the default arm is non-OpenAI,
+    # so it gets system), and the summarization one-shot keeps TODAY'S exact
+    # shapes —
     # max_completion_tokens, no reasoning_effort (the gem's per-chat
     # callbacks mean the construction hook never ran there; the I36 arm
     # stays off it).
@@ -480,10 +485,10 @@ module Tart
       main_request, summary_request = requests[0], requests[1]
       refute main_request.key?("thinking")
       refute main_request.key?("tool_stream")
-      assert_equal "developer", main_request["messages"].first["role"]
+      assert_equal "system", main_request["messages"].first["role"]
       refute summary_request.key?("thinking"), "no thinking object on the one-shot"
       refute summary_request.key?("tool_stream")
-      assert_equal "developer", summary_request["messages"].first["role"]
+      assert_equal "system", summary_request["messages"].first["role"]
       assert summary_request.key?("max_completion_tokens"), "today's max-token key unchanged"
       refute summary_request.key?("max_tokens")
       assert_equal "medium", summary_request["reasoning_effort"],
@@ -494,6 +499,10 @@ module Tart
     # Pin 9 — the switch seam: switch_model(compat:) swaps the dialect
     # mid-session and compat: nil restores the default arm (the wholesale
     # re-resolve idiom — nil IS "the switched model declares none").
+    # The default-arm role is system since fast-completions 0.10.0 (pi
+    # v1.6.0 #10741 — openai-completions.js:890 instructionRole +
+    # :1259-1265 supportsDeveloperRole = isOpenAI; the default arm is
+    # non-OpenAI); the zai explicit-true arm below still opts in.
     def test_switch_model_swaps_the_compat_dialect_and_restores
       @server.script([
         {type: :message, content: "one"},
@@ -514,7 +523,7 @@ module Tart
 
       first, second, third = @server.captured_requests
       refute first.key?("thinking"), "compat-nil boot: today's arm"
-      assert_equal "developer", first["messages"].first["role"]
+      assert_equal "system", first["messages"].first["role"]
 
       assert_equal({"type" => "enabled", "clear_thinking" => false}, second["thinking"],
         "the swapped dialect governs the next request")
@@ -522,7 +531,7 @@ module Tart
       assert_equal "system", second["messages"].first["role"]
 
       refute third.key?("thinking"), "compat nil restores the default arm"
-      assert_equal "developer", third["messages"].first["role"]
+      assert_equal "system", third["messages"].first["role"]
       assert_equal "high", third["reasoning_effort"], "the I36 effort wiring re-resolves wholesale"
     end
 

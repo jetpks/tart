@@ -8,7 +8,7 @@ gemspec
 # pre-0.4.0 form was a relative path pin (lane worktrees escaped via a
 # per-run, never-committed FAST_COMPLETIONS_PATH override) — retired with
 # the rubygems pin.
-gem "fast-completions", "0.9.0"
+gem "fast-completions", "0.10.0"
 
 # The ratatui_ruby runtime dependency, temporarily a git pin (I109): the
 # event-fd seam lives on the jetpks fork's local branch until it upstreams.
