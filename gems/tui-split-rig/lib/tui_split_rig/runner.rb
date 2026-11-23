@@ -10,32 +10,41 @@ require "shellwords"
 require_relative "../../../../test/support/mock_llm_server"
 
 module TuiSplitRig
-  # The oracle resolution seam (I67 R1): the pinned repos/pi clone @ v1.1.0
-  # is the rig's ONLY oracle — the system pi on PATH is never consulted.
-  # Resolution order, frozen: the --pi-bin flag (kept verbatim) → the
-  # TUI_SPLIT_RIG_PI_BIN env escape hatch → the pinned clone default
-  # <pi-root>/packages/coding-agent/dist/bundle/cli.js (the clone's built
-  # entry — package.json "bin": {"pi": "dist/bundle/cli.js"}).
-  # pi_root is the sibling `pi` of the tart repo root; the default-root
-  # case alone falls back to the CANONICAL checkout (git rev-parse
-  # --git-common-dir, dirname'd — the worktree case) when the direct
-  # sibling is missing. An explicit tart_root gets NO git fallback (the
-  # pure testability contract). Unresolvable → Error naming the expected
-  # clone path. Direct oracle execs must strip PI_PACKAGE_DIR — pi's
-  # getPackageDir prefers the env over the __dirname walk
-  # (coding-agent config.ts:393-405); the rig's pane env scrub
-  # (env_flags) already covers the in-pane class.
+  # The oracle resolution seam (I67 R1; repinned to the promoted worktree
+  # by I114): the promoted standing worktree build/pi-oracle-v1.6.0 (tag
+  # v1.6.0) is the rig's ONLY default oracle — the system pi on PATH is
+  # never consulted, and the retired repos/pi v1.1.0 clone is reachable
+  # only via --pi-bin / TUI_SPLIT_RIG_PI_BIN (retirement is byte-stable,
+  # never deletion). Resolution order, frozen: the --pi-bin flag (kept
+  # verbatim) → the TUI_SPLIT_RIG_PI_BIN env escape hatch → the promoted
+  # worktree default
+  # <worktree>/packages/coding-agent/dist/bundle/cli.js (the worktree's
+  # built entry — package.json "bin": {"pi": "dist/bundle/cli.js"}).
+  # oracle_worktree_for derives the worktree off the CANONICAL tart
+  # checkout (git rev-parse --git-common-dir, dirname'd — the worktree
+  # case), so every lane-worktree seat resolves the SAME promoted
+  # worktree; an explicit tart_root gets NO git fallback (the pure
+  # testability contract) — its worktree is derived deterministically
+  # relative to the injected root (<tart_root>/../build/pi-oracle-v1.6.0,
+  # so a tmpdir fixture can stage the layout). Unresolvable → Error
+  # naming the expected worktree cli path. Direct oracle execs must strip
+  # PI_PACKAGE_DIR — pi's getPackageDir prefers the env over the
+  # __dirname walk (coding-agent config.ts:393-405); the rig's pane env
+  # scrub (env_flags) already covers the in-pane class. (I67 history: the
+  # original default was the sibling repos/pi clone @ v1.1.0 — retired by
+  # the I114 repin.)
   def self.resolve_pi_bin(flag: nil, env: ENV, tart_root: nil)
     return flag unless flag.nil? || flag.to_s.empty?
 
     from_env = env["TUI_SPLIT_RIG_PI_BIN"]
     return from_env unless from_env.nil? || from_env.to_s.empty?
 
-    cli = File.join(pi_root_for(tart_root), "packages", "coding-agent", "dist", "bundle", "cli.js")
+    cli = File.join(oracle_worktree_for(tart_root), "packages", "coding-agent", "dist", "bundle", "cli.js")
     return File.expand_path(cli) if File.executable?(cli)
 
-    raise Error, "pinned pi clone not found: expected #{cli} " \
-                 "(repos/pi on tag v1.1.0 with a built dist/bundle/cli.js)"
+    raise Error, "promoted pi oracle worktree not found: expected #{cli} " \
+                 "(build/pi-oracle-v1.6.0 on tag v1.6.0 with a built dist/bundle/cli.js; " \
+                 "the retired repos/pi v1.1.0 clone is reachable only via --pi-bin / TUI_SPLIT_RIG_PI_BIN)"
   end
 
   # CI-honesty guard (2026-11-22): the pinned pi oracle clone is a LOCAL
@@ -49,24 +58,28 @@ module TuiSplitRig
     false
   end
 
-  # The pi clone root: the sibling `pi` of the tart repo root. Explicit
-  # tart_root → sibling, no fallback. Default root → the rig's own repo
-  # root, and when the direct sibling clone is missing there, the
-  # canonical checkout via git rev-parse --git-common-dir (a worktree's
+  # The promoted oracle worktree root: build/pi-oracle-v1.6.0 beside the
+  # space root (the worktree-oracle law — a candidate oracle rides a git
+  # worktree under build/, never a checkout in the pinned clone).
+  # Explicit tart_root → derived relative to the injected root, no git
+  # fallback (the pure testability contract). Default root → the rig's
+  # own repo root, and when the worktree is missing there, the CANONICAL
+  # checkout via git rev-parse --git-common-dir (a worktree's
   # git-common-dir points at the canonical .git — dirname is the
-  # canonical checkout; git failure degrades to the direct sibling, whose
-  # missing cli.js raises with the named path).
-  def self.pi_root_for(tart_root)
+  # canonical checkout; the space root sits two levels above it:
+  # <space>/repos/tart → <space>). Git failure degrades to the direct
+  # derivation, whose missing cli.js raises with the named path.
+  def self.oracle_worktree_for(tart_root)
     repo = tart_root ? File.expand_path(tart_root) : File.expand_path("../../../..", __dir__)
-    sibling = File.expand_path("../pi", repo)
-    return sibling if tart_root
-    return sibling if File.executable?(File.join(sibling, "packages", "coding-agent", "dist", "bundle", "cli.js"))
+    worktree = File.expand_path("../build/pi-oracle-v1.6.0", repo)
+    return worktree if tart_root
+    return worktree if File.directory?(worktree)
 
     git_dir = Open3.capture2("git", "-C", repo, "rev-parse", "--git-common-dir")[0].to_s.strip
-    return sibling if git_dir.empty?
+    return worktree if git_dir.empty?
 
     canonical = File.expand_path("..", File.expand_path(git_dir, repo))
-    File.expand_path("../pi", canonical)
+    File.expand_path("../../build/pi-oracle-v1.6.0", canonical)
   end
 
   # Drives one scenario: for each run, boots ONE mock LLM server, stages
@@ -853,8 +866,10 @@ module TuiSplitRig
     end
 
     def default_pi_bin
-      # I67 R1: the pinned repos/pi clone @ v1.1.0 — `command -v pi` is
-      # GONE (the system pi on PATH, 1.2.0+, is never the oracle again).
+      # I114 repin: the promoted build/pi-oracle-v1.6.0 worktree @ v1.6.0
+      # — `command -v pi` is GONE (the system pi on PATH, 1.2.0+, is
+      # never the oracle), and the retired repos/pi v1.1.0 clone is
+      # reachable only via --pi-bin / TUI_SPLIT_RIG_PI_BIN.
       TuiSplitRig.resolve_pi_bin(env: ENV)
     end
 

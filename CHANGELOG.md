@@ -4,6 +4,17 @@
 
 ### Changed
 
+- **The parity oracle repins v1.1.0 → v1.6.0 (I114 — the ratified REPIN, plan ENTRY 1).**
+  `Identity::ORACLE_VERSION` bumps to `"1.6.0"` (the tracked constant — the pi-mode
+  version-banner pair moves BY DESIGN with the oracle pin) and the rig's DEFAULT oracle
+  resolution is PROMOTED to the standing git worktree
+  `build/pi-oracle-v1.6.0/packages/coding-agent/dist/bundle/cli.js` (derived off the canonical
+  tart checkout via the existing git-common-dir mechanism, so every lane-worktree seat resolves
+  the same worktree). The retired repos/pi v1.1.0 clone is byte-stable, never deleted, and
+  demoted to flag/env-only (`--pi-bin` / `TUI_SPLIT_RIG_PI_BIN`) — never a default again.
+  Owner ruling recorded: LaTeX rendering (present in pi v1.6.0, absent in tart) is GATED as a
+  sanctioned deviation — reopened on owner pain, never a work item here. No gem/fork/upstream
+  change; the constant's consumers interpolate it and never move.
 - **Inline terminal images land in the transcript (I112 — kitty/iterm2, the I111 post-flush overlay's sibling).**
   `Tart::Capabilities` gains the `images` arm in the SAME cached hash (pi terminal-image.ts:70-139 —
   kitty/ghostty/wezterm/Warp → `"kitty"`, iterm → `"iterm2"`, every other arm nil; the family +
