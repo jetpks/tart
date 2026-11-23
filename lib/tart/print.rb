@@ -14,10 +14,12 @@ module Tart
   # output goes through output-guard.ts writeRawStdout:85 — raw, unbuffered).
   # Tools execute unconditionally, as everywhere (agent-loop.ts:832).
   #
-  # Exit codes (print-mode.ts:145-160): 0 on success, 1 when the agent
-  # stopped on error/abort (message to stderr) or an error was raised
-  # (:160-162). pi's SIGTERM->143/SIGHUP->129 handlers (:51-66) are a
-  # process concern, not ported into the library (parity table).
+  # Exit codes (print-mode.ts:148-174, the v1.6.0 sources): 0 on success,
+  # 1 when the agent stopped on error/abort (message to stderr, :154-156)
+  # or on the output-token truncation arm (the warn :163-166, #10799), or
+  # an error was raised (:172-174). pi's SIGTERM->143/SIGHUP->129 handlers
+  # (:55-73) are a process concern, not ported into the library (parity
+  # table).
   module Print
     EXIT_OK = 0
     EXIT_ERROR = 1
@@ -106,6 +108,8 @@ module Tart
       return error_exit(agent, stderr) if agent.last_error || agent.interrupted?
 
       final_response(agent, stdout)
+      return truncated_exit(agent, stderr) if truncated_stop?(agent)
+
       EXIT_OK
     rescue StandardError => e
       stderr.write("#{e.message}\n")
@@ -155,10 +159,10 @@ module Tart
       nil
     end
 
-    # pi's text-mode tail (print-mode.ts:143-158): the last message decides —
-    # error/aborted goes to stderr with exit 1, an assistant message's text
-    # contents each go to stdout with a trailing newline, anything else
-    # prints nothing.
+    # pi's text-mode tail (print-mode.ts:148-168, the v1.6.0 sources): the
+    # last message decides — error/aborted goes to stderr with exit 1
+    # (:154-156), an assistant message's text contents each go to stdout
+    # with a trailing newline (:158-161), anything else prints nothing.
     def error_exit(agent, stderr)
       error = agent.last_error
       stderr.write("#{error ? error.message : "Request aborted"}\n")
@@ -179,6 +183,23 @@ module Tart
       when String then [content]
       when Array then content.filter_map { |part| part[:text] if part.is_a?(Hash) }
       end
+    end
+
+    # The truncation arm (#10799, pi v1.6.0 print-mode.ts:163-166): a
+    # "length" stop still lands the assistant text (final_response, above —
+    # the warn comes AFTER the text), then the EXACT v1.6.0 warning rides
+    # stderr and the exit is 1. The stop reason arrives through the existing
+    # map_stop_reason → Message#finish_reason path — no new seam. The
+    # error/aborted arm (error_exit) keeps its precedence ABOVE this branch
+    # (:154-156 before :158-166); any other stop keeps exit 0.
+    def truncated_stop?(agent)
+      final = agent.new_messages.last
+      final&.role == :assistant && final.finish_reason == "length"
+    end
+
+    def truncated_exit(agent, stderr)
+      stderr.write("Response was truncated: the model reached its output token limit.\n")
+      EXIT_ERROR
     end
 
     # A null terminal session for the loop kernel: blocks one poll budget

@@ -690,31 +690,26 @@ module Tart
       # buildSummarizationContext, compaction.ts:637-647 + :671-741): a
       # fresh one-shot chat on the same context/endpoint — system =
       # SUMMARIZATION_SYSTEM_PROMPT, one user message carrying the serialized
-      # conversation; not the chat history, no tools. max_tokens =
-      # min(floor(0.8 * reserve_tokens), model max) (:683-686); the gem's
-      # model.max_output_tokens is the model max (model.rb:36). Runs INLINE
-      # on the turn fiber (cooperative I/O — a kernel interrupt cancels it
-      # natively: the Chat's CancelledError→Async::Cancel conversion
-      # unwinds the stream, this frame never swallows a Cancel). nil
-      # (compaction aborted) when the call fails. The full reply Message is
-      # returned — its usage is pi's CompactionResult.usage (compaction.ts
-      # :1085).
+      # conversation; not the chat history, no tools. NO per-call output cap
+      # (v1.6.0 #9512: compaction.ts:603-605 createSummarizationOptions sets
+      # no maxTokens; :647/:699 reserveTokens is unused for the cap —
+      # summaries use the model's output limit; reserveTokens' surviving job
+      # is the START-TIME trigger, never the cap). The wire cap is the gem's
+      # clamp of the wire model's own max_tokens (clamp_max_tokens, the pi
+      # clampMaxTokensToContext port). Runs INLINE on the turn fiber
+      # (cooperative I/O — a kernel interrupt cancels it natively: the
+      # Chat's CancelledError→Async::Cancel conversion unwinds the stream,
+      # this frame never swallows a Cancel). nil (compaction aborted) when
+      # the call fails. The full reply Message is returned — its usage is
+      # pi's CompactionResult.usage (compaction.ts :1085).
       def summarize(preparation, custom_instructions: nil)
         prompt = Compaction.summarization_prompt(preparation.messages_to_summarize,
           previous_summary: preparation.previous_summary, custom_instructions:)
-        summary_chat = @chat.summary_chat(instructions: Compaction::SUMMARIZATION_SYSTEM_PROMPT,
-          max_output_tokens: summarization_max_tokens)
+        summary_chat = @chat.summary_chat(instructions: Compaction::SUMMARIZATION_SYSTEM_PROMPT)
         summary_chat.add_message(Message.user(prompt))
         summary_chat.step
       rescue Fast::Completions::CancelledError, StandardError
         nil # compaction aborts, the run continues (today's ANY-Failure rule)
-      end
-
-      def summarization_max_tokens
-        reserve = @compaction_settings.reserve_tokens
-        model_max = @chat.model&.max_tokens
-        cap = model_max.is_a?(Integer) && model_max.positive? ? model_max : Float::INFINITY
-        [(reserve * 0.8).floor, cap].min
       end
 
       # One Chat #step INLINE on the turn fiber (the de-bridged seam — the

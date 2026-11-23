@@ -2175,6 +2175,24 @@ module Tart
         # tui-alt-screen.ts:1638-1667); the click rect latches for the
         # mouse (nil whenever the pill is absent).
         @jump_pill_rect = compose_jump_pill(window, width, rows, rail_visible)
+        # The OSC-8 carrier's submission (I111, the post-flush overlay —
+        # Grounds §1 ruling A): the FINAL window rows, in order, ride to
+        # the session's overlay. The transcript area is the fullscreen
+        # layout's TOP child (build_widget's first constraint) — the
+        # screen origin is (0, 0). Capability-off → never submitted (the
+        # overlay never runs: zero cost, zero bytes); double sessions
+        # (ScriptedSession) answer respond_to? — the submission law is
+        # the capability, the guard is the duck-typed seam.
+        if Capabilities.hyperlinks? && @session.respond_to?(:submit_link_rows)
+          @session.submit_link_rows(window, y0: 0, x0: 0)
+        end
+        # The image carrier's submission (I112 — the additive sibling): the
+        # SAME final window rows ride to the image overlay when images are
+        # capable. Capability-off → never submitted (zero cost, zero
+        # bytes); the guard is the duck-typed seam.
+        if Capabilities.images? && @session.respond_to?(:submit_image_rows)
+          @session.submit_image_rows(window, y0: 0, x0: 0)
+        end
         TUI.paragraph(text: window, wrap: false)
       end
 
