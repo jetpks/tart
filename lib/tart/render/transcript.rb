@@ -54,6 +54,17 @@ module Tart
       # region reached the buffer.
       PendingTool = Struct.new(:name, :args, :region, :registration)
 
+      # The winch sweep's continuation-slice budget (I108): an INTEGER count
+      # of registrations rebuilt per non-window slice — never wall-clock (the
+      # I37/I103 owner law; the counter IS the deterministic bound). Default
+      # measured at the Grounds §1 bench shape: a registration's rebuild
+      # (markdown re-parse + re-wrap) costs ≈0.29–0.35 ms at 7501
+      # registrations, so 128 ≈ 41–45 ms of builder work per continuation
+      # frame — one render interval at pi's measured ≈22 fps; 7501 stale
+      # registrations drain in ≤59 continuation frames after the window
+      # pass, and no frame ever pays the old one-shot's O(scrollback) cost.
+      DEFAULT_SWEEP_SLICE_BUDGET = 128
+
       # The tool name that dispatches to pi's shell renderers (bash.ts:115
       # createShellRenderers — shared by bash and powershell; the port
       # runs bash only).
@@ -79,10 +90,19 @@ module Tart
       # @param reseed_sink [Proc] +call(message)+ — the footer usage
       #   reseed from a replayed assistant entry (late-bound — the footer
       #   is the coordinator's).
-      def initialize(width_reader:, history_sink:, reseed_sink:)
+      def initialize(width_reader:, history_sink:, reseed_sink:, sweep_slice_budget: DEFAULT_SWEEP_SLICE_BUDGET)
         @width_reader = width_reader
         @history_sink = history_sink
         @reseed_sink = reseed_sink
+        # The continuation-slice budget (I108 — the injected counter seam;
+        # the Chat constructor kwarg threads through, the accessor lets the
+        # pins dial it). nil = the caller asked for the default explicitly.
+        @sweep_slice_budget = sweep_slice_budget || DEFAULT_SWEEP_SLICE_BUDGET
+        # The winch sweep's pending flag (I108): armed by {mark_sweep_pending}
+        # (every registration stale), drained by {sweep_slice} — the frame
+        # boundary's gate and the completion observable ({Chat
+        # #sweep_pending?} delegates it). Plain flag — same-reactor writes only.
+        @sweep_pending = false
         # Completed lines awaiting the transcript buffer on the next frame
         # (I107/Q1 — a plain Array: producer + consumer are fibers on the
         # host reactor, drained each frame as today; the enqueue family's
@@ -127,6 +147,10 @@ module Tart
       # The ctrl+o toggle's state (the coordinator's dispatcher reads it
       # to flip — pi's setToolsExpanded call site).
       attr_reader :tool_output_expanded
+
+      # The continuation-slice budget (I108 — registrations rebuilt per
+      # non-window slice; the injected counter seam, never wall-clock).
+      attr_accessor :sweep_slice_budget
 
       # A pre-built region pushed raw (the compaction line's blank, the
       # flushed reasoning rows): no container gate — none of the base call
@@ -399,8 +423,11 @@ module Tart
           item = @scrollback.shift
           case item
           when MarkedRegion
+            # stale: false — the rows materialized at the CURRENT width
+            # (I108: the flush registers CLEAN; only {mark_sweep_pending}
+            # arms staleness, so a mid-sweep enqueue never re-builds).
             registered = {start: @transcript.size, size: item.rows.length,
-                          builder: item.builder, expands: item.expands}
+                          builder: item.builder, expands: item.expands, stale: false}
             @expandable_blocks << registered
             @transcript.concat(item.rows)
             # The pending blocks' drain links EVERY registry entry's
@@ -421,7 +448,7 @@ module Tart
             # not the drain loop's variable.
             rows = item
             registered = {start: @transcript.size, size: rows.length,
-                          builder: ->(_expanded) { rows }, expands: false}
+                          builder: ->(_expanded) { rows }, expands: false, stale: false}
             @expandable_blocks << registered
             @transcript.concat(rows)
           end
@@ -460,6 +487,11 @@ module Tart
             delta += rows.length - registered[:size]
             registered[:start] = start
             registered[:size] = rows.length
+            # The flip rebuilt at the CURRENT width — the block is clean for
+            # the pending sweep (I108 §c interleavings: ctrl+o mid-sweep
+            # leaves touched registrations clean; the winch mark need not
+            # re-invoke them).
+            registered[:stale] = false
           else
             registered[:start] += delta # the rows stay; the range moves
           end
@@ -488,14 +520,76 @@ module Tart
           delta += rows.length - registered[:size]
           registered[:start] = start
           registered[:size] = rows.length
+          registered[:stale] = false # every registration rebuilt — nothing stale survives
           rebuilt = true
         end
+        # The one-shot IS the full drain (I108 — the staged path's byte
+        # comparator): no sweep work may survive it.
+        @sweep_pending = false
         return rebuilt unless @status_registration
 
         # The walk rebuilt the pair's range too (expands: false — swept,
         # never flipped): re-point at the rebuilt Line objects (identity —
         # the {status_at_tail?} comparison survives).
         @status_pair = @transcript[@status_registration[:start], @status_registration[:size]]
+        rebuilt
+      end
+
+      # The winch's mark (I108 §c): EVERY registration goes stale + the
+      # pending flag arms — O(registry), zero builder work (the handler's
+      # cheap arm; the frame boundary does the building). Idempotent: a
+      # drag burst's second winch re-marks without double-charging the
+      # builders (the flags are booleans, not work orders yet).
+      def mark_sweep_pending
+        @expandable_blocks.each { |registered| registered[:stale] = true }
+        @sweep_pending = true
+        nil
+      end
+
+      # The sweep's completion observable (I108 AC3): true while any
+      # registration still needs a rebuild — {Chat#sweep_pending?}
+      # delegates it, the pins and the self-pumping continuation read it.
+      def sweep_pending?
+        @sweep_pending
+      end
+
+      # ONE bounded sweep pass (I108 §c): {set_tool_output_expanded}'s
+      # ascending delta-carrying walk where a registration rebuilds ONLY
+      # if stale AND (window nil OR intersecting the window — the first
+      # pass); already-clean or out-of-window registrations take the
+      # SHIFT-ONLY branch (+start += delta+, builder NOT invoked) — their
+      # rows physically moved when earlier splices changed sizes, the
+      # walk's own invariant keeps starts/sizes coherent. The +window+ is
+      # a Row-index Range over the pre-slice buffer (the coordinator's
+      # read-only {Viewport#window} arithmetic); the window pass covers
+      # its WHOLE intersecting stale range — bounded by the window rows,
+      # never by the budget (AC2's nothing-over-new-width-in-one-frame
+      # needs more registrations than any useful budget at real
+      # scrollback; the budget bounds the ASCENDING continuation, AC3's
+      # +1 slice in the ceil bound IS this window pass). +budget+ bounds
+      # the continuation: stale registrations rebuild lowest-start-first
+      # until the count is spent; the rest stay stale for the next frame.
+      # Returns the count rebuilt (0 when nothing was stale); clears the
+      # pending flag when no stale registration remains.
+      def sweep_slice(budget:, window: nil)
+        delta = 0
+        rebuilt = 0
+        @expandable_blocks.each do |registered|
+          start = registered[:start] + delta
+          if registered[:stale] && (window ? window_intersects?(registered, window) : rebuilt < budget)
+            rows = registered[:builder].call(@tool_output_expanded)
+            @transcript[start, registered[:size]] = rows
+            delta += rows.length - registered[:size]
+            registered[:start] = start
+            registered[:size] = rows.length
+            registered[:stale] = false
+            rebuilt += 1
+          else
+            registered[:start] = start # shift-only: rows stay, the range moves
+          end
+        end
+        @sweep_pending = @expandable_blocks.any? { |registered| registered[:stale] }
+        repoint_status_pair
         rebuilt
       end
 
@@ -514,6 +608,7 @@ module Tart
         @status_pair = nil
         @status_registration = nil
         @chat_started = false
+        @sweep_pending = false # /new mid-sweep: no stale residue (I108 §c)
       end
 
       # Markdown text as themed display lines (the Render::Markdown
@@ -541,6 +636,15 @@ module Tart
         content_width = width - Panel::OUTPUT_PAD.length * 2
         rows = Render::Markdown.rows(text, width: content_width).flat_map { |row| Text.wrap_row(row, content_width) }
         rows.map do |row|
+          # The image passthrough (I112, pi markdown.ts:328/:344): a row
+          # carrying an image-escape span is the ANCHOR row — it bypasses
+          # the themed re-span map (which would drop the carrier field)
+          # and the pad/bg margins entirely; TUI.markdown_line builds the
+          # zero-width line and records (produced Line → sequence) in the
+          # image anchor registry. The anchor reserves exactly ONE row.
+          carrier = row.find { |span| span.respond_to?(:image) && span.image }
+          next TUI.markdown_line(row) if carrier
+
           themed = row.map do |span|
             fg = Theme.md_fg(span.fg)
             modifiers = span.modifiers
@@ -609,13 +713,14 @@ module Tart
         else
           # Content followed the pair (no longer the tail): the old rows
           # stay, the fresh pair appends with its own registration.
-          registration = {start: 0, size: 0, builder: builder, expands: false}
+          registration = {start: 0, size: 0, builder: builder, expands: false, stale: false}
           @expandable_blocks << registration
         end
         rows = status_rows(text)
         registration[:start] = @transcript.size
         registration[:size] = rows.length
         registration[:builder] = builder
+        registration[:stale] = false # the pair rebuilt at the CURRENT width (I108)
         @transcript.concat(rows)
         @status_pair = rows
         @status_registration = registration
@@ -639,6 +744,31 @@ module Tart
         pair = @status_pair
         !pair.nil? && pair.size <= @transcript.size &&
           pair.each_with_index.all? { |line, i| @transcript[-pair.size + i].equal?(line) }
+      end
+
+      # Whether a registration's row range meets the slice's +window+ (a
+      # row-index Range over the PRE-slice buffer — I108: membership is
+      # decided against the original start/size, the coordinates the
+      # coordinator computed the window over, never against the walk's
+      # shifting positions). Endless/beginless ranges tolerated (nil end).
+      def window_intersects?(registered, window)
+        first = registered[:start]
+        last = first + registered[:size] - 1
+        from = window.begin
+        to = window.end
+        to -= 1 if to && window.exclude_end?
+        (from.nil? || from <= last) && (to.nil? || first <= to)
+      end
+
+      # The pair's post-slice re-point ({rebuild_scrollback}'s tail, one
+      # slice at a time): a slice that moved the pair's range (rebuilt it,
+      # or shifted its start) must refresh {@status_pair} so the
+      # {status_at_tail?} identity check keeps working. Reading the same
+      # objects when nothing moved is a no-op.
+      def repoint_status_pair
+        return unless @status_registration
+
+        @status_pair = @transcript[@status_registration[:start], @status_registration[:size]]
       end
 
       # The submitted prompt's echo (item 4, pi UserMessageComponent,
@@ -871,7 +1001,10 @@ module Tart
         when WRITE_TOOL
           ->(expanded) { FileBlocks.write_block_rows(args, result, viewport_width, expanded:) }
         when READ_TOOL
-          ->(expanded) { FileBlocks.read_block_rows(args, result, viewport_width, expanded:) }
+          # The details side channel rides the READ arm (I112 — the image
+          # preview placement; the replay path already carries it, and
+          # absent details render today's block exactly).
+          ->(expanded) { FileBlocks.read_block_rows(args, result, viewport_width, expanded:, details:) }
         when EDIT_TOOL
           ->(_expanded) { EditBlock.edit_block_rows(args, result, details, viewport_width) }
         end
@@ -923,6 +1056,7 @@ module Tart
           registration[:size] = final_rows.length
           registration[:builder] = builder
           registration[:expands] = true # the final family reads the toggle
+          registration[:stale] = false  # the final rows built at the CURRENT width (I108)
         else
           @expandable_blocks.delete_at(index)
         end

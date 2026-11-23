@@ -682,5 +682,52 @@ module Tart
       assert_equal "yes", result.settings.dig("compaction", "enabled")
       assert_empty result.diagnostics, "no new diagnostics — the schema is a view, not a gate"
     end
+
+    # pi #10785's `--tools` flag shapes (pi sdk.ts :280-291 + settings-manager
+    # getToolListError :97-107): absent/empty = nil; only `+name`/`-name`
+    # entries = a modifier list; anything else = an explicit allowlist.
+    # Mixing the two — or a `*` pattern inside a modifier — raises with
+    # pi's exact literals.
+    def test_parse_tool_selection_validates_pi_shapes
+      assert_nil Settings.parse_tool_selection(nil)
+      assert_nil Settings.parse_tool_selection("")
+      assert_nil Settings.parse_tool_selection(" , ")
+      assert_equal({explicit: %w[read bash]}, Settings.parse_tool_selection("read, bash"))
+      assert_equal({modifiers: %w[+find -edit]}, Settings.parse_tool_selection("+find,-edit"))
+
+      mixed = assert_raises(ArgumentError) { Settings.parse_tool_selection("read,+find") }
+      assert_equal "tool names cannot be mixed with +name or -name entries", mixed.message
+      pattern = assert_raises(ArgumentError) { Settings.parse_tool_selection("+fi*") }
+      assert_equal "+name and -name entries take exact tool names, not patterns: +fi*", pattern.message
+    end
+
+    # The per-session composition (pi #10785: sdk.ts :283-286 +
+    # agent-session.ts :562/:1907-1948): a resumed session restores its
+    # RECORDED loadout; `+name`/`-name` entries compose on top (both
+    # directions); an EXPLICIT list selects exactly and skips the restore;
+    # no recorded loadout keeps the current (default) tools.
+    def test_resolve_session_tool_names_restores_and_composes_modifiers
+      default = %w[read bash edit write]
+      recorded = %w[read bash edit write find]
+
+      assert_equal recorded,
+        Settings.resolve_session_tool_names(cli_tools: nil, default_tools: default, recorded:)
+      assert_equal %w[read bash edit write find grep],
+        Settings.resolve_session_tool_names(cli_tools: {modifiers: %w[+grep]}, default_tools: default, recorded:)
+      assert_equal %w[read bash edit write],
+        Settings.resolve_session_tool_names(cli_tools: {modifiers: %w[-find]}, default_tools: default, recorded:)
+      assert_equal %w[read],
+        Settings.resolve_session_tool_names(cli_tools: {explicit: %w[read]}, default_tools: default, recorded:)
+      assert_equal %w[read bash edit write grep],
+        Settings.resolve_session_tool_names(cli_tools: {modifiers: %w[+grep]}, default_tools: default, recorded: nil)
+      assert_equal default,
+        Settings.resolve_session_tool_names(cli_tools: nil, default_tools: default, recorded: nil)
+      # The empty-record hazard: an EMPTY recorded loadout (a session that
+      # records none — no system entry) must read as "keep the current
+      # tools", and an empty Array is TRUTHY in Ruby — the guard tests
+      # emptiness, never truthiness (the 0-vs-nil cap cousin, I116).
+      assert_equal default,
+        Settings.resolve_session_tool_names(cli_tools: nil, default_tools: default, recorded: [])
+    end
   end
 end

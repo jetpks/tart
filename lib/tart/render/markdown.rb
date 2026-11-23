@@ -5,10 +5,12 @@ require "strscan" # the inline probes: anchored scans with no tail-slice allocat
 module Tart
   module Render
     # The markdown converter (BRIEF §7.1): the pi `markdown.ts` subset —
-    # headings h1–h6, paragraphs, bold, italic, strikethrough, inline code,
-    # fenced code blocks, blockquotes, horizontal rules, unordered + ordered
-    # lists, links — as a pure, gem-neutral styled-rows vocabulary. Hand-rolled
-    # parser; no new runtime deps.
+    # headings h1–h6 (ATX and setext), paragraphs, bold, italic, strikethrough,
+    # inline code, fenced code blocks, blockquotes, horizontal rules,
+    # unordered + ordered lists, task-list markers, GFM tables, links (bare,
+    # titled and angle-wrapped destinations), angle autolinks — as a pure,
+    # gem-neutral styled-rows vocabulary. Hand-rolled parser; no new runtime
+    # deps.
     #
     # Vocabulary (the wave-2 markdown-seam lane's consumption contract): a
     # conversion is an Array of rows, one row per display line; a row is an
@@ -38,9 +40,17 @@ module Tart
     class Markdown
       # One styled run within a row: +text+, +fg+ (+TUI.style+ color symbol
       # or nil), +modifiers+ (+TUI.style+ modifier symbols), +bg+ (the
-      # panel bg the tool-block call rows ride — nil off-panel).
-      Span = Struct.new(:text, :fg, :modifiers, :bg, keyword_init: true) do
-        def initialize(text:, fg: nil, modifiers: [], bg: nil)
+      # panel bg the tool-block call rows ride — nil off-panel), +href+
+      # (the OSC-8 URL a capable terminal links the run to — nil when the
+      # run is not a link or the capability is off; the converter itself
+      # never emits an escape — the emission lives in the TUI seam), and
+      # +image+ (I112 — the RAW image-escape line the span CARRIES for the
+      # post-flush overlay; the converter never emits an escape, the
+      # field is the carrier the anchor registry reads, and the span's
+      # visible text is empty so the row renders zero-width). Additive,
+      # the +href+ precedent.
+      Span = Struct.new(:text, :fg, :modifiers, :bg, :href, :image, keyword_init: true) do
+        def initialize(text:, fg: nil, modifiers: [], bg: nil, href: nil, image: nil)
           super
         end
       end
@@ -63,6 +73,31 @@ module Tart
       # (markdown.ts:616); the converter has no terminal context, so the
       # caller (the seam) passes +width+ — nil means the cap.
       MAX_HR_WIDTH = 80
+
+      # pi's maxUnbrokenWordWidth (markdown.ts:878): a column's minimum
+      # never exceeds this, however long its longest word.
+      MAX_UNBROKEN_WORD_WIDTH = 30
+
+      # GFM table delimiter row (marked's gfmTable align capture, rules.ts):
+      # ` {0,3}`-indented `-` runs with optional `:` at either end, pipe-
+      # separated, optional edge pipes. The tokenizer additionally requires
+      # a `:` or `|` somewhere in the row (other.tableDelimiter /[:|]/ — a
+      # bare `---`/`===` underline is NEVER a delimiter row; it falls to
+      # the setext scan). The shape alone (no guard, no cell count) is the
+      # paragraph-interrupt probe.
+      TABLE_DELIM = /\A {0,3}(?:\| *)?:?-+:? *(?:\| *:?-+:? *)*(?:\| *)?\z/.freeze
+
+      # Setext underline (marked lheadingCore ` {0,3}(=+|-+) *`): `=` → h1,
+      # `-` → h2. A single dash qualifies; three+ dashes also match HR —
+      # the paragraph claims them as underlines first.
+      SETEXT = /\A {0,3}(=+|-+) *\z/.freeze
+
+      # lheadingGfm's content blocker (rules.ts, the `table` replacement):
+      # a delimiter-ish pipe row (`\|?` then 1+ of `[:- ]*|`) that setext
+      # content may neither START on nor cross — this is what keeps
+      # `para\nTitle\n---` one heading while `para\n| a |\n| --- |\n---`
+      # stays paragraph ∥ table ∥ hr (oracle-verified).
+      PIPE_ROW = /\A {0,3}\|?(?:[-: ]*\|)+[-: ]*\z/.freeze
 
       class << self
         # @param width [Integer, nil] content width, for the hr (markdown.ts:616).
@@ -121,7 +156,7 @@ module Tart
       # level (they only matter inside link parsing, which scans its own
       # window); `~` breaks the run only because the del probe re-checks
       # its own `~~` opening pair.
-      BORING_RUN = /[^\\`*_~\[]+/.freeze
+      BORING_RUN = /[^\\`*_~\[<]+/.freeze
 
       # One inline parse node: +kind+ is :text, :code (raw codespan
       # content), :link (+text+ the raw label, +href+, +children+ the
@@ -168,6 +203,8 @@ module Tart
             elsif ch == "`" && (tok = code_token(src, i))
               tok
             elsif ch == "[" && (tok = link_token(src, i))
+              tok
+            elsif ch == "<" && (tok = autolink_token(scan, bi))
               tok
             elsif (ch == "*" || ch == "_") && (tok = delim_token(src, i))
               tok
@@ -227,11 +264,42 @@ module Tart
         [Node.new(kind: :code, text: content), k + m - i]
       end
 
+      # Angle autolink (marked's inline autolink rule, live-verified): a
+      # URI — `<scheme:rest>` where the scheme is 2–32 chars and the rest
+      # carries no whitespace, control char or `<>` — becomes a link whose
+      # text IS the href; the marked email shape (atext @ labels with at
+      # least one dot-label, the address not followed by `-/_`) becomes a
+      # `mailto:` link. Both ride the standing link render (markdown.ts
+      # :699-719) — the `" (href)"` suffix dies in the existing
+      # text==href comparison, so neither form appends anything. Anything
+      # else in angle brackets falls through to plain text.
+      AUTOLINK_URI = /\A<([a-zA-Z][a-zA-Z0-9+.-]{1,31}):([^\s\x00-\x1f<>]*)>/.freeze
+      AUTOLINK_EMAIL = %r{\A<([a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+)(?![-_])>}.freeze
+
+      # StringScanner-anchored like {#del_token} (no tail slice); +scan+ is
+      # shared with the del probe and repositioned on every use.
+      def autolink_token(scan, bi)
+        scan.pos = bi
+        if scan.scan(AUTOLINK_URI)
+          addr = "#{scan.captures[0]}:#{scan.captures[1]}"
+          href = addr
+        elsif scan.scan(AUTOLINK_EMAIL)
+          addr = scan.captures[0]
+          href = "mailto:#{addr}"
+        else
+          return nil
+        end
+        # marked builds one plain-text child (Tokenizer.autolink) — no
+        # inline constructs inside an autolink.
+        [Node.new(kind: :link, text: addr, href:, children: [Node.new(kind: :text, text: addr)]), scan.matched_size]
+      end
+
       # Link (marked's link rule; rendered at markdown.ts:699-719):
       # [label](dest) — the label nests balanced brackets (escapes
-      # skipped) and stays on one line; the dest carries balanced parens
-      # with no whitespace, the final unbalanced `)` closing it (R6). No
-      # match → the `[` is literal text, one-char advance.
+      # skipped) and stays on one line; the destination, the parens'
+      # whitespace tolerance and the optional (discarded) title live in
+      # {#link_href}. No match → the `[` is literal text, one-char
+      # advance (the R6 letter).
       def link_token(src, i)
         return nil unless src[i] == "["
 
@@ -241,13 +309,11 @@ module Tart
         label = src[(i + 1)...j]
         return nil if label.empty? || label.include?("\n")
 
-        k = link_dest_end(src, j + 1)
-        return nil unless k
+        href, end_ix = link_href(src, j + 1)
+        return nil unless end_ix
+        return nil if href.empty? # `[a]()` stays literal (the R6 letter)
 
-        href = src[(j + 2)...k]
-        return nil if href.empty?
-
-        [Node.new(kind: :link, text: label, href:, children: parse_inline(label)), k + 1 - i]
+        [Node.new(kind: :link, text: label, href:, children: parse_inline(label)), end_ix - i]
       end
 
       # The matching `]` for the `[` at i — balanced brackets, escapes
@@ -270,31 +336,102 @@ module Tart
         depth.zero? && j < src.length ? j : nil
       end
 
-      # The index of the `)` that closes a link destination whose `(` sits
-      # at k — balanced parens, escapes skipped, no whitespace (R6) — or
-      # nil when the destination never closes.
-      def link_dest_end(src, k)
+      # The destination arm (the I68 R6 law, superseded in two arms by the
+      # I110 letter): `(` ws* dest ws* title? ws* `)`. The dest is
+      # angle-wrapped ({#angle_dest} — inner whitespace allowed,
+      # D-angle-dest) or bare ({#bare_dest} — balanced parens, escapes
+      # skipped, no whitespace). The title (`"…"` / `'…'` / `(…)`), when
+      # present, is parsed and DISCARDED — marked drops it at token level
+      # (oracle: `[a](url "title")` → href `url`). Returns [href,
+      # index-after-`)`], or nil when the production never closes.
+      def link_href(src, k)
         return nil unless src[k] == "("
 
-        depth = 1
         k += 1
-        while k < src.length
-          c = src[k]
+        k += 1 while src[k]&.match?(WHITESPACE)
+        if src[k] == "<"
+          href, k = angle_dest(src, k)
+          return nil unless k
+        else
+          href, k = bare_dest(src, k)
+          return nil unless k
+        end
+        k += 1 while src[k]&.match?(WHITESPACE)
+        k = skip_title(src, k)
+        return nil unless k
+        k += 1 while src[k]&.match?(WHITESPACE)
+        return nil unless src[k] == ")"
+
+        [href, k + 1]
+      end
+
+      # The angle-wrapped destination (`[a](<url with space>)` —
+      # D-angle-dest): `<…>` with inner whitespace, no raw newline or
+      # angle, escapes skip, 1+ chars required (marked's
+      # `<(?:\\.|[^\n<>\\])+>`). Returns [href, next_index].
+      def angle_dest(src, k)
+        j = k + 1
+        while j < src.length && src[j] != ">"
+          j += src[j] == "\\" ? 2 : 1
+        end
+        return nil unless j < src.length
+
+        href = src[(k + 1)...j]
+        return nil if href.empty? || href.include?("\n")
+
+        [href, j + 1]
+      end
+
+      # The bare destination — the R6 walker (balanced parens, escapes
+      # skipped) extended to STOP at the first whitespace so an optional
+      # title may follow; whitespace inside a paren group still kills the
+      # destination (the R6 no-whitespace law). Returns [href, next_index]
+      # where next_index sits ON the closer paren or the separator.
+      def bare_dest(src, k)
+        depth = 1
+        j = k
+        while j < src.length
+          c = src[j]
           if c == "\\"
-            k += 2
+            j += 2
             next
           end
           if c == "("
             depth += 1
           elsif c == ")"
             depth -= 1
-            return k if depth.zero?
+            return [src[k...j], j] if depth.zero?
           elsif WHITESPACE.match?(c)
-            return nil
+            return [src[k...j], j] if depth == 1 # title territory
+            return nil                            # whitespace inside the dest
           end
-          k += 1
+          j += 1
         end
         nil
+      end
+
+      # The optional link title (marked's title shapes) — parsed and
+      # discarded: a `"…"`/`'…'` run closed by the first unescaped
+      # matching quote, or a `(…)` run closed by the first unescaped `)`.+
+      # Returns the index after the title, or +k+ when there is none, or
+      # nil when the title never closes (the whole link then fails).
+      def skip_title(src, k)
+        opener = src[k]
+        return k unless opener == '"' || opener == "'" || opener == "("
+
+        closer = opener == "(" ? ")" : opener
+        j = k + 1
+        while j < src.length
+          c = src[j]
+          if c == "\\"
+            j += 2 # escapes skip
+            next
+          end
+          break if c == closer
+
+          j += 1
+        end
+        j < src.length ? j + 1 : nil
       end
 
       # A delimiter run: a maximal +*+/+_+ run with the CommonMark
@@ -502,8 +639,19 @@ module Tart
             quote_block(line, lines)
           elsif (m = LIST_ITEM.match(line))
             list_block(m, lines)
+          # The image passthrough (I112, D-PASSTHROUGH-GATED): a source
+          # line carrying a kitty/iterm2 escape rides through as ONE block
+          # — ONLY when the images capability is on. OFF (the rail's
+          # force-off and every battery/golden seat) the line parses
+          # exactly as today, byte-identical (the paragraph fallback).
+          # The arm rides AFTER the structural matches (an escape line
+          # matches none of them — the ESC byte is no fence/heading/quote/
+          # list/table opener) and INSTEAD OF the paragraph fallback that
+          # would inline the escape as visible text.
+          elsif TerminalImages.image_escape_line?(line) && Capabilities.images?
+            [:image_line, line]
           else
-            paragraph_block(line, lines)
+            table_block(line, lines) || paragraph_block(line, lines)
           end
         end
         blocks
@@ -553,6 +701,11 @@ module Tart
 
             lines.shift
             loose = true
+          elsif BLOCK_START.match?(nxt) && indent_of(nxt) <= base_indent
+            # An unindented block opener ends the item's lazy continuation
+            # (marked: `- item\n---` → list ∥ hr — an hr can interrupt the
+            # item paragraph); deeper-indented lines still continue.
+            break
           else # continuation (incl. deeper-indented nested markers, re-parsed per item)
             lines.shift
             item << nxt.lstrip
@@ -563,14 +716,143 @@ module Tart
       end
 
       def paragraph_block(first, lines)
+        extent, level = setext_extent(first, lines)
+        if level
+          lines.shift(extent.length) # the extent (minus +first+) + the underline, claimed by lheading
+          return [:heading, level, extent.join("\n")]
+        end
+
         src = [first]
         until lines.empty?
           nxt = lines.first
           break if nxt.strip.empty? || BLOCK_START.match?(nxt)
-
+          # marked's paragraph interrupt set (rules.ts _paragraph under
+          # gfm — "interrupt paragraphs with table"): a table-shaped
+          # header+delimiter pair at the next line ends the paragraph. The
+          # pair re-dispatches from the top, so a count-mismatch pair
+          # degrades to paragraph text (oracle-verified: the 2-vs-1 pair
+          # after a paragraph splits into two paragraphs).
+          break if table_shape?(nxt, lines[1])
+          # The image passthrough interrupts a paragraph (I112): pi checks
+          # the RENDERED lines (markdown.ts:328 — isImageLine per line), so
+          # an escape line rides through wherever it lands; here an escape
+          # line ends the paragraph and becomes its own [:image_line]
+          # block (the next lines resume as a fresh paragraph). Only when
+          # images are capable — OFF parses byte-identically.
+          break if TerminalImages.image_escape_line?(nxt) && Capabilities.images?
           src << lines.shift
         end
         [:paragraph, src.join("\n")]
+      end
+
+      # The lheading scan (rules.ts lheadingGfm, run at dispatch BEFORE the
+      # paragraph rule): +extent+ is the would-be heading content, +level+
+      # 1 (`=`) / 2 (`-`) when the extent terminates in a setext underline,
+      # nil otherwise. The content may neither START on nor cross a
+      # pipe-row line (the `table` content blocker) or a blank/block
+      # opener; an underline beyond any of them is unreachable and the
+      # paragraph builds normally (oracle: `para\nTitle\n---` is ONE h2,
+      # `para\n| a |\n| --- |\n---` is paragraph ∥ table ∥ hr).
+      def setext_extent(first, lines)
+        extent = [first]
+        return [extent, nil] if PIPE_ROW.match?(first)
+
+        lines.each do |nxt|
+          if (m = SETEXT.match(nxt))
+            return [extent, m[1].start_with?("=") ? 1 : 2] # the underline itself is NOT content
+          end
+          return [extent, nil] if nxt.strip.empty? || BLOCK_START.match?(nxt) || PIPE_ROW.match?(nxt)
+
+          extent << nxt
+        end
+        [extent, nil]
+      end
+
+      # The paragraph-interrupt pair shape (marked's gfmTable pattern
+      # level — no guard, no cell-count check: a count-mismatch pair still
+      # interrupts): a non-blank header line + a delimiter-row line.
+      def table_shape?(header, delim)
+        !header.strip.empty? && delim && TABLE_DELIM.match?(delim)
+      end
+
+      # GFM table (marked 18.0.11's letter, live-verified): a header line
+      # + delimiter row whose cell counts are EQUAL, the delimiter carrying
+      # the `[:|]` guard (a bare `---`/`===` underline is never a delimiter
+      # row and falls to the setext scan). Body rows run to a blank line or
+      # a block opener; +raw+ keeps the source lines for the too-narrow
+      # fallback. +align+ is captured but NOT rendered (D-align — pi
+      # v1.1.0's renderTable never reads token.align).
+      def table_block(header, lines)
+        delim = lines.first
+        return nil unless delim && TABLE_DELIM.match?(delim) && delim.match?(/[:|]/)
+
+        headers = split_cells(header)
+        aligns = table_aligns(delim)
+        return nil unless headers.length == aligns.length
+
+        # consumed only AFTER the count check — a mismatched pair consumes
+        # nothing and degrades to paragraph text at re-dispatch
+        delim = lines.shift
+        body = []
+        until lines.empty? || lines.first.strip.empty? || BLOCK_START.match?(lines.first)
+          body << lines.shift
+        end
+        [:table, headers, aligns, body.map { |row| split_cells(row, headers.length) },
+         [header, delim, *body].join("\n")]
+      end
+
+      # marked's splitCells (rules.ts helpers): every unescaped pipe gains
+      # a leading space (an odd backslash-run before it = escaped), the row
+      # splits on " |", an empty first/last cell is dropped (the edge
+      # pipes), cells trim and `\|` unescapes; +count+ pads with empties /
+      # truncates (body rows to the header count).
+      def split_cells(row, count = nil)
+        spaced = +""
+        row.each_char.with_index do |ch, i|
+          spaced << if ch != "|"
+            ch
+          elsif slash_run_odd?(row, i)
+            "|" # escaped pipe: no split, no space
+          else
+            " |" # unescaped pipe: gains the split space
+          end
+        end
+        cells = spaced.split(" |", -1)
+        cells.shift if !cells.empty? && cells.first.strip.empty?
+        cells.pop if !cells.empty? && cells.last.strip.empty?
+        if count
+          cells = cells.first(count)
+          cells << "" while cells.length < count
+        end
+        cells.map { |cell| cell.strip.gsub("\\|", "|") }
+      end
+
+      # An odd number of backslashes immediately before the pipe at +i+
+      # escapes it (marked's escape walk in splitCells).
+      def slash_run_odd?(row, i)
+        odd = false
+        j = i - 1
+        while j >= 0 && row[j] == "\\"
+          odd = !odd
+          j -= 1
+        end
+        odd
+      end
+
+      # marked's align read (Tokenizer.table): the delimiter minus one
+      # leading pipe and one trailing `| *`, split on plain `|`; each cell
+      # is right / center / left / none by its colon posture. Captured but
+      # NOT rendered (D-align).
+      def table_aligns(delim)
+        delim.sub(/\A\|/, "").sub(/\| *\z/, "").split("|", -1).map do |cell|
+          if cell.match?(/\A *-+: *\z/)
+            :right
+          elsif cell.match?(/\A *:-+: *\z/)
+            :center
+          elsif cell.match?(/\A *:-+ *\z/)
+            :left
+          end
+        end
       end
 
       def render_block(block)
@@ -578,10 +860,16 @@ module Tart
         when :space then [[]] # space token → blank row (markdown.ts:594-596)
         when :heading then heading_rows(block)
         when :paragraph then split_rows(inline_spans(block[1]))
+        when :table then table_rows(block)
         when :code then code_rows(block)
         when :quote then quote_rows(block)
         when :hr then [[Span.new(text: "─" * hr_length, fg: FG[:hr])]]
         when :list then list_rows(block)
+        # The image passthrough (I112): one row whose single span carries
+        # the RAW escape line in the +image+ field — zero visible width,
+        # so Text.wrap_row passes the row through UNCHANGED (the fits arm;
+        # no text.rb change) and the escape never enters a buffer cell.
+        when :image_line then [[Span.new(text: "", image: block[1])]]
         end
       end
 
@@ -612,9 +900,160 @@ module Tart
       def quote_rows(block)
         block[1].flat_map { |inner| render_block(inner) }.map do |row|
           [Span.new(text: "│ ", fg: FG[:quote_border])] + row.map do |span|
-            Span.new(text: span.text, fg: span.fg || FG[:quote], modifiers: span.modifiers | [:italic])
+            Span.new(text: span.text, fg: span.fg || FG[:quote], modifiers: span.modifiers | [:italic],
+              href: span.href)
           end
         end
+      end
+
+      # pi v1.1.0 renderTable (markdown.ts:852-1015): bordered rows in the
+      # Span vocabulary, sized against the converter's content width; nil
+      # width = the natural-fit arm — columns at natural widths, cells
+      # unwrapped (the display path always passes a width). Layout: the
+      # top border; one row per wrapped header line (cells bold, padding
+      # included — pi's theme.bold(padded)); a separator; the body rows
+      # with separators BETWEEN them; the bottom border. Borders are
+      # single default-styled spans (pi renders them unstyled —
+      # D-border-style). Alignment is never read (D-align).
+      def table_rows(block)
+        _, headers, _align, body, raw = block
+        num = headers.length
+        return [] if num.zero?
+
+        header_cells = headers.map { |cell| inline_spans(cell) }
+        body_cells = body.map { |row| row.map { |cell| inline_spans(cell) } }
+        widths = table_widths(header_cells, body_cells, num)
+        return raw_fallback_rows(raw) unless widths
+
+        sep = ->(left, mid, right) { [Span.new(text: left + widths.map { |w| "─" * w }.join(mid) + right)] }
+        rows = [sep.call("┌─", "─┬─", "─┐")]
+        rows.concat(bordered_cell_rows(header_cells, widths, num, bold: true))
+        rows << sep.call("├─", "─┼─", "─┤")
+        body_cells.each_with_index do |row, i|
+          rows.concat(bordered_cell_rows(row, widths, num, bold: false))
+          rows << sep.call("├─", "─┼─", "─┤") if i < body_cells.length - 1
+        end
+        rows << sep.call("└─", "─┴─", "─┘")
+        rows
+      end
+
+      # The width arithmetic (markdown.ts:880-949): per-column natural and
+      # min-word widths (visible width over the rendered cell spans; the
+      # longest whitespace-delimited word, capped at
+      # MAX_UNBROKEN_WORD_WIDTH); minimum regrow when the mins overflow;
+      # then natural fit or proportional shrink. Returns nil when even one
+      # column per cell cannot fit — the too-narrow raw fallback.
+      def table_widths(header_cells, body_cells, num)
+        natural = Array.new(num, 0)
+        min_word = Array.new(num, 1)
+        header_cells.each_with_index { |cell, i| note_cell(natural, min_word, i, cell) }
+        body_cells.each { |row| row.each_with_index { |cell, i| note_cell(natural, min_word, i, cell) } }
+
+        return (0...num).map { |i| [natural[i], min_word[i]].max } unless @width
+
+        overhead = 3 * num + 1
+        available = @width - overhead
+        return nil if available < num
+
+        mins = min_word.dup
+        mins = regrown_minimums(min_word, available, num) if mins.sum > available
+        if natural.sum + overhead <= @width
+          (0...num).map { |i| [natural[i], mins[i]].max }
+        else
+          shrunk_columns(natural, mins, available, num)
+        end
+      end
+
+      # One cell's contribution to its column's natural (full visible
+      # width) and min-word (max(1, longest word ≤ 30)) measures
+      # (markdown.ts:883-898 + getLongestWordWidth :821-830).
+      def note_cell(natural, min_word, i, cell)
+        text = cell.map(&:text).join
+        natural[i] = [natural[i], TUI.text_width(text)].max
+        longest = text.split(/[[:space:]]+/).reject(&:empty?).filter_map { |word| TUI.text_width(word) }.max || 0
+        min_word[i] = [min_word[i], [longest, MAX_UNBROKEN_WORD_WIDTH].min, 1].max
+      end
+
+      # The minimum regrow (markdown.ts:907-931): floors of the weighted
+      # share (weight = max(0, w−1)), the leftover round-robin from 1.
+      def regrown_minimums(min_word, available, num)
+        mins = Array.new(num, 1)
+        remaining = available - num
+        if remaining.positive?
+          weights = min_word.map { |w| [0, w - 1].max }
+          total = weights.sum
+          growth = weights.map { |w| total.positive? ? w * remaining / total : 0 }
+          mins = mins.each_with_index.map { |m, i| m + growth[i] }
+          leftover = remaining - growth.sum
+          i = 0
+          while leftover.positive? && i < num
+            mins[i] += 1
+            leftover -= 1
+            i += 1
+          end
+        end
+        mins
+      end
+
+      # The proportional shrink (markdown.ts:946-968): each column grows
+      # from its min by the floor of its share of the extra width (share =
+      # minDelta / totalGrowPotential · extraWidth), then the remainder
+      # goes round-robin to columns still below natural.
+      def shrunk_columns(natural, mins, available, num)
+        total_grow = (0...num).sum { |i| [0, natural[i] - mins[i]].max }
+        extra = [0, available - mins.sum].max
+        widths = (0...num).map do |i|
+          delta = [0, natural[i] - mins[i]].max
+          mins[i] + (total_grow.positive? ? delta * extra / total_grow : 0)
+        end
+        remaining = available - widths.sum
+        while remaining.positive?
+          grew = false
+          (0...num).each do |i|
+            break if remaining.zero?
+            next unless widths[i] < natural[i]
+
+            widths[i] += 1
+            remaining -= 1
+            grew = true
+          end
+          break unless grew
+        end
+        widths
+      end
+
+      # One display row per wrapped cell line: `│ ` + cells joined ` │ ` +
+      # ` │`; a cell shorter than its row-mate fills with a pad-only line
+      # (pi pads every line to the column width — markdown.ts:971-981).
+      def bordered_cell_rows(cells, widths, num, bold:)
+        lines = cells.each_with_index.map { |cell, i| table_cell_lines(cell, widths[i], bold) }
+        (0...lines.map(&:length).max).map do |h|
+          row = [Span.new(text: "│ ")]
+          lines.each_with_index do |cell_lines, i|
+            row.concat(cell_lines[h] || [Span.new(text: " " * widths[i], modifiers: bold ? [:bold] : [])])
+            row << Span.new(text: i == num - 1 ? " │" : " │ ")
+          end
+          row
+        end
+      end
+
+      # A cell's wrapped lines (the house Text.wrap_row, min width 1),
+      # each right-padded to the column width; +bold+ adds :bold to every
+      # span INCLUDING the padding (pi applies theme.bold to the padded
+      # cell text, markdown.ts:975-982).
+      def table_cell_lines(cell, width, bold)
+        Text.wrap_row(cell, width).map do |line|
+          line = line.map { |s| Span.new(text: s.text, fg: s.fg, modifiers: bold ? s.modifiers | [:bold] : s.modifiers, href: s.href) }
+          pad = width - TUI.text_width(line.map(&:text).join)
+          line << Span.new(text: " " * pad, modifiers: bold ? [:bold] : []) if pad.positive?
+          line
+        end
+      end
+
+      # The too-narrow fallback (markdown.ts:874-878): the block's raw
+      # source lines as plain spans wrapped to the width — no borders.
+      def raw_fallback_rows(raw)
+        raw.split("\n", -1).flat_map { |line| Text.wrap_row([Span.new(text: line)], @width) }
       end
 
       def list_rows(block, depth = 0)
@@ -671,11 +1110,28 @@ module Tart
           when :code
             spans << Span.new(text: node.text, fg: FG[:code]) # raw, no nesting (:695-697)
           when :link
-            spans.concat(render_nodes(node.children, FG[:link], modifiers + [:underlined])) # :701
-            # OSC-8 out of scope: the linkUrl fallback — URL appended in
-            # parens unless text already is the href (:711-719).
-            unless node.text == node.href || node.text == node.href.delete_prefix("mailto:")
-              spans << Span.new(text: " (#{node.href})", fg: FG[:link_url])
+            # The fresh child-modifiers array is the link's carrier
+            # identity (NO ALIASING — created per :link case; nested
+            # em/strong own further fresh arrays, each registered below).
+            child_modifiers = modifiers + [:underlined] # :701
+            children = render_nodes(node.children, FG[:link], child_modifiers)
+            spans.concat(children)
+            if Capabilities.hyperlinks?
+              # OSC-8: render as the link alone — NO inline URL fallback
+              # (markdown.ts:703-706). The href rides the +href+ field and
+              # the modifiers-array identity (the carrier that crosses the
+              # frozen Transcript.markdown_lines rebuild); markdown.rb
+              # emits NO escape sequence — the emission lives in TUI.
+              children.each do |child|
+                child.href = node.href
+                TUI::LinkOverlay.record_href_carrier(child.modifiers, node.href)
+              end
+            else
+              # The linkUrl fallback — URL appended in parens unless text
+              # already is the href (:711-719). BYTE-IDENTICAL to base.
+              unless node.text == node.href || node.text == node.href.delete_prefix("mailto:")
+                spans << Span.new(text: " (#{node.href})", fg: FG[:link_url])
+              end
             end
           when :em
             spans.concat(render_nodes(node.children, fg, modifiers + [:italic])) # :689-693
@@ -697,10 +1153,14 @@ module Tart
       end
 
       # Adjacent same-style spans coalesce (one text run per style, as pi's
-      # flat ANSI output renders).
+      # flat ANSI output renders). The href joins the style equality (I111
+      # — a link run never coalesces into an identically-styled plain run:
+      # different hrefs must not alias under one span). OFF-arm bytes are
+      # untouched (every href is nil there).
       def merge_adjacent(spans)
-        spans.chunk_while { |a, b| a.fg == b.fg && a.modifiers == b.modifiers }.map do |group|
-          Span.new(text: group.map(&:text).join, fg: group.first.fg, modifiers: group.first.modifiers)
+        spans.chunk_while { |a, b| a.fg == b.fg && a.modifiers == b.modifiers && a.href == b.href }.map do |group|
+          Span.new(text: group.map(&:text).join, fg: group.first.fg, modifiers: group.first.modifiers,
+            href: group.first.href)
         end
       end
 
@@ -711,7 +1171,7 @@ module Tart
         spans.each do |span|
           span.text.split("\n", -1).each_with_index do |part, i|
             rows << [] if i.positive?
-            rows.last << Span.new(text: part, fg: span.fg, modifiers: span.modifiers) unless part.empty?
+            rows.last << Span.new(text: part, fg: span.fg, modifiers: span.modifiers, href: span.href) unless part.empty?
           end
         end
         rows

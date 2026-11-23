@@ -177,7 +177,8 @@ module Tart
       def initialize(session:, kernel:, footer_data: nil, branch_reader: Footer::DEFAULT_BRANCH_READER, autocomplete: nil,
         motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
         prompts: [], skills: [], context_files: [], extensions: [], models: nil,
-        clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }, endpoint: nil)
+        clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }, endpoint: nil,
+        sweep_slice_budget: nil)
         @session = session
         @kernel = kernel
         @footer_data = footer_data
@@ -237,6 +238,13 @@ module Tart
         # clears it after {build_widget}).
         @logo_lines = nil
         @resize_dims = nil
+        # The resize sweep's window-pass arm (I108): set by
+        # {handle_resize}'s mark, consumed by the frame boundary's FIRST
+        # slice — the one pass that runs INSIDE the latch (the viewport
+        # window's stale range rebuilds before that compose; subsequent
+        # frames continue ascending, latch-free). A second winch mid-sweep
+        # re-arms it (the newest dims win).
+        @sweep_window_pending = false
         # The /resume session picker (item 2, pi SessionSelectorComponent
         # reduced): nil = closed; open it holds the {Picker} over the
         # launcher-built [{path:, label:}] list (newest first).
@@ -261,7 +269,8 @@ module Tart
         @transcript_state = Transcript.new(
           width_reader: -> { viewport_width },
           history_sink: ->(text) { @editor.add_to_history(text) },
-          reseed_sink: ->(message) { @footer.reseed_usage(message) }
+          reseed_sink: ->(message) { @footer.reseed_usage(message) },
+          sweep_slice_budget: sweep_slice_budget # nil → the Transcript default (I108)
         )
         # The !-prefix bash execution state machine (backlog C, pi
         # handleBashCommand): the coordinator routes into it — submit's
@@ -561,6 +570,7 @@ module Tart
         enqueue_motd if @motd_pending
         @motd_pending = false
         @transcript_state.flush_scrollback
+        run_sweep_slice
         widget = build_widget
         # One-frame latch semantics (I56): the resize event's dims drove
         # THIS compose; the draw's autoresize has refreshed the gem area
@@ -597,33 +607,43 @@ module Tart
         edit_input(event)
       end
 
-      # The SIGWINCH arm (I56 latch; I105 generalization): latch the event
-      # dims as the compose-time geometry (one frame — {render_frame}
-      # clears the latch after {build_widget}; on a real terminal the
-      # draw's autoresize refreshes the gem area by then), re-pick the
-      # header art at the new width ({@header_enqueued} now gates ONLY the
-      # re-pick), then DRAIN the scrollback queue (queued items materialize
-      # at the latched width and join the sweep — an item enqueued at the
-      # old width but unflushed at the winch lands at the NEW width; the
-      # queue is a plain same-reactor Array, the drain fiber-synchronous —
-      # I107) and run THE SWEEP: every scrollback registration re-derives
-      # at the latched dims, once per winch (never per frame), then request
-      # the draw. The viewport offset clamps on shrink in {Viewport#window}
-      # (no viewport change — the I105 pin proves the property). No header
+      # The SIGWINCH arm (I56 latch; I105 generalization; I108 the cheap
+      # form): latch the event dims as the compose-time geometry (one
+      # frame — {render_frame} clears the latch after {build_widget}; on
+      # a real terminal the draw's autoresize refreshes the gem area by
+      # then), re-pick the header art at the new width ({@header_enqueued}
+      # now gates ONLY the re-pick), then DRAIN the scrollback queue
+      # (queued items materialize at the latched width and register — an
+      # item enqueued at the old width but unflushed at the winch lands
+      # at the NEW width; the queue is a plain same-reactor Array, the
+      # drain fiber-synchronous — I107) and MARK the sweep pending. ZERO
+      # builder work here — the handler is O(1)-in-scrollback (I108 §a:
+      # the K-event drag burst collapses to one sweep-equivalent at the
+      # frame boundary; the drain registers CLEAN, the mark arms every
+      # registration stale, the first post-burst frame rebuilds the
+      # viewport window and the continuation frames drain the rest).
+      # Request the draw unconditionally — the frame is where the sweep
+      # runs (the kernel's per-event dirty mark is the second rail). The
+      # viewport offset clamps on shrink in {Viewport#window} (no
+      # viewport change — the I105 pin proves the property). No header
       # enqueued (motd: false — the /resume screens) → no art re-pick; the
-      # drain + sweep still run (the /resume screens re-wrap too). The
-      # predicate form mirrors the mouse arm (the base Event answers every
-      # ? predicate via method_missing — the respond_to? guard is what
-      # separates the classes).
+      # drain + mark still run (the /resume screens re-wrap too). A
+      # resize at constant dims marks + sweeps too — byte-identical no-op
+      # by the purity law. {rebuild_scrollback} DIED here (its only base
+      # caller — the one-shot stays the staged path's comparator API).
+      # The predicate form mirrors the mouse arm (the base Event answers
+      # every ? predicate via method_missing — the respond_to? guard is
+      # what separates the classes).
       def handle_resize(event)
         @resize_dims = [event.width, event.height]
         if @header_enqueued
           @logo_lines = Motd.motd_logo_lines(event.width, wordmark: @identity)
         end
         @transcript_state.flush_scrollback
-        rebuilt = @transcript_state.rebuild_scrollback
+        @transcript_state.mark_sweep_pending
+        @sweep_window_pending = true
         signal_state_change
-        @kernel.request_draw if rebuilt
+        @kernel.request_draw
       end
 
       # Agent event sink (I03 event surface). Runs on the agent fiber.
@@ -907,6 +927,15 @@ module Tart
         @transcript_state.enqueue_scrollback(text, fg: Theme[:muted])
       end
 
+      # The resize sweep's completion observable (I108 AC3 — completion
+      # is observable): delegates the Transcript's pending flag. Public:
+      # the burst/window pins and the probes drain frames until this
+      # falses, deterministically (no sleeps — the counter budget IS the
+      # bound).
+      def sweep_pending?
+        @transcript_state.sweep_pending?
+      end
+
       private
 
       # I103 — the state-signal broadcast (additive observability): the
@@ -924,6 +953,47 @@ module Tart
         @ready.push(:wake)
         Fiber.scheduler&.push(::Tart::Wake.new(@ready, :wake))
         nil
+      end
+
+      # The sweep's frame-boundary seat (I108 §b — pi's shape: resize →
+      # requestRender → one re-render per frame at the latest dims,
+      # tui.ts:916-921): at most ONE slice pass per frame, AFTER the
+      # flush (a mid-sweep drain registers CLEAN before the walk — no
+      # registry mutation mid-ascending-walk) and BEFORE the compose (the
+      # drawn window is the swept one). The first pass after a winch mark
+      # is window-first INSIDE the latch (the visible window re-wraps at
+      # the latched dims before this compose — AC2); the rest ascend from
+      # the front on the budget. Self-pumping continuation: a frame that
+      # leaves work pending requests its own successor draw (event-driven
+      # — the loop's request_draw marks dirty and wakes the idle loop; no
+      # timers, no threads). A slice that rebuilt signals (the I103 stat
+      # discipline + the status-pair re-point ride the slice path).
+      def run_sweep_slice
+        return unless @transcript_state.sweep_pending?
+
+        window = @sweep_window_pending ? sweep_window_range : nil
+        @sweep_window_pending = false
+        rebuilt = @transcript_state.sweep_slice(budget: @transcript_state.sweep_slice_budget, window: window)
+        signal_state_change if rebuilt.positive?
+        @kernel.request_draw if @transcript_state.sweep_pending?
+      end
+
+      # The viewport window's row range over the CURRENT (stale-width)
+      # buffer — {Viewport#window}'s arithmetic performed READ-ONLY: the
+      # draw's own window call owns the offset/follow maintenance (I56
+      # offset semantics unchanged; mutating here would double-apply the
+      # clamp for a detached viewport). Follow parks at the buffer tail
+      # (the common case); a detached offset's window otherwise; the
+      # transcript area's row budget is the same one {build_widget} uses.
+      # The range indexes DISPLAY rows — the transcript prefix is a
+      # 1:1 map (the live region rides at the tail), so registration
+      # ranges intersect it directly.
+      def sweep_window_range
+        rows = transcript_area_rows
+        lines = display_lines
+        max_offset = [lines.size - rows, 0].max
+        offset = @viewport.following? ? max_offset : @viewport.offset.clamp(0, max_offset)
+        offset..(offset + rows - 1)
       end
 
       # Completed content: queued for the transcript buffer.
@@ -2105,6 +2175,24 @@ module Tart
         # tui-alt-screen.ts:1638-1667); the click rect latches for the
         # mouse (nil whenever the pill is absent).
         @jump_pill_rect = compose_jump_pill(window, width, rows, rail_visible)
+        # The OSC-8 carrier's submission (I111, the post-flush overlay —
+        # Grounds §1 ruling A): the FINAL window rows, in order, ride to
+        # the session's overlay. The transcript area is the fullscreen
+        # layout's TOP child (build_widget's first constraint) — the
+        # screen origin is (0, 0). Capability-off → never submitted (the
+        # overlay never runs: zero cost, zero bytes); double sessions
+        # (ScriptedSession) answer respond_to? — the submission law is
+        # the capability, the guard is the duck-typed seam.
+        if Capabilities.hyperlinks? && @session.respond_to?(:submit_link_rows)
+          @session.submit_link_rows(window, y0: 0, x0: 0)
+        end
+        # The image carrier's submission (I112 — the additive sibling): the
+        # SAME final window rows ride to the image overlay when images are
+        # capable. Capability-off → never submitted (zero cost, zero
+        # bytes); the guard is the duck-typed seam.
+        if Capabilities.images? && @session.respond_to?(:submit_image_rows)
+          @session.submit_image_rows(window, y0: 0, x0: 0)
+        end
         TUI.paragraph(text: window, wrap: false)
       end
 

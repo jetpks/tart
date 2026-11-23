@@ -182,16 +182,20 @@ module Tart
       end
 
       # The compaction one-shot factory (Specification §5): same client,
-      # same wire model + facts, the summarization instructions and output
-      # cap — NO seam, NO private-API reach. The session's thinking level
-      # rides (pi compaction.ts:605-607 — the dialect branch carries it).
-      def summary_chat(instructions:, max_output_tokens:)
+      # same wire model + facts, the summarization instructions and an
+      # OPTIONAL output cap — nil (the summarize path's shape, #9512) sets
+      # NO per-call cap: the wire cap is the gem's clamp of the wire model's
+      # own max_tokens (pi v1.6.0 compaction.ts:603-605 sets no maxTokens;
+      # :647/:699 reserveTokens is unused for the cap) — NO seam, NO
+      # private-API reach. The session's thinking level rides (pi
+      # compaction.ts:605-607 — the dialect branch carries it).
+      def summary_chat(instructions:, max_output_tokens: nil)
         chat = Chat.new(client: @client, model_id: @model_id, provider_key: @provider_key,
                         endpoint: @endpoint)
         chat.apply_facts(model_reasoning: @model_reasoning, thinking_level_map: @thinking_level_map,
           compat: @compat, context_window: @facts.context_window, max_tokens: @facts.max_tokens)
         chat.with_instructions(instructions)
-        chat.with_max_output_tokens(max_output_tokens)
+        chat.with_max_output_tokens(max_output_tokens) # nil = the field's default, no per-call cap
         chat.thinking_level = @thinking_level
         chat
       end

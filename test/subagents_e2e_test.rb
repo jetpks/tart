@@ -868,7 +868,10 @@ module Tart
     # assertion can prove no i49-e2e-* dir survives.
     def i49_stage_home
       FileUtils.rm_rf(@home)
-      @home = Dir.mktmpdir("i49-e2e-home-")
+      # Parallel-safety (I111 D3): the prefix carries the leg's own test
+      # name — cross-worker legs' live scratch must never fail each
+      # other's hygiene glob under the parallel runner's sharding.
+      @home = Dir.mktmpdir("i49-e2e-#{name}-")
       @project_dir = File.join(@home, "project")
       FileUtils.mkdir_p(@project_dir)
       # I70 explicit-staging law (the runner's R3, mirrored): the staged
@@ -945,8 +948,11 @@ module Tart
     # pid) with kill_stray_children TERM'ing any non-terminal straggler
     # here before the dirs go away.
     def assert_i49_hygiene
-      assert_empty Dir.glob(File.join(Dir.tmpdir, "i49-e2e-*")),
-        "no i49-e2e-* scratch dirs survive the leg"
+      # Parallel-safety (I111 D3): scoped to THIS leg's unique prefix —
+      # the global glob caught concurrent legs' live scratch across
+      # workers (leg E ∥ leg F) and failed the suite by timing luck.
+      assert_empty Dir.glob(File.join(Dir.tmpdir, "i49-e2e-#{name}-*")),
+        "no i49-e2e-#{name}-* scratch dirs survive the leg"
     end
 
     # (minitest discovers public test methods only — the i49 helper block

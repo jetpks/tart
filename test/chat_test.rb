@@ -2097,6 +2097,12 @@ module Tart
 
         chat.on_event(RatatuiRuby::Event::Resize.new(width: 50, height: 40))
         draw(chat, session)
+        # I108 S4 mechanics re-derivation (name + end-state kept): the
+        # first post-winch frame presents only the WINDOW slice now —
+        # drive frames to completion (the pending drain) before the
+        # whole-transcript assertions. Deterministic: the injected budget
+        # is the bound, no sleeps.
+        draw(chat, session) while chat.sweep_pending?
         rows = transcript_lines(session, chat)
         joined = rows.join("\n")
         rows.each do |row|
@@ -2109,6 +2115,111 @@ module Tart
 
         draw(chat, session)
         assert_equal rows, transcript_lines(session, chat), "the second frame keeps the rebuilt rows"
+      end
+    end
+
+    # --- I108: the frame-boundary sweep (the cheap winch arm + the
+    # window-first slices; the owner complaint's second half) ---
+
+    # Pin 8 (AC1, supersedes the retired transcript once-per-winch pin —
+    # Grounds S3): a K=3 queued winch burst (a drag shape) with NO draws
+    # between — the drain_native back-to-back arm — collapses to ONE
+    # sweep-equivalent at the frame boundary: the handlers invoke ZERO
+    # builders, the first post-burst frame presents at the newest latched
+    # dims, each counting registration is invoked exactly once more
+    # across the whole drain, and constant-width renders invoke nothing.
+    def test_winch_burst_collapses_to_one_sweep_at_the_frame_boundary
+      with_chat(width: 120, screen_height: 40) do |chat, session|
+        ts = chat.instance_variable_get(:@transcript_state)
+        counts = Hash.new(0)
+        2.times do |i|
+          ts.push_expandable(->(_expanded) { counts[i] += 1; [TUI.line("counting #{i}")] })
+        end
+        md = "assistant prose long enough to wrap when the window narrows to eighty cells for sure yes"
+        30.times { |j| chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "#{md} (#{j})")}) }
+        draw(chat, session)
+        base = counts.values.dup
+        assert_equal [1, 1], base, "the push materialized each counting region once"
+
+        [100, 90, 80].each { |w| chat.on_event(RatatuiRuby::Event::Resize.new(width: w, height: 40)) }
+        assert_equal base, counts.values.dup, "the handlers invoke ZERO builders (O(1) in scrollback)"
+
+        draw(chat, session) # the first post-burst frame — the window slice runs inside the latch
+        over = session.buffer_content.map { |r| r.rstrip }.select { |r| !r.empty? && r.length > 80 }
+        assert_empty over, "the first post-burst frame presents at the newest dims (80)"
+
+        draw(chat, session) while chat.sweep_pending?
+        assert_equal base.map { |c| c + 1 }, counts.values.dup,
+          "exactly ONE sweep-equivalent per registration across the whole burst (K never multiplies the work)"
+
+        draw(chat, session) # a render at constant width
+        assert_equal base.map { |c| c + 1 }, counts.values.dup, "renders at constant width invoke nothing"
+      end
+    end
+
+    # Pin 9 (AC2): ONE winch at large scrollback — the FIRST post-winch
+    # frame presents the viewport window re-wrapped at the latched dims
+    # (nothing over), the chrome — editor border, footer — correct in the
+    # SAME frame (I56 latch parity: the first slice runs inside the
+    # latch), and the far out-of-window registration is UNTOUCHED at that
+    # draw; completion still reaches it exactly once.
+    def test_first_post_winch_frame_presents_the_window_at_new_dims
+      with_chat(width: 120, screen_height: 40) do |chat, session|
+        ts = chat.instance_variable_get(:@transcript_state)
+        far = [0]
+        near = [0]
+        ts.push_expandable(->(_expanded) { far[0] += 1; [TUI.line("far counting #{far[0]}")] })
+        md = "assistant prose long enough to wrap when the window narrows to eighty cells for sure yes"
+        60.times { |j| chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "#{md} (#{j})")}) }
+        ts.push_expandable(->(_expanded) { near[0] += 1; [TUI.line("near counting #{near[0]}")] })
+        draw(chat, session)
+        base_far = far[0]
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 80, height: 40))
+        assert_equal base_far, far[0], "the handler invokes no builders"
+
+        draw(chat, session) # the FIRST post-winch frame
+        assert_equal base_far, far[0], "the far out-of-window registration untouched at the first draw"
+        assert_equal 80, session.buffer_content[-5].rstrip.length, "the editor border composes at the latched width in the same frame"
+        footer = session.buffer_content[-2, 2].map { |r| r.rstrip.length }
+        assert footer.all? { |len| len.positive? && len <= 80 }, "the footer composes at the latched width in the same frame"
+        window_rows = session.buffer_content[0, transcript_height(session, chat)].map(&:rstrip)
+        assert window_rows.select { |r| !r.empty? && r.length > 80 }.empty?,
+          "the visible window re-wrapped at the latched width (nothing over)"
+
+        draw(chat, session) while chat.sweep_pending?
+        assert_equal base_far + 1, far[0], "completion reaches the far registration exactly once"
+        all_rows = session.buffer_content[0, transcript_height(session, chat)].map(&:rstrip)
+        assert all_rows.select { |r| !r.empty? && r.length > 80 }.empty?, "nothing over 80 after completion"
+      end
+    end
+
+    # Pin 10 (AC3+AC4): the pending observable drains within the
+    # deterministic slice bound (the injected budget arithmetic — the +1
+    # is the window pass), every frame's render returns during the sweep,
+    # and the editor accepts input mid-sweep (a key event between frames
+    # processes without error). No wall-clock anywhere — the counter IS
+    # the bound.
+    def test_resize_sweep_completion_observable_and_input_liveness_holds
+      with_chat(width: 120, screen_height: 40) do |chat, session|
+        ts = chat.instance_variable_get(:@transcript_state)
+        ts.sweep_slice_budget = 2 # the injected counter — the deterministic bound
+        md = "assistant prose long enough to wrap when the window narrows to eighty cells for sure yes"
+        40.times { |j| chat.on_agent_event({type: :message_end, message: MessageDouble.new(:assistant, "#{md} (#{j})")}) }
+        draw(chat, session)
+        stale = ts.instance_variable_get(:@expandable_blocks).size
+
+        chat.on_event(RatatuiRuby::Event::Resize.new(width: 80, height: 40))
+        bound = (stale.to_f / 2).ceil + 1
+        frames = 0
+        while chat.sweep_pending?
+          chat.on_event(TUI.key_event("x")) if frames.zero? # input BETWEEN frames, mid-sweep
+          draw(chat, session) # every frame's render returns during the sweep
+          frames += 1
+          assert_operator frames, :<=, bound, "the pending drain stays within the deterministic slice bound"
+        end
+        refute chat.sweep_pending?, "completion observable"
+        assert_equal "x", session.buffer_content[input_row(session)].rstrip, "the editor accepted the mid-sweep key"
       end
     end
 
@@ -6199,6 +6310,75 @@ module Tart
     def line_fg(session, y, glyph)
       x = session.buffer_content[y].index(glyph)
       session.cell_fg(x, y)
+    end
+
+    # --- I111 — the OSC-8 carrier's full-frame submission ---
+
+    # The headless chat frame submits the FINAL transcript window rows to
+    # the session's overlay when capable: the drawn writer carries the
+    # link entries at their exact (y, x) — including the carrier crossing
+    # the frozen Transcript.markdown_lines rebuild (the array-identity
+    # channel) and TWO links resolving independently (no aliasing). The
+    # theme mode is pinned (COLORTERM=truecolor) so the emission literal
+    # is seat-independent (the md_link hex → 38;2;105;173;208).
+    def test_osc8_chat_frame_submits_transcript_link_rows
+      saved_color = ENV["COLORTERM"]
+      ENV["COLORTERM"] = "truecolor"
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        with_hyperlinks("1") do
+          captured = StringIO.new
+          session.writer = captured
+          finish_message(chat, "see [pi](https://pi.dev) and [docs](https://docs.dev) end")
+          draw(chat, session)
+
+          y = session.buffer_content.index { |row| row.include?("see pi and docs end") }
+          refute_nil y, "the link row rendered"
+          # The transcript row: pad(1) + "see "(4) → "pi" at 0-based x=5;
+          # + "pi"(2) + " and "(5) → "docs" at 0-based x=12.
+          expected = "\e[#{y + 1};6H\e[4m\e[38;2;105;173;208m\e]8;;https://pi.dev\e\\pi\e]8;;\e\\\e[0m" \
+            "\e[#{y + 1};13H\e[4m\e[38;2;105;173;208m\e]8;;https://docs.dev\e\\docs\e]8;;\e\\\e[0m"
+          assert_equal expected, captured.string,
+            "both links emit, in (y, x) order, each through its own carrier"
+
+          second = StringIO.new
+          session.writer = second
+          draw(chat, session)
+          assert_equal "", second.string, "the identity-stable frame re-submits but emits nothing"
+        end
+      end
+    ensure
+      if saved_color.nil?
+        ENV.delete("COLORTERM")
+      else
+        ENV["COLORTERM"] = saved_color
+      end
+    end
+
+    # --- I112 — the image carrier's full-frame submission --------------
+
+    # The headless chat frame submits the FINAL transcript window rows to
+    # the session's IMAGE overlay when capable: a markdown image-escape
+    # line rides the passthrough as an anchor row and the drawn writer
+    # carries the transmission at its row — the pi markdown.ts:328 letter
+    # end to end. Capability-off (the rail's force-off default) → the
+    # second with_chat frame proves no submission, no bytes.
+    def test_termimg_chat_frame_submits_image_rows_when_capable
+      with_chat(width: 60, screen_height: 24) do |chat, session|
+        with_images("kitty") do
+          captured = StringIO.new
+          session.writer = captured
+          finish_message(chat, "before\n\e_Ga=T,f=100,q=2;AAAA\e\\\nafter")
+          draw(chat, session)
+          assert_includes captured.string, "\e_Ga=T,f=100,q=2;AAAA\e\\",
+            "the passthrough transmission rides the chat frame's window"
+          assert_includes captured.string, "\e_Ga=d,d=a,q=2\e\\",
+            "the frame clear rides the first image-bearing frame"
+          second = StringIO.new
+          session.writer = second
+          draw(chat, session)
+          assert_equal "", second.string, "the identity-stable frame re-submits but emits nothing"
+        end
+      end
     end
 
     private

@@ -11,6 +11,14 @@ module Tart
   # wire), and most-recent-session-for-cwd selection — against the real
   # fast-completions client over the local mock endpoint.
   class SessionTest < Test
+    # The fake message the entry pins feed the recorder: a role + the
+    # recorded body hash (OpenStruct left Ruby's default gems at 4.0 — the
+    # I47 custom_message pins were authored on it, another reason they
+    # never ran).
+    FakeMsg = Struct.new(:role, :attrs) do
+      def to_h = attrs
+    end
+
     def setup
       @server = MockLLMServer.new.start
       @dir = Dir.mktmpdir("tart-session-")
@@ -104,9 +112,15 @@ module Tart
       ].join("\n"))
 
       messages = Agent::Session.context_messages(path)
-      assert_equal %i[system user assistant], messages.map { |m| m[:role] }
-      assert_equal ["", "", ""], messages.map { |m| m[:content] },
-        "null/missing content must be tolerated (the port's '' mapping), non-message entries project to nothing"
+      # I117 re-seat (pi #10785): system entries are PROMPT STATE — the
+      # context projection skips them (pi resolveTranscript collapses
+      # system messages; the loadout record is the restore's bookkeeping,
+      # never conversation), so the system arm projects to nothing here.
+      # The null/missing-content tolerance still rides the user/assistant
+      # arms (the port's '' mapping), and the entry itself LOADS fine.
+      assert_equal %i[user assistant], messages.map { |m| m[:role] }
+      assert_equal ["", ""], messages.map { |m| m[:content] },
+        "null/missing content must be tolerated (the port's '' mapping), system and non-message entries project to nothing"
     end
 
     def test_resume_seeds_prior_turns_and_records_into_a_linked_new_file
@@ -626,34 +640,12 @@ module Tart
       assert_equal [:role, :content, :tool_call_id], tool.keys
     end
 
-    private
-
-    def agent_on_kernel(tools: {}, recorder: nil, seed_messages: [])
-      chat = TestChat.build(@server, tools: tools.values, system_prompt: "test prompt")
-      Agent::Loop.new(chat:, tools:, recorder:, seed_messages:)
-    end
-
-    def run_agent(agent, prompt)
-      kernel = Core::Loop.new(session: ScriptedSession.new)
-      kernel.run { agent.run(prompt) }
-    end
-
-    # A minimal but valid session file (header + one user message entry).
-    def write_session_file(dir, cwd:)
-      path = File.join(dir, "#{Agent::Session.uuidv7}.jsonl")
-      header = Agent::Session.header(id: Agent::Session.uuidv7, cwd:, timestamp: Agent::Session.now_iso)
-      entry = Agent::Session.message_entry({role: "user", content: "hi"},
-        id: Agent::Session.generate_id(Set.new), parent_id: nil, timestamp: Agent::Session.now_iso)
-      File.write(path, "#{JSON.generate(header)}\n#{JSON.generate(entry)}\n")
-      path
-    end
-
     # --- I47: the custom_message entry (pi CustomMessageEntry,
     # session-manager.ts:1339-1360) ---
 
     def test_append_custom_message_writes_the_pi_entry_shape_on_the_leaf_chain
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
-      user_id = recorder.append_message(OpenStruct.new(role: :user, content: "hi", to_h: {role: "user", content: "hi"}))
+      user_id = recorder.append_message(FakeMsg.new(:user, {role: "user", content: "hi"}))
       custom_id = recorder.append_custom_message(custom_type: "memory-recall", content: "RECALL", display: true)
 
       entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
@@ -673,7 +665,7 @@ module Tart
       refute recorder.persisted?, "a recall never creates a session file alone"
       refute File.exist?(recorder.path)
 
-      recorder.append_message(OpenStruct.new(role: :user, content: "hi", to_h: {role: "user", content: "hi"}))
+      recorder.append_message(FakeMsg.new(:user, {role: "user", content: "hi"}))
       assert recorder.persisted?
       types = File.readlines(recorder.path).map { |line| JSON.parse(line)["type"] }
       assert_equal %w[session custom_message message], types, "the held entry rides the first flush in order"
@@ -681,13 +673,115 @@ module Tart
 
     def test_custom_message_replays_as_a_user_role_context_message
       recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
-      recorder.append_message(OpenStruct.new(role: :user, content: "hi", to_h: {role: "user", content: "hi"}))
+      recorder.append_message(FakeMsg.new(:user, {role: "user", content: "hi"}))
       recorder.append_custom_message(custom_type: "memory-recall", content: "RECALL", display: true)
 
       messages = Agent::Session.context_messages(recorder.path)
 
-      assert_equal [%i[user user], ["hi", "RECALL"]], messages.map { |message| [message[:role], message[:content]] },
+      assert_equal [[:user, "hi"], [:user, "RECALL"]], messages.map { |message| [message[:role], message[:content]] },
         "pi sessionEntryToContextMessages: the recall text rides the wire again on resume"
+    end
+
+    # pi #10785 (agent-session.ts :1907-1948): the session records its tool
+    # loadout as a system-message entry — pi's toolsAdded/toolsRemoved
+    # declaration deltas. The entry is NON-conversation-bearing (it never
+    # opens the file alone) and chains on the leaf like every entry.
+    def test_append_tool_loadout_writes_the_pi_system_entry_shape
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      read_decl = {name: "read", description: "Read a file", parameters: {type: "object"}}
+      loadout_id = recorder.append_tool_loadout(added: [read_decl], removed: [])
+
+      refute recorder.persisted?, "a loadout record never creates a session file alone"
+      refute File.exist?(recorder.path)
+
+      user_id = recorder.append_message(FakeMsg.new(:user, {role: "user", content: "hi"}))
+      assert recorder.persisted?, "the first conversation-bearing message flushes the held entry"
+      entries = File.readlines(recorder.path).map { |line| JSON.parse(line) }
+      assert_equal %w[session message message], entries.map { |entry| entry["type"] },
+        "header, the loadout record, then the conversation"
+      loadout = entries[1]
+      assert_equal({"role" => "system", "content" => "", "toolsAdded" => [JSON.parse(JSON.generate(read_decl))]},
+                   loadout["message"].slice("role", "content", "toolsAdded"))
+      refute loadout["message"].key?("toolsRemoved"), "pi's empty-list-omitted shape"
+      assert_equal loadout_id, loadout["id"]
+      assert_equal loadout_id, entries[2]["parentId"], "the conversation chains from the loadout entry"
+      assert_equal %w[read], Agent::Session.recorded_tools(Agent::Session.load_entries(recorder.path)),
+        "the replay law reads the names back (pi transcript.ts getCurrentTools)"
+    end
+
+    # The DELTA law (pi agent-loop.ts declareToolChanges): a resumed
+    # session's fork carries the parent's entries verbatim, so its own
+    # record must carry the DIFFERENCE to the effective loadout —
+    # replaying parent + delta converges to exactly the effective
+    # loadout (a plain re-add would leave dropped tools stranded).
+    def test_tool_loadout_delta_replays_to_the_effective_loadout
+      decl = ->(name) { {name:, description: "The #{name} tool", parameters: {type: "object"}} }
+      parent = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      parent.append_tool_loadout(added: [decl.("read"), decl.("bash"), decl.("edit")], removed: [])
+      parent.append_message(FakeMsg.new(:user, {role: "user", content: "hi"}))
+      assert_equal %w[read bash edit], Agent::Session.recorded_tools(Agent::Session.load_entries(parent.path))
+
+      forked = Agent::Session::Recorder.new(cwd: @dir, root: @root, parent_session: parent.path)
+      forked.append_tool_loadout(added: [decl.("find")], removed: [decl.("edit")])
+      forked.append_message(FakeMsg.new(:user, {role: "user", content: "again"}))
+      assert_equal %w[read bash find], Agent::Session.recorded_tools(Agent::Session.load_entries(forked.path)),
+        "parent record + delta replays to exactly the effective loadout (pi #10785 + declareToolChanges)"
+    end
+
+    # The loadout record is the restore's BOOKKEEPING, never conversation:
+    # pi's system messages are prompt state, so the context projection
+    # skips them — a resumed session never seeds a system message onto
+    # the wire (no new wire surface).
+    def test_context_projection_skips_system_tool_entries
+      recorder = Agent::Session::Recorder.new(cwd: @dir, root: @root)
+      recorder.append_tool_loadout(added: [{name: "read", description: "Read", parameters: {}}], removed: [])
+      recorder.append_message(FakeMsg.new(:user, {role: "user", content: "hi"}))
+
+      messages = Agent::Session.context_messages(recorder.path)
+      assert_equal [[:user, "hi"]], messages.map { |message| [message[:role], message[:content]] },
+        "the system entry projects to nothing (pi resolveTranscript collapses system messages)"
+    end
+
+    # The restore's slice law (pi _applyToolLoadout + "Unknown and hidden
+    # tool names are ignored", agent-session.ts :1605-1610): the recorded
+    # order governs the restored wire order, and names the current boot
+    # cannot build — a gone MCP server, an off extension — drop silently.
+    def test_restore_slices_the_loadout_in_recorded_order_ignoring_unknown_names
+      loadout = Tools::Registry.build(selected: %w[read bash edit write find grep], cwd: @dir)
+      effective = %w[grep read mcp__gone__tool bash]
+
+      restored = effective.filter_map { |name| loadout[name] }
+
+      assert_equal %w[grep read bash], restored.map(&:name),
+        "recorded order is the wire order; unknown names are ignored (pi #10785)"
+    end
+
+    private
+
+    # I117: `private` sat ABOVE the I47 custom_message pins, making them
+    # module-private — minitest runs only PUBLIC test methods, so the three
+    # had been silently dead since I47 (the I105 stray-`end` defect class,
+    # second instance). The barrier now sits below every test_ def; only
+    # the helpers are private.
+
+    def agent_on_kernel(tools: {}, recorder: nil, seed_messages: [])
+      chat = TestChat.build(@server, tools: tools.values, system_prompt: "test prompt")
+      Agent::Loop.new(chat:, tools:, recorder:, seed_messages:)
+    end
+
+    def run_agent(agent, prompt)
+      kernel = Core::Loop.new(session: ScriptedSession.new)
+      kernel.run { agent.run(prompt) }
+    end
+
+    # A minimal but valid session file (header + one user message entry).
+    def write_session_file(dir, cwd:)
+      path = File.join(dir, "#{Agent::Session.uuidv7}.jsonl")
+      header = Agent::Session.header(id: Agent::Session.uuidv7, cwd:, timestamp: Agent::Session.now_iso)
+      entry = Agent::Session.message_entry({role: "user", content: "hi"},
+        id: Agent::Session.generate_id(Set.new), parent_id: nil, timestamp: Agent::Session.now_iso)
+      File.write(path, "#{JSON.generate(header)}\n#{JSON.generate(entry)}\n")
+      path
     end
   end
 end
