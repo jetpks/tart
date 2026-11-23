@@ -111,10 +111,20 @@ max-token field for endpoints that only accept the deprecated name).
 Unknown compat keys are tolerated and ignored (pi's schema keeps them
 `additionalProperties: true`), so a catalog copied from pi loads clean.
 The fireworks default boot is unchanged: a model without `compat` (or
-with a non-`zai` `thinkingFormat`) wires exactly as before. Note that
-`apiKey` values are passed through verbatim — `$ENV` references are NOT
-expanded; use a literal key or the `<IDENTITY>_API_KEY` environment
-override. A zai provider block looks like:
+with a non-`zai` `thinkingFormat`) wires exactly as before. An `apiKey` may
+reference the environment instead of holding a literal (pi's models.json
+grammar): `"$VAR"` and `"${VAR}"` resolve when the key is USED — never when
+the catalog loads — so a catalog copied from pi (`"apiKey":
+"$FIREWORKS_API_KEY"`) works as-is. `$$` is a literal `$`, `$!` a literal
+`!`, and anything else — `"${VAR:-default}"`, an unclosed `${`, a stray
+`$` — stays literal; an unset OR empty variable fails the request by name
+(`Failed to resolve API key for provider "<id>" from environment variable:
+<VAR>`) rather than sending the template or falling back to another key.
+`"!command"` keys are not supported (they are neither run nor sent). The
+precedence is unchanged: `<IDENTITY>_API_KEY` still wins over the catalog
+key, a literal key rides verbatim, and nothing else in `models.json`
+(`baseUrl`, names, model ids) or `settings.json` expands. A zai provider
+block looks like:
 
 ```json
 {"providers": {"zai": {"name": "Z.AI",
@@ -248,7 +258,11 @@ path with `TART_MCP_CONFIG`; a missing file means no servers):
 
 A configured server's tools join the loadout as `mcp__<server>__<tool>` and
 are declared to the model like the built-in tools; a server that fails to
-connect is skipped with a warning.
+connect is skipped with a warning. The server's `env` VALUES expand with the
+same `$VAR`/`${VAR}` grammar as `apiKey` (above) when the server connects —
+an unset or empty variable fails that server's connection by name, and the
+child still receives only tart's explicit environment (never the literal
+template).
 
 ### Print mode
 

@@ -682,5 +682,26 @@ module Tart
         "the fill lives at the fact seams ONLY — Shapes::Model#to_h stays DECLARED")
       assert_nil entry.max_tokens, "no merge-at-load"
     end
+
+    # I119 AC2: the loader never resolves — a templated apiKey rides the
+    # catalog byte-exactly (the typed attribute AND the to_h emission),
+    # with the variable unset anywhere (the catalog LOADS like today's).
+    def test_env_template_load_output_carries_the_raw_template
+      write_models(JSON.generate(
+        "default" => "glm/glm-5.3",
+        "providers" => {"glm" => {"baseUrl" => "$BASE_URL", "apiKey" => "$FIREWORKS_API_KEY", "name" => "$NAME",
+          "models" => [{"id" => "$MODEL_ID", "name" => "$DISPLAY", "reasoning" => true}]}}))
+      config = load_models
+
+      assert_nil config.error, "the catalog loads clean (a template is a plain string)"
+      provider = config.provider("glm")
+      assert_equal "$FIREWORKS_API_KEY", provider.api_key
+      assert_equal "$FIREWORKS_API_KEY", provider.to_h.fetch(:api_key), "the to_h emission carries the raw template"
+      assert_equal "$BASE_URL", provider.base_url, "baseUrl never expands at load"
+      assert_equal "$NAME", provider.name
+      entry = config.model_entries.first
+      assert_equal "$MODEL_ID", entry.id, "model ids never expand"
+      assert_equal "$DISPLAY", entry.name
+    end
   end
 end
