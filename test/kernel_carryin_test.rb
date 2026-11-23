@@ -4,30 +4,33 @@ require_relative "test_helper"
 
 module Tart
   # I02 carry-ins (defect ledger / I02 Verdict): exception-safe kernel
-  # teardown, SIGINT trap restoration, surfaced poller joins, and the
-  # documented event-only mode.
+  # teardown, SIGINT trap restoration, surfaced teardown errors, and the
+  # documented event-only mode. (I109: the poller-thread pins are re-seated
+  # on the input seam — the thread class died with the thread.)
   class KernelCarryInTest < Test
-    def test_raising_event_handler_terminates_poller_and_reraises
+    def test_raising_event_handler_stops_the_input_seam_and_reraises
       session = ScriptedSession.new
       event_loop = Core::Loop.new(session:, on_event: ->(_event, _source) { raise "handler boom" })
       session.push_native(KeyEvent.new("q", []))
 
       error = assert_raises(RuntimeError) { event_loop.run { sleep 30 } }
       assert_equal "handler boom", error.message
-      refute event_loop.poller&.thread&.alive?, "no orphan poller after a handler raise"
+      assert_predicate event_loop.input_seam, :stopped?,
+        "no orphan input-seam producer after a handler raise"
     end
 
-    def test_raising_renderer_terminates_poller_and_reraises
+    def test_raising_renderer_stops_the_input_seam_and_reraises
       session = ScriptedSession.new
       event_loop = Core::Loop.new(session:, renderer: -> { raise "renderer boom" })
       session.push_native(KeyEvent.new("q", []))
 
       error = assert_raises(RuntimeError) { event_loop.run { sleep 30 } }
       assert_equal "renderer boom", error.message
-      refute event_loop.poller&.thread&.alive?, "no orphan poller after a renderer raise"
+      assert_predicate event_loop.input_seam, :stopped?,
+        "no orphan input-seam producer after a renderer raise"
     end
 
-    def test_raising_work_terminates_poller_and_reraises
+    def test_raising_work_stops_the_input_seam_and_reraises
       session = ScriptedSession.new
       event_loop = Core::Loop.new(session:)
 
@@ -48,7 +51,8 @@ module Tart
         end
       end
       assert_equal "work boom", error.message
-      refute event_loop.poller&.thread&.alive?, "no orphan poller after a work raise"
+      assert_predicate event_loop.input_seam, :stopped?,
+        "no orphan input-seam producer after a work raise"
     end
 
     def test_sigint_trap_disposition_restored_after_run
@@ -91,18 +95,6 @@ module Tart
       end
     end
 
-    def test_poller_stop_surfaces_missed_join
-      session = ScriptedSession.new(poll_timeout: 10) # a poll takes 10 s
-      poller = Core::Poller.new(session, queue: Async::Queue.new, frame_interval: 1.0 / 60,
-                                stop_flag: stop_flag)
-      poller.start
-
-      error = assert_raises(Core::PollerLingerError) { poller.stop }
-      assert_includes error.message, "poller thread"
-    ensure
-      poller.thread.kill if poller.thread&.alive?
-    end
-
     def test_blockless_run_is_event_only_mode
       session = ScriptedSession.new
       event_loop = Core::Loop.new(session:)
@@ -118,12 +110,5 @@ module Tart
       assert event_loop.stats.is_a?(Hash)
     end
 
-    private
-
-    def stop_flag
-      @stop_flag ||= Class.new do
-        def stop_requested? = false
-      end.new
-    end
   end
 end

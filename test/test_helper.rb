@@ -225,6 +225,16 @@ module Tart
         @synthetic = Async::Queue.new
         @drawn = []
         @scrollback = []
+        # The pipe-backed input seam (I109): the kernel's input producer
+        # parks on THESE fds exactly like a real session's — kernel tests
+        # drive native + synthetic events through the REAL input path, not
+        # a bypass. The :tty fd wakes on push_native (the producer answers
+        # with the non-blocking poll_event(0)); the :wake fd wakes on
+        # push_event (the producer drains it and pushes the :wake sentinel
+        # when synthetic events are pending).
+        @native_pipe_r, @native_pipe_w = IO.pipe
+        @wake_pipe_r, @wake_pipe_w = IO.pipe
+        [@native_pipe_w, @wake_pipe_w].each { |w| w.sync = true }
         # draw/insert_before are same-reactor mutation points (the frame
         # loop's fibers; MRI fibers on one thread are cooperative) — no
         # draw mutex since I107 (the V4 collapse).
@@ -244,8 +254,18 @@ module Tart
 
       Rect = Struct.new(:x, :y, :width, :height)
 
+      # The input-wait fds double (the Session contract, I109): both pipes
+      # present at every seat of this double.
+      # @return [Hash] <tt>{tty: Integer, wake: Integer}</tt>.
+      def input_wait_fds
+        {tty: @native_pipe_r.fileno, wake: @wake_pipe_r.fileno}
+      end
+
       def push_native(event)
         @events << event
+        # The wake byte on the pipe-backed :tty fd (the producer's selector
+        # reports readiness; poll_event(0) pops the event).
+        @native_pipe_w.write("\0")
       end
 
       def draw(widget)
@@ -274,12 +294,19 @@ module Tart
       attr_reader :scrollback
 
       def poll_event(timeout:)
-        sleep(@poll_timeout)
+        # The timeout-0 form is the fd seam's ready-read (I109) — no modeled
+        # sleep; a nonzero timeout keeps the modeled blocking-poll sleep
+        # (the shape the poller used to drive).
+        sleep(@poll_timeout) unless timeout.zero?
         @events.empty? ? TUI_NONE : @events.pop
       end
 
       def push_event(event)
         @synthetic << event
+        # The wake byte on the pipe-backed :wake fd — the self-waking rail
+        # (the producer pushes the :wake sentinel; the idle loop's in-loop
+        # drain dispatches).
+        @wake_pipe_w.write("\0")
       end
 
       def drain_synthetic

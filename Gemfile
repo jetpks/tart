@@ -10,6 +10,13 @@ gemspec
 # the rubygems pin.
 gem "fast-completions", "0.10.0"
 
+# The ratatui_ruby runtime dependency, temporarily a git pin (I109): the
+# event-fd seam lives on the jetpks fork's local branch until it upstreams.
+# Carve-out owner-ratified (same gem, git source — no new dependency). At
+# upstreaming, restore `spec.add_dependency "ratatui_ruby"` in tart.gemspec
+# and resolve this pin from the published gem (owner-side follow-up).
+gem "ratatui_ruby", github: "jetpks/RatatuiRuby", branch: "event-fd-seam"
+
 # Dev deps live here (not the gemspec): minitest 5.x is required — 6.x
 # dropped minitest/mock, which ratatui_ruby's test tooling depends on.
 gem "minitest", "~> 5.20"
