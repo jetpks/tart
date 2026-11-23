@@ -496,6 +496,43 @@ module Tart
         "the no-hook premise died with the seam)"
     end
 
+    # The #9512 pin (v1.6.0 compaction.ts:603-605 — createSummarizationOptions
+    # sets NO maxTokens; :647/:699 reserveTokens is UNUSED for the cap): the
+    # summarize one-shot's output cap is INDEPENDENT of reserve_tokens — two
+    # compaction runs over the SAME scripted turns at reserve 1 and 100 carry
+    # the SAME max-token value (the wire model's own cap, clamped by the
+    # gem's clamp_max_tokens). The summarize request is selected by the
+    # SUMMARIZATION_SYSTEM_PROMPT leading system message, never by index.
+    # reserveTokens' surviving job is the START-TIME trigger, which stays
+    # untouched — this pin varies ONLY the cap.
+    def test_summarization_cap_ignores_reserve_tokens
+      caps = [1, 100].map do |reserve|
+        @server.script([
+          {type: :stream, content: "first answer"},
+          {type: :message, content: "a summary of the first turn"},
+          {type: :stream, content: "second answer"},
+          {type: :message, content: "a summary of the second turn"},
+        ])
+        agent, _events = agent_on_kernel(
+          compaction: {reserve_tokens: reserve, keep_recent_tokens: 1}, context_window: 14)
+        agent.push_message("second question")
+        run_agent(agent, "first question")
+
+        summary = @server.captured_requests.find do |request|
+          request["messages"].first["content"].to_s
+            .start_with?("You are a context summarization assistant.")
+        end
+        assert summary, "no summarize request found at reserve #{reserve}"
+        summary["max_completion_tokens"] || summary["max_tokens"]
+      end
+
+      assert caps[0].is_a?(Integer),
+        "the summarize request must carry the model's output cap, got #{caps[0].inspect}"
+      assert_equal caps[0], caps[1],
+        "reserve_tokens still shapes the summarize cap: #{caps.inspect} (pi #9512 — " \
+        "summaries use the model's output limit)"
+    end
+
     # Pin 9 — the switch seam: switch_model(compat:) swaps the dialect
     # mid-session and compat: nil restores the default arm (the wholesale
     # re-resolve idiom — nil IS "the switched model declares none").
