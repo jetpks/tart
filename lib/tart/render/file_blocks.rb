@@ -51,7 +51,9 @@ module Tart
       # rows, uncapped (formatReadResult:130 — maxLines = expanded ?
       # lines.length : 10; trailing-empty lines trimmed). The error text
       # renders in both states.
-      def read_block_rows(args, result, width, expanded:)
+      # +details+ threads the I57 side channel (I112 — the read-image
+      # placement; nil renders today's block exactly, byte-identical).
+      def read_block_rows(args, result, width, expanded:, details: nil)
         bg = Panel.tool_panel_bg(result)
         region = [Panel.blank_line, Panel.panel_blank_line(width, bg)]
         region.concat(read_call_rows(args, width, expanded, bg:))
@@ -67,6 +69,7 @@ module Tart
           region << Panel.panel_blank_line(width, bg)
           region.concat(rows)
         end
+        region.concat(read_image_region(details, result, width, bg))
         region << Panel.panel_blank_line(width, bg)
         region
       end
@@ -104,6 +107,57 @@ module Tart
         return [] if lines.empty?
 
         Panel.padded_fg_rows(lines.join("\n"), width, fg: Theme[:tool_output], bg: bg)
+      end
+
+      # The ENTRY-1 image mimes the read tool's mime sniffer emits
+      # (lib/tart/tools/support/mime.rb — FROZEN): the iterm2 arm takes
+      # every one of them inline; kitty is PNG-only (D-PNG-ONLY-KITTY).
+      ENTRY_IMAGE_MIMES = %w[image/png image/jpeg image/gif image/webp image/bmp].freeze
+
+      # The read-image placement (I112, pi tool-execution.ts:344-381 +
+      # image.ts:96-160): when the images capability is on AND the result
+      # carries the I57 details side channel's image record AND the result
+      # is not an error, the block appends the image region AFTER the
+      # result rows — reserved blank panel rows (the first registered as
+      # the image anchor with its spec + x offset + count) when the image
+      # is transmittable, the fallback row otherwise (D-FALLBACK-ONLY-
+      # CAPABLE). The text note stays in every arm (pi renders the note
+      # AND the image); the PENDING block never reaches here; capability-
+      # off (or absent details) renders NOTHING — today's bytes,
+      # byte-identical, no registration. The reservation is
+      # `calculate_rows(dims, min(60, content_width))` (pi imageWidthCells
+      # default 60, settings-manager.ts:59); the sweep registration
+      # re-derives it at any width.
+      def read_image_region(details, result, width, bg)
+        return [] if details.nil? || Capabilities.images?.nil?
+
+        image = details.is_a?(Hash) ? details[:image] : nil
+        return [] unless image.is_a?(Hash)
+        return [] if result.is_a?(Hash) && result[:error]
+
+        mime = image[:mime_type]
+        path = image[:path]
+        bytes = image[:bytes]
+        dims = TerminalImages.image_dimensions(path, mime)
+        max_width = [60, width - Panel::OUTPUT_PAD.length * 2].min
+        transmittable =
+          if Capabilities.images? == "kitty"
+            mime == "image/png" && !dims.nil? && bytes.to_i <= TerminalImages::INLINE_BYTE_CAP
+          else
+            ENTRY_IMAGE_MIMES.include?(mime) && !dims.nil? && bytes.to_i <= TerminalImages::INLINE_BYTE_CAP
+          end
+        if transmittable
+          size = TerminalImages.calculate_cell_size(dims, max_width)
+          rows = Array.new(size[:rows]) { Panel.panel_blank_line(width, bg) }
+          ImageOverlay.record_anchor(rows.first,
+            path: path, mime_type: mime, bytes: bytes.to_i,
+            width_px: dims[:width_px], height_px: dims[:height_px],
+            columns: size[:columns], rows: size[:rows],
+            x_offset: Panel::OUTPUT_PAD.length)
+          rows
+        else
+          [TerminalImages.fallback_row({ mime_type: mime, path: path, dimensions: dims }, width, bg: bg)]
+        end
       end
 
       # pi write.ts:99-100 — the bold toolTitle `write` header + the

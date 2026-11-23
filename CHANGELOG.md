@@ -4,6 +4,31 @@
 
 ### Changed
 
+- **Inline terminal images land in the transcript (I112 — kitty/iterm2, the I111 post-flush overlay's sibling).**
+  `Tart::Capabilities` gains the `images` arm in the SAME cached hash (pi terminal-image.ts:70-139 —
+  kitty/ghostty/wezterm/Warp → `"kitty"`, iterm → `"iterm2"`, every other arm nil; the family +
+  jediterm + Windows-console arms hardcode `true_color: true` while tmux/screen/herdr/unknown keep the
+  `COLORTERM` hint), forced by the `TART_IMAGE_PROTOCOL` override (`kitty`/`iterm2`/`none`/`0`,
+  case-insensitive, composing independently of `TART_HYPERLINKS`). The new `Tart::TerminalImages`
+  module ports pi's protocol letter: the kitty transmission (`a=T,f=100,q=2,C=1` + 4096-char `m=1`/`m=0`
+  chunking), the three erase commands, the placement-only re-emit over registered metadata, the iterm2
+  1337 letter (`inline=1,size=,width=,height=auto`, BEL), the four bounded dimension sniffers (64 KiB
+  header reads; bmp → nil), the 9×18-default injectable cell geometry with the aspect-optimizing pass,
+  the bottom-clip crop arithmetic, and the `[Image: …]` fallback row. The read tool block reserves
+  blank panel rows for a transmittable image (dimensions-derived, ≤ 60 cells wide, gated on an 8 MiB
+  inline cap) with the first row registered as the overlay anchor, or renders the fallback row
+  otherwise; the markdown converter passes image-escape lines through as zero-width carrier rows
+  (capability-gated — OFF parses byte-identically). `Session#draw` emits the image escapes to the
+  session's writer AFTER the frame flushes: per the owner's erase/redraw ruling (2026-11-21) images
+  NEVER live in the scrollback buffer — kitty frames emit `delete_all_kitty_placements` then re-place
+  every visible anchor (transmitting once per content generation `[path, bytes, mime]`, cached and
+  bounded at 16 entries / 32 MiB / 64 MiB with offscreen eviction deleting image data; static frames
+  emit ZERO bytes), iterm2 re-emits the cached sequence, and the exit path best-effort emits
+  `delete_all_kitty_images`. Recorded deviations: kitty transmits PNG only (no transcoder — no new
+  deps), the live cell-size query is cut (the 9×18 default is injectable), the fallback renders only
+  when images are capable but the image is not transmittable (the OFF arm is today's bytes), and
+  sniffer reads are 64 KiB-bounded. No gem/fork/upstream change; the wire shapes and the read tool's
+  schema are untouched.
 - **The last Thread in `lib/` is gone: the TUI input path is now fiber-native end to end (I109).** The dedicated poller thread (the I107 concurrency-law exemption) is deleted — `Poller`/`PollerLingerError` and the poller-lifecycle linger machinery with it. In its place the kernel runs an fd-driven input seam on the reactor: per-fd tasks park on the session's exposed input-wait fds via `IO#wait_readable` (io-event under the Async scheduler) and push onto the same event queue — the wake fd drains its byte(s) and pushes the `:wake` sentinel when synthetic events are pending; the tty fd runs the non-blocking ready-read (`poll_event(timeout: 0)`, the GVL-free call, invoked only on reported readiness). No polling timer replaces the thread: a session with no fds (headless/test mode) leaves the idle loop parked on the queue. The kernel exposes the producer (`Loop#input_seam`, `stopped?` observable); teardown stops it with the reactor's own `Task#stop` — no join, no linger class. The I103 boot/teardown `signal_state_change` broadcasts keep their exact seats, re-seated on the seam's lifecycle. `TUI::Session` gains `input_wait_fds` (empty when no real terminal — non-exposing doubles keep working unchanged); the `ratatui_ruby` dependency moves to a Gemfile git pin (`jetpks/RatatuiRuby`, branch `event-fd-seam` — the owner-ratified same-gem/git-source carve-out; the gemspec carries a restore-at-upstreaming note). Input latency and SIGWINCH delivery are at parity with the poller shape (measured: medians ~8 ms both arms — the Builder Report's table).
 
 - **The tree's remaining Thread/Mutex/ConditionVariable concurrency is migrated to async/fiber primitives per the owner's concurrency law (2026-11-21, PR-#28 review).** Every long-lived worker (the sink flusher, the herdr sender, the manager watcher, the supervisor channel poller, the MCP stdio readers/writer, the print deadline) now runs as a task on the host reactor; one-shot bounded work self-gates through `Kernel#Sync`; cross-thread wakes use the dual-path queue ping (direct push + scheduler-ready rider); the kernel's per-signal disposable thread, the test belt's ConditionVariable park, and all guard Mutexes whose funnels became same-reactor are deleted — zero behavior change beyond synchronization mechanics. Two sites survive as named, owner-ratified exemptions: the TUI poller thread (ratatui's FFI poll has no unblock function, so a fiber cannot stand in) and `FileMutationQueue`'s two Mutexes (same-file mutation serialization across the bare off-reactor call seats, where every async wait primitive would crash).

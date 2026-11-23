@@ -4,11 +4,15 @@ require "minitest/autorun"
 require "async"
 require_relative "../lib/tart"
 
-# The OSC-8 capability rail (I111): the default-safe posture made
+# The capability rails (I111 + I112): the default-safe posture made
 # ambient-proof — every non-injecting test renders the OFF arm regardless
 # of the seat's terminal (the detection matrix never reads ambient env
-# here; ||= keeps an explicit seat override usable).
+# here; ||= keeps an explicit seat override usable). The image rail joins
+# the hyperlink rail (the D4 law: both keys are SEAT_SCRUB_EXEMPT — the
+# require-time seat scrub runs after these lines and would otherwise
+# DELETE the force-off at every seat, the I111 integrate-fix mechanism).
 ENV["TART_HYPERLINKS"] ||= "0"
+ENV["TART_IMAGE_PROTOCOL"] ||= "none"
 
 module Tart
   # Shared base class for the minitest suite.
@@ -54,6 +58,24 @@ module Tart
       Capabilities.reset!
     end
 
+    # The images-capability inject seam (I112, the with_hyperlinks
+    # sibling): forces the +TART_IMAGE_PROTOCOL+ arm for the block
+    # ("kitty"/"iterm2"/"none"), drops the cached capability consult,
+    # and restores both after — the ON-arm pins' only door.
+    def with_images(value)
+      previous = ENV["TART_IMAGE_PROTOCOL"]
+      ENV["TART_IMAGE_PROTOCOL"] = value
+      Capabilities.reset!
+      yield
+    ensure
+      if previous.nil?
+        ENV.delete("TART_IMAGE_PROTOCOL")
+      else
+        ENV["TART_IMAGE_PROTOCOL"] = previous
+      end
+      Capabilities.reset!
+    end
+
     # The shared version-loop (the Gate's #await delegates here too).
     def self.await_event(subject, what, belt:)
       unless subject.respond_to?(:state_version) && subject.respond_to?(:wait_state_change)
@@ -91,7 +113,10 @@ module Tart
     # non-injecting test (the I111 D4 seat-sensitivity, caught by the
     # driver's integrate-proof run at a herdr+tmux seat: 13 link pins
     # red; exempting makes the OFF arm deterministic at every seat).
-    SEAT_SCRUB_EXEMPT = %w[TART_TEST_JOBS TART_E2E_SPACE TART_HYPERLINKS].freeze
+    # (the I112 rail var joins by name — the D4 law: a non-exempt force-off
+    # is deleted by the scrub below and ambient detection shapes every
+    # non-injecting test at a herdr/tmux seat).
+    SEAT_SCRUB_EXEMPT = %w[TART_TEST_JOBS TART_E2E_SPACE TART_HYPERLINKS TART_IMAGE_PROTOCOL].freeze
 
     # The pre-scrub snapshot (frozen {String => String}): exactly the
     # keys the last scrub_seat_env! deleted, so scrub/restore are exact

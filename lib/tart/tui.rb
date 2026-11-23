@@ -3,8 +3,12 @@
 # The OSC-8 capability seam + overlay (I111) load with the TUI seam —
 # lib/tart.rb is byte-held (out of the touch set), so the requires live
 # here: capabilities first (standalone), then the overlay (nests in TUI).
+# I112 adds the image seam: the transmission module (pure functions) and
+# the per-session image overlay (Tart::ImageOverlay, per its letter).
 require_relative "capabilities"
 require_relative "link_overlay"
+require_relative "terminal_images"
+require_relative "image_overlay"
 
 require "ratatui_ruby"
 
@@ -331,6 +335,11 @@ module Tart
 
       def initialize
         @link_overlay = LinkOverlay.new
+        # The image overlay (I112): the erase/redraw delta state + the
+        # transmission cache ride this per-session instance; the anchor
+        # registry is the class-level carrier (ImageOverlay).
+        @image_overlay = ImageOverlay.new
+        @images_ever_capable = false
       end
 
       # The OSC-8 overlay's byte writer (the osc52_copy idiom: default
@@ -342,10 +351,36 @@ module Tart
       # returns, the post-flush OSC-8 overlay (Grounds §1 ruling A) writes
       # this frame's fresh link entries to the writer — ordered after the
       # gem's flush on the same fd; the next flush re-positions the cursor
-      # (the backend always MoveTo's its first cell).
+      # (the backend always MoveTo's its first cell). The image overlay
+      # (I112) flushes right after, through the same writer — the
+      # erase/redraw ruling's sibling emission, ordered after the links.
       def draw(widget)
         RatatuiRuby.draw(widget)
         emit_link_overlay
+        emit_image_overlay
+      end
+
+      # The image surface's per-frame submission (I112 — the
+      # chat.rb transcript_widget sibling): the SAME final window rows the
+      # link overlay receives, with the transcript area's screen origin.
+      # Capability-off → never called (the submission and the overlay
+      # never run: zero cost, zero bytes).
+      def submit_image_rows(rows, y0:, x0:)
+        @image_frame = [rows, y0, x0]
+      end
+
+      # The exit cleanup (I112 — pi beforeTerminalStop :396-401): best-
+      # effort `delete_all_kitty_images` when images were ever capable
+      # this session. Never raises; the caller runs it in the ensure path
+      # BEFORE the terminal restore.
+      def image_exit_cleanup
+        return unless @images_ever_capable
+
+        out = writer || $stdout
+        out.write(TerminalImages.delete_all_kitty_images)
+        out.flush
+      rescue StandardError
+        nil
       end
 
       # The chat surface's per-frame submission (chat.rb transcript_widget):
@@ -372,6 +407,28 @@ module Tart
         area = viewport_area
         epoch = area ? [area.width, area.height] : [80, 24]
         bytes = @link_overlay.emissions(frame[0], y0: frame[1], x0: frame[2], epoch: epoch)
+        return if bytes.empty?
+
+        out = writer || $stdout
+        out.write(bytes)
+        out.flush
+      end
+
+      # The image overlay's flush (I112): the same gates — capability,
+      # submission — and the same epoch law; capability-on marks the
+      # session for the exit cleanup (images were ever capable). Emission
+      # runs AFTER the link overlay (the draw order).
+      def emit_image_overlay
+        return unless Capabilities.images?
+
+        @images_ever_capable = true
+        frame = @image_frame
+        return unless frame
+
+        @image_frame = nil
+        area = viewport_area
+        epoch = area ? [area.width, area.height] : [80, 24]
+        bytes = @image_overlay.emissions(frame[0], y0: frame[1], x0: frame[2], epoch: epoch)
         return if bytes.empty?
 
         out = writer || $stdout
@@ -515,13 +572,29 @@ module Tart
           begin
             yield session
           ensure
+            # The image exit cleanup (I112) runs BEFORE the terminal
+            # restore, both arms (pi beforeTerminalStop :396-401).
+            begin
+              session.image_exit_cleanup
+            rescue StandardError
+              nil
+            end
             RatatuiRuby.restore_terminal
           end
         end
       else
         SignalGuard.arm_and_complete do
           RatatuiRuby.run(viewport:, height:, focus_events:, bracketed_paste:) do |_tui|
-            yield session
+            begin
+              yield session
+            ensure
+              # The image exit cleanup (I112), real-terminal arm.
+              begin
+                session.image_exit_cleanup
+              rescue StandardError
+                nil
+              end
+            end
           end
         end
       end
@@ -653,7 +726,15 @@ module Tart
         LinkOverlay.record_span_href(produced, href) if href
         produced
       end
-      line(spans)
+      built = line(spans)
+      # The image carrier (I112): a source span carrying the raw escape
+      # line registers (produced Line → passthrough anchor spec) — ONE
+      # reserved row, unpadded, x offset 0 (pi markdown.ts:328/:344).
+      # Registration only when a carrier exists: every ordinary row pays
+      # one respond_to? per span, nothing more.
+      carrier = row.find { |s| s.respond_to?(:image) && s.image }
+      ImageOverlay.record_anchor(built, sequence: carrier.image, rows: 1, x_offset: 0) if carrier
+      built
     end
 
     # @return [Integer] the display width of +string+ in terminal cells
