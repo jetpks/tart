@@ -162,6 +162,24 @@ module Tart
       assert_equal %i[user assistant], Agent::Session.context_messages(recorder.path).map { |m| m[:role] }
     end
 
+    # pi #10799 (v1.6.0 print-mode.ts:163-166): a "length" stop still lands
+    # the assistant text on stdout (the warn comes AFTER the text), then the
+    # EXACT truncation warning rides stderr and the exit is 1. The stop
+    # reason is injected through the mock's raw stream deltas (D4 — never
+    # ambient state); it arrives as the Message's normalized "length".
+    def test_print_truncation_warns_and_exits_one
+      @server.script([{type: :stream, chunks: [
+        {choices: [{delta: {role: "assistant", content: "partial answer"}}]},
+        {choices: [{delta: {}, finish_reason: "length"}]},
+      ]}])
+      code = Print.run(prompt: "hello", chat: chat, tools: {},
+                       stdout: @stdout, stderr: @stderr)
+
+      assert_equal Print::EXIT_ERROR, code
+      assert_equal "partial answer\n", @stdout.string
+      assert_equal "Response was truncated: the model reached its output token limit.\n", @stderr.string
+    end
+
     def test_print_exit_code_1_on_agent_error
       @server.script([{type: :error, status: 400, message: "bad request"}])
       code = Print.run(prompt: "hi", chat: chat, tools: {},

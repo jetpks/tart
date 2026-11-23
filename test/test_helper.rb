@@ -4,6 +4,16 @@ require "minitest/autorun"
 require "async"
 require_relative "../lib/tart"
 
+# The capability rails (I111 + I112): the default-safe posture made
+# ambient-proof — every non-injecting test renders the OFF arm regardless
+# of the seat's terminal (the detection matrix never reads ambient env
+# here; ||= keeps an explicit seat override usable). The image rail joins
+# the hyperlink rail (the D4 law: both keys are SEAT_SCRUB_EXEMPT — the
+# require-time seat scrub runs after these lines and would otherwise
+# DELETE the force-off at every seat, the I111 integrate-fix mechanism).
+ENV["TART_HYPERLINKS"] ||= "0"
+ENV["TART_IMAGE_PROTOCOL"] ||= "none"
+
 module Tart
   # Shared base class for the minitest suite.
   class Test < Minitest::Test
@@ -28,6 +38,42 @@ module Tart
     # call site needs a special park anymore. No clock lines.
     def await(subject, what, belt: WEDGE_BELT_S, &predicate)
       Test.await_event(subject, what, belt: belt, &predicate)
+    end
+
+    # The OSC-8 capability inject seam (I111): forces the +TART_HYPERLINKS+
+    # arm for the block ("1"/"0"), drops the cached capability consult,
+    # and restores both after — the ON-arm pins' only door (the detection
+    # matrix and the tmux probe are never driven by ambient env here).
+    def with_hyperlinks(value)
+      previous = ENV["TART_HYPERLINKS"]
+      ENV["TART_HYPERLINKS"] = value
+      Capabilities.reset!
+      yield
+    ensure
+      if previous.nil?
+        ENV.delete("TART_HYPERLINKS")
+      else
+        ENV["TART_HYPERLINKS"] = previous
+      end
+      Capabilities.reset!
+    end
+
+    # The images-capability inject seam (I112, the with_hyperlinks
+    # sibling): forces the +TART_IMAGE_PROTOCOL+ arm for the block
+    # ("kitty"/"iterm2"/"none"), drops the cached capability consult,
+    # and restores both after — the ON-arm pins' only door.
+    def with_images(value)
+      previous = ENV["TART_IMAGE_PROTOCOL"]
+      ENV["TART_IMAGE_PROTOCOL"] = value
+      Capabilities.reset!
+      yield
+    ensure
+      if previous.nil?
+        ENV.delete("TART_IMAGE_PROTOCOL")
+      else
+        ENV["TART_IMAGE_PROTOCOL"] = previous
+      end
+      Capabilities.reset!
     end
 
     # The shared version-loop (the Gate's #await delegates here too).
@@ -60,8 +106,17 @@ module Tart
     # so a setup hook would silently miss them — require time covers the
     # serial run AND every parallel worker by construction. The staged
     # fixtures win by construction afterward; the exempt keys are the
-    # harness's own (the runner's jobs override; the e2e live-space gate).
-    SEAT_SCRUB_EXEMPT = %w[TART_TEST_JOBS TART_E2E_SPACE].freeze
+    # harness's own (the runner's jobs override; the e2e live-space gate)
+    # — and the capability rail's force-off (line 11): the require-time
+    # scrub runs AFTER the rail sets it, so without the exemption the
+    # scrub deletes the force-off and ambient detection shapes every
+    # non-injecting test (the I111 D4 seat-sensitivity, caught by the
+    # driver's integrate-proof run at a herdr+tmux seat: 13 link pins
+    # red; exempting makes the OFF arm deterministic at every seat).
+    # (the I112 rail var joins by name — the D4 law: a non-exempt force-off
+    # is deleted by the scrub below and ambient detection shapes every
+    # non-injecting test at a herdr/tmux seat).
+    SEAT_SCRUB_EXEMPT = %w[TART_TEST_JOBS TART_E2E_SPACE TART_HYPERLINKS TART_IMAGE_PROTOCOL].freeze
 
     # The pre-scrub snapshot (frozen {String => String}): exactly the
     # keys the last scrub_seat_env! deleted, so scrub/restore are exact

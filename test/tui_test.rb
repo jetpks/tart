@@ -248,5 +248,129 @@ module Tart
       $stdout = previous
       assert_equal "\e]52;c;#{["hi"].pack("m0")}\a", captured.string
     end
+
+    # --- I111 — the post-flush OSC-8 overlay through Session#draw ---
+
+    # Capability-off: a submitted frame emits NOTHING (zero cost, zero
+    # bytes) — the rail's default-safe posture at the draw site.
+    def test_osc8_session_draw_emits_nothing_when_capability_off
+      TUI.run(headless: true, width: 40, screen_height: 8) do |session|
+        captured = StringIO.new
+        session.writer = captured
+        line = TUI.markdown_line([
+          Render::Markdown::Span.new(text: "see "),
+          Render::Markdown::Span.new(text: "pi", fg: :light_blue, modifiers: [:underlined], href: "https://pi.dev")
+        ])
+        session.submit_link_rows([line], y0: 0, x0: 0)
+        session.draw(TUI.paragraph(text: [line], wrap: false))
+        assert_equal "", captured.string, "capability-off: the pending frame never emits"
+        assert_equal "p", session.cell_symbol(4, 0),
+          "the buffer stays PLAIN — the link row renders as ordinary text cells"
+      end
+    end
+
+    # Capability-on: the draw writes the fresh link entries to the
+    # injected writer AFTER RatatuiRuby.draw returns (the osc52_copy
+    # idiom), and the identity-stable second frame emits zero bytes.
+    def test_osc8_session_draw_overlays_visible_link_post_flush
+      TUI.run(headless: true, width: 40, screen_height: 8) do |session|
+        with_hyperlinks("1") do
+          captured = StringIO.new
+          session.writer = captured
+          line = TUI.markdown_line([
+            Render::Markdown::Span.new(text: "see "),
+            Render::Markdown::Span.new(text: "pi", fg: :light_blue, modifiers: [:underlined], href: "https://pi.dev")
+          ])
+          session.submit_link_rows([line], y0: 0, x0: 0)
+          session.draw(TUI.paragraph(text: [line], wrap: false))
+          assert_equal "\e[1;5H\e[4m\e[38;5;12m\e]8;;https://pi.dev\e\\pi\e]8;;\e\\\e[0m", captured.string,
+            "the exact post-flush emission literal"
+          second = StringIO.new
+          session.writer = second
+          session.draw(TUI.paragraph(text: [line], wrap: false))
+          assert_equal "", second.string, "the identity-stable frame re-emits nothing"
+        end
+      end
+    end
+
+    # --- I112 — the image overlay through Session#draw -----------------
+
+    # The canonical passthrough anchor: the raw transmission carried in an
+    # image span (no file — the sequence IS the payload), registered by
+    # TUI.markdown_line.
+    IMAGE_SEQUENCE = "\e_Ga=T,f=100,q=2;AAAA\e\\"
+
+    def image_anchor_line
+      TUI.markdown_line([Render::Markdown::Span.new(text: "", image: IMAGE_SEQUENCE)])
+    end
+
+    # Capability-off: a submitted frame emits NOTHING (zero cost, zero
+    # bytes) — the rail's default-safe posture at the draw site.
+    def test_termimg_session_draw_emits_nothing_when_images_off
+      TUI.run(headless: true, width: 40, screen_height: 8) do |session|
+        captured = StringIO.new
+        session.writer = captured
+        line = image_anchor_line
+        session.submit_image_rows([TUI.line(""), line], y0: 0, x0: 0)
+        session.draw(TUI.paragraph(text: [TUI.line(""), line], wrap: false))
+        assert_equal "", captured.string, "capability-off: the pending frame never emits"
+      end
+    end
+
+    # Capability-on: the draw writes the image escape to the injected
+    # writer AFTER RatatuiRuby.draw returns (the link overlay's sibling,
+    # ordered after it), and the identity-stable second frame emits zero
+    # bytes.
+    def test_termimg_session_draw_places_visible_images_post_flush
+      TUI.run(headless: true, width: 40, screen_height: 8) do |session|
+        with_images("kitty") do
+          captured = StringIO.new
+          session.writer = captured
+          line = image_anchor_line
+          session.submit_image_rows([TUI.line(""), line], y0: 0, x0: 0)
+          session.draw(TUI.paragraph(text: [TUI.line(""), line], wrap: false))
+          assert_equal "\e_Ga=d,d=a,q=2\e\\\e[2;1H#{IMAGE_SEQUENCE}", captured.string,
+            "the exact post-flush placement: the frame clear, then the anchor row (y=1, x offset 0)"
+          second = StringIO.new
+          session.writer = second
+          session.draw(TUI.paragraph(text: [TUI.line(""), line], wrap: false))
+          assert_equal "", second.string, "the identity-stable frame re-emits nothing"
+        end
+      end
+    end
+
+    # The exit cleanup (pi beforeTerminalStop :396-401): best-effort
+    # delete_all_kitty_images through the session's writer when images
+    # were ever capable — AFTER the run block, BEFORE the terminal
+    # restore; a raising writer is swallowed (guarded to never raise).
+    def test_termimg_session_exit_deletes_kitty_images_best_effort
+      captured = StringIO.new
+      TUI.run(headless: true, width: 40, screen_height: 8) do |session|
+        with_images("kitty") do
+          session.writer = captured
+          line = image_anchor_line
+          session.submit_image_rows([line], y0: 0, x0: 0)
+          session.draw(TUI.paragraph(text: [line], wrap: false))
+          assert_includes captured.string, IMAGE_SEQUENCE, "the frame emitted first"
+        end
+      end
+      assert captured.string.end_with?(TerminalImages.delete_all_kitty_images),
+        "the exit cleanup rides the ensure path (after the block)"
+      # Best-effort: the exit cleanup never raises — the flag was set by
+      # the good draw; a dead writer is swallowed by the ensure path.
+      raising = Class.new do
+        def write(_bytes) = raise StandardError, "dead fd"
+        def flush = nil
+      end.new
+      TUI.run(headless: true, width: 40, screen_height: 8) do |session|
+        with_images("kitty") do
+          session.writer = captured
+          line = image_anchor_line
+          session.submit_image_rows([line], y0: 0, x0: 0)
+          session.draw(TUI.paragraph(text: [line], wrap: false))
+          session.writer = raising
+        end
+      end
+    end
   end
 end
