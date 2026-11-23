@@ -187,6 +187,56 @@ Keep it tight. No code changes needed. This is a "what's going on" question — 
         Render::Markdown.rows("[https://pi.dev](https://pi.dev)"), "markdown.ts:712-714"
     end
 
+    # --- I111 OSC-8: the converter arm (href field; the emission lives
+    # in the TUI seam — markdown.rb never emits an escape) ---
+
+    # markdown.ts:703-706 — when capable the URL fallback is NOT appended;
+    # every link child span carries href (nested styling splits it into
+    # fragments, each carrying its own href). Two links in one row resolve
+    # independently (the NO-ALIASING law).
+    def test_osc8_link_span_carries_href_and_drops_url_suffix_when_capable
+      with_hyperlinks("1") do
+        assert_equal [[S.new(text: "see "),
+                       S.new(text: "pi", fg: :light_blue, modifiers: [:underlined], href: "https://pi.dev"),
+                       S.new(text: " now")]],
+          Render::Markdown.rows("see [pi](https://pi.dev) now"),
+          "no ' (href)' fallback when capable (markdown.ts:703-706)"
+        assert_equal [[S.new(text: "one", fg: :light_blue, modifiers: [:underlined], href: "https://one.dev"),
+                       S.new(text: " mid "),
+                       S.new(text: "two", fg: :light_blue, modifiers: [:underlined], href: "https://two.dev")]],
+          Render::Markdown.rows("[one](https://one.dev) mid [two](https://two.dev)"),
+          "two links never alias through a shared carrier"
+      end
+    end
+
+    # The OFF arm is byte-identical to today — the fallback span rides,
+    # href stays nil, the mailto comparison is unchanged.
+    def test_osc8_link_fallback_bytes_held_when_capability_off
+      with_hyperlinks("0") do
+        assert_equal [[S.new(text: "pi", fg: :light_blue, modifiers: [:underlined]),
+                       S.new(text: " (https://pi.dev)", fg: :gray)]],
+          Render::Markdown.rows("[pi](https://pi.dev)"), "the fallback bytes held"
+        assert_equal [[S.new(text: "foo@bar.com", fg: :light_blue, modifiers: [:underlined])]],
+          Render::Markdown.rows("<foo@bar.com>"), "the mailto comparison unchanged"
+      end
+    end
+
+    # Autolinks and titled links carry href when capable (the marked
+    # oracle: autolink text==href; the title is dropped from the URL).
+    def test_osc8_autolinks_and_titled_links_carry_href_when_capable
+      with_hyperlinks("1") do
+        assert_equal [[S.new(text: "https://pi.dev", fg: :light_blue, modifiers: [:underlined],
+                           href: "https://pi.dev")]],
+          Render::Markdown.rows("<https://pi.dev>"), "the uri autolink"
+        assert_equal [[S.new(text: "foo@bar.com", fg: :light_blue, modifiers: [:underlined],
+                           href: "mailto:foo@bar.com")]],
+          Render::Markdown.rows("<foo@bar.com>"), "the email autolink's mailto href"
+        assert_equal [[S.new(text: "docs", fg: :light_blue, modifiers: [:underlined],
+                           href: "https://d.dev")]],
+          Render::Markdown.rows("[docs](https://d.dev \"the docs\")"), "the titled link"
+      end
+    end
+
     def test_escaped_delimiters_are_literal
       assert_equal [[S.new(text: "*not em*")]], Render::Markdown.rows("\\*not em\\*")
     end
@@ -274,6 +324,285 @@ Keep it tight. No code changes needed. This is a "what's going on" question — 
     def test_converter_source_is_gem_neutral
       source = File.read(File.expand_path("../lib/tart/render/markdown.rb", __dir__))
       refute_includes source, "RatatuiRuby", "the tui-seam gate scans all of lib"
+    end
+
+    # --- I110 gfm-tables: the 22 declared pins (SPEC g) ---
+
+    # Tables (11). Recognition letter: marked 18.0.11 live-verified
+    # (rules.ts gfmTable + Tokenizer.table's /[:|]/ guard + splitCells);
+    # rendering letter: pi v1.1.0 renderTable (markdown.ts:852-1015).
+    def test_table_basic_renders_the_bordered_shape
+      rows = Render::Markdown.rows("| Name | Qty |\n| --- | --- |\n| apple | 3 |", width: 30)
+      assert_equal [
+        [S.new(text: "┌───────┬─────┐")],
+        [S.new(text: "│ "), S.new(text: "Name", modifiers: [:bold]), S.new(text: " ", modifiers: [:bold]),
+         S.new(text: " │ "), S.new(text: "Qty", modifiers: [:bold]), S.new(text: " │")],
+        [S.new(text: "├───────┼─────┤")],
+        [S.new(text: "│ "), S.new(text: "apple"), S.new(text: " │ "), S.new(text: "3"),
+         S.new(text: "  "), S.new(text: " │")],
+        [S.new(text: "└───────┴─────┘")]
+      ], rows,
+        "natural-fit widths — col0's natural is apple's 5, so the header pads bold " \
+        "(markdown.ts:936-939; theme.bold(padded) :975-982); borders default-styled (D-border-style)"
+    end
+
+    def test_table_recognizes_a_pipeless_header_row
+      rows = Render::Markdown.rows("a | b\n--- | ---\n1 | 2", width: 40)
+      assert_equal [
+        [S.new(text: "┌───┬───┐")],
+        [S.new(text: "│ "), S.new(text: "a", modifiers: [:bold]), S.new(text: " │ "),
+         S.new(text: "b", modifiers: [:bold]), S.new(text: " │")],
+        [S.new(text: "├───┼───┤")],
+        [S.new(text: "│ "), S.new(text: "1"), S.new(text: " │ "), S.new(text: "2"), S.new(text: " │")],
+        [S.new(text: "└───┴───┘")]
+      ], rows,
+        "marked's gfmTable header needs no pipes — the delimiter carries the [:|] guard " \
+        "(rules.ts gfmTable; oracle tbl(\"a | b\\n--- | ---\\n1 | 2\") → header [a,b])"
+    end
+
+    def test_table_delimiter_without_colon_or_pipe_is_not_a_table
+      assert_equal [[S.new(text: "Title", fg: :yellow, modifiers: [:bold])]],
+        Render::Markdown.rows("Title\n---"),
+        "the [:|] guard (Tokenizer.table → other.tableDelimiter): a bare --- underline is " \
+        "NEVER a delimiter row — it falls to the setext h2 (marked-verified: heading:d2)"
+    end
+
+    def test_table_cell_count_mismatch_renders_the_source_raw
+      rows = Render::Markdown.rows("| a | b |\n| --- |\n| 1 |", width: 30)
+      assert_equal [
+        [S.new(text: "| a | b |")], [S.new(text: "| --- |")], [S.new(text: "| 1 |")]
+      ], rows,
+        "header/align counts must be EQUAL (Tokenizer.table) — a mismatch is no table and " \
+        "no interrupt: the source degrades to paragraph text (marked-verified: one paragraph)"
+    end
+
+    def test_table_alignment_syntax_is_recognized_and_rendered_left
+      rows = Render::Markdown.rows("| a | b |\n| :-: | --: |\n| c | d |", width: 30)
+      assert_equal [
+        [S.new(text: "┌───┬───┐")],
+        [S.new(text: "│ "), S.new(text: "a", modifiers: [:bold]), S.new(text: " │ "),
+         S.new(text: "b", modifiers: [:bold]), S.new(text: " │")],
+        [S.new(text: "├───┼───┤")],
+        [S.new(text: "│ "), S.new(text: "c"), S.new(text: " │ "), S.new(text: "d"), S.new(text: " │")],
+        [S.new(text: "└───┴───┘")]
+      ], rows,
+        "alignment cells make the delimiter valid (marked align [center, right]) but pi " \
+        "v1.1.0 renderTable NEVER reads token.align — rendered left (D-align)"
+    end
+
+    def test_table_escaped_pipe_unescapes_within_the_cell
+      rows = Render::Markdown.rows("| a |\n| --- |\n| \\| x |", width: 20)
+      assert_equal [
+        [S.new(text: "┌─────┐")],
+        [S.new(text: "│ "), S.new(text: "a", modifiers: [:bold]), S.new(text: "  ", modifiers: [:bold]),
+         S.new(text: " │")],
+        [S.new(text: "├─────┤")],
+        [S.new(text: "│ "), S.new(text: "| x"), S.new(text: " │")],
+        [S.new(text: "└─────┘")]
+      ], rows,
+        "splitCells: an odd backslash-run escapes the pipe (no split), the cell trims and " \
+        "\\| unescapes (marked-verified: cell text \"| x\")"
+    end
+
+    def test_table_body_rows_run_until_a_blank_line
+      rows = Render::Markdown.rows("| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n\npara", width: 30)
+      assert_equal [
+        [S.new(text: "┌───┬───┐")],
+        [S.new(text: "│ "), S.new(text: "a", modifiers: [:bold]), S.new(text: " │ "),
+         S.new(text: "b", modifiers: [:bold]), S.new(text: " │")],
+        [S.new(text: "├───┼───┤")],
+        [S.new(text: "│ "), S.new(text: "1"), S.new(text: " │ "), S.new(text: "2"), S.new(text: " │")],
+        [S.new(text: "├───┼───┤")],
+        [S.new(text: "│ "), S.new(text: "3"), S.new(text: " │ "), S.new(text: "4"), S.new(text: " │")],
+        [S.new(text: "└───┴───┘")],
+        [],
+        [S.new(text: "para")]
+      ], rows,
+        "body rows to the blank line (marked body capture), separators BETWEEN body rows " \
+        "(markdown.ts:1004-1006), then the spacing law (tables are not lists, §b5)"
+    end
+
+    def test_table_interrupts_a_paragraph
+      rows = Render::Markdown.rows("para\n| a | b |\n| --- | --- |\n| 1 | 2 |", width: 30)
+      assert_equal "para", rows[0].first.text
+      assert_equal [S.new(text: "┌───┬───┐")], rows[2],
+        "marked-verified: para then table row → [paragraph, table] (rules.ts _paragraph " \
+        "gfm: table interrupts paragraphs)"
+    end
+
+    def test_table_wraps_cells_to_the_available_width
+      src = "| head one | head two |\n| --- | --- |\n| the first cell wraps here | short |"
+      rows = Render::Markdown.rows(src, width: 25)
+
+      assert_equal 8, rows.length
+      rows.each do |row| # no row exceeds the width
+        assert_operator Tart::TUI.text_width(row.map(&:text).join), :<=, 25
+      end
+      # borders: single default-styled spans, one shared grid geometry
+      [rows[0], rows[3], rows[7]].each do |border|
+        assert_equal 1, border.length
+        assert_nil border.first.fg
+        assert_equal 25, Tart::TUI.text_width(border.first.text)
+      end
+      assert_match(/\A┌─+┬─+┐\z/, rows[0].first.text)
+      assert_match(/\A├─+┼─+┤\z/, rows[3].first.text)
+      assert_match(/\A└─+┴─+┘\z/, rows[7].first.text)
+      # the │ columns align across rows: fixed length, three │ walls
+      # (the ├─┼─┤ separator row has none by design)
+      rows.select { |row| row.map(&:text).join.include?("│") }.each do |row|
+        assert_equal 25, Tart::TUI.text_width(row.map(&:text).join)
+        assert_equal 3, row.map(&:text).join.scan("│").length
+      end
+      # header bold (theme.bold :975-982), body not
+      [rows[1], rows[2]].each do |row|
+        row.reject { |s| %[│  │  │].include?(s.text) }.each do |span|
+          assert_includes span.modifiers, :bold
+        end
+      end
+      rows[4, 3].each do |row|
+        row.each { |span| refute_includes span.modifiers, :bold }
+      end
+      # every cell byte present, in order, after the proportional shrink
+      # (markdown.ts:946-968: floors of minDelta/totalGrow · extraWidth,
+      # remainder round-robin → widths [12, 6]); the row-major join renders
+      # each COLUMN's cells in source order (rows interleave the columns)
+      text = rows.flat_map { |row| row.map(&:text) }.join
+      %w[head one two the first cell wraps here short].each do |word|
+        assert_includes text, word
+      end
+      [%w[head one the first cell wraps here], %w[head two short]].each do |column|
+        column.each_cons(2) do |a, b|
+          assert_operator text.index(a), :<, text.index(b), "cells render in source order"
+        end
+      end
+    end
+
+    def test_table_too_narrow_renders_the_raw_source_wrapped
+      rows = Render::Markdown.rows("| a | b |\n| --- | --- |\n| 1 | 2 |", width: 8)
+      assert_equal [
+        [S.new(text: "| a | b")], [S.new(text: "|")],
+        [S.new(text: "| --- |")], [S.new(text: "--- |")],
+        [S.new(text: "| 1 | 2")], [S.new(text: "|")]
+      ], rows,
+        "availableForCells < numCols → the block's RAW source as plain spans wrapped to the " \
+        "width, no borders (markdown.ts:874-878 wrapTextWithAnsi(token.raw))"
+    end
+
+    def test_table_inside_a_blockquote_renders
+      rows = Render::Markdown.rows("> | abc | def |\n> | --- | --- |\n> | 1 | 2 |", width: 14)
+      assert_equal [S.new(text: "│ ", fg: :gray), S.new(text: "┌─────┬─────┐", fg: :gray, modifiers: [:italic])],
+        rows[0],
+        "the in-quote table sizes against the CONTENT width (D-quote-width — the quote seam " \
+        "never re-threads width; at 14-2 the shrink arm would give widths [3,2], not [3,3]); " \
+        "the quote overlay rides every span (markdown.ts:566-606)"
+      assert_equal [S.new(text: "│ ", fg: :gray), S.new(text: "│ ", fg: :gray, modifiers: [:italic]),
+                    S.new(text: "abc", fg: :gray, modifiers: %i[bold italic]),
+                    S.new(text: " │ ", fg: :gray, modifiers: [:italic]),
+                    S.new(text: "def", fg: :gray, modifiers: %i[bold italic]),
+                    S.new(text: " │", fg: :gray, modifiers: [:italic])], rows[1]
+    end
+
+    # Setext headings (4). marked lheading (rules.ts lheadingCore /
+    # lheadingGfm), rendered through heading_rows (markdown.ts:481-493).
+    def test_setext_equals_underline_renders_the_h1_shape
+      assert_equal [[S.new(text: "Title", fg: :yellow, modifiers: %i[bold underlined])]],
+        Render::Markdown.rows("Title\n==="),
+        "=== underline → h1, byte-identical to '# Title' (lheadingCore (=+); h1 = " \
+        "heading(bold(underline)) markdown.ts:481-483)"
+    end
+
+    def test_setext_dashes_underline_renders_the_h2_shape
+      assert_equal [[S.new(text: "Title", fg: :yellow, modifiers: [:bold])]],
+        Render::Markdown.rows("Title\n---"),
+        "--- underline → h2, byte-identical to '## Title' (the [:|] guard frees the pair for " \
+        "lheading; h2 = heading(bold) markdown.ts:483-489)"
+    end
+
+    def test_setext_covers_a_multi_line_paragraph
+      assert_equal [
+        [S.new(text: "first", fg: :yellow, modifiers: %i[bold underlined])],
+        [S.new(text: "second", fg: :yellow, modifiers: %i[bold underlined])]
+      ], Render::Markdown.rows("first\nsecond\n==="),
+        "marked-verified: multi-line setext content is ONE heading; the rows follow the " \
+        "standing soft-break law (D-setext-rows — one heading-styled row per line)"
+    end
+
+    def test_setext_requires_an_immediately_preceding_paragraph
+      assert_equal [[S.new(text: "para")], [], [S.new(text: "─" * 80, fg: :gray)]],
+        Render::Markdown.rows("para\n\n---"), "after a blank the --- stays an hr (markdown.ts:615-617)"
+      assert_equal [[S.new(text: "│ ", fg: :gray), S.new(text: "quote", fg: :gray, modifiers: [:italic])],
+                    [],
+                    [S.new(text: "─" * 80, fg: :gray)]],
+        Render::Markdown.rows("> quote\n---"),
+        "marked-verified: > quote then --- → [blockquote, hr] — no setext across a quote edge"
+      assert_equal [[S.new(text: "- ", fg: :light_magenta), S.new(text: "item")],
+                    [S.new(text: "─" * 80, fg: :gray)]],
+        Render::Markdown.rows("- item\n---"),
+        "marked-verified: an unindented hr ends the item's lazy continuation → [list, hr]"
+    end
+
+    # Angle autolinks (3). marked's inline autolink rule, riding the
+    # existing link render (markdown.ts:699-719).
+    def test_angle_autolink_uri_renders_a_styled_link_without_url_suffix
+      assert_equal [[S.new(text: "see "),
+                     S.new(text: "https://example.com/a?b=c", fg: :light_blue, modifiers: [:underlined]),
+                     S.new(text: " now")]],
+        Render::Markdown.rows("see <https://example.com/a?b=c> now"),
+        "autolink → link(text==href) — the linkUrl fallback dies in the standing comparison " \
+        "(markdown.ts:711-719); scheme 2-32 chars, rest free of ws/control/<>"
+    end
+
+    def test_angle_autolink_email_renders_a_mailto_link
+      assert_equal [[S.new(text: "mail "),
+                     S.new(text: "foo@bar.com", fg: :light_blue, modifiers: [:underlined]),
+                     S.new(text: " ok")]],
+        Render::Markdown.rows("mail <foo@bar.com> ok"),
+        "the marked email shape → href mailto:foo@bar.com — the suffix dies on " \
+        "text == href minus mailto: (marked-verified; markdown.ts:711-719)"
+    end
+
+    def test_angle_brackets_that_do_not_autolink_stay_literal
+      assert_equal [[S.new(text: "not <foo bar> or <b>")]],
+        Render::Markdown.rows("not <foo bar> or <b>"),
+        "whitespace and bare tags never autolink (marked-verified: no link token) — pi renders " \
+        "html raw; text stays literal"
+    end
+
+    # Titled links (3). marked's inline link rule; the title is parsed and
+    # DISCARDED at token level (§d — the R6 law superseded in these arms).
+    def test_titled_link_parses_and_ignores_the_title
+      assert_equal [[S.new(text: "a", fg: :light_blue, modifiers: [:underlined]),
+                     S.new(text: " (url)", fg: :gray)]],
+        Render::Markdown.rows("[a](url \"the title\")"),
+        "marked-verified: [a](url \"title\") → href url, title dropped — byte-identical to " \
+        "[a](url) (Tokenizer.inlineLink)"
+    end
+
+    def test_titled_link_accepts_every_title_shape_and_inner_whitespace
+      rows = Render::Markdown.rows("[a](url \"two words\") [b](url 'x y') [c](url (p q))")
+      hrefs = rows.flat_map { |row| row.select { |s| s.fg == :gray } }.map(&:text)
+      assert_equal [" (url)", " (url)", " (url)"], hrefs,
+        "all three title shapes (dquote/squote/paren) parse with INNER WHITESPACE and are " \
+        "discarded (marked-verified probes 13-14 + the ws-tolerant parens probe 15)"
+    end
+
+    def test_link_angle_wrapped_destination_parses
+      assert_equal [[S.new(text: "a", fg: :light_blue, modifiers: [:underlined]),
+                     S.new(text: " (url with space)", fg: :gray)]],
+        Render::Markdown.rows("[a](<url with space>)"),
+        "the angle-wrapped destination (D-angle-dest) — marked's <...> href arm, whitespace " \
+        "allowed (oracle probe 16: href 'url with space')"
+    end
+
+    # The task-marker HOLD (§e — the I68 R8 letter frozen beside the new work).
+    def test_task_list_marker_folds_into_the_bullet_span_hold
+      rows = Render::Markdown.rows("- [X] done\n- [ ] todo")
+      assert_equal [
+        [S.new(text: "- [x] ", fg: :light_magenta), S.new(text: "done")],
+        [S.new(text: "- [ ] ", fg: :light_magenta), S.new(text: "todo")]
+      ], rows,
+        "R8 hold: the marker folds INTO the listBullet span, checked normalizes to x, the " \
+        "continuation follows the FULL marker width (markdown.ts:782-783)"
     end
 
     # --- I68 markdown-parity battery: the frozen 48-case oracle fixture ---

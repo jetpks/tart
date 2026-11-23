@@ -89,6 +89,73 @@ module Tart
       assert_includes result, "Some lines truncated to 500 chars"
     end
 
+    # pi #9276 (v1.6.0 grep.ts:168): rg --context events carry the
+    # surrounding lines, so NO matched file is ever read — the pre-fix
+    # File.read shape (the OOM-on-large-files exposure) is dead. The stub
+    # raises if any matched-file read fires; the bytes are the standing
+    # fixture's exact context block.
+    def test_grep_context_from_rg_events_never_reads_matched_files
+      result = nil
+      File.stub(:read, ->(*) { raise "matched file read (pi #9276 grep.ts:168)" }) do
+        result = Tools::Grep.new(cwd: @dir).execute(pattern: "y = 2", path: "sub", context: 1)
+      end
+      assert_equal "cherry.rb-1- x = 1\ncherry.rb:2: y = 2", result,
+        "the context block comes from rg's own events (pi #9276), byte-identical to the file-read arm"
+    end
+
+    # pi #9276's event-stream shape: rg emits a MERGED block — every line
+    # once — where the pre-fix per-match format_block REPEATED overlapping
+    # context lines per match.
+    def test_grep_overlapping_match_context_emitted_once
+      File.write(File.join(@dir, "sub", "cherry.rb"), "a = 1\nb = 2\nc = 3\nd = 4\n")
+      result = Tools::Grep.new(cwd: @dir).execute(pattern: "= [23]", path: "sub", context: 1)
+      assert_equal "cherry.rb-1- a = 1\ncherry.rb:2: b = 2\ncherry.rb:3: c = 3\ncherry.rb-4- d = 4", result,
+        "rg's event stream carries each line exactly once (pi #9276; the pre-fix arm repeated lines 2-3)"
+    end
+
+    # pi grep.ts:185-190 (the #9276 event consumption): at the limit rg
+    # still sends the last allowed match's trailing context (kept up to
+    # the window end), and ONLY another match proves the limit actually
+    # cut results off — the notice waits for that proof.
+    def test_grep_limit_notice_waits_for_proof_of_one_more_match
+      File.write(File.join(@dir, "single.txt"), "hit\n")
+      quiet = Tools::Grep.new(cwd: @dir).execute(pattern: "hit", path: "single.txt", limit: 1)
+      assert_equal "single.txt:1: hit", quiet, "exactly-limit matches prove nothing was cut — no notice"
+
+      File.write(File.join(@dir, "trail.txt"), "hit\nsecond\nx\nhit\n")
+      loud = Tools::Grep.new(cwd: @dir).execute(pattern: "hit", path: "trail.txt", context: 1, limit: 1)
+      assert_equal "trail.txt:1: hit\ntrail.txt-2- second\n\n[1 matches limit reached. Use limit=2 for more, or refine pattern]", loud,
+        "the trailing-context window is shown, the proof match is suppressed, the notice fires"
+    end
+
+    # The OOM exposure, dead: a hostile-large matched file (3 x 8MiB lines)
+    # searched WITH context completes with bounded output and never reads
+    # the file — the context rides rg's events (pi #9276) and the byte cap
+    # (pi grep.ts:231) counts without storing.
+    def test_grep_hostile_large_file_context_search_is_bounded
+      big = File.join(@dir, "hostile.txt")
+      File.open(big, "w") do |file|
+        file.puts "pad #{'a' * (8 * 1024 * 1024)}"
+        file.puts "needle #{'b' * (8 * 1024 * 1024)}"
+        file.puts "pad #{'c' * (8 * 1024 * 1024)}"
+      end
+      result = nil
+      File.stub(:read, ->(*) { raise "matched file read (pi #9276 grep.ts:168)" }) do
+        result = Tools::Grep.new(cwd: @dir).execute(pattern: "needle", path: "hostile.txt", context: 1)
+      end
+      lines = result.split("\n")
+      assert_equal 3, lines.count { |line| line.start_with?("hostile.txt") },
+        "the match plus its two context lines, nothing else"
+      assert lines[0].start_with?("hostile.txt-1- pad aaaa"), "leading context line from rg's event"
+      assert lines[1].start_with?("hostile.txt:2: needle bbbb"), "the match line from rg's event"
+      assert lines[2].start_with?("hostile.txt-3- pad cccc"), "trailing context line from rg's event"
+      assert_equal 3, lines[0..2].count { |line| line.end_with?("... [truncated]") },
+        "each 8MiB line truncates to 500 chars"
+      assert_includes result, "Some lines truncated to 500 chars", "the standing line-truncation notice"
+      refute_includes result, "matches limit reached", "no match-limit notice on a single-match search"
+      refute_includes result, "50KB limit reached", "no byte-cap notice on a bounded hostile search"
+    end
+
     def test_registry_schema_gating
       tools = Tools::Registry.build(selected: %w[read ls], cwd: @dir)
       assert_equal %w[ls read], tools.keys.sort

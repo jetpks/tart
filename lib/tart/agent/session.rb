@@ -174,11 +174,60 @@ module Tart
         persisted.compact
       end
 
+      # The session's tool-loadout declaration entry (pi's system-message
+      # tool deltas — pi-ai transcript.ts createInitialSystemMessage/:10-30
+      # + agent-loop.ts declareToolChanges: system messages carry the
+      # `toolsAdded`/`toolsRemoved` deltas that a resume replays, pi
+      # #10785 agent-session.ts:1907-1948). The message body rides the
+      # recorded open Hash like every entry: +added+/+removed+ are tool
+      # DECLARATIONS ({name:, description:, parameters:}); the restore reads
+      # only the names. pi's shape law: empty lists omit the field, content
+      # is "" (a loadout record never carries prompt text here).
+      def tool_loadout_entry(added:, removed:, id:, parent_id:, timestamp: now_iso)
+        message = {role: "system", content: ""}
+        message[:toolsAdded] = added unless added.empty?
+        message[:toolsRemoved] = removed unless removed.empty?
+        message_entry(message, id:, parent_id:, timestamp:)
+      end
+
+      # The replay law (pi-ai transcript.ts getCurrentTools :58-66): an
+      # insertion-ordered map of tool name => declaration; per system
+      # message, `toolsRemoved` deletes first, then `toolsAdded` sets — the
+      # branch's system messages replay to the session's loadout in entry
+      # order. Non-system entries and foreign-shaped deltas are skipped
+      # (the tolerance rule). Returns the name => declaration map.
+      def recorded_tool_decls(entries)
+        tools = {}
+        entries.each do |entry|
+          envelope = Shapes::MessageEntry.of(entry)
+          next unless envelope&.role == "system"
+
+          message = envelope.message
+          Array(message["toolsRemoved"]).each do |tool|
+            tools.delete(tool["name"]) if tool.is_a?(Hash) && tool["name"].is_a?(String)
+          end
+          Array(message["toolsAdded"]).each do |tool|
+            tools[tool["name"]] = tool if tool.is_a?(Hash) && tool["name"].is_a?(String)
+          end
+        end
+        tools
+      end
+
+      # The recorded loadout's NAMES, in replay order (the restore consults
+      # this — pi #10785 _restoreToolsFromTranscript :1932).
+      def recorded_tools(entries)
+        recorded_tool_decls(entries).keys
+      end
+
       # pi sessionEntryToContextMessages :439 for the message subset: message
       # entries project to their message, made chat-ready (symbol keys,
       # symbol role); null/missing content is tolerated ("" on the port —
       # module doc for the [] deviation). Compaction entries project to the
-      # wrapped summary (see module doc). Other entry types project to
+      # wrapped summary (see module doc). System entries project to NOTHING
+      # — pi's system messages are prompt state (the port composes the
+      # system prompt from the loadout at boot; a seeded system message
+      # would be new wire surface, and the loadout record is the restore's
+      # bookkeeping, never conversation). Other entry types project to
       # nothing; malformed entries are tolerated, never fatal — every gate
       # rides the typed envelopes (Shapes::MessageEntry / CompactionEntry),
       # whose .of nil-skips reproduce the guard chains exactly. Returns the
@@ -198,6 +247,10 @@ module Tart
 
         envelope = Shapes::MessageEntry.of(entry)
         return nil unless envelope
+        # pi's system messages are prompt state — never seeded into the
+        # chat replay (pi-ai transcript.ts resolveTranscript collapses them;
+        # the port has no mid-conversation system messages on the wire).
+        return nil if envelope.role == "system"
 
         return bash_execution_context_message(envelope) if envelope.role == "bashExecution"
 
@@ -463,6 +516,28 @@ module Tart
           entry[:id]
         end
 
+        # Appends the session's tool-loadout declaration entry (pi's
+        # system-message tool deltas, #10785 — agent-session.ts :1226-1234
+        # persists role "system" messages as message entries; the loadout
+        # record is the one the port writes). NON-conversation-bearing (pi
+        # _persist's _hasConversation gate): a loadout record never opens a
+        # session file alone; before the first flush it waits in @entries
+        # and rides the first conversation-bearing create — the same law
+        # as {append_custom_message}. +added+/+removed+ are declaration
+        # hashes ({Session.tool_loadout_entry}). Returns the entry id.
+        def append_tool_loadout(added:, removed:)
+          entry = Session.tool_loadout_entry(added:, removed:,
+            id: Session.generate_id(@ids),
+            parent_id: @leaf_id,
+            timestamp: Session.now_iso,
+          )
+          @ids << entry[:id]
+          @leaf_id = entry[:id]
+          @entries << entry
+          persist_non_conversation
+          entry[:id]
+        end
+
         # Appends a custom_message entry (pi appendCustomMessageEntry,
         # agent-session.ts:1144-1160 — the nextTurn injection's record, same
         # leaf chain). NON-conversation-bearing for the persist gate: a
@@ -480,7 +555,7 @@ module Tart
           @ids << entry[:id]
           @leaf_id = entry[:id]
           @entries << entry
-          persist_custom_message
+          persist_non_conversation
           entry[:id]
         end
 
@@ -534,10 +609,10 @@ module Tart
           end
         end
 
-        # The custom_message persist arm: appends when flushed, never
-        # creates (a recall never opens a session file alone — see
-        # {append_custom_message}).
-        def persist_custom_message
+        # The non-conversation persist arm: appends when flushed, never
+        # creates (a recall or a loadout record never opens a session file
+        # alone — see {append_custom_message} / {append_tool_loadout}).
+        def persist_non_conversation
           return unless @flushed
 
           File.write(@path, entry_line(@entries.last), mode: "a")

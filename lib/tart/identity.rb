@@ -25,10 +25,11 @@ module Tart
     ENV_KEY = "TART_IDENTITY"
     SETTINGS_KEY = "identity"
 
-    # The oracle's user-visible version (coding-agent package.json:3) —
-    # the pi-mode logo line renders it; tart-mode renders Tart::VERSION.
-    # A tracked constant, bumped with the oracle parity target.
-    ORACLE_VERSION = "1.1.0"
+    # The oracle's user-visible version (coding-agent package.json:3 at
+    # the promoted oracle-v1.6.0 worktree, build/pi-oracle-v1.6.0) — the
+    # pi-mode logo line renders it; tart-mode renders Tart::VERSION. A
+    # tracked constant, bumped with the oracle parity target.
+    ORACLE_VERSION = "1.6.0"
 
     # An invalid identity value — the launcher maps this to a clean abort.
     Error = Class.new(StandardError)

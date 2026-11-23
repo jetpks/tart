@@ -51,7 +51,9 @@ module Tart
       # rows, uncapped (formatReadResult:130 — maxLines = expanded ?
       # lines.length : 10; trailing-empty lines trimmed). The error text
       # renders in both states.
-      def read_block_rows(args, result, width, expanded:)
+      # +details+ threads the I57 side channel (I112 — the read-image
+      # placement; nil renders today's block exactly, byte-identical).
+      def read_block_rows(args, result, width, expanded:, details: nil)
         bg = Panel.tool_panel_bg(result)
         region = [Panel.blank_line, Panel.panel_blank_line(width, bg)]
         region.concat(read_call_rows(args, width, expanded, bg:))
@@ -67,6 +69,7 @@ module Tart
           region << Panel.panel_blank_line(width, bg)
           region.concat(rows)
         end
+        region.concat(read_image_region(details, result, width, bg))
         region << Panel.panel_blank_line(width, bg)
         region
       end
@@ -106,12 +109,64 @@ module Tart
         Panel.padded_fg_rows(lines.join("\n"), width, fg: Theme[:tool_output], bg: bg)
       end
 
+      # The ENTRY-1 image mimes the read tool's mime sniffer emits
+      # (lib/tart/tools/support/mime.rb — FROZEN): the iterm2 arm takes
+      # every one of them inline; kitty is PNG-only (D-PNG-ONLY-KITTY).
+      ENTRY_IMAGE_MIMES = %w[image/png image/jpeg image/gif image/webp image/bmp].freeze
+
+      # The read-image placement (I112, pi tool-execution.ts:344-381 +
+      # image.ts:96-160): when the images capability is on AND the result
+      # carries the I57 details side channel's image record AND the result
+      # is not an error, the block appends the image region AFTER the
+      # result rows — reserved blank panel rows (the first registered as
+      # the image anchor with its spec + x offset + count) when the image
+      # is transmittable, the fallback row otherwise (D-FALLBACK-ONLY-
+      # CAPABLE). The text note stays in every arm (pi renders the note
+      # AND the image); the PENDING block never reaches here; capability-
+      # off (or absent details) renders NOTHING — today's bytes,
+      # byte-identical, no registration. The reservation is
+      # `calculate_rows(dims, min(60, content_width))` (pi imageWidthCells
+      # default 60, settings-manager.ts:59); the sweep registration
+      # re-derives it at any width.
+      def read_image_region(details, result, width, bg)
+        return [] if details.nil? || Capabilities.images?.nil?
+
+        image = details.is_a?(Hash) ? details[:image] : nil
+        return [] unless image.is_a?(Hash)
+        return [] if result.is_a?(Hash) && result[:error]
+
+        mime = image[:mime_type]
+        path = image[:path]
+        bytes = image[:bytes]
+        dims = TerminalImages.image_dimensions(path, mime)
+        max_width = [60, width - Panel::OUTPUT_PAD.length * 2].min
+        transmittable =
+          if Capabilities.images? == "kitty"
+            mime == "image/png" && !dims.nil? && bytes.to_i <= TerminalImages::INLINE_BYTE_CAP
+          else
+            ENTRY_IMAGE_MIMES.include?(mime) && !dims.nil? && bytes.to_i <= TerminalImages::INLINE_BYTE_CAP
+          end
+        if transmittable
+          size = TerminalImages.calculate_cell_size(dims, max_width)
+          rows = Array.new(size[:rows]) { Panel.panel_blank_line(width, bg) }
+          ImageOverlay.record_anchor(rows.first,
+            path: path, mime_type: mime, bytes: bytes.to_i,
+            width_px: dims[:width_px], height_px: dims[:height_px],
+            columns: size[:columns], rows: size[:rows],
+            x_offset: Panel::OUTPUT_PAD.length)
+          rows
+        else
+          [TerminalImages.fallback_row({ mime_type: mime, path: path, dimensions: dims }, width, bg: bg)]
+        end
+      end
+
       # pi write.ts:99-100 — the bold toolTitle `write` header + the
       # renderToolPath display (accent token), wrapped through the
       # call-row family ({wrapped_call_rows}).
       def write_call_rows(args, width, bg: nil)
         wrapped_call_rows([tool_title_span("write"), Markdown::Span.new(text: " "),
-                           Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent])], width, bg:)
+                           Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent],
+                             href: tool_path_href(args))], width, bg:)
       end
 
       # The styled call-row family (pi's per-tool renderCall Texts inside
@@ -170,7 +225,8 @@ module Tart
                              Markdown::Span.new(text: " (ctrl+o to expand)", fg: Theme[:dim])], width, bg:)
         else
           wrapped_call_rows([tool_title_span("read"), Markdown::Span.new(text: " "),
-                             Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent]),
+                             Markdown::Span.new(text: tool_path_display(args), fg: Theme[:accent],
+                               href: tool_path_href(args)),
                              *line_range_spans(args)], width, bg:)
         end
       end
@@ -186,14 +242,27 @@ module Tart
       # pi render-utils.ts:102-110 renderToolPath over :10-18 shortenPath
       # — the display path: the ~ contraction under home, verbatim
       # otherwise; the empty/absent path renders the toolOutput "..."
-      # (write.ts:105 / read.ts:104 fallback). linkPath's OSC8 hyperlink
-      # is capability-gated — the port's TUI carries none (recorded).
+      # (write.ts:105 / read.ts:104 fallback).
       def tool_path_display(args)
         raw_path = args["file_path"] || args["path"]
         return "..." if raw_path.nil? || raw_path.empty?
 
         home = Dir.home
         raw_path.start_with?(home) ? "~#{raw_path[home.length..]}" : raw_path
+      end
+
+      # pi linkPath (render-utils.ts:19-23): the tool-path span's OSC-8
+      # href, capability-gated — nil when off (the display is untouched
+      # either way; the ~ contraction is display-only, the URL uses the
+      # RAW path). The session cwd is the launcher's cwd (pi's cwd
+      # semantic); the frozen tool-block builders never thread one, so
+      # the pins pass +cwd:+ and real runs resolve against Dir.pwd.
+      def tool_path_href(args, cwd: Dir.pwd)
+        raw_path = args["file_path"] || args["path"]
+        return nil if raw_path.nil? || raw_path.empty?
+        return nil unless Capabilities.hyperlinks?
+
+        TUI::LinkOverlay.file_url(raw_path, cwd: cwd)
       end
 
       # pi read.ts:35-42 formatReadLineRange — the warning-colored
