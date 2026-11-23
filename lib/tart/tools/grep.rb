@@ -68,15 +68,14 @@ module Tart
 
           context_value = context && context.positive? ? context : 0
           effective_limit = [1, limit || DEFAULT_LIMIT].max
-          matches, match_limit_reached, exit_ok = run_rg(
-            rg_path, pattern, search_path, glob, ignore_case, literal, effective_limit
+          output_lines, match_count, match_limit_reached, lines_truncated, output_line_count, output_bytes, exit_ok = run_rg(
+            rg_path, pattern, search_path, glob, ignore_case, literal, effective_limit, context_value, is_directory
           )
           Fast::Completions::Cancellation.check
           raise ArgumentError, "ripgrep exited with code #{exit_ok}" unless exit_ok
 
-          return "No matches found" if matches.empty?
-
-          format_matches(matches, search_path, is_directory, context_value, effective_limit, match_limit_reached)
+          format_output(output_lines, match_count, match_limit_reached, effective_limit,
+            lines_truncated, output_line_count, output_bytes)
         end
       end
 
@@ -97,8 +96,16 @@ module Tart
         raise ArgumentError, "Path not found: #{path}"
       end
 
-      # Streams `rg --json` lines until the match limit or EOF. Returns
-      # [matches, match_limit_reached, exit_code_or_nil].
+      # Streams `rg --json` match AND context events until EOF or the proven
+      # match limit. Returns [output_lines, match_count, match_limit_reached,
+      # lines_truncated, output_line_count, output_bytes, exit_code_or_nil].
+      #
+      # #9276 (pi grep.ts:168): rg emits the surrounding lines as `context`
+      # events when --context is passed, so NO matched file is ever read here
+      # — the pre-fix File.read shape (the OOM-on-large-files exposure) is
+      # dead. The byte-cap arm (pi grep.ts:231, the same fix): rows past the
+      # 50KB cap are COUNTED but never STORED, so the output buffer stays
+      # bounded no matter how much rg streams.
       #
       # I106 (owner concurrency law, PR-#28 review) — the process shape:
       # `Kernel#Sync` is the one gateway (the live tool task yields inline;
@@ -111,12 +118,16 @@ module Tart
       # ToolTimeout raise instead of a hung session.
       REAP_BUDGET_SECONDS = 5
 
-      def run_rg(rg_path, pattern, search_path, glob, ignore_case, literal, effective_limit)
+      def run_rg(rg_path, pattern, search_path, glob, ignore_case, literal, effective_limit,
+                 context_value, is_directory)
         timeout = tool_timeout_seconds
         args = ["--json", "--line-number", "--color=never", "--hidden"]
         args << "--ignore-case" if ignore_case
         args << "--fixed-strings" if literal
         args += ["--glob", glob] if glob
+        # rg emits the surrounding lines as `context` events, so no matched
+        # file is ever read here (#9276).
+        args += ["--context", context_value.to_s] if context_value.positive?
         args += ["--", pattern, search_path]
 
         Sync do
@@ -134,21 +145,69 @@ module Tart
 
           status = nil
           match_limit_reached = false
-          matches = []
+          match_count = 0
+          output_lines = []
+          lines_truncated = false
+          # #9276's counting arm (pi grep.ts:172-186): the byte cap counts
+          # EVERY row but stores only up to it — output_bytes counts a
+          # newline after every line; the joined output has one fewer.
+          output_bytes = 0
+          output_line_count = 0
+          # The proven-limit window (pi grep.ts:185-190): rg still sends the
+          # last allowed match's trailing context (kept up to
+          # trailing_context_end), and only ANOTHER match proves the limit
+          # actually cut results off — the notice waits for that proof.
+          limit_hit = false
+          trailing_context_end = 0
+          last_file = nil
+          push_line = lambda do |file_path, line_number, line_text, is_match|
+            last_file = file_path
+            relative = format_path(file_path, search_path, is_directory)
+            # Strip only the line terminator: a lone CR inside a line is
+            # content (pi's /\r?\n?$/ replace).
+            sanitized = line_text.gsub(/\r?\n?\z/, "")
+            truncated = Truncate.truncate_line(sanitized)
+            lines_truncated ||= truncated[:was_truncated]
+            line = is_match ? "#{relative}:#{line_number}: #{truncated[:text]}" :
+              "#{relative}-#{line_number}- #{truncated[:text]}"
+            output_lines << line if output_bytes - 1 <= Truncate::DEFAULT_MAX_BYTES
+            output_bytes += line.bytesize + 1
+            output_line_count += 1
+          end
           begin
             Async::Task.current.with_timeout(timeout, Async::TimeoutError) do
               out_rd.each_line do |line|
                 event = safe_parse(line)
-                next unless event&.fetch("type", nil) == "match"
+                next unless event
+                is_match = event["type"] == "match"
+                next unless is_match || event["type"] == "context"
 
                 data = event["data"]
-                matches << {file_path: data.dig("path", "text"), line_number: data["line_number"],
-                            line_text: data.dig("lines", "text")}
-                next unless matches.length >= effective_limit
+                file_path = decode_rg_text(data.is_a?(Hash) ? data["path"] : nil)
+                line_number = data.is_a?(Hash) ? data["line_number"] : nil
+                next if file_path.empty? || !line_number.is_a?(Integer)
 
-                match_limit_reached = true
-                kill_group(pid, "TERM") # the whole GROUP — the deadline path's shape
-                break
+                if limit_hit
+                  in_window = file_path == last_file && line_number <= trailing_context_end
+                  # A match inside the last match's trailing context is
+                  # shown as context (pi grep.ts:186-189).
+                  push_line.call(file_path, line_number, decode_rg_text(data["lines"]), false) if in_window
+                  match_limit_reached = true if is_match
+                  if match_limit_reached && !(in_window && line_number < trailing_context_end)
+                    kill_group(pid, "TERM") # the whole GROUP — the deadline path's shape
+                    break
+                  end
+                  next
+                end
+
+                push_line.call(file_path, line_number, decode_rg_text(data["lines"]), is_match)
+                next unless is_match
+
+                match_count += 1
+                if match_count >= effective_limit
+                  limit_hit = true
+                  trailing_context_end = line_number + context_value
+                end
               end
               status = match_limit_reached ? expire_group(pid) : waitpid_status(pid)
             end
@@ -175,7 +234,8 @@ module Tart
             err_rd.close unless err_rd.closed?
           end
 
-          [matches, match_limit_reached, match_limit_reached ? 0 : status&.exitstatus]
+          [output_lines, match_count, match_limit_reached, lines_truncated, output_line_count,
+           output_bytes, match_limit_reached ? 0 : status&.exitstatus]
         end
       end
 
@@ -261,24 +321,32 @@ module Tart
         nil
       end
 
-      def format_matches(matches, search_path, is_directory, context_value, effective_limit, match_limit_reached)
-        lines_truncated = false
-        output_lines = matches.flat_map do |match|
-          if context_value.zero? && match[:line_text]
-            relative = format_path(match[:file_path], search_path, is_directory)
-            sanitized = match[:line_text].gsub("\r\n", "\n").tr("\r", "").delete_suffix("\n")
-            truncated = Truncate.truncate_line(sanitized)
-            lines_truncated ||= truncated[:was_truncated]
-            "#{relative}:#{match[:line_number]}: #{truncated[:text]}"
-          else
-            format_block(match[:file_path], match[:line_number], search_path, is_directory, context_value) do |was|
-              lines_truncated ||= was
-            end
-          end
-        end
+      # pi grep.ts:70-76 (decodeRgText): rg's JSON text fields carry UTF-8
+      # data as `text` and NON-UTF-8 data base64-encoded in `bytes` — the
+      # no-matched-file-reads law (#9276) needs the bytes arm or a binary
+      # match would render empty. Returns "" for a missing/foreign-shaped
+      # field (pi's fallthrough).
+      def decode_rg_text(field)
+        return "" unless field.is_a?(Hash)
+        return field["text"] if field["text"].is_a?(String)
+        return field["bytes"].unpack1("m0").force_encoding(Encoding::UTF_8).scrub if field["bytes"].is_a?(String)
+
+        ""
+      end
+
+      # The collected stream rows become the final output (pi grep.ts
+      # :276-302). The truncation totals carry the COUNTED rows — the
+      # stored ones stop at the byte cap (#9276's :231 note), so the raw
+      # content alone would understate them; pi overwrites both after
+      # truncateHead and the port follows.
+      def format_output(output_lines, match_count, match_limit_reached, effective_limit,
+                        lines_truncated, output_line_count, output_bytes)
+        return "No matches found" if match_count.zero?
 
         raw_output = output_lines.join("\n")
         truncation = Truncate.truncate_head(raw_output, max_lines: Float::MAX.to_i)
+        truncation.total_lines = output_line_count
+        truncation.total_bytes = output_bytes - 1
         output = truncation.content
         notices = []
         @details = {}
@@ -305,34 +373,6 @@ module Tart
           return relative unless relative.empty? || relative.start_with?("..")
         end
         File.basename(file_path)
-      end
-
-      # Context blocks: `path:line: text` for the match line,
-      # `path-line- text` for context (pi's formatBlock).
-      def format_block(file_path, line_number, search_path, is_directory, context_value)
-        relative = format_path(file_path, search_path, is_directory)
-        lines = file_lines(file_path)
-        return ["#{relative}:#{line_number}: (unable to read file)"] if lines.empty?
-
-        start = context_value.positive? ? [1, line_number - context_value].max : line_number
-        finish = context_value.positive? ? [lines.length, line_number + context_value].min : line_number
-        (start..finish).map do |current|
-          line_text = lines[current - 1] || ""
-          sanitized = line_text.tr("\r", "")
-          truncated = Truncate.truncate_line(sanitized)
-          yield truncated[:was_truncated]
-          if current == line_number
-            "#{relative}:#{current}: #{truncated[:text]}"
-          else
-            "#{relative}-#{current}- #{truncated[:text]}"
-          end
-        end
-      end
-
-      def file_lines(file_path)
-        File.read(file_path).gsub("\r\n", "\n").tr("\r", "\n").split("\n")
-      rescue StandardError
-        []
       end
     end
   end

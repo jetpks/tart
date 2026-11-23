@@ -313,6 +313,53 @@ module Tart
       tools
     end
 
+    # The `--tools` flag's parsed shape (pi sdk.ts:280-291 + settings-manager
+    # getToolListError :97-107, the #10785 interactive arm). nil = the flag is
+    # absent; a list of ONLY `+name`/`-name` entries is a MODIFIER list (they
+    # compose on the default selection, and on a resumed session's RESTORED
+    # loadout); anything else is an EXPLICIT allowlist (the print-mode
+    # letter — plain names select exactly). Raises ArgumentError with pi's
+    # literals when plain names and modifiers mix, or a modifier carries a
+    # `*` pattern.
+    def parse_tool_selection(value)
+      return nil if value.nil?
+
+      entries = value.split(",").map(&:strip).reject(&:empty?)
+      return nil if entries.empty?
+
+      modifiers, plains = entries.partition { |entry| tool_modifier?(entry) }
+      unless modifiers.empty? || plains.empty?
+        raise ArgumentError, "tool names cannot be mixed with +name or -name entries"
+      end
+      if (pattern = modifiers.find { |entry| entry.include?("*") })
+        raise ArgumentError, "+name and -name entries take exact tool names, not patterns: #{pattern}"
+      end
+      modifiers.empty? ? {explicit: entries} : {modifiers:}
+    end
+
+    # The per-session tool-name composition (pi #10785: sdk.ts :283-286 +
+    # agent-session.ts :562/:1907-1948). +cli_tools+ is
+    # {Settings.parse_tool_selection}'s result (nil/explicit/modifiers);
+    # +default_tools+ the boot's settings-resolved selection; +recorded+
+    # the resumed session's replayed loadout names (nil OR EMPTY when the
+    # session records no loadout — "No recorded loadout: keep the current
+    # tools"; an empty Array is TRUTHY in Ruby, so the guard must test
+    # emptiness, never truthiness). An EXPLICIT list selects exactly (the
+    # restore is skipped, pi changelog #10785); modifiers compose on the
+    # RESTORED loadout when one exists, else on the default; absent = the
+    # restored loadout when recorded, else the default.
+    def resolve_session_tool_names(cli_tools:, default_tools:, recorded: nil)
+      base = recorded.nil? || recorded.empty? ? default_tools : recorded
+      case cli_tools
+      in {explicit: names}
+        names
+      in {modifiers:}
+        apply_tool_modifiers(base, modifiers)
+      else
+        base
+      end
+    end
+
     # The known thinkingLevelMap for one model id (the boot/switch map
     # tier beside {MODEL_CONTEXT_WINDOWS}/{MODEL_REASONING}). nil = no
     # known map (pi's map-less rule).
