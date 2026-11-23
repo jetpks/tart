@@ -84,8 +84,14 @@ module Tart
     # so a setup hook would silently miss them — require time covers the
     # serial run AND every parallel worker by construction. The staged
     # fixtures win by construction afterward; the exempt keys are the
-    # harness's own (the runner's jobs override; the e2e live-space gate).
-    SEAT_SCRUB_EXEMPT = %w[TART_TEST_JOBS TART_E2E_SPACE].freeze
+    # harness's own (the runner's jobs override; the e2e live-space gate)
+    # — and the capability rail's force-off (line 11): the require-time
+    # scrub runs AFTER the rail sets it, so without the exemption the
+    # scrub deletes the force-off and ambient detection shapes every
+    # non-injecting test (the I111 D4 seat-sensitivity, caught by the
+    # driver's integrate-proof run at a herdr+tmux seat: 13 link pins
+    # red; exempting makes the OFF arm deterministic at every seat).
+    SEAT_SCRUB_EXEMPT = %w[TART_TEST_JOBS TART_E2E_SPACE TART_HYPERLINKS].freeze
 
     # The pre-scrub snapshot (frozen {String => String}): exactly the
     # keys the last scrub_seat_env! deleted, so scrub/restore are exact
