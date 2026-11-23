@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **The compat-nil default-arm instruction role changes developer → system (I115 — the
+  fast-completions 0.10.0 re-pin; the wire-parity half of the REPIN).** The gem absorbs the
+  three pi v1.6.0 wire fixes (the vocabulary default #10741, the cross-model thinking drop
+  #10995, the `tools: []` fallback gate #11843); the VISIBLE echo on tart's default arm is
+  the instruction role: pi `openai-completions.js:890` instructionRole + `:1259-1265`
+  `supportsDeveloperRole = isOpenAI` — the default dialect arm is non-OpenAI, so its
+  reasoning-model instruction message rides `system` now (`test/agent_loop_test.rb` Pins 8/9
+  re-seated in place; the zai explicit-true arm still opts in to `developer`). The rig wire
+  goldens are byte-held (the mock models are `reasoning: false`); nothing renders — zero
+  screen movement.
 - **The parity oracle repins v1.1.0 → v1.6.0 (I114 — the ratified REPIN, plan ENTRY 1).**
   `Identity::ORACLE_VERSION` bumps to `"1.6.0"` (the tracked constant — the pi-mode
   version-banner pair moves BY DESIGN with the oracle pin) and the rig's DEFAULT oracle
