@@ -276,6 +276,20 @@ module Tart
       # denominator) — the test/launcher readback for the switch seam.
       attr_reader :context_window
 
+      # pi getContextUsage (the ctx.getContextUsage the architect-loop's
+      # driving-cadence guard reads): the I29/I31 usage estimate over the
+      # flat history + the resolved context window — no new estimation
+      # machinery, both inputs already maintained by the compaction
+      # trigger path. nil when the window is unresolvable (usage
+      # unmeasurable — the cadence guard skips, never compacts blind).
+      def context_usage
+        window = resolved_context_window
+        return nil unless window.is_a?(Integer) && window.positive?
+
+        tokens = Compaction.estimate_context_tokens(@chat.messages, tools: @chat.tools)[:tokens]
+        {tokens: tokens, context_window: window, percent: (tokens * 100.0 / window).round}
+      end
+
       # The session's thinking level (pi agent.state.thinkingLevel) — the
       # surface's readback ({Render::Chat#apply_thinking_selection} drives
       # it through {set_thinking_level}).

@@ -530,7 +530,7 @@ module Tart
 
         Spawn contract: every role spawn is a subagent tool call carrying async: true and an explicit timeout_ms sized for that role's whole run — spec 3600000, builder 7200000, judge 7200000, narrator 300000 — never the 30-minute default. Every spawn also carries an explicit model pin from the standing routing: #{pins}. If the plan pins model/thinking for a role on a specific iteration, pass that pin in the spawn's model field as provider/id[:thinking] — it overrides the standing routing for that spawn. (tart cwd law: role children always run in THIS session's cwd — launch the driver from the space root so spec/judge/narrator children land there; a builder child honors its lane-worktree cwd law through its task, which names the worktree as the working directory to work inside.)
 
-        Compaction: call the architect_compact tool after every child launch, while a child is in flight — this playbook (with the plan reference and routing pins) is the compaction's keep-essentials; everything else is recoverable from disk. A child in flight is the wake source that resumes the session after the compaction aborts the turn: NEVER compact before this session's first child launch, and never once every child has settled — that leaves an aborted turn with no wake source, and the loop stalls. (Port note: the tart port never aborts the turn — architect_compact schedules the compaction at the post-run point; the tool result returns, the run ends, the compaction lands, and the in-flight child's completion wake resumes the session.)
+        Compaction: call the architect_compact tool after every child launch, while a child is in flight — the tool self-guards on context size, so a call under the compaction threshold is a cheap no-op: keep the cadence, never measure tokens yourself. When it does compact, this playbook (with the plan reference and routing pins) is the compaction's keep-essentials, and it is re-sent into the session after every compaction; everything else is recoverable from disk. A child in flight is the wake source that resumes the session after the compaction aborts the turn: NEVER compact before this session's first child launch, and never once every child has settled — that leaves an aborted turn with no wake source, and the loop stalls. (Port note: the tart port never aborts the turn — architect_compact schedules the compaction at the post-run point; the tool result returns, the run ends, the compaction lands, and the in-flight child's completion wake resumes the session; every compaction — the scheduled ones and the loop's own alike — also re-sends this playbook as a next-turn message the next wake delivers.)
 
         Tending: rely on native async completion wakes. Never sleep and never poll-loop. If a child died as infrastructure (failed to start, or crashed before doing any work), relaunch it ONCE. A child that hit its timeout is not infrastructure death, and reviving its session fails deterministically upstream — do not attempt resume: launch exactly one replacement in the same cwd with a larger explicit timeout_ms, and make auditing the inherited uncommitted diff its first task. Anything else — a failed child, a verdict you cannot act on, anything you cannot root-cause — is an exception.
 
@@ -617,6 +617,31 @@ module Tart
       nil
     end
 
+    # --- driver compaction threshold (pi architect-loop.ts :453-475, the
+    # 6576da6 update): the cadence compacts only a meaningfully full
+    # context ---
+
+    # The floor: never compact on cadence below this many tokens, whatever
+    # the window (pi COMPACT_FLOOR_TOKENS).
+    COMPACT_FLOOR_TOKENS = 150_000
+    # The window fraction: ~15% of the context window (pi
+    # COMPACT_WINDOW_FRACTION; 150k on a 1.0M window).
+    COMPACT_WINDOW_FRACTION = 0.15
+
+    # The driver-cadence compaction threshold (pi compactionThreshold): the
+    # harder-to-reach of the token floor and the window fraction — a small
+    # window never slides back into over-compaction (the failure this
+    # threshold exists to fix), a large window scales up.
+    def compaction_threshold(context_window)
+      [COMPACT_FLOOR_TOKENS, (COMPACT_WINDOW_FRACTION * context_window).floor].max
+    end
+
+    # True only strictly over the threshold (pi shouldCompact); nil tokens
+    # (just compacted, no estimate yet) never compact.
+    def should_compact?(tokens, context_window)
+      !tokens.nil? && tokens > compaction_threshold(context_window)
+    end
+
     # --- surfaces (A-Law 4/5: two surfaces, one code path) ---
 
     # The /loop command handler (pi registerCommand loop :599-609): parse
@@ -664,6 +689,22 @@ module Tart
         @driver_playbook_text = nil
         config = resolve_config(session_cwd, env: env)
         generate_agent_files(config, output:, catalog: catalog_loader, env: env) if config
+      end
+
+      # Every compaction — the architect_compact cadence's own and the
+      # loop's auto-compaction alike — emits :compaction. While driving,
+      # the playbook is re-sent right after it (pi's session_compact hook,
+      # architect-loop.ts :635-644): the loop's own compactions carry no
+      # customInstructions, so without the re-send an auto-compaction would
+      # strip the driver's operating instructions mid-drive. The I47
+      # send_next_turn queue is pi's sendMessage({triggerTurn: false})
+      # analog — queue only; the next wake (the in-flight child's
+      # completion) drains it, so a re-send never opens a turn by itself.
+      hooks.on(:compaction) do |_event, _context|
+        next if @driver_playbook_text.nil?
+
+        hooks.send_next_turn(custom_type: "architect-driver-playbook",
+                             content: @driver_playbook_text, display: false)
       end
 
       # The builder guard for subagent-spawned builders (pi :583-591):
