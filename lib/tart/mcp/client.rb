@@ -298,6 +298,12 @@ module Tart
         end
 
         @protocol_version = result["protocolVersion"]
+        # pi's optional transport hook (client.ts:242): after initialize the
+        # negotiated version rides the MCP-Protocol-Version header on every
+        # Streamable HTTP request (the I122 transport implements it; Stdio
+        # has no such header and no method — the respond_to? guard keeps
+        # the stdio seam byte-untouched).
+        transport.set_protocol_version(@protocol_version) if transport.respond_to?(:set_protocol_version)
         @server_info = result["serverInfo"]
         @server_capabilities = result["capabilities"]
         @instructions = result["instructions"]

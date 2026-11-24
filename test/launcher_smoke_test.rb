@@ -64,6 +64,95 @@ module Tart
       FileUtils.rm_rf(home)
     end
 
+    # I122 (AC2, the models.json never-raise law at the REAL boots): a bad
+    # mcp.json never crashes a boot — every failure class becomes a named
+    # stderr warn (print, the models.error seat) and the run completes.
+    # At the base the same boots DIE on the raw ConfigError backtrace (the
+    # owner's recorded crash — the interactive seat at bin/tart's bare
+    # load; the print seat through build_tools' default kwarg, whose raise
+    # escapes the method's own rescue: a Ruby default-kwarg raise is not
+    # caught by the body's rescue — measured).
+    def test_mcp_streamable_print_boot_never_raises_on_a_bad_mcp_config
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "still boots"}])
+
+      home = Dir.mktmpdir("t122-mcp-home-")
+      config = File.join(home, "mcp.json")
+      classes = {
+        "malformed json" => ["{not json", /tart: #{Regexp.escape(config)}: /],
+        "root shape" => ["[1, 2]",
+          /tart: #{Regexp.escape(config)}: expected an object with an "mcpServers" object/],
+        "per-server schema failure" =>
+          [{"mcpServers" => {"x" => {"cwd" => 3}}}.to_json,
+           /tart: #{Regexp.escape(config)}: server "x": cwd must be a string/],
+        "legacy sse transport" =>
+          [{"mcpServers" => {"x" => {"type" => "sse", "url" => "https://e/mcp"}}}.to_json,
+           /legacy SSE transport is not supported; use the streamable HTTP URL/]
+      }
+      classes.each do |label, (body, pattern)|
+        File.write(config, body)
+        server.script([{type: :message, content: "still boots"}])
+        stdout, stderr, status = Open3.capture3(smoke_env(home, server).merge("TART_MCP_CONFIG" => config),
+          RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "say the word",
+          chdir: REPO_ROOT)
+        assert_equal 0, status.exitstatus, "#{label}: the boot never crashes (stderr: #{stderr})"
+        assert_includes stdout, "still boots", "#{label}: the run completes"
+        assert_match(pattern, stderr, "#{label}: the named diagnostic warns on stderr")
+      end
+    ensure
+      server.stop
+      FileUtils.rm_rf(home)
+    end
+
+    # I122 (AC2 + the print/children deferral ruling): an HTTP server entry
+    # in print mode warn-and-skips at the NAMED reactor-seat error (the
+    # mcp-print-reactor backlog class, extended to the HTTP transport — the
+    # same seat law as Stdio; the boot completes, the default wire holds).
+    def test_mcp_streamable_print_boot_warns_the_seat_error_for_http_servers
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "print answer"}])
+
+      home = Dir.mktmpdir("t122-mcp-seat-")
+      config = File.join(home, "mcp.json")
+      File.write(config, {"mcpServers" => {"prod-mcp-gw" => {"type" => "http",
+                                                             "url" => "http://127.0.0.1:9/mcp"}}}.to_json)
+      stdout, stderr, status = Open3.capture3(smoke_env(home, server).merge("TART_MCP_CONFIG" => config),
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "say the word",
+        chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "the owner's config shape never crashes the boot (stderr: #{stderr})"
+      assert_includes stdout, "print answer", "the run completes"
+      assert_match(/tart: mcp server "prod-mcp-gw" failed to connect: MCP HTTP start runs on the host reactor/, stderr)
+      body = server.captured_request_logs.pop[:body]
+      refute_includes body["tools"].map { |tool| tool["function"]["name"] }.join(" "), "mcp__",
+        "the skipped server leaves no tool on the wire"
+    ensure
+      server.stop
+      FileUtils.rm_rf(home)
+    end
+
+    # I122 (the boot seats, source-shaped): the interactive boot consumes
+    # the never-raising loader, surfaces its diagnostics as command rows
+    # (the models.error seat), and the build_tools default is the lenient
+    # loader too (the print-crash landmine). The transports' reactor-seat
+    # connect deferral is the named mcp-boot-reactor follow-up (the
+    # mcp-http-e2e gate proves the boot-shaped Sync seat).
+    def test_mcp_streamable_boot_seats_source_shape
+      source = File.read(File.join(REPO_ROOT, "bin", "tart"))
+      assert_includes source, "Mcp::Config.load_with_diagnostics(mcp_config_path)",
+        "both boots load through the never-raising seam"
+      assert_equal 3, source.scan(/Mcp::Config\.load_with_diagnostics\(mcp_config_path\)/).size,
+        "exactly three load seats (interactive + print + the build_tools default — the landmine death)"
+      assert_includes source, "mcp.diagnostics.each { |d| surface.command_line(d) }",
+        "the interactive diagnostics ride command rows (the models.error seat)"
+      assert_includes source, 'mcp.diagnostics.each { |d| warn "tart: #{d}" }',
+        "the print diagnostics ride stderr warns (the models.error print seat)"
+      assert_includes source, "mcp_servers: Mcp::Config.load_with_diagnostics(mcp_config_path).servers",
+        "the build_tools default is the lenient loader (the print-crash landmine dies)"
+      refute_includes source, "streamable HTTP transport is not supported",
+        "the dead port-specific error string is gone from the launcher"
+    end
+
     # The async-reactor IO::Buffer experimental warning never fires in print
     # mode (print mode records no session and its LLM turns run on the same
     # fiber-scheduler-cooperative :net_http path as every mode — I50 de-bridge:

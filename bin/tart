@@ -161,9 +161,11 @@ module Tart
           templates are listed in the startup [Prompts] section.
 
         MCP servers:
-          MCP stdio servers are loaded from ~/.tart/mcp.json (shape:
-          {"mcpServers": {name: {command, args?, env?}}}); their tools join
-          the loadout as mcp__<server>__<tool>.
+          MCP servers are loaded from ~/.tart/mcp.json (shape:
+          {"mcpServers": {name: ...}}): stdio entries carry a command,
+          streamable HTTP entries a url (with optional headers); their
+          tools join the loadout as mcp__<server>__<tool>. A bad mcp.json
+          never crashes a boot - the bad server is skipped with a warning.
 
         Environment:
           Every app variable speaks the resolved identity's namespace —
@@ -284,6 +286,12 @@ module Tart
       resolved = Shapes::ResolvedSettings.from_load(result, identity:)
       models = Models.load
       warn "tart: #{models.error}" if models.error
+      # The MCP config rides the same never-raise law in print mode (the
+      # models.json warn seat): a bad mcp.json is a named stderr warn,
+      # the good servers still load — a boot never crashes on the config
+      # file (the interactive crash the owner recorded, both boots).
+      mcp = Mcp::Config.load_with_diagnostics(mcp_config_path)
+      mcp.diagnostics.each { |d| warn "tart: #{d}" }
       require_api_key(settings, models, identity:, resolved:)
       skills = Skills.load(cwd: workdir)
       context_files = Agent::ContextFiles.load(cwd: workdir, agent_dir: Agent::Session.default_root)
@@ -348,6 +356,7 @@ module Tart
         prompt: options[:print],
         chat:,
         tools: selected_tools ? nil : build_tools(workdir, settings,
+          mcp_servers: mcp.servers,
           identity:, session_env: print_session_env(recorder, boot, thinking.fetch(:thinking_level)), hooks:),
         selected_tools:,
         steer_inbox: options[:steer_inbox],
@@ -419,7 +428,14 @@ module Tart
         prompts = Prompts::Result.new(templates: Subagents.merge_workflow_templates(prompts.templates),
                                       diagnostics: prompts.diagnostics)
       end
-      mcp_servers = Mcp::Config.load(mcp_config_path)
+      # The MCP config (I122, the models.json never-raise law): the boot
+      # consumes the never-raising load — a malformed file, a bad root
+      # shape, or an invalid server entry is a NAMED diagnostic (surfaced
+      # as a row below) and the server is SKIPPED; the good servers still
+      # load. Config.load's fail-fast raise contract stays for direct
+      # callers — the boot seat owns the never-raise.
+      mcp = Mcp::Config.load_with_diagnostics(mcp_config_path)
+      mcp_servers = mcp.servers
       # The models.json catalog (I27): the /model menu's entries and the
       # boot-model resolution's middle layer; a load/parse/schema
       # failure sets its error (surfaced below, never a crash).
@@ -648,6 +664,7 @@ module Tart
         start_session.call(nil, "startup") unless resume_path
         report_diagnostics(result.diagnostics, surface:)
         surface.command_line(models.error) if models.error
+        mcp.diagnostics.each { |d| surface.command_line(d) }
         skills.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
         prompts.diagnostics.each { |d| surface.command_line("#{d.path}: #{d.message}") }
 
@@ -1017,7 +1034,12 @@ module Tart
       }
     end
 
-    def build_tools(workdir, settings, mcp_servers: Mcp::Config.load(mcp_config_path),
+    # The default is the never-raising load (I122): a stale fail-fast
+    # default here crashed the PRINT boot on any bad mcp.json — a Ruby
+    # default-kwarg raise escapes the method's own rescue (measured; the
+    # landmine dies with the lenient default; every boot caller passes
+    # mcp_servers explicitly, the diagnostics never silently dropped).
+    def build_tools(workdir, settings, mcp_servers: Mcp::Config.load_with_diagnostics(mcp_config_path).servers,
                     identity: Identity::DEFAULT, session_env: {}, hooks: nil, selected: nil)
       Tools::Registry.build(selected: selected || Settings.selected_tools(settings), cwd: workdir,
         mcp_servers:, identity:, session_env:, hooks:)
