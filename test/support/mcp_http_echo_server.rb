@@ -23,6 +23,12 @@
 # - MCP_HTTP_ECHO_GET_STREAM=1  GET opens a server-to-client SSE stream
 #   and sends one `ping` REQUEST after the first POST is seen; the client's
 #   built-in ping answer comes back as a POST the server records.
+# - MCP_HTTP_ECHO_GET_STALL=1   GET opens a server-to-client SSE stream
+#   and then sends NOTHING (the stalled-stream row: the reader must fail
+#   within the request timeout, never hang).
+# - MCP_HTTP_ECHO_SLOW_SSE=1    (with MCP_HTTP_ECHO_SSE) the SSE reply's
+#   answer event arrives 2s after an immediate unrelated notification —
+#   a reply no bounded client can wait out (the bounded-read row).
 # - MCP_HTTP_ECHO_STATUS=<n>    answer HTTP <n> with a JSON error body on
 #   every POST (the named-error taxonomy rows).
 # - MCP_HTTP_ECHO_LATE_404=1    answer 404 on every POST after the first
@@ -173,6 +179,9 @@ serve_connection = lambda do |conn|
       ping = JSON.generate({jsonrpc: "2.0", id: "srv-1", method: "ping"})
       sse_chunk.call(conn, "event: message\r\ndata: #{ping}\r\n\r\n")
       conn.read(1) rescue nil # hold the stream open until the client closes
+    elsif ENV["MCP_HTTP_ECHO_GET_STALL"]
+      write_response.call(conn, 200, "OK", {"Content-Type" => "text/event-stream", "Cache-Control" => "no-store"}, nil)
+      conn.read(1) rescue nil # headers only — the stream never sends a byte
     else
       write_response.call(conn, 405, "Method Not Allowed", {"Content-Type" => "application/json"}, "{}")
     end
@@ -198,6 +207,7 @@ serve_connection = lambda do |conn|
                                           "Mcp-Session-Id" => session_id,
                                           "Cache-Control" => "no-store"}, nil)
     sse_chunk.call(conn, "event: message\r\ndata: #{notification}\r\n\r\n")
+    sleep 2.0 if ENV["MCP_HTTP_ECHO_SLOW_SSE"] # later than any bounded read
     sse_chunk.call(conn, "event: message\r\ndata: #{response}\r\n\r\n")
     conn.write("0\r\n\r\n")
     conn.flush
