@@ -4,19 +4,21 @@ require "dry/monads"
 
 require_relative "mcp/jsonrpc"
 require_relative "mcp/stdio"
+require_relative "mcp/http"
 require_relative "mcp/client"
 require_relative "mcp/config"
 require_relative "mcp/tool"
 require_relative "config_value"
 
 module Tart
-  # MCP server support (BRIEF §7.3): hand-rolled stdio JSON-RPC client,
-  # mcp.json-shaped configuration, and the tool wrapper that puts configured
-  # servers' tools into the loadout as mcp__<server>__<tool>.
+  # MCP server support (BRIEF §7.3): hand-rolled JSON-RPC client over the
+  # two transports (stdio + Streamable HTTP, I122), mcp.json-shaped
+  # configuration, and the tool wrapper that puts configured servers'
+  # tools into the loadout as mcp__<server>__<tool>.
   #
-  # Parity shape (pi): transports/ (Stdio) split from the protocol client
-  # (Client); config validation carries pi's exact error strings (Config);
-  # the exposure surface ships `direct` only.
+  # Parity shape (pi): transports/ (Stdio + Http) split from the protocol
+  # client (Client); config validation carries pi's exact error strings
+  # (Config, both arms); the exposure surface ships `direct` only.
   #
   # I45: the client's call surface returns Results — a server that fails to
   # connect or list arrives here as a Failure value (no rescue wall): the
@@ -58,19 +60,30 @@ module Tart
     #   explicit in the branches).
     def server_tools(name, config, used:, env: ENV)
       client = Client.new
-      # I119: the server's env VALUES resolve at connect (pi
-      # extensions/mcp/runtime.ts:112-113 — `resolveConfigValueOrThrow(value,
-      # `MCP server "<name>" env "<KEY>"`)`); an unresolvable value (or a
-      # `!command` value) is THIS server's connect failure — the named
-      # message on the existing warn surface, no child spawned. The scrub
-      # composition in Stdio#spawn_child (I73) is untouched: the resolved
-      # hash rides where the raw one did, config still winning over the base.
+      # The transport dispatch (pi's createDefaultTransport,
+      # extensions/mcp/runtime.ts:98-124): an `url` entry rides the
+      # Streamable HTTP transport — its `headers` VALUES resolving exactly
+      # like stdio's env VALUES (I119; pi's resolveHeadersOrThrow with the
+      # `MCP server "<name>" header "<KEY>"` description) — and a
+      # `command` entry rides Stdio unchanged (the I119 env law verbatim:
+      # an unresolvable or `!command` value is THIS server's connect
+      # failure — the named message on the existing warn surface, no
+      # child spawned; the I73 scrub composition in Stdio#spawn_child is
+      # untouched, the resolved hash riding where the raw one did).
       connected = begin
-        resolved_env = config[:env]&.to_h do |key, value|
-          [key, ConfigValue.resolve!(value, "MCP server \"#{name}\" env \"#{key}\"", env:)]
+        transport = if config[:url]
+          resolved_headers = config[:headers]&.to_h do |key, value|
+            [key, ConfigValue.resolve!(value, "MCP server \"#{name}\" header \"#{key}\"", env:)]
+          end
+          Http.new(url: config[:url], headers: resolved_headers)
+        else
+          resolved_env = config[:env]&.to_h do |key, value|
+            [key, ConfigValue.resolve!(value, "MCP server \"#{name}\" env \"#{key}\"", env:)]
+          end
+          Stdio.new(command: config[:command], args: config[:args],
+                    env: resolved_env, cwd: config[:cwd])
         end
-        client.connect(Stdio.new(command: config[:command], args: config[:args],
-                                 env: resolved_env, cwd: config[:cwd]))
+        client.connect(transport)
       rescue ConfigValue::Error => e
         Failure(e)
       end
