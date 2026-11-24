@@ -788,9 +788,13 @@ module Tart
     # The print-boot subprocess env for the templated legs: staged HOME, the
     # pi identity, NO <IDENTITY>_API_KEY, the model tiers nil-scrubbed so the
     # catalog's default decides, MCP absent.
+    # nil-scrubs FIREWORKS_API_KEY too: spawn merges the parent env, and a
+    # CI/agent parent carrying the identity's key would resolve the template
+    # (and hit the network) instead of exercising the named-failure leg.
     def templated_env(home)
       {"PATH" => ENV.fetch("PATH", nil), "HOME" => home, "TART_IDENTITY" => "pi",
        "TART_MCP_CONFIG" => File.join(home, "absent-mcp.json"),
+       "FIREWORKS_API_KEY" => nil,
        "PI_MODEL" => nil, "PI_PROVIDER" => nil, "TART_MODEL" => nil, "TART_PROVIDER" => nil,
        "PI_CONTEXT_WINDOW" => nil, "TART_CONTEXT_WINDOW" => nil}
     end
