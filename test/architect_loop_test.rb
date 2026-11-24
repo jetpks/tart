@@ -71,24 +71,136 @@ module Tart
       Core::Loop.new(session: Test::ScriptedSession.new).run { yield }
     end
 
-    # --- A-Law 1: the gate (default off; settings row + env tier) ---
+    # --- A-Law 1: the gate (DEFAULT ON since the I121 flip — the I70
+    # subagents precedent; the settings row + env tier override BOTH
+    # directions; the ladder moved into Settings.resolve_setting) ---
 
-    def test_gate_is_default_off_with_settings_and_env_tiers
-      assert_equal false, ArchitectLoop.enabled?({}, identity: "pi", env: {}),
-        "no settings row and no env tier = OFF (the default-off law)"
+    # I121 move (was …_default_off_…): the gate defaults ON — the row pin
+    # moves with the flip, both-direction tier discrimination preserved,
+    # and the foreign-identity assert re-seats over a staged file opt-out
+    # (under default-on the DEFAULTS tier answers on, so the foreign-tier
+    # discrimination needs the opt-out row to stay observable).
+    def test_loop_default_gate_is_default_on_with_both_direction_tier_overrides
+      assert_equal true, Settings::DEFAULTS["architect_loop"], "the DEFAULTS row flipped (the I70 literal)"
+      assert_equal "ARCHITECT_LOOP", Settings::RESOLUTION_ENV["architect_loop"], "the env registry entry"
+      assert_equal true, ArchitectLoop.enabled?({}, identity: "pi", env: {}),
+        "no settings row and no env tier = ON (the I121 default-on law)"
       assert_equal true, ArchitectLoop.enabled?({"architect_loop" => true}, identity: "pi", env: {})
       assert_equal true, ArchitectLoop.enabled?({"architect_loop" => "true"}, identity: "pi", env: {})
       assert_equal true, ArchitectLoop.enabled?({"architect_loop" => "1"}, identity: "pi", env: {})
       assert_equal false, ArchitectLoop.enabled?({"architect_loop" => false}, identity: "pi", env: {}),
-        "an explicit false row stays off"
+        "the file opt-out tier (a PRESENT false beats the default — the I70 false-presence cure)"
+      assert_equal false, ArchitectLoop.enabled?({"architect_loop" => "0"}, identity: "pi", env: {}),
+        "the file opt-out '0' spelling"
+      assert_equal false, ArchitectLoop.enabled?({"architect_loop" => "false"}, identity: "pi", env: {}),
+        "the file opt-out 'false' spelling"
       assert_equal true, ArchitectLoop.enabled?({}, identity: "pi", env: {"PI_ARCHITECT_LOOP" => "1"})
       assert_equal true, ArchitectLoop.enabled?({}, identity: "pi", env: {"PI_ARCHITECT_LOOP" => "true"})
       assert_equal true, ArchitectLoop.enabled?({}, identity: "tart", env: {"TART_ARCHITECT_LOOP" => "1"}),
         "the env tier rides the identity's namespace"
-      assert_equal false, ArchitectLoop.enabled?({}, identity: "tart", env: {"PI_ARCHITECT_LOOP" => "1"}),
-        "a foreign identity's tier never reads"
+      assert_equal false, ArchitectLoop.enabled?({"architect_loop" => false}, identity: "tart",
+                                           env: {"PI_ARCHITECT_LOOP" => "1"}),
+        "a foreign identity's tier never reads (the file opt-out holds — the PI_ row is not consulted)"
+      assert_equal false, ArchitectLoop.enabled?({}, identity: "pi", env: {"PI_ARCHITECT_LOOP" => "0"}),
+        "the env opt-out tier (any non-on value)"
+      assert_equal false, ArchitectLoop.enabled?({}, identity: "pi", env: {"PI_ARCHITECT_LOOP" => "false"})
+      assert_equal true, ArchitectLoop.enabled?({"architect_loop" => false}, identity: "pi", env: {"PI_ARCHITECT_LOOP" => "1"}),
+        "the env tier beats the file tier, on direction"
+      assert_equal false, ArchitectLoop.enabled?({"architect_loop" => true}, identity: "pi", env: {"PI_ARCHITECT_LOOP" => "0"}),
+        "the env tier beats the file tier, off direction"
       assert_equal false, ArchitectLoop.enabled?({"architect_loop" => "on"}, identity: "pi", env: {}),
-        "the on spellings are exactly true/\"true\"/\"1\""
+        "the on spellings are exactly true/\"true\"/\"1\" (the carried I95 discrimination)"
+    end
+
+    # --- the I121 default-seat family (/loop_default/): the flip's own
+    # discriminators — a DEFAULT boot registers the full surface and arms
+    # the guard; a default-gated session start regenerates the role files
+    # against a staged yaml; /loop --from launches end to end. ---
+
+    # The register-site composition (the seat's exact shape: the module
+    # predicate over a DEFAULT boot's resolved settings gates the one
+    # register call): the full surface lands and the builder guard arms.
+    def test_loop_default_seat_registers_the_surface_and_arms_the_guard
+      dir = tmpdir!("i121-seat-")
+      space, = toy_config(dir)
+      home = File.join(dir, "home")
+      FileUtils.mkdir_p(File.join(home, ".tart"))
+      # A DEFAULT boot's resolved settings: no architect_loop row staged
+      # anywhere, no env tier — the DEFAULTS tier answers on.
+      settings = Settings.load(cwd: space, root: File.join(home, ".tart")).settings
+      assert_equal true, ArchitectLoop.enabled?(settings, identity: "pi"),
+        "the default boot's resolved settings answer ON — the register site fires"
+
+      lane_wt = File.join(dir, "build", "i121-lane-x", "wt")
+      FileUtils.mkdir_p(lane_wt)
+      hooks, notices, env, catalog = new_module_hooks(lane_wt)
+      # The seat composition: register only when the predicate answers on
+      # (bin/tart's `if architect_loop_enabled?(settings, identity)`).
+      ArchitectLoop.register(hooks:, cwd: lane_wt, identity: "pi", agent: -> { nil },
+                             output: ->(text) { notices << text }, env:, catalog:) if ArchitectLoop.enabled?(settings, identity: "pi")
+      names = hooks.registered_tools.map { |tool| tool.name.to_s }.sort
+      assert_equal %w[architect_compact architect_loop], names, "the two tools registered by default"
+      assert hooks.registered_commands.any? { |command| command[:name] == "loop" }, "/loop registered by default"
+
+      # The builder guard armed: a git-write bash call inside the lane
+      # worktree blocks with the carried denial (the registry-gate idiom).
+      tools = Tools::Registry.build(selected: %w[bash], cwd: lane_wt, hooks:)
+      blocked = tools["bash"].call(command: "git commit -m 'nope'")
+      assert_equal "architect builder guard: git commit writes repository state — the architect CLI owns all commits " \
+                    "and git mutations; leave repository state alone and report what you would have run", blocked
+
+      # The opt-out seat: the SAME composition over an opted-out boot's
+      # resolved settings registers NOTHING.
+      opt_home = File.join(dir, "opt-home")
+      FileUtils.mkdir_p(File.join(opt_home, ".tart"))
+      File.write(File.join(opt_home, ".tart", "settings.json"), JSON.generate("architect_loop" => false))
+      opt_settings = Settings.load(cwd: space, root: File.join(opt_home, ".tart")).settings
+      refute ArchitectLoop.enabled?(opt_settings, identity: "pi"), "the file opt-out resolves off"
+      hooks2, = new_module_hooks(lane_wt)
+      ArchitectLoop.register(hooks: hooks2, cwd: lane_wt, identity: "pi", agent: -> { nil },
+                             output: ->(text) { notices << text }, env:, catalog:) if ArchitectLoop.enabled?(opt_settings, identity: "pi")
+      assert_empty hooks2.registered_tools, "the opted-out boot registers nothing"
+      assert_empty hooks2.registered_commands
+    end
+
+    # AC4: a default-gated session start regenerates the role files from a
+    # staged architect.yaml, write-if-changed — the 2026-11-24 stale
+    # .tart/agents residue (zai/* frontmatter against an openrouter/* yaml)
+    # is exactly what this leg cures at the next default session start.
+    def test_loop_default_session_start_regenerates_role_files_write_if_changed
+      dir = tmpdir!("i121-regen-")
+      space, config = toy_config(dir)
+      agents_dir = File.join(space, ".tart", "agents")
+      FileUtils.mkdir_p(agents_dir)
+
+      # The STALE residue shape: a pre-generated spec file whose frontmatter
+      # pins a DIFFERENT provider than the staged yaml (the flipper-era gap).
+      stale = ArchitectLoop.render_agent_file("spec", config)
+        .sub("model: mock/toy-spec:high\n", "model: zai/glm-5.3:high\n")
+      spec_path = File.join(agents_dir, "architect-spec.md")
+      File.write(spec_path, stale)
+      # An IDENTICAL narrator file: the write-if-changed no-op leg.
+      narrator = ArchitectLoop.render_agent_file("narrator", config)
+      narrator_path = File.join(agents_dir, "architect-narrator.md")
+      File.write(narrator_path, narrator)
+      narrator_mtime = File.mtime(narrator_path)
+
+      settings = Settings.load(cwd: space, root: File.join(File.join(dir, "home"), ".tart")).settings
+      FileUtils.mkdir_p(File.dirname(File.join(dir, "home", ".tart")))
+      hooks, notices, env, catalog = new_module_hooks(space)
+      ArchitectLoop.register(hooks:, cwd: space, identity: "pi", agent: -> { nil },
+                             output: ->(text) { notices << text }, env:, catalog:) if ArchitectLoop.enabled?(settings, identity: "pi")
+      assert hooks.registered_commands.any? { |command| command[:name] == "loop" },
+        "the default-gated register fired"
+
+      hooks.emit({"type" => "session_start", "reason" => "startup"}, context: {cwd: space, mode: "tui", identity: "pi"})
+      assert_equal ArchitectLoop.render_agent_file("spec", config), File.read(spec_path),
+        "the stale role file regenerated from the staged yaml (the write-if-changed rewrite)"
+      assert_equal narrator, File.read(narrator_path), "the identical file is byte-untouched"
+      assert_equal narrator_mtime, File.mtime(narrator_path), "write-if-changed: no rewrite when bytes match"
+      %w[builder judge].each do |role|
+        assert File.file?(File.join(agents_dir, "architect-#{role}.md")), "architect-#{role} generated"
+      end
     end
 
     # --- A-Law 2: split/compose ---
@@ -822,7 +934,11 @@ module Tart
     # The live harness: real Manager + SupervisorChannel + wake kernel over
     # a ScriptedSession, the module registered through the FULL boot path,
     # the driver loop carrying the module's tools + the real subagent tool.
-    def build_live_harness(space)
+    # gate_settings: :default (the I121 legs) composes the register-site
+    # shape — the register fires only when the module predicate answers on
+    # over a DEFAULT boot's resolved settings (no architect_loop row, no
+    # env tier); nil (the I95 legs) registers explicitly, byte-unchanged.
+    def build_live_harness(space, gate_settings: nil)
       stage_live_home
       @hooks = Hooks.new
       @session = Test::ScriptedSession.new
@@ -837,10 +953,18 @@ module Tart
       @channel.start
       @channels << @channel
       @manager.supervisor_channel = @channel
-      ArchitectLoop.register(hooks: @hooks, cwd: space, identity: "pi", agent: -> { @driver },
-                             output: ->(text) { @notices << text },
-                             env: {"SPACE_ARCHITECT_GLOBAL_CONFIG" => File.join(@home, "absent-global.yaml")},
-                             catalog: -> { Models.load(root: File.join(@home, ".tart")) })
+      register = -> do
+        ArchitectLoop.register(hooks: @hooks, cwd: space, identity: "pi", agent: -> { @driver },
+                               output: ->(text) { @notices << text },
+                               env: {"SPACE_ARCHITECT_GLOBAL_CONFIG" => File.join(@home, "absent-global.yaml")},
+                               catalog: -> { Models.load(root: File.join(@home, ".tart")) })
+      end
+      if gate_settings == :default
+        default_settings = Settings.load(cwd: space, root: File.join(@home, ".tart")).settings
+        register.call if ArchitectLoop.enabled?(default_settings, identity: "pi")
+      else
+        register.call
+      end
       @space = space
       tools = {}
       @hooks.registered_tools.each { |tool| tools[tool.name.to_s] = tool }
@@ -1006,6 +1130,53 @@ module Tart
           Process.kill("TERM", -record[:pid]) rescue nil
         end
       end
+    end
+
+    # AC5 (I121): the DEFAULT-GATED native launch — the /loop command on a
+    # default interactive boot installs the driver playbook and driving
+    # begins in-turn (the first child in flight before the driver's turn
+    # ends — the never-idle-first-spawn law); the 2026-11-24 manual-install
+    # deviation becomes the native path. The register itself is gated by
+    # the module predicate over a DEFAULT boot's resolved settings — at the
+    # base (default off) the harness carries NO module surface and the leg
+    # fails loud at the /loop handler (the designed-RED discriminator).
+    def test_loop_default_loop_command_launch_installs_and_driving_begins_in_turn
+      Sync do
+        space = stage_live_space
+        build_live_harness(space, gate_settings: :default)
+        assert @hooks.registered_commands.any? { |command| command[:name] == "loop" },
+          "the default-gated register fired (no row, no env — the flip)"
+
+        # The command launch: /loop --from installs the playbook.
+        plan = File.join(space, "notes", "plan-toy.md")
+        @hooks.command_handler("loop").call("--from #{plan}")
+        assert_includes @notices,
+          "architect loop: driver mode engaged — this session now drives the plan (#{plan}); " \
+          "driving starts this turn, first architect_compact after the first child launch.",
+          "pi's engaged notice carried verbatim"
+        config = ArchitectLoop.resolve_config(space, env: {"SPACE_ARCHITECT_GLOBAL_CONFIG" => File.join(@home, "absent-global.yaml")})
+        assert_equal ArchitectLoop.driver_playbook(config, plan, nil), ArchitectLoop.driver_playbook_text,
+          "the installed playbook is the composed one"
+
+        # Driving begins in-turn: the driver's FIRST request spawns the spec
+        # child (async) — the first child in flight before the turn ends.
+        @server.script([
+          {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body) == ["Drive the toy plan"] },
+           tool_calls: [{id: "d1", name: "subagent",
+                         arguments: {agent: "architect-spec", task: LIVE_SPEC_TASK, async: true,
+                                     timeout_ms: 3_600_000, model: "mock/toy-spec:high"}}]},
+          {type: :stream, match: ->(body) { child_request?(body, SPEC_PROFILE_MARKER) }, content: LIVE_SPEC_ANSWER}
+        ])
+        run_in_background(@driver, "Drive the toy plan")
+        await(@manager, "the default-launched spec run to register", belt: CHILD_BELT_S) { run_by_agent("architect-spec") }
+        record = run_by_agent("architect-spec")
+        assert record, "the first child is in flight in the launch turn"
+        join_run
+        wait_terminal(@manager, record[:id])
+        assert_run_terminal(record)
+      end
+    ensure
+      kill_stray_children
     end
 
     # (1)-(4): the tool installs the playbook, the role files land, a real

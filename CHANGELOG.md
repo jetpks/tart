@@ -4,6 +4,17 @@
 
 ### Changed
 
+- **Architect loop is on by default (I121, the I70 subagents precedent).**
+  The `architect_loop` driver-mode module — the `/loop` command, the
+  `architect_loop`/`architect_compact` tools, the builder guard, and the
+  session-start role-file regeneration under `<spaceRoot>/.tart/agents/`
+  — now registers on every default INTERACTIVE boot, so a tart session can
+  launch a space-architect loop natively without installing the playbook by
+  hand. The opt-out is a settings row `{"architect_loop": false}` or
+  `<IDENTITY>_ARCHITECT_LOOP=0` ("1"/"true" turn it back on); print mode never
+  registers (unchanged). The gate ladder moved into `Settings.resolve_setting`
+  beside `subagents`.
+
 - **The endpoint follows the model: one provider-keyed client/endpoint registry
   (`Tart::Endpoints`) resolves boot, `/model` switches, `/new`, compaction, and
   subagent children — the endpoint is no longer a session-lifetime boot fact.**
