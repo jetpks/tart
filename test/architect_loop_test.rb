@@ -18,8 +18,9 @@ module Tart
   # subagent tool + a real Manager + SupervisorChannel + the W3/W4
   # wake-kernel harness) over a toy scratch SPACE with real `bin/tart -p`
   # children performing the full arc, ONE staged escalation round trip,
-  # and the architect_compact carry observed in the captured summarization
-  # request. Hermetic: staged HOME/space, MockLLMServer, the
+  # and the architect_compact driving-cadence self-guard observed live
+  # (the skip text back to the driver, nothing scheduled under threshold).
+  # Hermetic: staged HOME/space, MockLLMServer, the
   # intercom/e2e/wake-wiring idioms with SELF-CONTAINED helpers (the I90
   # precedent). ZERO new skips; the only threads are the sanctioned
   # harness reactor threads (the intercom/wake-wiring precedents).
@@ -634,7 +635,7 @@ module Tart
       tool = Tools::ArchitectLoop.new(cwd: space, output: ->(text) { notices << text }, env:, catalog:)
       assert_equal "architect_loop", tool.name
       assert_includes tool.description, "the detached coordinator is retired"
-      assert_includes tool.description, "call architect_compact only after a child launch, never before the first"
+      assert_includes tool.description, "call architect_compact after each child launch, never before the first (the tool self-guards on context size)"
       assert_includes tool.description, "Requires the cwd to be inside a space (space.yaml + architect.yaml)."
 
       assert_equal "architect_loop: pass exactly one of `from` (path to the plan file, preferred) or `plan` (the plan text)",
@@ -731,6 +732,154 @@ module Tart
       raising.define_singleton_method(:request_manual_compaction) { |**| raise StandardError, "boom" }
       failing = Tools::ArchitectCompact.new(driver: driver_module, agent: -> { raising })
       assert_equal({error: "architect_compact: compaction failed — boom"}, failing.execute)
+
+      # The 6576da6 threshold update rides the description verbatim.
+      assert_includes tool.description,
+        "the playbook is re-sent into the session after any compaction; everything else is recoverable from disk"
+      assert_includes tool.description,
+        "a call with the context under the compaction threshold (max(150k tokens, 15% of the context window)) is a skipped no-op"
+    end
+
+    # --- the driving-cadence threshold (pi architect-loop.ts :453-475, the
+    # 6576da6 update) — the cadence compacts only a meaningfully full context
+
+    def test_compaction_threshold_is_the_harder_to_reach_of_floor_and_window_fraction
+      threshold = ArchitectLoop.method(:compaction_threshold)
+      assert_equal 150_000, threshold.call(1_000_000), "both say 150k"
+      assert_equal 150_000, threshold.call(900_000), "15% is 135k — the floor wins"
+      assert_equal 150_000, threshold.call(200_000), "15% would be 30k — small windows never over-compact"
+      assert_equal 165_000, threshold.call(1_100_000), "the fraction wins past 1M"
+      assert_equal 300_000, threshold.call(2_000_000)
+    end
+
+    def test_should_compact_never_on_nil_tokens_and_only_strictly_over
+      should = ArchitectLoop.method(:should_compact?)
+      refute should.call(nil, 1_000_000), "just compacted, no estimate yet"
+      refute should.call(0, 1_000_000)
+      refute should.call(150_000, 1_000_000), "at the threshold is not over it"
+      assert should.call(150_001, 1_000_000)
+      assert should.call(400_000, 2_000_000), "over the floor AND the window fraction"
+      refute should.call(250_000, 2_000_000), "over the floor, under the window fraction"
+      assert should.call(300_001, 2_000_000)
+    end
+
+    # A driver-module fake with the threshold functions (the register
+    # wiring's driver: is the module; tests stage the same surface).
+    def threshold_driver(playbook)
+      driver = Object.new
+      driver.define_singleton_method(:driver_playbook_text) { playbook }
+      driver.define_singleton_method(:compaction_threshold) { |window| ArchitectLoop.compaction_threshold(window) }
+      driver.define_singleton_method(:should_compact?) { |tokens, window| ArchitectLoop.should_compact?(tokens, window) }
+      driver
+    end
+
+    # A loop fake with the usage seam (pi's setContextUsage fake shape).
+    def usage_loop(requests, usage)
+      loop = Object.new
+      loop.define_singleton_method(:request_manual_compaction) { |**kwargs| requests << kwargs; nil }
+      loop.define_singleton_method(:context_usage) { usage }
+      loop
+    end
+
+    def test_architect_compact_while_driving_skips_below_the_threshold
+      requests = []
+      loop = usage_loop(requests, {tokens: 90_000, context_window: 1_000_000, percent: 9})
+      tool = Tools::ArchitectCompact.new(driver: threshold_driver("THE PLAYBOOK"), agent: -> { loop })
+
+      assert_equal "architect_compact: skipped — context at ~90,000 tokens (9% of a 1,000,000-token window), " \
+        "under the 150,000-token compaction threshold. " \
+        "Keep the cadence: call again after the next child launch.", tool.execute
+      assert_empty requests, "nothing scheduled — the cadence call was free"
+
+      # A window past 1M scales the threshold (the fraction wins).
+      big = usage_loop(requests, {tokens: 250_000, context_window: 2_000_000, percent: 13})
+      tool = Tools::ArchitectCompact.new(driver: threshold_driver("THE PLAYBOOK"), agent: -> { big })
+      assert_includes tool.execute, "under the 300,000-token compaction threshold"
+      assert_empty requests
+    end
+
+    def test_architect_compact_while_driving_skips_unmeasurable_usage
+      requests = []
+      loop = usage_loop(requests, nil)
+      tool = Tools::ArchitectCompact.new(driver: threshold_driver("THE PLAYBOOK"), agent: -> { loop })
+
+      assert_equal "architect_compact: skipped — context usage is not measurable right now, so nothing compacted. " \
+        "Keep the cadence: call again after the next child launch.", tool.execute
+      assert_empty requests
+    end
+
+    def test_architect_compact_while_driving_skips_nil_tokens_with_a_measured_window
+      requests = []
+      loop = usage_loop(requests, {tokens: nil, context_window: 1_000_000, percent: nil})
+      tool = Tools::ArchitectCompact.new(driver: threshold_driver("THE PLAYBOOK"), agent: -> { loop })
+
+      assert_equal "architect_compact: skipped — context size is not measurable right now " \
+        "(threshold 150,000 tokens). " \
+        "Keep the cadence: call again after the next child launch.", tool.execute
+      assert_empty requests
+
+      # A nil percent renders pi's "?" placeholder.
+      measured = usage_loop(requests, {tokens: 90_000, context_window: 1_000_000, percent: nil})
+      tool = Tools::ArchitectCompact.new(driver: threshold_driver("THE PLAYBOOK"), agent: -> { measured })
+      assert_includes tool.execute, "(?% of a 1,000,000-token window)"
+      assert_empty requests
+    end
+
+    def test_architect_compact_over_the_threshold_compacts_with_the_playbook
+      requests = []
+      loop = usage_loop(requests, {tokens: 400_000, context_window: 1_000_000, percent: 40})
+      tool = Tools::ArchitectCompact.new(driver: threshold_driver("THE PLAYBOOK"), agent: -> { loop })
+
+      assert_equal "Session compaction scheduled with the driver playbook as customInstructions — the keep-essentials " \
+        "(plan reference, routing pins, per-iteration procedure) survive; ground everything else from disk.", tool.execute
+      assert_equal [{custom_instructions: "THE PLAYBOOK"}], requests
+    end
+
+    def test_architect_compact_not_driving_is_unconditional_even_under_threshold
+      requests = []
+      loop = usage_loop(requests, {tokens: 5_000, context_window: 1_000_000, percent: 1})
+      tool = Tools::ArchitectCompact.new(driver: threshold_driver(nil), agent: -> { loop })
+
+      # Not driving: the call is explicit intent — compact however empty.
+      assert_equal "Session compaction scheduled — no driver playbook in this session, compacted plainly.", tool.execute
+      assert_equal [{}], requests
+    end
+
+    def test_every_compaction_resends_the_driver_playbook_while_driving
+      dir = tmpdir!("i123-resend-")
+      space, = toy_config(dir)
+      hooks, notices, env, catalog = new_module_hooks(space)
+      ArchitectLoop.register(hooks:, cwd: space, identity: "pi", agent: -> { nil },
+                             output: ->(text) { notices << text }, env:, catalog:)
+
+      # Not driving: a compaction re-sends nothing.
+      hooks.emit({"type" => "compaction", "reason" => "threshold"}, context: {cwd: space})
+      assert_empty hooks.pending_next_turn
+
+      # Driving (pi's own auto-compaction included — no customInstructions
+      # on that path): the playbook is re-queued verbatim as the next-turn
+      # message the next wake delivers, display-quiet.
+      ArchitectLoop.instance_variable_set(:@driver_playbook_text, "THE PLAYBOOK")
+      hooks.emit({"type" => "compaction", "reason" => "threshold"}, context: {cwd: space})
+      assert_equal [{custom_type: "architect-driver-playbook", content: "THE PLAYBOOK", display: false}],
+                   hooks.pending_next_turn
+    ensure
+      ArchitectLoop.instance_variable_set(:@driver_playbook_text, nil)
+    end
+
+    def test_context_usage_reads_the_real_estimate_and_resolved_window
+      loop, chat = small_compaction_loop("usage harness")
+      chat.add_message(Agent::Message.user("a modest turn of context"))
+      assert_nil loop.context_usage,
+                 "no resolvable window means unmeasurable usage — the guard skips, never blind"
+
+      windowed = Agent::Loop.new(chat: Test::TestChat.build(@server, system_prompt: "windowed usage"),
+                                 tools: {}, system_prompt: "windowed usage", context_window: 1_000_000)
+      usage = windowed.context_usage
+      assert_kind_of Integer, usage[:tokens]
+      assert_operator usage[:tokens], :>, 0, "the I29/I31 estimate over the flat history"
+      assert_equal 1_000_000, usage[:context_window], "the resolved window"
+      assert_kind_of Integer, usage[:percent]
     end
 
     def test_session_start_handler_resets_regenerates_and_quietly_no_ops
@@ -938,7 +1087,7 @@ module Tart
     # shape — the register fires only when the module predicate answers on
     # over a DEFAULT boot's resolved settings (no architect_loop row, no
     # env tier); nil (the I95 legs) registers explicitly, byte-unchanged.
-    def build_live_harness(space, gate_settings: nil)
+    def build_live_harness(space, gate_settings: nil, context_window: nil)
       stage_live_home
       @hooks = Hooks.new
       @session = Test::ScriptedSession.new
@@ -970,8 +1119,11 @@ module Tart
       @hooks.registered_tools.each { |tool| tools[tool.name.to_s] = tool }
       tools["subagent"] = Tools::Subagent.new(manager: @manager)
       chat = Test::TestChat.build(@server, system_prompt: "driver harness prompt")
+      # context_window: the additive kwarg the cadence legs stage so the
+      # self-guard reads a MEASURED usage against a known window (the
+      # default nil keeps the I95 legs' unresolvable-window shape).
       @driver = Agent::Loop.new(chat:, tools:, system_prompt: "driver harness prompt", hooks: @hooks,
-                                compaction: {keep_recent_tokens: 1, reserve_tokens: 16_384, enabled: true})
+                                context_window:, compaction: {keep_recent_tokens: 1, reserve_tokens: 16_384, enabled: true})
       # The boot's session_start emission (the register precedes it in the
       # real boot): reset + regenerate + validate through the staged catalog.
       @hooks.emit({"type" => "session_start", "reason" => "startup"},
@@ -1407,14 +1559,19 @@ module Tart
     end
 
     # (6): after a child launch the driver calls architect_compact — the
-    # pending compaction runs at the post-run point with the playbook as
-    # custom instructions, observed in the captured summarization request.
-    def test_live_compaction_after_first_child_launch_carries_the_playbook
+    # 6576da6 self-guard makes the cadence call a cheap no-op on this small
+    # real context (staged 1,000,000-token window): nothing scheduled, no
+    # summarization request, the skip text rides back as the tool result
+    # and the drive continues to the completion wake with the history
+    # UN-compacted. (The scheduled-manual drain + the playbook carry keep
+    # their own real-loop coverage — the post-run drain test and the
+    # over-threshold tool leg; the I123 declared pin move.)
+    def test_live_cadence_call_after_first_child_launch_skips_under_threshold
       # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
-      # the migrated workers are reactor tasks. Same name, same assertions.
+      # the migrated workers are reactor tasks.
       Sync do
         space = stage_live_space
-        build_live_harness(space)
+        build_live_harness(space, context_window: 1_000_000)
         @server.script([
           {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).empty? && user_texts(body) == ["Compact the toy drive"] },
            tool_calls: [{id: "k1", name: "architect_loop", arguments: {from: File.join(space, "notes", "plan-toy.md")}}]},
@@ -1426,16 +1583,14 @@ module Tart
            tool_calls: [{id: "k3", name: "architect_compact", arguments: {}}]},
           {type: :stream, match: ->(body) { driver_request?(body) && tool_calls(body).map { |c| c["id"] } == %w[k1 k2 k3] &&
             user_texts(body).none? { |text| text.include?("Background task completed") } },
-           content: "driving on — compaction scheduled"},
-          # The scheduled-manual summarization request (the post-run point).
-          {type: :stream, match: ->(body) { summarization_request?(body) }, content: "TOY COMPACT SUMMARY"},
+           content: "driving on — cadence call returned"},
           {type: :stream, match: ->(body) { child_request?(body, SPEC_PROFILE_MARKER) }, content: LIVE_SPEC_ANSWER},
           {type: :stream, match: ->(body) { driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") } },
            content: "COMPACT DRIVE DONE"}
         ])
 
         run_in_background(@driver, "Compact the toy drive")
-        join_run # run 1 ends after the compaction landed (the post-run drain)
+        join_run # run 1 ends after the cadence turn (no compaction scheduled)
         await(@manager, "the spec run to register", belt: CHILD_BELT_S) { run_by_agent("architect-spec") }
         spec_run = run_by_agent("architect-spec")
         assert_equal :completed, wait_terminal(@manager, spec_run[:id])
@@ -1448,17 +1603,22 @@ module Tart
           end
         end
         summary_request = @captures.find { |body| summarization_request?(body) }
-        refute_nil summary_request, "the pending manual compaction ran at the post-run point"
-        prompt = summary_request["messages"].last["content"].to_s
-        expected_playbook = live_expected_playbook(space)
-        assert prompt.end_with?("\n\nAdditional focus: #{expected_playbook}"),
-          "the summarization request carries pi's exact carry bytes + the playbook text"
-        assert_equal expected_playbook, ArchitectLoop.driver_playbook_text, "the driver state held the carried playbook"
+        assert_nil summary_request,
+                   "under the threshold nothing compacted — the cadence call was free"
+        # The skip text rode back to the driver as the tool result (the
+        # real usage estimate + the staged 1,000,000-token window).
+        skip_request = @captures.find do |body|
+          body["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "k3" }
+        end
+        refute_nil skip_request, "the cadence turn's result reached the driver"
+        compact_result = skip_request["messages"].find { |m| m["role"] == "tool" && m["tool_call_id"] == "k3" }["content"].to_s
+        assert_match(/\Aarchitect_compact: skipped — context at ~\d[\d,]* tokens \(\d+% of a 1,000,000-token window\), under the 150,000-token compaction threshold\. Keep the cadence: call again after the next child launch\.\z/,
+          compact_result)
+        assert_equal live_expected_playbook(space), ArchitectLoop.driver_playbook_text,
+                   "the driver state held the playbook through the skipped call"
 
-        # The compaction LANDED before the wake: the wake request's history
-        # carries the summary marker and the original prompt is gone (the
-        # notify's kick fires right after the child settles — the server's
-        # request-arrival seam pings each driver turn).
+        # The wake turn arrives with the session UN-compacted: the original
+        # prompt is still in the history (no summary marker anywhere).
         wake_request = nil
         await(@server, "the completion wake turn", belt: CHILD_BELT_S) do
           drain_captures
@@ -1466,20 +1626,8 @@ module Tart
             driver_request?(body) && user_texts(body).any? { |text| text.include?("Background task completed: **architect-spec**") }
           end
         end
-        summary_message = wake_request["messages"].to_a.find do |m|
-          m["role"] == "user" && m["content"].to_s.include?(Compaction::COMPACTION_SUMMARY_PREFIX)
-        end
-        refute_nil summary_message, "the post-compaction summary rides the history"
-        assert_includes summary_message["content"].to_s, "TOY COMPACT SUMMARY"
-        refute_includes JSON.generate(wake_request["messages"]), "Compact the toy drive",
-          "the pre-compaction prompt was summarized away"
-        # The tool's own result text rode the wire (pi's byte-carried string).
-        compact_result_request = @captures.find do |body|
-          body["messages"].to_a.any? { |m| m["role"] == "tool" && m["tool_call_id"] == "k3" }
-        end
-        compact_result = compact_result_request["messages"].find { |m| m["role"] == "tool" && m["tool_call_id"] == "k3" }["content"].to_s
-        assert_equal "Session compaction scheduled with the driver playbook as customInstructions — the keep-essentials " \
-          "(plan reference, routing pins, per-iteration procedure) survive; ground everything else from disk.", compact_result
+        assert_includes JSON.generate(wake_request["messages"]), "Compact the toy drive",
+          "the original prompt survived — nothing was summarized away"
         assert_run_terminal(spec_run)
       ensure
         kill_stray_children
