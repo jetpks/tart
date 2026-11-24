@@ -28,7 +28,7 @@ module Tart
         "Pass `from` (path to the committed plan file; preferred) or `plan` (the plan text verbatim). " \
         "Validates routing against architect.yaml and regenerates the space's role agent files, then installs the driver playbook: " \
         "it comes back as this result's text (your operating instructions), and every architect_compact while you drive carries it as the keep-essentials — " \
-        "call architect_compact only after a child launch, never before the first. Begin driving in this turn: ground from disk and proceed to the first child spawn; " \
+        "call architect_compact after each child launch, never before the first (the tool self-guards on context size). Begin driving in this turn: ground from disk and proceed to the first child spawn; " \
         "do not end the turn before the first child is in flight. " \
         "Requires the cwd to be inside a space (space.yaml + architect.yaml)."
 
