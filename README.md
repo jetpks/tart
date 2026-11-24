@@ -85,6 +85,19 @@ thinkingLevelMap}]}}}` plus an optional `"default"` boot reference
 identity-namespaced MODEL/PROVIDER env (below) > the models.json default
 > the settings `defaultModel`/`defaultProvider`.
 
+The endpoint FOLLOWS the model (the provider-keyed registry,
+`Tart::Endpoints`): the client (base URL + key) resolves per PROVIDER —
+the boot provider through the chain above, a mid-session `/model` switch
+to a different provider through the TARGET provider's own models.json
+block (its `apiKey` resolved at use, its `baseUrl` required, else the
+`settings.json` `apiKey` file tier; the switch refuses with an error row
+and nothing half-applies), and a switch back reuses the cached client.
+`<IDENTITY>_API_KEY`/`_API_BASE` stay BOOT-ONLY — they are the launcher's
+pin for the provider it booted and never follow a switch (the boot
+provider's key is never sent to another provider). `/new` keeps the
+session's current model pair (persisted and non-persisted switches
+alike); compaction rides the current provider's client.
+
 `thinkingLevelMap` maps the thinking levels onto the model's native
 `reasoning_effort` values (`{"off": "low", "low": "low", "medium":
 "medium", ...}`; a `null` marks a level unsupported, and `xhigh`/`max`
@@ -355,6 +368,17 @@ default: add `"subagents": true` to settings.json (user or project) or set
 `<IDENTITY>_SUBAGENTS=1` (pi reads `PI_SUBAGENTS`, tart `TART_SUBAGENTS`).
 With the gate off, nothing changes — no tool on the wire, no watcher, no
 run dirs.
+
+A child resolves its own provider: the child boots with its pinned
+provider (the `model:` call arg or the profile's `model:` — validated
+against the catalog at the spawn, and REFUSED with a named error when the
+key would not resolve at the child's boot) and resolves that provider's
+models.json block through the same registry at its own boot. The parent's
+boot endpoint facts never ride the child env — only an explicit
+`<IDENTITY>_API_KEY`/`_API_BASE` in the parent's environment propagates
+(and still wins at the child's boot). An UNPINNED child inherits the
+parent's CURRENT model pair (a mid-session `/model` switch is what the
+child sees).
 
 Built-in agents: `worker` (implementation; read/grep/find/ls/bash/edit/
 write), `oracle` (high-context decision consistency; runs from a FORK of

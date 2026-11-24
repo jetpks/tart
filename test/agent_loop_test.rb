@@ -1634,11 +1634,13 @@ module Tart
       assert_equal 0, @server.request_count, "the summary request never reached the wire either"
     end
 
-    # I119 (ruling A): the wire endpoint is BOOT-FIXED across a `/model` switch
-    # — pre-existing since I52, unrelated to templates — PINNED AS HELD. After
-    # a switch to another provider the request still carries the boot
-    # provider's resolved key to the boot endpoint (the switch swaps the wire
-    # model + provider metadata only; the Client is immutable).
+    # I119 -> I120 RE-SEAT (comment only; the asserts hold byte-identically):
+    # the loop-level switch seam's client: kwarg is NIL here — the frozen
+    # nil-means-keep contract (every injected-client test, the same-provider
+    # switch). The ENDPOINT-follows-switch fix lives one seam up: the
+    # surface's cross-provider gate threads the registry's client (the
+    # provider_swap pins below); at this seat a nil client keeps the boot
+    # endpoint and resolved key riding the wire.
     def test_env_template_switch_keeps_the_boot_endpoint_and_resolved_key_held
       @server.script([{type: :message, content: "boot key"}])
       boot = Agent::Chat.new(client: Fast::Completions::Client.new(base_url: @server.url,
@@ -1652,6 +1654,95 @@ module Tart
       assert_equal "Bearer boot-resolved-key", log.fetch(:headers)["authorization"],
         "the boot provider's RESOLVED key keeps riding the wire after the switch (held, not changed)"
       assert_equal "glm-5.3", log.fetch(:body)["model"], "the switch swapped the wire model only"
+    end
+
+    # I120 provider-swap — the loop seam: a switch threading client: swaps
+    # the chat's client + endpoint facts (the registry's per-provider client)
+    # and CLEARS any carried request_error; the wire model swaps with it.
+    def test_provider_swap_switch_model_threads_the_client_and_clears_the_request_error
+      error = ConfigValue::UnresolvedError.new("boot carried")
+      @server.script([{type: :message, content: "swapped"}])
+      boot = Agent::Chat.new(client: Fast::Completions::Client.new(base_url: @server.url,
+        api_key: "boot-key", timeout: 10), model_id: "a-1", provider_key: "alpha", request_error: error)
+      boot.with_instructions("test prompt")
+      agent, = agent_on_kernel_with_chat(boot)
+
+      swapped_client = Fast::Completions::Client.new(base_url: @server.url, api_key: "beta-key", timeout: 10)
+      agent.switch_model("b-1", provider: "beta", model_reasoning: false,
+        client: swapped_client, endpoint: {provider: "beta", api_key: "beta-key", api_base: @server.url})
+      assert_same swapped_client, boot.client, "the swap seam replaced the client"
+      assert_equal "beta", boot.endpoint.fetch(:provider), "the endpoint facts swapped"
+      run_agent(agent, "hello")
+
+      assert_nil boot.instance_variable_get(:@request_error), "the boot-carried error was cleared"
+      log = @server.captured_request_logs.first
+      assert_equal "Bearer beta-key", log.fetch(:headers)["authorization"], "the SWAPPED key rides the wire"
+      assert_equal "b-1", log.fetch(:body)["model"], "the wire model swapped"
+    end
+
+    # I120 provider-swap — the two-server routing proof (the AC1 hermetic
+    # shape): boot on A, switch to B with the registry's client, the next
+    # request lands on B carrying B's key and A sees NOTHING.
+    def test_provider_swap_cross_provider_switch_reroutes_the_wire_to_the_target_provider
+      server_b = MockLLMServer.new.start
+      server_b.script([{type: :message, content: "from b"}])
+      begin
+        @server.script([{type: :message, content: "from a"}])
+        boot = Agent::Chat.new(client: Fast::Completions::Client.new(base_url: @server.url,
+          api_key: "alpha-key", timeout: 10), model_id: "a-1", provider_key: "alpha")
+        boot.with_instructions("test prompt")
+        agent, = agent_on_kernel_with_chat(boot)
+        run_agent(agent, "hello")
+        assert_equal 1, @server.request_count, "the boot request hit A"
+
+        beta_client = Fast::Completions::Client.new(base_url: server_b.url, api_key: "beta-key", timeout: 10)
+        agent.switch_model("b-1", provider: "beta", model_reasoning: false,
+          client: beta_client, endpoint: {provider: "beta", api_key: "beta-key", api_base: server_b.url})
+        run_agent(agent, "and again")
+        assert_equal 1, @server.request_count, "A saw NOTHING after the switch"
+        assert_equal 1, server_b.request_count, "the next request landed on B"
+        log = server_b.captured_request_logs.first
+        assert_equal "Bearer beta-key", log.fetch(:headers)["authorization"], "carrying B's key"
+      ensure
+        server_b.stop
+      end
+    end
+
+    # I120 provider-swap — the LIVE pair reader (the subagents Manager's
+    # inherited arm + the surface's same/cross discriminator read this).
+    def test_provider_swap_current_model_pair_reads_the_live_pair
+      chat = TestChat.build(@server, system_prompt: "test prompt")
+      agent, = agent_on_kernel_with_chat(chat)
+      assert_equal [chat.provider_key, chat.model_id, "medium"], agent.current_model_pair
+
+      agent.switch_model("mock-2", provider: "mock", model_reasoning: true, thinking_level_map: nil)
+      agent.set_thinking_level("high")
+      assert_equal ["mock", "mock-2", "high"], agent.current_model_pair, "the pair follows the switch"
+    end
+
+    # I120 provider-swap — compaction follows the swap (AC6): the summary
+    # chat built AFTER a cross-provider swap inherits the CURRENT client —
+    # its request lands on the target provider with the target's key (and
+    # a boot-carried request_error dies with the swap).
+    def test_provider_swap_summary_chat_uses_the_swapped_client
+      error = ConfigValue::UnresolvedError.new("boot carried")
+      @server.script([{type: :message, content: "ok"}])
+      boot = Agent::Chat.new(client: Fast::Completions::Client.new(base_url: @server.url,
+        api_key: "boot-key", timeout: 10), model_id: "a-1", provider_key: "alpha", request_error: error)
+      boot.with_instructions("test prompt")
+      agent, = agent_on_kernel_with_chat(boot)
+
+      swapped_client = Fast::Completions::Client.new(base_url: @server.url, api_key: "beta-key", timeout: 10)
+      agent.switch_model("b-1", provider: "beta", model_reasoning: false,
+        client: swapped_client, endpoint: {provider: "beta", api_key: "beta-key", api_base: @server.url})
+
+      summary = boot.summary_chat(instructions: "summarize")
+      assert_same swapped_client, summary.client, "the summary chat inherits the CURRENT client"
+      summary.add_message(Agent::Message.user("the tail"))
+      Sync { summary.step }
+      log = @server.captured_request_logs.first
+      assert_equal "Bearer beta-key", log.fetch(:headers)["authorization"],
+        "the compaction request carried the SWAPPED provider's key"
     end
 
     # AC1: a mid-stream failure accumulates the step's streamed chunks (the
