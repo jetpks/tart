@@ -34,6 +34,36 @@ module Tart
       FileUtils.rm_rf(home)
     end
 
+    # I121 (AC3): the print boot NEVER registers the architect-loop surface
+    # — driver mode is the launching interactive session's concept (I95,
+    # unchanged by the default-on flip). The DEFAULT print home stages NO
+    # settings.json (no architect_loop row, no subagents row) so the wire
+    # proves both defaults at once: subagents ON (the I70 flip, print
+    # registers) and architect_loop ABSENT (the interactive-only law).
+    # The captured-request leg — the request_count peek first (the drains
+    # hazard), then the one body popped.
+    def test_loop_default_print_boot_never_registers_the_architect_tools
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "print answer"}])
+
+      home = Dir.mktmpdir("t121-print-home-")
+      _stdout, _stderr, status = Open3.capture3(smoke_env(home, server),
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "say the word",
+        chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "print boot exit 0 (stderr: #{_stderr})"
+      assert_operator server.request_count, :>=, 1, "the boot made its request"
+      body = server.captured_request_logs.pop[:body]
+      names = body["tools"].map { |tool| tool["function"]["name"] }
+      assert_equal %w[read bash edit write subagent], names,
+        "the default print wire: subagents on, architect tools NEVER registered"
+      assert_empty names.select { |name| name.include?("architect") },
+        "no architect tool on the print wire (the I95 law, unchanged by the flip)"
+    ensure
+      server.stop
+      FileUtils.rm_rf(home)
+    end
+
     # The async-reactor IO::Buffer experimental warning never fires in print
     # mode (print mode records no session and its LLM turns run on the same
     # fiber-scheduler-cooperative :net_http path as every mode — I50 de-bridge:

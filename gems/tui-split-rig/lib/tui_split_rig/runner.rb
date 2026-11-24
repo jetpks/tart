@@ -419,7 +419,7 @@ module TuiSplitRig
       # context_window scenarios (same zeroed knobs as before; row values
       # byte-identical when present) and stage_memory's deep-merge composes
       # unchanged.
-      settings = {"subagents" => false}
+      settings = {"subagents" => false, "architect_loop" => false}
       settings["compaction"] = {"enabled" => true, "reserveTokens" => 0, "keepRecentTokens" => 0} if @scenario.context_window
       File.write(File.join(dir, "settings.json"), JSON.pretty_generate(settings))
     end
@@ -630,11 +630,16 @@ module TuiSplitRig
         "#{prefix}CONTEXT_WINDOW" => (@scenario.context_window || 32_768).to_s,
         # I70: the explicit subagents opt-out rides the env tier (any
         # non-on value — the app's own semantics) for EVERY parity boot:
-        # no parity path rides the app default, which flipped ON this
+        # no parity path rides the app default, which flipped ON that
         # iteration. Identity-namespaced like every staged key; the
         # non-compaction boots need it because their staged opt-out file
         # is moved aside (see boot_session — the [Context] listing).
-        "#{prefix}SUBAGENTS" => "0"
+        "#{prefix}SUBAGENTS" => "0",
+        # I121: the architect-loop opt-out rides the same law — the gate
+        # flipped default-ON (the I70 precedent, second application); the
+        # two registered tools would otherwise move the frozen TOOLS
+        # digest on every parity boot.
+        "#{prefix}ARCHITECT_LOOP" => "0"
       )
       "cd #{Shellwords.escape(@tart_dir)} && exec env #{env_flags(staged)} #{Shellwords.escape(@bundle_bin)} exec bin/tart #{Shellwords.escape(sandbox)}"
     end

@@ -517,6 +517,24 @@ parsing, profile generation/provider catalogs, chains, package-tier agents,
 agentScanDirs/ExcludeDirs, the fleet UI, nested delegation (unchanged I48
 cut), and the TS workflow-script machinery the templates replace.
 
+## Architect loop
+
+The native driver-mode module (I95, ported from pi's architect-loop.ts;
+DEFAULT ON since I121): an interactive tart session can drive a
+space-architect loop itself. On every interactive boot the module
+registers the `/loop` command, the `architect_loop` / `architect_compact`
+tools, and the builder guard (git-write verbs are denied in bash commands
+when the session cwd is a lane worktree); at every session start it
+regenerates the space's role agent files under `<spaceRoot>/.tart/agents/`
+from `architect.yaml` (write-if-changed). `/loop --from <plan>` installs
+the driver playbook and driving begins in the same turn. The OPT-OUT is a
+settings row `{"architect_loop": false}` (user or project) or the env tier
+`<IDENTITY>_ARCHITECT_LOOP=0` (pi reads `PI_ARCHITECT_LOOP`, tart
+`TART_ARCHITECT_LOOP`; `1`/`true` are the on spellings). Print mode never
+registers the module — driver mode is the launching interactive session's
+concept — and the space requirement stands: the cwd (or a parent) must
+carry both `space.yaml` and `architect.yaml`.
+
 ## Herdr
 
 When tart runs inside a herdr pane (all three env vars set: `HERDR_ENV=1`,
