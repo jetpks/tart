@@ -262,20 +262,35 @@ fires.
 
 ### MCP servers
 
-MCP stdio servers are loaded from `~/.tart/mcp.json` (override the
-path with `TART_MCP_CONFIG`; a missing file means no servers):
+MCP servers are loaded from `~/.tart/mcp.json` (override the path with
+`TART_MCP_CONFIG`; a missing file means no servers). Two transports:
+stdio (a local `command`) and Streamable HTTP (a `url`; `url` wins when
+both are present):
 
 ```json
-{"mcpServers": {"echo": {"command": "/path/to/echo-server", "args": [], "env": {}}}}
+{"mcpServers": {
+  "echo": {"command": "/path/to/echo-server", "args": [], "env": {}},
+  "gateway": {"type": "http", "url": "https://gw.example.com/mcp", "headers": {"Authorization": "Bearer ..."}}
+}}
 ```
 
 A configured server's tools join the loadout as `mcp__<server>__<tool>` and
 are declared to the model like the built-in tools; a server that fails to
-connect is skipped with a warning. The server's `env` VALUES expand with the
-same `$VAR`/`${VAR}` grammar as `apiKey` (above) when the server connects —
-an unset or empty variable fails that server's connection by name, and the
-child still receives only tart's explicit environment (never the literal
-template).
+connect is skipped with a warning. The server's `env` VALUES (stdio) and
+`headers` VALUES (HTTP) expand with the same `$VAR`/`${VAR}` grammar as
+`apiKey` (above) when the server connects — an unset or empty variable
+fails that server's connection by name, and the stdio child still receives
+only tart's explicit environment (never the literal template).
+
+A bad config file never crashes a boot: malformed JSON, a bad schema row,
+or an unsupported transport is a named warning (a command-line row
+interactively, a stderr line in print mode) and only the offending server
+is skipped — the other servers still connect (the same never-raise law as
+models.json). Configured servers do not connect at the boot seat yet in any mode —
+the connect runs on a host reactor (a Sync-wrapped seat) and the bare
+boots warn-and-skip with the named reactor-seat line (a known backlog
+item, `mcp-boot-reactor`); the transport itself is proven at the
+Sync-wrapped seat.
 
 ### Print mode
 

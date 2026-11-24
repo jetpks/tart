@@ -2,7 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- **Streamable HTTP MCP servers (I122).** `~/.tart/mcp.json` entries with a
+  `url` (type `http`, `streamable-http`, or omitted) now connect over the
+  Streamable HTTP transport — session id, negotiated protocol version
+  header, `headers` with `$VAR`/`${VAR}` expansion at connect, JSON and
+  SSE replies, and the server-to-client GET stream. `url` wins when an
+  entry carries both `url` and `command` (pi's dispatch); `type: "sse"` is
+  the named legacy rejection.
+
 ### Changed
+
+- **A bad mcp.json never crashes a boot (I122, the models.json law).**
+  Malformed JSON, a bad root shape, an invalid server row, or an
+  unsupported transport is a named warning (a command-line row
+  interactively, a stderr line in print mode) and only the offending
+  server is skipped — the remaining servers still connect. The
+  boot-seat reactor deferral is unchanged and now named: configured
+  servers warn-and-skip with the named reactor-seat line at the bare
+  boots (interactive, print, subagent children alike — pre-existing
+  since I107, the `mcp-boot-reactor` backlog item; the transport is
+  proven at the Sync-wrapped seat).
 
 - **Architect loop is on by default (I121, the I70 subagents precedent).**
   The `architect_loop` driver-mode module — the `/loop` command, the
