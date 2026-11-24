@@ -14,7 +14,10 @@ require_relative "../identity"
 require_relative "../render/subagent_box"
 # I78 Law 4: the validation seat loads the model catalog from the same
 # staged root the Manager carries (`Models.load(root: @root)`).
+# I120: the spawn seat resolves a PINNED provider's key through the same
+# registry the child's own boot uses (the named refusal at the spawn).
 require_relative "../models"
+require_relative "../endpoints"
 
 # I74: the session-sink module rides THIS require site — the sink is
 # coupled to the child-capture law (child_env's five picks feed the
@@ -142,7 +145,6 @@ module Tart
         @agent = agent
         @arm_deadline_supervisor = arm_deadline_supervisor
         @supervisor_channel = nil
-        @endpoint = nil
         # S2 — the per-boot identity (I99): minted ONCE in initialize and
         # returned (never memoized) until a live recorder resolves. The
         # pre-loop window matches nothing on disk by construction — this
@@ -172,14 +174,6 @@ module Tart
         @state_version = 0
         FileUtils.mkdir_p(@home)
       end
-
-      # The parent's resolved endpoint facts ({api_key:, api_base:} — the
-      # Chat's endpoint reader) when the child env tier is unset: the
-      # launcher threads the boot's resolution onto the returned Manager
-      # (the same chain build_chat consumed; the gate stages NO env key;
-      # production boots resolve identically from the same staged HOME/cwd,
-      # so the fallback is convergence-neutral there — PHASE 0 item).
-      attr_accessor :endpoint
 
       # Spawns one child (§2.2). async:true returns the run record
       # immediately (the watcher owns it); async:false BLOCKS on the
@@ -216,6 +210,30 @@ module Tart
         catalog = source ? Models.load(root: @root) : nil
         provider, model_id, level =
           source ? Subagents.resolve_model(source, catalog: catalog, fallback: parent_model_pair) : parent_model_pair
+        # I120 provider-swap — the spawn-seat refusal (the same named-failure
+        # law as I119, at this seat): a child PINNED (call `model:` or
+        # profile `model:`) to a provider whose key would not resolve at
+        # the child's OWN boot refuses the spawn up front — the raise rides
+        # the existing raise → {error:} tool-result path and NO child
+        # process is spawned. The pre-flight mirrors the child's boot chain
+        # exactly (Endpoints.boot_facts over the SAME scrubbed env tier
+        # child_env picks, the same catalog the I78 validation just loaded,
+        # the same settings files the child reads — HOME/cwd ride the child
+        # env unchanged), refusal on the KEY only (the child's boot never
+        # refuses on a base — it falls to the settings view's tier, today's
+        # law): the parent names NOW the failure the child's first request
+        # would name. The inherited arm never validates (I78 Law 4 — the
+        # parent is running on it).
+        if source && provider
+          scrubbed = ChildEnv.scrub(@env.to_h)
+          child_resolved = Shapes::ResolvedSettings.from_load(Settings.load(cwd: @cwd),
+            identity: @identity, env: scrubbed)
+          facts = Endpoints.boot_facts(catalog,
+            Shapes::ModelRef.new(provider: provider, id: model_id.to_s),
+            identity: @identity, resolved: child_resolved, env: scrubbed)
+          raise facts.fetch(:api_key_error) if facts[:api_key_error]
+          raise Endpoints::Error, "No API key for provider \"#{provider}\"" if facts[:api_key].nil?
+        end
         # I49 D5: every gate-on child gets the intercom bridge —
         # contact_supervisor appended to its tools and the instruction
         # appended to its prompt (pi applyIntercomBridgeToAgent, mode
@@ -755,9 +773,17 @@ module Tart
         # dead key nothing read — it only worked while DEFAULT was "pi";
         # the I69 flip exposed it (the child clean-aborted on TART_API_KEY).
         env[Identity::ENV_KEY] = @identity
-        api_key = source[key.("API_KEY")] || @endpoint&.dig(:api_key) || @endpoint&.dig("api_key")
+        # I120: the parent's BOOT endpoint facts NO LONGER ride the child
+        # env — the fallback tier DEFEATED the child's own block resolution
+        # at its boot (an openrouter-pinned child under a zai parent posted
+        # the openrouter id to api.z.ai with the zai key; both directions
+        # broken — the I49 §3b pick-list shape superseded, itemized). The
+        # EXPLICIT parent-env tier still propagates and still wins (a
+        # legitimate user override); otherwise the child resolves its own
+        # pinned provider's block through the same registry at its own boot.
+        api_key = source[key.("API_KEY")]
         env[key.("API_KEY")] = api_key if api_key
-        api_base = source[key.("API_BASE")] || @endpoint&.dig(:api_base) || @endpoint&.dig("api_base")
+        api_base = source[key.("API_BASE")]
         env[key.("API_BASE")] = api_base if api_base
         env[key.("MODEL")] = run[:model_id] if run[:model_id]
         env[key.("PROVIDER")] = run[:provider] if run[:provider]
@@ -837,7 +863,17 @@ module Tart
         File.expand_path("../../../bin/tart", __dir__)
       end
 
+      # I120 provider-swap: the LIVE parent pair first (pi's children follow
+      # the parent's current model) — the threaded agent callable's
+      # current_model_pair reader, so an unpinned child of a parent that
+      # switched mid-session spawns on the CURRENT pair, not the frozen
+      # boot env. The env read stays as the fallback (print parents pass no
+      # agent; bare test Managers; the pre-loop window) — byte-held there.
       def parent_model_pair
+        loop = @agent.respond_to?(:call) ? @agent.call : @agent
+        pair = loop&.current_model_pair if loop&.respond_to?(:current_model_pair)
+        return pair if pair && pair[0] && pair[1]
+
         key = ->(suffix) { Identity.env_key(@identity, suffix) }
         [@env[key.("PROVIDER")], @env[key.("MODEL")], @env[key.("THINKING_LEVEL")]]
       end

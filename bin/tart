@@ -34,6 +34,7 @@ require "optparse"
 require_relative "../lib/tart"
 require_relative "../lib/tart/session_sink"
 require_relative "../lib/tart/config_value"
+require_relative "../lib/tart/endpoints"
 require_relative "../lib/tart/utf8_boot"
 
 module Tart
@@ -327,7 +328,6 @@ module Tart
       # returned Manager owns the agent-end drain below (pi's auto-drain).
       manager = subagents_enabled?(settings, identity) ?
         Subagents.register(hooks:, cwd: workdir, env: ENV, identity:) : nil
-      manager&.endpoint = chat.endpoint
       hooks.emit({"type" => "session_start", "reason" => "startup"},
         context: {cwd: workdir, mode: "print", session: session_ref(recorder), identity:})
       # --system-prompt-file (I48 §5.2): the file bytes REPLACE the
@@ -454,9 +454,10 @@ module Tart
         extensions = mcp_servers.keys.dup
         extensions << "memory.ts" if memory_on
         extensions << "herdr-agent-state" if Herdr.enabled?(ENV)
+        boot_provider = Models.resolve_boot_model(models, settings, identity:).provider
         surface = build_surface(session:, kernel:, skills: skills.skills, prompts: prompts.templates,
           mcp_servers:, resume: resume_path, identity:, models:, context_files:, extensions:, hooks:,
-          endpoint: endpoint_facts(models, Models.resolve_boot_model(models, settings, identity:),
+          settings:, endpoint: endpoint_facts(models, Models.resolve_boot_model(models, settings, identity:),
             identity:, resolved:))
         Memory.register(hooks:, identity:) if memory_on
         Herdr.register(hooks:)
@@ -476,9 +477,6 @@ module Tart
           subagents_manager = Subagents.register(hooks:,
             kernel: Subagents.wake_bridge(session),
             agent: -> { surface.agent }, cwd: workdir, env: ENV, identity:)
-          subagents_manager.endpoint =
-            endpoint_facts(models, Models.resolve_boot_model(models, settings, identity:),
-              identity:, resolved:)
           # I81 Law 1 — the profile diagnostics surface (OQ-2): one
           # command_line row per profile diagnostic, the skills/prompts
           # idiom below ("#{d.path}: #{d.message}"). A fresh READ-ONLY
@@ -563,8 +561,15 @@ module Tart
           # The boot model resolves per session (identity-namespaced env >
           # models.json "default" > Settings — I27), so a ctrl+s persisted
           # default is honored by the next /new too.
-          boot = Models.resolve_boot_model(models, settings, identity:)
-          chat = build_chat(models, boot, identity:, resolved:)
+          # I120 provider-swap: the SURFACE's current model ref rides as
+          # the boot override when present — /new keeps the session's
+          # current pair (persisted and non-persisted switches alike; pi's
+          # /new is a clear-only, interactive-mode.ts:7166-7176, and the
+          # model_change recording + resume restore is the named follow-up
+          # this interim shape deliberately carries across new AND resume:
+          # one seam, no per-reason branching).
+          boot = new_session_boot_ref(surface, models, settings, identity:)
+          chat = build_chat(models, boot, identity:, resolved:, settings:, boot_provider:)
           facts = footer_data(workdir, settings, boot:, chat:, identity:, models:, resolved:)
           surface.footer_data = facts
           # The catalog entry resolves ONCE (the same helper the compat:
@@ -890,7 +895,7 @@ module Tart
     # every new surface kwarg ships with a launcher-seam regression pin,
     # launcher_smoke_test's /listing_endpoint/ leg).
     def build_surface(session:, kernel:, skills:, prompts:, mcp_servers:, resume:, identity:, models:,
-                      context_files: [], extensions: nil, hooks: nil, endpoint: nil)
+                      context_files: [], extensions: nil, hooks: nil, endpoint: nil, settings: nil)
       Render::Chat.new(
         session:, kernel:,
         # Autocomplete sources (AC1): the builtin slash commands + the
@@ -912,7 +917,8 @@ module Tart
         # the section renderer).
         extensions: extensions || mcp_servers.keys,
         models:,
-        endpoint:
+        endpoint:,
+        settings:
       )
     end
 
@@ -923,48 +929,56 @@ module Tart
     # the identity-namespaced API_KEY/API_BASE keep working against it.
     # The gem's Client carries the endpoint (timeout 120; NO retries —
     # Grounds D9: a transient 5xx/429 surfaces immediately); the Chat
-    # carries the wire model + the endpoint facts (the subagents Manager
-    # threads them to its children).
-    def build_chat(models, boot, identity:, resolved:, env: ENV)
-      endpoint = endpoint_facts(models, boot, identity:, resolved:, env:)
-      # I119: the client only ever receives RESOLVED keys — a block apiKey
-      # that names an unset variable (or a `!command` value) builds the client
-      # KEYLESS and the Chat carries the named failure for its first request.
-      client = Fast::Completions::Client.new(base_url: endpoint.fetch(:api_base),
-        api_key: endpoint.fetch(:api_key), timeout: 120)
+    # carries the wire model + the endpoint facts.
+    #
+    # I120: the client comes from the provider-keyed registry
+    # (Tart::Endpoints) — ONE resolution seam for boot, `/model` and the
+    # `/new` carryover. The process boot (+ a `/new` whose carried pair is
+    # STILL the boot provider) resolves through the BOOT chain (the env
+    # tier is the launcher's pin, and it governs its own provider for the
+    # process lifetime); a `/new` that carries a DIFFERENT provider
+    # (+boot_provider:) resolves through the mid-session chain wrapped
+    # never-raise (Endpoints.carry_facts — the I119 keyless-client +
+    # carried-error discipline holds at this seat too).
+    def build_chat(models, boot, identity:, resolved:, env: ENV, settings: nil, boot_provider: nil)
+      endpoint = if boot_provider.nil? || boot.provider == boot_provider
+        Endpoints.boot_facts(models, boot, identity:, resolved:, env:)
+      else
+        Endpoints.carry_facts(boot.provider, models:, settings:, fallback_base: resolved.api_base, env:)
+      end
+      client = Endpoints.seed(boot.provider, api_key: endpoint.fetch(:api_key),
+        api_base: endpoint.fetch(:api_base)).fetch(:client)
       Agent::Chat.new(client:, model_id: boot.id, provider_key: boot.provider, endpoint:,
         request_error: endpoint[:api_key_error])
+    end
+
+    # I120 provider-swap — the /new + resume boot-ref resolution: the
+    # surface's RUNTIME model (a /model switch's entry — the ONLY carry
+    # source; a fresh boot's footer_data is not yet assigned when the
+    # first start_session runs, so the surface's boot-ref fallback would
+    # thread a placeholder), else today's boot tiers (no switch, the print
+    # path, the pre-surface window). The runtime entry SURVIVES /new (the
+    # surface never clears it), so a carried pair carries forward.
+    def new_session_boot_ref(surface, models, settings, identity:)
+      current = surface&.runtime_model_ref
+      return Shapes::ModelRef.new(provider: current.provider, id: current.id) if current
+
+      Models.resolve_boot_model(models, settings, identity:)
     end
 
     # The endpoint facts (the boot's key/base resolution — the SAME chain
     # build_chat always spoke): identity-namespaced env > the models.json
     # provider config > the resolved-settings view's keys.
     #
-    # I119: the provider block's apiKey resolves HERE, at the use seam —
-    # never at load (the catalog stays byte-untouched; pi resolves at its auth
-    # provider's resolve, provider-composer.ts:462-484). A template naming an
-    # unset or empty variable, or a `!command` value, yields api_key nil +
-    # api_key_error (the named failure the first request raises) — it NEVER
-    # falls through to the settings view's apiKey and NEVER sends the
-    # literal (pi's check: a configured key that does not resolve is a
-    # failure, not an absent key).
+    # I120: the chain lives in the registry now (Tart::Endpoints.boot_facts
+    # — byte-identical semantics, provider-keyed beside Models at the lib
+    # boundary); this delegation stays the launcher seam the smoke pins
+    # exercise. I119's law holds verbatim: the provider block's apiKey
+    # resolves at THIS use seam, never at load, and an unresolvable value
+    # yields api_key nil + api_key_error — never a fall-through, never the
+    # literal on the wire.
     def endpoint_facts(models, boot, identity:, resolved:, env: ENV)
-      provider = models.provider(boot.provider)
-      key = env[Identity.env_key(identity, "API_KEY")]
-      error = nil
-      if key.nil? && provider && !provider.api_key.nil?
-        begin
-          key = ConfigValue.resolve!(provider.api_key, "API key for provider \"#{boot.provider}\"", env:)
-        rescue ConfigValue::Error => e
-          error = e
-        end
-      end
-      key = resolved.api_key if key.nil? && error.nil?
-      {
-        api_key: key,
-        api_base: env[Identity.env_key(identity, "API_BASE")] || provider&.base_url || resolved.api_base,
-        api_key_error: error
-      }
+      Endpoints.boot_facts(models, boot, identity:, resolved:, env:)
     end
 
     # The bash tool's session-env readers over the interactive surface (I41

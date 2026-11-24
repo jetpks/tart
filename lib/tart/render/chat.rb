@@ -21,6 +21,7 @@ require_relative "slash_source"
 require_relative "transcript"
 require_relative "../models"
 require_relative "../config_value"
+require_relative "../endpoints"
 # Law 3 — the box's data seam: the Chat surface reaches the boot-wired
 # Manager through {Subagents.current_manager} (bin/tart is hard-frozen).
 require_relative "../subagents"
@@ -183,7 +184,7 @@ module Tart
         motd: true, identity: Identity::DEFAULT, settings_root: Agent::Session.default_root,
         prompts: [], skills: [], context_files: [], extensions: [], models: nil,
         clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }, endpoint: nil,
-        sweep_slice_budget: nil, env: ENV)
+        settings: nil, sweep_slice_budget: nil, env: ENV)
         @session = session
         @kernel = kernel
         @footer_data = footer_data
@@ -193,6 +194,12 @@ module Tart
         # speaks: {api_key:, api_base:}); the live-listing fallback tier.
         # nil = no listing fallback (every existing test construction).
         @endpoint = endpoint
+        # I120 provider-swap: the merged settings hash (the FILE tier source
+        # the /model switch gate reads — `settings["apiKey"]`, never
+        # Settings.resolve_setting, which would re-read the boot-only
+        # identity env tier). nil = a degenerate construction (every
+        # pre-I120 test surface): the switch gate stays disengaged.
+        @settings = settings
         # The I119 listing key-resolution env (injected; never ENV elsewhere
         # in the render layer).
         @env = env
@@ -2955,6 +2962,34 @@ module Tart
       # overlays flow into {footer_data}), report (pi showStatus — the
       # transcript tail row, I33), and persist the default when asked.
       #
+      # I120 provider-swap — the switch's endpoint gate (pi setModel's
+      # checkAuth, agent-session.ts:2659-2662): a CROSS-PROVIDER target
+      # resolves through the registry BEFORE any mutation — a refusal is
+      # the error row and NO switch (pi's throw lands in the UI catch,
+      # interactive-mode.ts:5451-5453: nothing half-applies). Same
+      # provider = no client work at all; the registry's cache makes a
+      # switch BACK to the boot provider reuse the boot client (the
+      # launcher pin rides home). The gate engages only on a
+      # launcher-wired surface that can NAME the current provider (the
+      # threaded boot facts' :provider, or the live agent pair — every
+      # production boot; a degenerate construction without them keeps the
+      # legacy client-held switch).
+      def switch_endpoint_kwargs(entry)
+        return {} unless @endpoint && @models
+
+        current = @agent.respond_to?(:current_model_pair) ? @agent.current_model_pair : nil
+        current_provider = current ? current[0] : @endpoint[:provider]
+        return {} if current_provider.nil? || entry.provider == current_provider
+
+        facts = Endpoints.provide(entry.provider, models: @models, settings: @settings, env: @env)
+        {client: facts.fetch(:client),
+         endpoint: {provider: entry.provider, api_key: facts.fetch(:api_key), api_base: facts.fetch(:api_base)}}
+      rescue ConfigValue::Error, Endpoints::Error => e
+        error_line(e.message)
+        @kernel.request_draw
+        nil
+      end
+
       # I40, pi setModel (agent-session.ts:2477-2496): the switch resolves
       # a level FOR THE SWITCH — _getThinkingLevelForModelSwitch
       # (:2670-2679): the FILE-declared default, else the session level
@@ -2979,6 +3014,11 @@ module Tart
         entry = Shapes::Model.new(**entry,
           thinking_level_map: entry.fetch(:thinking_level_map, nil),
           compat: entry.fetch(:compat, nil)) unless entry.is_a?(Shapes::Model)
+        # I120: the endpoint gate runs BEFORE any mutation — a refusal
+        # leaves the surface state, the thinking level and the loop
+        # untouched (pi's setModel throws before the assignment).
+        swap = switch_endpoint_kwargs(entry)
+        return if swap.nil?
         status = persist ? "Default model: #{entry.provider}/#{entry.id}" : "Model: #{entry.id}"
         # The provider key rides the switch as METADATA (the wire model's
         # provider attribute — the dialect rides the model by
@@ -3007,7 +3047,8 @@ module Tart
           max_tokens: Models.entry_max_tokens(entry),
           model_reasoning: facts.reasoning,
           thinking_level_map: facts.thinking_level_map,
-          compat:)
+          compat:,
+          **swap)
         @agent&.set_thinking_level(effective)
         Settings.save(@settings_root, "defaultProvider" => entry.provider, "defaultModel" => entry.id) if persist
         @kernel.request_draw
@@ -3038,6 +3079,14 @@ module Tart
           reasoning: data[:reasoning] == true, context_window: data[:context_window],
           max_tokens: nil, thinking_level_map: data[:thinking_level_map], compat: nil
         )
+      end
+
+      # I120 provider-swap — the /new carryover's source: the RUNTIME
+      # switch only, never the footer fallback (a fresh boot's footer_data
+      # is not yet assigned when the first start_session runs — the
+      # fallback would thread a "no-model" placeholder).
+      def runtime_model_ref
+        @runtime_model
       end
 
       # The ✓ current marker's ref: the runtime switch, else the boot
@@ -3085,7 +3134,7 @@ module Tart
           Settings::DEFAULT_THINKING_LEVEL
       end
 
-      public :set_thinking_level, :cycle_thinking_level, :current_model_ref
+      public :set_thinking_level, :cycle_thinking_level, :current_model_ref, :runtime_model_ref
 
       # app.tools.expand (pi setToolsExpanded :6810-6826): the GLOBAL
       # toggle — every expandable block rebuilds collapsed↔expanded in
