@@ -24,9 +24,11 @@ module Tart
   # House shape: the Memory/Herdr register idiom (A-Law 1) — registered
   # ONCE from the INTERACTIVE boot beside the Memory/Herdr lines, BEFORE
   # build_tools so the tools merge into the loadout; gated by the
-  # default-off "architect_loop" settings row / <IDENTITY>_ARCHITECT_LOOP
-  # env tier (the print boot never registers — driver mode is the
-  # launching interactive session's concept). Module state is the one
+  # "architect_loop" settings row / <IDENTITY>_ARCHITECT_LOOP env tier,
+  # DEFAULT ON since the I121 flip (the I70 subagents precedent; the
+  # opt-out is a settings row {"architect_loop": false} or any non-on env
+  # value). The print boot never registers — driver mode is the
+  # launching interactive session's concept. Module state is the one
   # installed driver playbook (or nil): reset at every session_start —
   # driver mode is never inherited. NO threads of its own: everything
   # rides the existing channels/fibers (A-Law 1's threads-budget law).
@@ -181,17 +183,18 @@ module Tart
 
     module_function
 
-    # The boot gate (A-Law 1, the memory gate's idiom): the resolved
-    # settings row "architect_loop" or the <IDENTITY>_ARCHITECT_LOOP env
-    # tier; the on spellings are true/"true"/"1"; DEFAULT OFF. The row is
-    # read straight off the resolved settings hash — the RESOLUTION_ENV/
-    # DEFAULTS registries live in settings.rb, which this lane's frozen
-    # touch set does not carry (the env > file > default-off ladder and the
-    # spellings are preserved here verbatim; itemized in the lane report).
+    # The boot gate (A-Law 1, the subagents gate's exact idiom post-I121):
+    # the resolved settings row "architect_loop" or the <IDENTITY>
+    # _ARCHITECT_LOOP env tier through Settings.resolve_setting — the
+    # DEFAULTS/RESOLUTION_ENV registries own the env > file > default
+    # ladder (DEFAULT ON since the I121 flip, the I70 subagents precedent);
+    # the on spellings are true/"true"/"1", every other value ("0",
+    # "false", "on", …) opts out. The I95 module-local ladder moved into
+    # settings.rb with the flip (its frozen touch-set exclusion ended);
+    # the bin/tart seat helper delegates here, byte-unchanged.
     def enabled?(settings, identity: Identity::DEFAULT, env: ENV)
-      row = env[Identity.env_key(identity, "ARCHITECT_LOOP")]
-      row = settings["architect_loop"] if row.nil? && settings.is_a?(Hash) && settings.key?("architect_loop")
-      row == true || row == "true" || row == "1"
+      resolved = Settings.resolve_setting("architect_loop", settings, identity: identity, env: env)
+      resolved == true || resolved == "true" || resolved == "1"
     end
 
     # --- config resolution (the resolveConfig port, tart-shaped) ---

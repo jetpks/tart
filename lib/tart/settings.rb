@@ -71,7 +71,20 @@ module Tart
       # subagents_enabled?). Off = no subagent tool, no watcher, no run dirs
       # (the frozen wire digests are the I48-off bar). The env tier reads
       # <IDENTITY>_SUBAGENTS.
-      "subagents" => true
+      "subagents" => true,
+      # The architect-loop driver-mode module's gate (I95 A-Law 1; the I121
+      # default-on flip, the I70 subagents precedent): DEFAULT ON — the
+      # register seat in bin/tart's interactive boot fires on every default
+      # boot, so a tart session can launch a space-architect loop natively
+      # (the /loop command + the architect_loop/architect_compact tools +
+      # the builder guard + the session-start role-file regeneration). The
+      # opt-out is a settings row {"architect_loop": false} or the
+      # <IDENTITY>_ARCHITECT_LOOP env tier — any non-on value ("1"/"true"
+      # stay the on spellings; "0"/"false" opt out). The print boot never
+      # registers (driver mode is the launching interactive session's
+      # concept — I95, unchanged). The env tier reads
+      # <IDENTITY>_ARCHITECT_LOOP.
+      "architect_loop" => true
     }.freeze
 
     # pi's ThinkingLevel vocabulary (model-schema.ts:2-3, agent types.ts:349).
@@ -101,6 +114,9 @@ module Tart
       # an ADDITIVE boot knob (the child spawn reads the routed level
       # through it; unset = today's resolution, no boot path calls it).
       "subagents" => "SUBAGENTS",
+      # I121: the architect-loop gate's env tier (the I95 module read it
+      # directly pre-flip; the ladder now lives here like subagents').
+      "architect_loop" => "ARCHITECT_LOOP",
       "thinkingLevel" => "THINKING_LEVEL"
     }.freeze
 
