@@ -373,6 +373,126 @@ module Tart
       File.join(install, "bin")
     end
 
+    # --- I120 provider-swap: build_chat through the registry + the /new
+    # --- carryover chain ---
+
+    # The BOOT arm is byte-held: the env tier wins first, the client lands
+    # in the per-provider registry cache (the switch-back reuse seat), and
+    # the Chat carries the resolved key + boot facts.
+    def test_provider_swap_build_chat_boot_arm_seeds_the_registry
+      launcher
+      Tart::Endpoints.clear_cache
+      home = Dir.mktmpdir("tart-i120-boot-")
+      models = stage_two_provider_catalog(home, "http://a.test/v1", "http://b.test/v1")
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      boot = Shapes::ModelRef.new(provider: "alpha", id: "a-1")
+      chat = Executable.build_chat(models, boot, identity: "pi", resolved:,
+        env: {"PI_API_KEY" => "launcher-pin"})
+
+      assert_equal "launcher-pin", chat.endpoint[:api_key], "the env tier wins at boot"
+      assert_equal "alpha", chat.endpoint[:provider], "the boot facts name the provider"
+      cached = Tart::Endpoints.provide("alpha", models: models, env: {"PI_API_KEY" => "launcher-pin"})
+      assert_same cached.fetch(:client), chat.client, "the boot client IS the registry's cached entry"
+    ensure
+      Tart::Endpoints.clear_cache
+      FileUtils.rm_rf(home)
+    end
+
+    # The CARRY arm (a /new that carries a DIFFERENT provider's pair):
+    # build_chat resolves the carried provider through the MID-SESSION
+    # chain — never the identity env tier (the launcher pin governs its
+    # own provider only) — and the chat posts to the CARRIED provider with
+    # ITS key.
+    def test_provider_swap_build_chat_carry_arm_resolves_the_carried_provider
+      launcher
+      Tart::Endpoints.clear_cache
+      home = Dir.mktmpdir("tart-i120-carry-")
+      models = stage_two_provider_catalog(home, "http://a.test/v1", "http://b.test/v1")
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      carried = Shapes::ModelRef.new(provider: "beta", id: "b-1")
+      chat = Executable.build_chat(models, carried, identity: "pi", resolved:,
+        settings: {"apiKey" => nil}, boot_provider: "alpha",
+        env: {"PI_API_KEY" => "launcher-pin", "PI_API_BASE" => "http://a.test/v1"})
+
+      assert_equal "beta-key", chat.endpoint[:api_key], "BETA's block key — never the launcher pin"
+      assert_equal "http://b.test/v1", chat.endpoint[:api_base], "BETA's own base — never the pin base"
+      assert_equal "beta", chat.endpoint[:provider]
+      assert_nil chat.instance_variable_get(:@request_error)
+    ensure
+      Tart::Endpoints.clear_cache
+      FileUtils.rm_rf(home)
+    end
+
+    # The carry arm's never-raise discipline (I119 at the /new seat): a
+    # carried provider whose key does not resolve boots KEYLESS with the
+    # named error carried — /new never crashes the session.
+    def test_provider_swap_build_chat_carry_arm_never_raises
+      launcher
+      Tart::Endpoints.clear_cache
+      home = Dir.mktmpdir("tart-i120-carrynr-")
+      FileUtils.mkdir_p(File.join(home, ".tart"))
+      File.write(File.join(home, ".tart", "models.json"), JSON.generate(
+        "providers" => {"alpha" => {"baseUrl" => "http://a.test/v1", "apiKey" => "alpha-key",
+          "models" => [{"id" => "a-1"}]},
+          "gamma" => {"baseUrl" => "http://g.test/v1", "apiKey" => "$GAMMA_KEY",
+            "models" => [{"id" => "g-1"}]}}))
+      models = Models.load(root: File.join(home, ".tart"))
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      carried = Shapes::ModelRef.new(provider: "gamma", id: "g-1")
+      chat = Executable.build_chat(models, carried, identity: "pi", resolved:,
+        settings: {"apiKey" => nil}, boot_provider: "alpha", env: {})
+
+      assert_nil chat.endpoint[:api_key], "the unresolvable carried key boots keyless"
+      assert_instance_of ConfigValue::UnresolvedError, chat.instance_variable_get(:@request_error),
+        "the named failure is CARRIED for the first request (never a raise)"
+    ensure
+      Tart::Endpoints.clear_cache
+      FileUtils.rm_rf(home)
+    end
+
+    # The /new boot-ref helper: the surface's CURRENT model ref rides as
+    # the boot override when one answers (a /model switch's pair survives
+    # /new); no surface (or a surface with no ref) falls to today's boot
+    # tiers.
+    def test_provider_swap_new_session_boot_ref_threads_the_current_pair
+      launcher
+      home = Dir.mktmpdir("tart-i120-newref-")
+      models = stage_two_provider_catalog(home, "http://a.test/v1", "http://b.test/v1")
+      surface = Object.new
+      surface.define_singleton_method(:runtime_model_ref) do
+        Struct.new(:provider, :id).new("beta", "b-1")
+      end
+      carried = Executable.new_session_boot_ref(surface, models, {}, identity: "pi")
+      assert_equal "beta", carried.provider, "the surface's current ref rode"
+      assert_equal "b-1", carried.id
+
+      no_switch = Object.new
+      no_switch.define_singleton_method(:runtime_model_ref) { nil }
+      unswitched = Executable.new_session_boot_ref(no_switch, models, {}, identity: "pi")
+      assert_equal "alpha", unswitched.provider, "a surface with NO runtime switch falls to the boot tiers"
+      assert_equal "a-1", unswitched.id
+
+      fresh = Executable.new_session_boot_ref(nil, models, {"defaultProvider" => "alpha",
+        "defaultModel" => "a-1"}, identity: "pi")
+      assert_equal "alpha", fresh.provider, "no surface → today's boot tiers"
+      assert_equal "a-1", fresh.id
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
+    # A staged TWO-provider catalog (the registry's cross-provider arms):
+    # alpha + beta, each with its own base and literal key.
+    def stage_two_provider_catalog(home, alpha_base, beta_base)
+      FileUtils.mkdir_p(File.join(home, ".tart"))
+      File.write(File.join(home, ".tart", "models.json"), JSON.generate(
+        "default" => "alpha/a-1",
+        "providers" => {
+          "alpha" => {"baseUrl" => alpha_base, "apiKey" => "alpha-key", "models" => [{"id" => "a-1"}]},
+          "beta" => {"baseUrl" => beta_base, "apiKey" => "beta-key", "models" => [{"id" => "b-1"}]}
+        }))
+      Models.load(root: File.join(home, ".tart"))
+    end
+
     # --- I119 env-templates: `endpoint_facts` resolves the provider block's
     # apiKey at the USE seam (never at load), on an injected env ---
 

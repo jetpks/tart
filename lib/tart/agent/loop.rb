@@ -329,7 +329,7 @@ module Tart
       # switched entry's maxTokens — D5; nil = the window fallback, the
       # no-entry shape).
       def switch_model(model_id, provider:, context_window: nil, max_tokens: nil, model_reasoning: nil,
-        thinking_level_map: nil, compat: nil)
+        thinking_level_map: nil, compat: nil, client: nil, endpoint: nil)
         # pi has no cached window to go stale: setModel swaps the Model
         # object (agent-session.ts:2484) and every check reads
         # model.contextWindow live (:2965). The port's cache re-resolves
@@ -344,6 +344,12 @@ module Tart
         @thinking_level_map = thinking_level_map
         @compat = compat
         @max_tokens = max_tokens
+        # I120 provider-swap: a cross-provider switch threads the registry's
+        # client through the Chat's swap seam (nil = keep the current
+        # client — the same-provider switch and every injected-client test);
+        # the swap lands BEFORE the wire model so the new pair is never
+        # served on the old endpoint.
+        @chat.swap_endpoint(client:, endpoint: endpoint || {}) if client
         @chat.apply_facts(model_id: model_id, provider_key: provider,
           model_reasoning: @model_reasoning, thinking_level_map: @thinking_level_map,
           compat: @compat, context_window: context_window, max_tokens: @max_tokens)
@@ -357,7 +363,19 @@ module Tart
         self
       end
 
-      # Runs the agent to completion of the prompt and every queued message.
+      # I120 provider-swap — the LIVE pair reader (pi's children follow the
+      # parent's current model; the subagents Manager's inherited arm reads
+      # this in place of the frozen boot env, and the surface's switch gate
+      # reads it to tell same-provider from cross-provider): the CHAT's
+      # current wire pair + the session's thinking level — [provider,
+      # model_id, level], nils preserved (a placeholder chat before the
+      # first apply_facts answers its construction pair).
+      # @return [Array(String, String, String)] the current [provider, model, level].
+      def current_model_pair
+      [@chat.provider_key, @chat.model_id, @thinking_level]
+    end
+
+    # Runs the agent to completion of the prompt and every queued message.
       # Must be called on the kernel reactor fiber (as the Core::Loop work
       # block): every model/tool step runs INLINE on this fiber — the LLM
       # HTTP I/O and tool execution are fiber-scheduler-cooperative, so the

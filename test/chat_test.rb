@@ -3534,6 +3534,124 @@ module Tart
 
     # --- the live /v1/models listing merge (I71 R4/AC3) ---
 
+    # --- I120 provider-swap: the switch's endpoint gate (pi setModel's
+    # --- checkAuth at the surface seat) ---
+
+    # The production shape: a launcher-wired surface (boot facts WITH
+    # :provider, catalog, settings) threads the registry's client + facts
+    # through the loop seam on a CROSS-provider switch.
+    def test_provider_swap_cross_provider_switch_threads_the_registry_client
+      Endpoints.clear_cache
+      boot_endpoint = {provider: "alpha", api_key: "alpha-key", api_base: "https://alpha.example/v1"}
+      switched = []
+      with_chat(width: 40, screen_height: 16, models: swap_gate_catalog, settings: {"apiKey" => nil},
+        endpoint: boot_endpoint, footer_data: {cwd: @dir, model: "a-1", default_provider: "alpha"}) do |chat|
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:switch_model) do |*args, **kwargs| switched << kwargs end
+          agent.define_singleton_method(:current_model_pair) { ["alpha", "a-1", "medium"] }
+          agent.define_singleton_method(:set_thinking_level) { |_level| }
+        end
+        chat.switch_model(provider: "beta", id: "b-1", name: "B", reasoning: false, context_window: 1_000, max_tokens: nil)
+        assert_equal 1, switched.size, "the switch reached the loop seam exactly once"
+        kwargs = switched.first
+        assert_kind_of Fast::Completions::Client, kwargs.fetch(:client), "the registry's client threaded"
+        assert kwargs.key?(:endpoint), "the endpoint facts threaded"
+        assert_equal "beta", kwargs.fetch(:endpoint).fetch(:provider)
+        assert_equal "beta-key", kwargs.fetch(:endpoint).fetch(:api_key), "B's resolved key"
+        assert_equal "https://beta.example/v1", kwargs.fetch(:endpoint).fetch(:api_base), "B's own base"
+      end
+    ensure
+      Endpoints.clear_cache
+    end
+
+    # The refusal (pi's setModel throw → the UI error row): an unresolvable
+    # target key/base = the error row and NO switch — the runtime model,
+    # the thinking level and the loop seam all untouched.
+    def test_provider_swap_unresolvable_switch_refuses_with_no_partial_switch
+      Endpoints.clear_cache
+      boot_endpoint = {provider: "alpha", api_key: "alpha-key", api_base: "https://alpha.example/v1"}
+      with_chat(width: 40, screen_height: 16, models: swap_gate_catalog(keyless: true), settings: {"apiKey" => nil},
+        endpoint: boot_endpoint, footer_data: {cwd: @dir, model: "a-1", default_provider: "alpha"}) do |chat, session|
+        calls = []
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:switch_model) { |*| calls << :switch }
+          agent.define_singleton_method(:current_model_pair) { ["alpha", "a-1", "medium"] }
+          agent.define_singleton_method(:set_thinking_level) { |_level| calls << :level }
+        end
+        chat.switch_model(provider: "gamma", id: "g-1", name: "G", reasoning: false, context_window: 1_000, max_tokens: nil)
+        assert_empty calls, "the switch never half-applied (no model/level mutation)"
+        assert_nil chat.instance_variable_get(:@runtime_model), "the runtime model held"
+        assert_nil chat.instance_variable_get(:@thinking_level), "the thinking level held"
+        draw(chat, session)
+        rows = transcript_lines(session, chat)
+        assert_includes rows.join, 'Error: No API key for provider "gamma"', "the named refusal drew the error row"
+      end
+    ensure
+      Endpoints.clear_cache
+    end
+
+    # Same provider = no client work at all (the kwargs carry no client).
+    def test_provider_swap_same_provider_switch_threads_no_client
+      Endpoints.clear_cache
+      boot_endpoint = {provider: "alpha", api_key: "alpha-key", api_base: "https://alpha.example/v1"}
+      switched = []
+      with_chat(width: 40, screen_height: 16, models: swap_gate_catalog, settings: {"apiKey" => nil},
+        endpoint: boot_endpoint, footer_data: {cwd: @dir, model: "a-1", default_provider: "alpha"}) do |chat|
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:switch_model) do |*args, **kwargs| switched << kwargs end
+          agent.define_singleton_method(:current_model_pair) { ["alpha", "a-1", "medium"] }
+          agent.define_singleton_method(:set_thinking_level) { |_level| }
+        end
+        chat.switch_model(provider: "alpha", id: "a-2", name: "A2", reasoning: false, context_window: 1_000, max_tokens: nil)
+        assert_equal 1, switched.size
+        refute switched.first.key?(:client), "a same-provider switch never rebuilds the client"
+      end
+    ensure
+      Endpoints.clear_cache
+    end
+
+    # The degenerate construction (boot facts without :provider — every
+    # pre-I120 test surface) keeps the legacy client-held switch: the gate
+    # engages only when the surface can NAME the current provider.
+    def test_provider_swap_degenerate_surface_keeps_the_legacy_switch
+      Endpoints.clear_cache
+      switched = []
+      with_chat(width: 40, screen_height: 16, models: swap_gate_catalog,
+        endpoint: {api_key: "k", api_base: "https://alpha.example/v1"},
+        footer_data: {cwd: @dir, model: "a-1", default_provider: "alpha"}) do |chat|
+        chat.agent = Object.new.tap do |agent|
+          agent.define_singleton_method(:switch_model) do |*args, **kwargs| switched << kwargs end
+          agent.define_singleton_method(:set_thinking_level) { |_level| }
+        end
+        chat.switch_model(provider: "beta", id: "b-1", name: "B", reasoning: false, context_window: 1_000, max_tokens: nil)
+        assert_equal 1, switched.size
+        refute switched.first.key?(:client), "no registry consult on a degenerate surface"
+      end
+    ensure
+      Endpoints.clear_cache
+    end
+
+    # The gate catalog: two resolvable provider blocks (+ the keyless gamma
+    # arm for the refusal pin).
+    def swap_gate_catalog(keyless: false)
+      providers = {
+        "alpha" => Shapes::Provider.new(name: "Alpha", base_url: "https://alpha.example/v1",
+          api_key: "alpha-key", api: nil, models: [Shapes::Model.new(id: "a-1", name: "A", reasoning: false,
+            context_window: 1_000, max_tokens: nil, thinking_level_map: nil, compat: nil, provider: "alpha"),
+            Shapes::Model.new(id: "a-2", name: "A2", reasoning: false,
+              context_window: 1_000, max_tokens: nil, thinking_level_map: nil, compat: nil, provider: "alpha")]),
+        "beta" => Shapes::Provider.new(name: "Beta", base_url: "https://beta.example/v1",
+          api_key: "beta-key", api: nil, models: [Shapes::Model.new(id: "b-1", name: "B", reasoning: false,
+            context_window: 1_000, max_tokens: nil, thinking_level_map: nil, compat: nil, provider: "beta")])
+      }
+      if keyless
+        providers["gamma"] = Shapes::Provider.new(name: "Gamma", base_url: "https://gamma.example/v1",
+          api_key: nil, api: nil, models: [Shapes::Model.new(id: "g-1", name: "G", reasoning: false,
+            context_window: 1_000, max_tokens: nil, thinking_level_map: nil, compat: nil, provider: "gamma")])
+      end
+      Models::Config.new(providers:, default: nil, error: nil)
+    end
+
     # A staged LOAD-PATH catalog whose zai block declares NO baseUrl and
     # NO apiKey: the vendored tier matches through the KEY arm (rule b),
     # and the menu fetch falls back per-field to the threaded endpoint
@@ -6518,7 +6636,8 @@ module Tart
     # kernel: injectable (the I38 animation-window pins record animate
     # calls; default IdleKernel unchanged).
     def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false,
-      models: nil, settings_root: nil, clock: nil, kernel: nil, identity: nil, endpoint: nil, env: nil)
+      models: nil, settings_root: nil, clock: nil, kernel: nil, identity: nil, endpoint: nil, env: nil,
+      settings: nil)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
         kernel ||= IdleKernel.new
         kwargs = {session:, kernel:, footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
@@ -6527,6 +6646,7 @@ module Tart
         kwargs[:clock] = clock if clock # the spinner's fake-time seam (pi's 80ms dwell pinned, zero sleeps)
         kwargs[:endpoint] = endpoint if endpoint # the I71 R5 live-listing fallback tier (nil = no listing)
         kwargs[:env] = env if env # the I119 listing key-resolution env (injected; never ENV)
+        kwargs[:settings] = settings if settings # the I120 switch gate's settings FILE tier
         chat = Render::Chat.new(**kwargs)
         yield(chat, session, kernel)
       end
