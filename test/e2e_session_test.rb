@@ -54,7 +54,14 @@ module Tart
     def setup
       @server = MockLLMServer.new.start
       @home = Dir.mktmpdir("tart-e2e-home-")
-      @scratch = File.join(space_root, "tmp", "i42-e2e-#{object_id}")
+      # Parallel-safety (the I111 D3 precedent, second application): the
+      # runner shards BY TEST, so the four legs can run in four worker
+      # processes at once — and object_id is deterministic per fresh
+      # process, so an object_id-keyed scratch collides across workers
+      # (one leg's teardown rm_rf deletes another's live edit-me.md; bit
+      # CI on the 1838-test shard map twice). The leg's own test name +
+      # the worker pid make the scratch unique on both axes.
+      @scratch = File.join(space_root, "tmp", "i42-e2e-#{name}-#{Process.pid}")
       FileUtils.mkdir_p(@scratch)
       puts "[e2e] space root: #{space_root}"
       puts "[e2e] repo dir:    #{repo_dir}"
