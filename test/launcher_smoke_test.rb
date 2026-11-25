@@ -34,6 +34,125 @@ module Tart
       FileUtils.rm_rf(home)
     end
 
+    # I121 (AC3): the print boot NEVER registers the architect-loop surface
+    # — driver mode is the launching interactive session's concept (I95,
+    # unchanged by the default-on flip). The DEFAULT print home stages NO
+    # settings.json (no architect_loop row, no subagents row) so the wire
+    # proves both defaults at once: subagents ON (the I70 flip, print
+    # registers) and architect_loop ABSENT (the interactive-only law).
+    # The captured-request leg — the request_count peek first (the drains
+    # hazard), then the one body popped.
+    def test_loop_default_print_boot_never_registers_the_architect_tools
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "print answer"}])
+
+      home = Dir.mktmpdir("t121-print-home-")
+      _stdout, _stderr, status = Open3.capture3(smoke_env(home, server),
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "say the word",
+        chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "print boot exit 0 (stderr: #{_stderr})"
+      assert_operator server.request_count, :>=, 1, "the boot made its request"
+      body = server.captured_request_logs.pop[:body]
+      names = body["tools"].map { |tool| tool["function"]["name"] }
+      assert_equal %w[read bash edit write subagent], names,
+        "the default print wire: subagents on, architect tools NEVER registered"
+      assert_empty names.select { |name| name.include?("architect") },
+        "no architect tool on the print wire (the I95 law, unchanged by the flip)"
+    ensure
+      server.stop
+      FileUtils.rm_rf(home)
+    end
+
+    # I122 (AC2, the models.json never-raise law at the REAL boots): a bad
+    # mcp.json never crashes a boot — every failure class becomes a named
+    # stderr warn (print, the models.error seat) and the run completes.
+    # At the base the same boots DIE on the raw ConfigError backtrace (the
+    # owner's recorded crash — the interactive seat at bin/tart's bare
+    # load; the print seat through build_tools' default kwarg, whose raise
+    # escapes the method's own rescue: a Ruby default-kwarg raise is not
+    # caught by the body's rescue — measured).
+    def test_mcp_streamable_print_boot_never_raises_on_a_bad_mcp_config
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "still boots"}])
+
+      home = Dir.mktmpdir("t122-mcp-home-")
+      config = File.join(home, "mcp.json")
+      classes = {
+        "malformed json" => ["{not json", /tart: #{Regexp.escape(config)}: /],
+        "root shape" => ["[1, 2]",
+          /tart: #{Regexp.escape(config)}: expected an object with an "mcpServers" object/],
+        "per-server schema failure" =>
+          [{"mcpServers" => {"x" => {"cwd" => 3}}}.to_json,
+           /tart: #{Regexp.escape(config)}: server "x": cwd must be a string/],
+        "legacy sse transport" =>
+          [{"mcpServers" => {"x" => {"type" => "sse", "url" => "https://e/mcp"}}}.to_json,
+           /legacy SSE transport is not supported; use the streamable HTTP URL/]
+      }
+      classes.each do |label, (body, pattern)|
+        File.write(config, body)
+        server.script([{type: :message, content: "still boots"}])
+        stdout, stderr, status = Open3.capture3(smoke_env(home, server).merge("TART_MCP_CONFIG" => config),
+          RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "say the word",
+          chdir: REPO_ROOT)
+        assert_equal 0, status.exitstatus, "#{label}: the boot never crashes (stderr: #{stderr})"
+        assert_includes stdout, "still boots", "#{label}: the run completes"
+        assert_match(pattern, stderr, "#{label}: the named diagnostic warns on stderr")
+      end
+    ensure
+      server.stop
+      FileUtils.rm_rf(home)
+    end
+
+    # I122 (AC2 + the print/children deferral ruling): an HTTP server entry
+    # in print mode warn-and-skips at the NAMED reactor-seat error (the
+    # mcp-print-reactor backlog class, extended to the HTTP transport — the
+    # same seat law as Stdio; the boot completes, the default wire holds).
+    def test_mcp_streamable_print_boot_warns_the_seat_error_for_http_servers
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "print answer"}])
+
+      home = Dir.mktmpdir("t122-mcp-seat-")
+      config = File.join(home, "mcp.json")
+      File.write(config, {"mcpServers" => {"prod-mcp-gw" => {"type" => "http",
+                                                             "url" => "http://127.0.0.1:9/mcp"}}}.to_json)
+      stdout, stderr, status = Open3.capture3(smoke_env(home, server).merge("TART_MCP_CONFIG" => config),
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "say the word",
+        chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "the owner's config shape never crashes the boot (stderr: #{stderr})"
+      assert_includes stdout, "print answer", "the run completes"
+      assert_match(/tart: mcp server "prod-mcp-gw" failed to connect: MCP HTTP start runs on the host reactor/, stderr)
+      body = server.captured_request_logs.pop[:body]
+      refute_includes body["tools"].map { |tool| tool["function"]["name"] }.join(" "), "mcp__",
+        "the skipped server leaves no tool on the wire"
+    ensure
+      server.stop
+      FileUtils.rm_rf(home)
+    end
+
+    # I122 (the boot seats, source-shaped): the interactive boot consumes
+    # the never-raising loader, surfaces its diagnostics as command rows
+    # (the models.error seat), and the build_tools default is the lenient
+    # loader too (the print-crash landmine). The transports' reactor-seat
+    # connect deferral is the named mcp-boot-reactor follow-up (the
+    # mcp-http-e2e gate proves the boot-shaped Sync seat).
+    def test_mcp_streamable_boot_seats_source_shape
+      source = File.read(File.join(REPO_ROOT, "bin", "tart"))
+      assert_includes source, "Mcp::Config.load_with_diagnostics(mcp_config_path)",
+        "both boots load through the never-raising seam"
+      assert_equal 3, source.scan(/Mcp::Config\.load_with_diagnostics\(mcp_config_path\)/).size,
+        "exactly three load seats (interactive + print + the build_tools default — the landmine death)"
+      assert_includes source, "mcp.diagnostics.each { |d| surface.command_line(d) }",
+        "the interactive diagnostics ride command rows (the models.error seat)"
+      assert_includes source, 'mcp.diagnostics.each { |d| warn "tart: #{d}" }',
+        "the print diagnostics ride stderr warns (the models.error print seat)"
+      assert_includes source, "mcp_servers: Mcp::Config.load_with_diagnostics(mcp_config_path).servers",
+        "the build_tools default is the lenient loader (the print-crash landmine dies)"
+      refute_includes source, "streamable HTTP transport is not supported",
+        "the dead port-specific error string is gone from the launcher"
+    end
+
     # The async-reactor IO::Buffer experimental warning never fires in print
     # mode (print mode records no session and its LLM turns run on the same
     # fiber-scheduler-cooperative :net_http path as every mode — I50 de-bridge:
@@ -371,6 +490,126 @@ module Tart
         JSON.generate("name" => Agent::SystemPrompt::PI_PACKAGE))
       File.write(File.join(install, "README.md"), "staged pi readme\n")
       File.join(install, "bin")
+    end
+
+    # --- I120 provider-swap: build_chat through the registry + the /new
+    # --- carryover chain ---
+
+    # The BOOT arm is byte-held: the env tier wins first, the client lands
+    # in the per-provider registry cache (the switch-back reuse seat), and
+    # the Chat carries the resolved key + boot facts.
+    def test_provider_swap_build_chat_boot_arm_seeds_the_registry
+      launcher
+      Tart::Endpoints.clear_cache
+      home = Dir.mktmpdir("tart-i120-boot-")
+      models = stage_two_provider_catalog(home, "http://a.test/v1", "http://b.test/v1")
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      boot = Shapes::ModelRef.new(provider: "alpha", id: "a-1")
+      chat = Executable.build_chat(models, boot, identity: "pi", resolved:,
+        env: {"PI_API_KEY" => "launcher-pin"})
+
+      assert_equal "launcher-pin", chat.endpoint[:api_key], "the env tier wins at boot"
+      assert_equal "alpha", chat.endpoint[:provider], "the boot facts name the provider"
+      cached = Tart::Endpoints.provide("alpha", models: models, env: {"PI_API_KEY" => "launcher-pin"})
+      assert_same cached.fetch(:client), chat.client, "the boot client IS the registry's cached entry"
+    ensure
+      Tart::Endpoints.clear_cache
+      FileUtils.rm_rf(home)
+    end
+
+    # The CARRY arm (a /new that carries a DIFFERENT provider's pair):
+    # build_chat resolves the carried provider through the MID-SESSION
+    # chain — never the identity env tier (the launcher pin governs its
+    # own provider only) — and the chat posts to the CARRIED provider with
+    # ITS key.
+    def test_provider_swap_build_chat_carry_arm_resolves_the_carried_provider
+      launcher
+      Tart::Endpoints.clear_cache
+      home = Dir.mktmpdir("tart-i120-carry-")
+      models = stage_two_provider_catalog(home, "http://a.test/v1", "http://b.test/v1")
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      carried = Shapes::ModelRef.new(provider: "beta", id: "b-1")
+      chat = Executable.build_chat(models, carried, identity: "pi", resolved:,
+        settings: {"apiKey" => nil}, boot_provider: "alpha",
+        env: {"PI_API_KEY" => "launcher-pin", "PI_API_BASE" => "http://a.test/v1"})
+
+      assert_equal "beta-key", chat.endpoint[:api_key], "BETA's block key — never the launcher pin"
+      assert_equal "http://b.test/v1", chat.endpoint[:api_base], "BETA's own base — never the pin base"
+      assert_equal "beta", chat.endpoint[:provider]
+      assert_nil chat.instance_variable_get(:@request_error)
+    ensure
+      Tart::Endpoints.clear_cache
+      FileUtils.rm_rf(home)
+    end
+
+    # The carry arm's never-raise discipline (I119 at the /new seat): a
+    # carried provider whose key does not resolve boots KEYLESS with the
+    # named error carried — /new never crashes the session.
+    def test_provider_swap_build_chat_carry_arm_never_raises
+      launcher
+      Tart::Endpoints.clear_cache
+      home = Dir.mktmpdir("tart-i120-carrynr-")
+      FileUtils.mkdir_p(File.join(home, ".tart"))
+      File.write(File.join(home, ".tart", "models.json"), JSON.generate(
+        "providers" => {"alpha" => {"baseUrl" => "http://a.test/v1", "apiKey" => "alpha-key",
+          "models" => [{"id" => "a-1"}]},
+          "gamma" => {"baseUrl" => "http://g.test/v1", "apiKey" => "$GAMMA_KEY",
+            "models" => [{"id" => "g-1"}]}}))
+      models = Models.load(root: File.join(home, ".tart"))
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      carried = Shapes::ModelRef.new(provider: "gamma", id: "g-1")
+      chat = Executable.build_chat(models, carried, identity: "pi", resolved:,
+        settings: {"apiKey" => nil}, boot_provider: "alpha", env: {})
+
+      assert_nil chat.endpoint[:api_key], "the unresolvable carried key boots keyless"
+      assert_instance_of ConfigValue::UnresolvedError, chat.instance_variable_get(:@request_error),
+        "the named failure is CARRIED for the first request (never a raise)"
+    ensure
+      Tart::Endpoints.clear_cache
+      FileUtils.rm_rf(home)
+    end
+
+    # The /new boot-ref helper: the surface's CURRENT model ref rides as
+    # the boot override when one answers (a /model switch's pair survives
+    # /new); no surface (or a surface with no ref) falls to today's boot
+    # tiers.
+    def test_provider_swap_new_session_boot_ref_threads_the_current_pair
+      launcher
+      home = Dir.mktmpdir("tart-i120-newref-")
+      models = stage_two_provider_catalog(home, "http://a.test/v1", "http://b.test/v1")
+      surface = Object.new
+      surface.define_singleton_method(:runtime_model_ref) do
+        Struct.new(:provider, :id).new("beta", "b-1")
+      end
+      carried = Executable.new_session_boot_ref(surface, models, {}, identity: "pi")
+      assert_equal "beta", carried.provider, "the surface's current ref rode"
+      assert_equal "b-1", carried.id
+
+      no_switch = Object.new
+      no_switch.define_singleton_method(:runtime_model_ref) { nil }
+      unswitched = Executable.new_session_boot_ref(no_switch, models, {}, identity: "pi")
+      assert_equal "alpha", unswitched.provider, "a surface with NO runtime switch falls to the boot tiers"
+      assert_equal "a-1", unswitched.id
+
+      fresh = Executable.new_session_boot_ref(nil, models, {"defaultProvider" => "alpha",
+        "defaultModel" => "a-1"}, identity: "pi")
+      assert_equal "alpha", fresh.provider, "no surface → today's boot tiers"
+      assert_equal "a-1", fresh.id
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
+    # A staged TWO-provider catalog (the registry's cross-provider arms):
+    # alpha + beta, each with its own base and literal key.
+    def stage_two_provider_catalog(home, alpha_base, beta_base)
+      FileUtils.mkdir_p(File.join(home, ".tart"))
+      File.write(File.join(home, ".tart", "models.json"), JSON.generate(
+        "default" => "alpha/a-1",
+        "providers" => {
+          "alpha" => {"baseUrl" => alpha_base, "apiKey" => "alpha-key", "models" => [{"id" => "a-1"}]},
+          "beta" => {"baseUrl" => beta_base, "apiKey" => "beta-key", "models" => [{"id" => "b-1"}]}
+        }))
+      Models.load(root: File.join(home, ".tart"))
     end
 
     # --- I119 env-templates: `endpoint_facts` resolves the provider block's

@@ -111,6 +111,31 @@ module Tart
         "the env tier beats the file tier"
     end
 
+    # I121 (the I70 subagents known-key precedent, second application): the
+    # architect_loop row becomes a KNOWN settings key with the default-on
+    # flip — no unknown-key warning for the opt-out row, and the ladder
+    # resolves env > file > default in both directions.
+    def test_loop_default_architect_loop_is_a_known_key_resolving_env_over_file_over_default
+      result = load_settings
+      assert_empty result.diagnostics, "the architect_loop row is known — no unknown-key warning"
+      assert_equal true, result.settings["architect_loop"], "the DEFAULTS tier is on (the I121 flip)"
+
+      write_settings(@user_path, '{"architect_loop": false}')
+      assert_equal false, load_settings.settings["architect_loop"], "the file opt-out tier"
+
+      assert_equal "1", Settings.resolve_setting("architect_loop", {}, identity: "pi", env: {"PI_ARCHITECT_LOOP" => "1"})
+      assert_equal true, Settings.resolve_setting("architect_loop", {}, identity: "tart", env: {}),
+        "the DEFAULTS tier is on (the I121 flip)"
+      assert_equal false, Settings.resolve_setting("architect_loop", {"architect_loop" => false}, identity: "tart", env: {}),
+        "the file opt-out tier resolves off"
+      assert_equal "0", Settings.resolve_setting("architect_loop", {}, identity: "tart", env: {"TART_ARCHITECT_LOOP" => "0"}),
+        "the env opt-out tier (any non-on value)"
+      assert_equal "1", Settings.resolve_setting("architect_loop", {"architect_loop" => false}, identity: "tart", env: {"TART_ARCHITECT_LOOP" => "1"}),
+        "the env tier beats the file tier"
+      assert_equal "0", Settings.resolve_setting("architect_loop", {"architect_loop" => true}, identity: "tart", env: {"TART_ARCHITECT_LOOP" => "0"}),
+        "the env opt-out beats an on file row"
+    end
+
     def test_project_deep_merges_over_user
       write_settings(@user_path, '{"compaction": {"reserveTokens": 1000, "keepRecentTokens": 500}}')
       write_settings(@project_path, '{"compaction": {"reserveTokens": 2000}, "defaultModel": "m-project"}')

@@ -348,15 +348,51 @@ module TuiSplitRig
       settings = JSON.parse(File.read(File.join(home, ".tart", "settings.json")))
       assert_equal false, settings.fetch("subagents"),
         "the always-staged settings.json carries the explicit opt-out (the I48-off shape)"
+      assert_equal false, settings.fetch("architect_loop"),
+        "I121: the staged settings.json carries the architect-loop opt-out too (the I95-off shape)"
       refute settings.key?("compaction"),
         "the compaction rows still ride ONLY the context_window scenarios"
+    end
+
+    # I121: the architect-loop opt-out rides the same two legs the I70
+    # subagents flip established — the always-staged settings.json row
+    # (this pin) and the identity-namespaced env tier for the
+    # non-compaction boots whose staged file is moved aside (the pin
+    # below). No parity path rides the app default, which flipped
+    # default-ON this iteration.
+    def test_stage_tart_home_stages_the_architect_loop_opt_out
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_text_turn.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      home = File.join(Dir.mktmpdir("tui-split-rig-home-"))
+      runner.stage_tart_home(home, 4711)
+
+      settings = JSON.parse(File.read(File.join(home, ".tart", "settings.json")))
+      assert_equal false, settings.fetch("architect_loop"),
+        "the staged opt-out row is present and false (the I95-off shape)"
+    end
+
+    def test_tart_command_stages_the_identity_namespaced_architect_loop_opt_out
+      scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_text_turn.yml"))
+      runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      cmd = runner.tart_command("/sbx", "/home", 4711)
+      assert_includes cmd, "PI_ARCHITECT_LOOP=0",
+        "the pi-parity boot stages the explicit architect-loop opt-out env row"
+
+      tart = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_tart.yml"))
+      tart_runner = Runner.new(scenario: tart, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))
+      tart_cmd = tart_runner.tart_command("/sbx", "/home", 4711)
+      assert_includes tart_cmd, "TART_ARCHITECT_LOOP=0",
+        "the tart-mode boot namespaces the architect-loop opt-out to the staged identity"
+      refute_includes tart_cmd, "PI_ARCHITECT_LOOP=0",
+        "never the pi spelling (the scrub's -u PI_* flags are not stagings)"
     end
 
     # I70: the non-compaction parity boots carry the explicit opt-out via
     # the env tier (the staged settings.json is moved aside — the [Context]
     # listing conflict, boot_session's comment): identity-namespaced
     # PI_SUBAGENTS/TART_SUBAGENTS=0, "0" = the app's non-on opt-out
-    # spelling.
+    # spelling. (The I121 architect-loop opt-out composes the same way —
+    # see its own pins above.)
     def test_tart_command_stages_the_identity_namespaced_subagents_opt_out
       scenario = Scenario.load(File.join(RIG_ROOT, "scenarios/s1_text_turn.yml"))
       runner = Runner.new(scenario:, out: File.join(Dir.mktmpdir("tui-split-rig-runner-")))

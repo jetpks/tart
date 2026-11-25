@@ -85,6 +85,19 @@ thinkingLevelMap}]}}}` plus an optional `"default"` boot reference
 identity-namespaced MODEL/PROVIDER env (below) > the models.json default
 > the settings `defaultModel`/`defaultProvider`.
 
+The endpoint FOLLOWS the model (the provider-keyed registry,
+`Tart::Endpoints`): the client (base URL + key) resolves per PROVIDER —
+the boot provider through the chain above, a mid-session `/model` switch
+to a different provider through the TARGET provider's own models.json
+block (its `apiKey` resolved at use, its `baseUrl` required, else the
+`settings.json` `apiKey` file tier; the switch refuses with an error row
+and nothing half-applies), and a switch back reuses the cached client.
+`<IDENTITY>_API_KEY`/`_API_BASE` stay BOOT-ONLY — they are the launcher's
+pin for the provider it booted and never follow a switch (the boot
+provider's key is never sent to another provider). `/new` keeps the
+session's current model pair (persisted and non-persisted switches
+alike); compaction rides the current provider's client.
+
 `thinkingLevelMap` maps the thinking levels onto the model's native
 `reasoning_effort` values (`{"off": "low", "low": "low", "medium":
 "medium", ...}`; a `null` marks a level unsupported, and `xhigh`/`max`
@@ -249,20 +262,35 @@ fires.
 
 ### MCP servers
 
-MCP stdio servers are loaded from `~/.tart/mcp.json` (override the
-path with `TART_MCP_CONFIG`; a missing file means no servers):
+MCP servers are loaded from `~/.tart/mcp.json` (override the path with
+`TART_MCP_CONFIG`; a missing file means no servers). Two transports:
+stdio (a local `command`) and Streamable HTTP (a `url`; `url` wins when
+both are present):
 
 ```json
-{"mcpServers": {"echo": {"command": "/path/to/echo-server", "args": [], "env": {}}}}
+{"mcpServers": {
+  "echo": {"command": "/path/to/echo-server", "args": [], "env": {}},
+  "gateway": {"type": "http", "url": "https://gw.example.com/mcp", "headers": {"Authorization": "Bearer ..."}}
+}}
 ```
 
 A configured server's tools join the loadout as `mcp__<server>__<tool>` and
 are declared to the model like the built-in tools; a server that fails to
-connect is skipped with a warning. The server's `env` VALUES expand with the
-same `$VAR`/`${VAR}` grammar as `apiKey` (above) when the server connects —
-an unset or empty variable fails that server's connection by name, and the
-child still receives only tart's explicit environment (never the literal
-template).
+connect is skipped with a warning. The server's `env` VALUES (stdio) and
+`headers` VALUES (HTTP) expand with the same `$VAR`/`${VAR}` grammar as
+`apiKey` (above) when the server connects — an unset or empty variable
+fails that server's connection by name, and the stdio child still receives
+only tart's explicit environment (never the literal template).
+
+A bad config file never crashes a boot: malformed JSON, a bad schema row,
+or an unsupported transport is a named warning (a command-line row
+interactively, a stderr line in print mode) and only the offending server
+is skipped — the other servers still connect (the same never-raise law as
+models.json). Configured servers do not connect at the boot seat yet in any mode —
+the connect runs on a host reactor (a Sync-wrapped seat) and the bare
+boots warn-and-skip with the named reactor-seat line (a known backlog
+item, `mcp-boot-reactor`); the transport itself is proven at the
+Sync-wrapped seat.
 
 ### Print mode
 
@@ -355,6 +383,17 @@ default: add `"subagents": true` to settings.json (user or project) or set
 `<IDENTITY>_SUBAGENTS=1` (pi reads `PI_SUBAGENTS`, tart `TART_SUBAGENTS`).
 With the gate off, nothing changes — no tool on the wire, no watcher, no
 run dirs.
+
+A child resolves its own provider: the child boots with its pinned
+provider (the `model:` call arg or the profile's `model:` — validated
+against the catalog at the spawn, and REFUSED with a named error when the
+key would not resolve at the child's boot) and resolves that provider's
+models.json block through the same registry at its own boot. The parent's
+boot endpoint facts never ride the child env — only an explicit
+`<IDENTITY>_API_KEY`/`_API_BASE` in the parent's environment propagates
+(and still wins at the child's boot). An UNPINNED child inherits the
+parent's CURRENT model pair (a mid-session `/model` switch is what the
+child sees).
 
 Built-in agents: `worker` (implementation; read/grep/find/ls/bash/edit/
 write), `oracle` (high-context decision consistency; runs from a FORK of
@@ -492,6 +531,24 @@ the parent), the before-settle reminder ladder, parent-side structured-reply
 parsing, profile generation/provider catalogs, chains, package-tier agents,
 agentScanDirs/ExcludeDirs, the fleet UI, nested delegation (unchanged I48
 cut), and the TS workflow-script machinery the templates replace.
+
+## Architect loop
+
+The native driver-mode module (I95, ported from pi's architect-loop.ts;
+DEFAULT ON since I121): an interactive tart session can drive a
+space-architect loop itself. On every interactive boot the module
+registers the `/loop` command, the `architect_loop` / `architect_compact`
+tools, and the builder guard (git-write verbs are denied in bash commands
+when the session cwd is a lane worktree); at every session start it
+regenerates the space's role agent files under `<spaceRoot>/.tart/agents/`
+from `architect.yaml` (write-if-changed). `/loop --from <plan>` installs
+the driver playbook and driving begins in the same turn. The OPT-OUT is a
+settings row `{"architect_loop": false}` (user or project) or the env tier
+`<IDENTITY>_ARCHITECT_LOOP=0` (pi reads `PI_ARCHITECT_LOOP`, tart
+`TART_ARCHITECT_LOOP`; `1`/`true` are the on spellings). Print mode never
+registers the module — driver mode is the launching interactive session's
+concept — and the space requirement stands: the cwd (or a parent) must
+carry both `space.yaml` and `architect.yaml`.
 
 ## Herdr
 

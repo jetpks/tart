@@ -2,7 +2,57 @@
 
 ## Unreleased
 
+### Added
+
+- **Streamable HTTP MCP servers (I122).** `~/.tart/mcp.json` entries with a
+  `url` (type `http`, `streamable-http`, or omitted) now connect over the
+  Streamable HTTP transport — session id, negotiated protocol version
+  header, `headers` with `$VAR`/`${VAR}` expansion at connect, JSON and
+  SSE replies, and the server-to-client GET stream. `url` wins when an
+  entry carries both `url` and `command` (pi's dispatch); `type: "sse"` is
+  the named legacy rejection.
+
 ### Changed
+
+- **A bad mcp.json never crashes a boot (I122, the models.json law).**
+  Malformed JSON, a bad root shape, an invalid server row, or an
+  unsupported transport is a named warning (a command-line row
+  interactively, a stderr line in print mode) and only the offending
+  server is skipped — the remaining servers still connect. The
+  boot-seat reactor deferral is unchanged and now named: configured
+  servers warn-and-skip with the named reactor-seat line at the bare
+  boots (interactive, print, subagent children alike — pre-existing
+  since I107, the `mcp-boot-reactor` backlog item; the transport is
+  proven at the Sync-wrapped seat).
+
+- **Architect loop is on by default (I121, the I70 subagents precedent).**
+  The `architect_loop` driver-mode module — the `/loop` command, the
+  `architect_loop`/`architect_compact` tools, the builder guard, and the
+  session-start role-file regeneration under `<spaceRoot>/.tart/agents/`
+  — now registers on every default INTERACTIVE boot, so a tart session can
+  launch a space-architect loop natively without installing the playbook by
+  hand. The opt-out is a settings row `{"architect_loop": false}` or
+  `<IDENTITY>_ARCHITECT_LOOP=0` ("1"/"true" turn it back on); print mode never
+  registers (unchanged). The gate ladder moved into `Settings.resolve_setting`
+  beside `subagents`.
+
+- **The endpoint follows the model: one provider-keyed client/endpoint registry
+  (`Tart::Endpoints`) resolves boot, `/model` switches, `/new`, compaction, and
+  subagent children — the endpoint is no longer a session-lifetime boot fact.**
+  A mid-session `/model` switch to a different provider routes subsequent
+  requests to the target provider's endpoint with its key (same-provider
+  switches never rebuild the client; a switch back reuses the cached one); an
+  unresolvable target key/base refuses the switch with an error row and no
+  partial switch. `<IDENTITY>_API_KEY`/`_API_BASE` stay boot-only (the
+  launcher's pin for the provider it booted — never sent to another provider).
+  `/new` keeps the session's current model pair. Subagent children resolve
+  their own pinned provider at their own boot (the parent's boot endpoint
+  no longer rides the child env — an explicit parent env tier still wins);
+  an unpinned child inherits the parent's LIVE model pair; a pinned child
+  whose key would not resolve is refused at the spawn with the named error.
+  The `Manager#endpoint` accessor is deleted (nothing left to refresh); the
+  I49 child-env fallback tier is superseded (itemized deviation); pi's
+  `model_change` session recording stays the named follow-up.
 
 - **grep context lines come from ripgrep's own events, and a resumed session restores its
   recorded tool loadout (I117 — the last two pi v1.6.0 parity ports, the REPIN plan's ENTRY 4;
