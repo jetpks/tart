@@ -196,6 +196,41 @@ module Tart
       end
     end
 
+    # -- the bounded wire (no unbounded network wait on any path) ----------
+
+    def test_mcp_streamable_http_stalled_get_stream_fails_within_the_request_timeout
+      server = start_echo_server("MCP_HTTP_ECHO_GET_STALL" => "1")
+      Sync do
+        errors = []
+        client = Mcp::Client.new(on_error: ->(error) { errors << error })
+        result = client.connect(Mcp::Http.new(url: server_url(server), request_timeout_ms: 500))
+        assert result.success?, result.failure&.message
+
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
+        until errors.any? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+          sleep 0.05
+        end
+        assert errors.any?, "a stalled GET stream must fail its reader within the request timeout, never hang"
+        client.close
+      end
+    end
+
+    def test_mcp_streamable_http_slow_sse_reply_fails_within_the_request_timeout
+      server = start_echo_server("MCP_HTTP_ECHO_SSE" => "1", "MCP_HTTP_ECHO_SLOW_SSE" => "1")
+      Sync do
+        client = Mcp::Client.new
+        result = client.connect(Mcp::Http.new(url: server_url(server), request_timeout_ms: 500))
+        assert result.success?, result.failure&.message
+
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        called = client.call_tool("echo", {"message" => "slow"})
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+        assert called.failure?, "an SSE reply that outlives the request timeout fails the request"
+        assert_operator elapsed, :<, 3, "the failure lands within a bounded wait, not the fixture's 2s drip"
+        client.close
+      end
+    end
+
     # -- the config schema's http arm (AC4, pi's exact strings) ------------
 
     def test_mcp_streamable_schema_accepts_the_http_arm_and_keeps_pi_strings
