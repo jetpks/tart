@@ -1602,6 +1602,58 @@ module Tart
       assert_equal %w[user user], wire.map { |m| m["role"] }
     end
 
+    # I119 AC3/AC4: a key failure resolved at boot rides THIS failure trace —
+    # the named error is @last_error, the synthesized failure assistant
+    # carries pi's exact message with finish_reason "error", and the keyless
+    # client never reaches the wire. The interactive surface renders whatever
+    # the loop emits (the I60 D3 pins), so the loop-level pin is the proof.
+    def test_env_template_unresolvable_key_rides_the_failure_trace
+      error = assert_raises(ConfigValue::UnresolvedError) do
+        ConfigValue.resolve!("$FIREWORKS_API_KEY$ZAI_KEY", 'API key for provider "mock"', env: {})
+      end
+      keyless = Agent::Chat.new(client: Fast::Completions::Client.new(base_url: @server.url, api_key: nil, timeout: 10),
+        model_id: "tart-test-model", provider_key: "mock", request_error: error)
+      keyless.with_instructions("test prompt")
+      agent, events = agent_on_kernel_with_chat(keyless)
+      run_agent(agent, "hello")
+
+      failure = agent.new_messages.last
+      assert_equal "error", failure.finish_reason
+      assert_equal 'Failed to resolve API key for provider "mock" from environment variables: FIREWORKS_API_KEY, ZAI_KEY',
+        failure.error_message
+      assert_same error, agent.last_error
+      assert events.find { |e| e[:type] == :agent_end }[:error], "agent_end carries the error (the I60 arm)"
+      assert_equal 0, @server.request_count, "nothing reached the wire"
+
+      # The compaction summary chat inherits the same failure (shared client):
+      # its first request raises the same named error before any wire I/O.
+      summary = keyless.summary_chat(instructions: "summarize")
+      summary.add_message(Agent::Message.user("the tail"))
+      raised = assert_raises(ConfigValue::UnresolvedError) { Sync { summary.step } }
+      assert_same error, raised
+      assert_equal 0, @server.request_count, "the summary request never reached the wire either"
+    end
+
+    # I119 (ruling A): the wire endpoint is BOOT-FIXED across a `/model` switch
+    # — pre-existing since I52, unrelated to templates — PINNED AS HELD. After
+    # a switch to another provider the request still carries the boot
+    # provider's resolved key to the boot endpoint (the switch swaps the wire
+    # model + provider metadata only; the Client is immutable).
+    def test_env_template_switch_keeps_the_boot_endpoint_and_resolved_key_held
+      @server.script([{type: :message, content: "boot key"}])
+      boot = Agent::Chat.new(client: Fast::Completions::Client.new(base_url: @server.url,
+        api_key: "boot-resolved-key", timeout: 10), model_id: "tart-test-model", provider_key: "mock")
+      boot.with_instructions("test prompt")
+      agent, = agent_on_kernel_with_chat(boot)
+      agent.switch_model("glm-5.3", provider: "zai", model_reasoning: false)
+      run_agent(agent, "hello")
+
+      log = @server.captured_request_logs.first
+      assert_equal "Bearer boot-resolved-key", log.fetch(:headers)["authorization"],
+        "the boot provider's RESOLVED key keeps riding the wire after the switch (held, not changed)"
+      assert_equal "glm-5.3", log.fetch(:body)["model"], "the switch swapped the wire model only"
+    end
+
     # AC1: a mid-stream failure accumulates the step's streamed chunks (the
     # same chunks the block receives) into the synthesis, and keeps its
     # existing message_start — never a second one (pi :459-468).

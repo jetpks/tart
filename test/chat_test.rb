@@ -3658,6 +3658,125 @@ module Tart
       end
     end
 
+    # --- I119 env-templates: the /model live listing resolves the CURRENT
+    # provider block's templated apiKey at menu open (the one consumer that
+    # reads the switched provider's block) ---
+
+    # A staged catalog whose zai block carries a templated apiKey + baseUrl:
+    # the mock's GET carries `Authorization: Bearer <resolved>` — never the
+    # literal template.
+    def stage_templated_list_catalog(server, api_key)
+      File.write(File.join(@dir, "models.json"), JSON.generate({"default" => "zai/glm-5.3",
+        "providers" => {"zai" => {"name" => "Z.AI", "baseUrl" => server.url, "apiKey" => api_key,
+          "models" => [{"id" => "glm-5.3", "name" => "Mine", "reasoning" => true}]}}}))
+      Models.load(root: @dir)
+    end
+
+    # [requests, authorization] — the count read BEFORE the drain
+    # (captured_request_logs empties the queue).
+    def listing_auth(server)
+      count = server.request_count
+      [count, server.captured_request_logs.first.fetch(:headers)["authorization"]]
+    end
+
+    def test_env_template_live_list_resolves_the_current_providers_block_key
+      Sync do
+        server = MockLLMServer.new.start
+        server.script([{type: :models, ids: ["glm-5.2"]}])
+        with_chat(width: 40, screen_height: 16, models: stage_templated_list_catalog(server, "$ZAI_LIST_KEY"),
+          endpoint: {api_key: "boot-key", api_base: server.url}, env: {"ZAI_LIST_KEY" => "resolved-list-key"},
+          footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat|
+          chat.open_model_menu
+          await(chat, "the live rows to merge") { live_menu_ids(chat).include?("glm-5.2") }
+
+          count, auth = listing_auth(server)
+          assert_equal "Bearer resolved-list-key", auth, "the block's template resolved at menu open"
+          assert_equal 1, count, "ONE fetch per menu open"
+        end
+      ensure
+        server&.stop
+      end
+    end
+
+    # An unresolvable block template is the listing's EXISTING failure surface
+    # — the one muted failure row a failed fetch draws — with NO fetch: the
+    # literal never reaches the wire and the boot endpoint's key never
+    # substitutes (the threaded endpoint carried a key).
+    def test_env_template_live_list_unresolvable_block_key_is_the_failure_row
+      Sync do
+        server = MockLLMServer.new.start
+        with_chat(width: 40, screen_height: 16, models: stage_templated_list_catalog(server, "$ZAI_MISSING"),
+          endpoint: {api_key: "boot-key-must-not-substitute", api_base: server.url}, env: {},
+          footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat, session|
+          chat.open_model_menu
+          await(chat, "the failure row to land") do
+            draw(chat, session)
+            session.buffer_content.any? { |row| row.include?("(live listing unavailable)") }
+          end
+          assert_equal 0, server.request_count, "no fetch — the literal template and the boot key both stayed home"
+          assert_equal ["glm-5.3"], live_menu_ids(chat), "the menu keeps the user entries"
+          assert chat.menu_open?, "no crash — the menu stays open"
+        end
+      ensure
+        server&.stop
+      end
+    end
+
+    # The `!command` cut on the listing: never executed (canary uncreated),
+    # never sent (no fetch), the failure row.
+    def test_env_template_live_list_command_block_key_is_the_failure_row_and_never_executes
+      Sync do
+        server = MockLLMServer.new.start
+        canary = File.join(@dir, "canary")
+        with_chat(width: 40, screen_height: 16, models: stage_templated_list_catalog(server, "!touch #{canary}"),
+          endpoint: {api_key: "boot-key", api_base: server.url}, env: {"PATH" => ENV["PATH"]},
+          footer_data: {cwd: @dir, model: "glm-5.3", default_provider: "zai"}) do |chat, session|
+          chat.open_model_menu
+          await(chat, "the failure row to land") do
+            draw(chat, session)
+            session.buffer_content.any? { |row| row.include?("(live listing unavailable)") }
+          end
+          assert_equal 0, server.request_count
+          refute File.exist?(canary), "the command never ran"
+        end
+      ensure
+        server&.stop
+      end
+    end
+
+    # Ruling A: after a `/model` switch to another provider the listing
+    # resolves the SWITCHED provider's block at the next menu open.
+    def test_env_template_live_list_after_a_switch_resolves_the_switched_providers_block
+      Sync do
+        server = MockLLMServer.new.start
+        server.script([{type: :models, ids: ["glm-5.2"]}])
+        File.write(File.join(@dir, "models.json"), JSON.generate({"default" => "boot/m-1",
+          "providers" => {
+            "boot" => {"baseUrl" => server.url, "apiKey" => "boot-literal", "models" => [{"id" => "m-1"}]},
+            "zai" => {"baseUrl" => server.url, "apiKey" => "$ZAI_LIST_KEY",
+                      "models" => [{"id" => "glm-5.3", "name" => "Mine", "reasoning" => true}]}}}))
+        models = Models.load(root: @dir)
+        with_chat(width: 40, screen_height: 16, models:, endpoint: {api_key: "boot-literal", api_base: server.url},
+          env: {"ZAI_LIST_KEY" => "switched-resolved"},
+          footer_data: {cwd: @dir, model: "m-1", default_provider: "boot"}) do |chat|
+          chat.agent = Object.new.tap do |agent|
+            agent.define_singleton_method(:switch_model) { |*| }
+            agent.define_singleton_method(:set_thinking_level) { |_level| }
+          end
+          chat.switch_model(provider: "zai", id: "glm-5.3", name: "Mine", reasoning: true,
+            context_window: 100_000, max_tokens: nil, thinking_level_map: nil)
+
+          chat.open_model_menu
+          await(chat, "the live rows to merge") { live_menu_ids(chat).include?("glm-5.2") }
+          count, auth = listing_auth(server)
+          assert_equal "Bearer switched-resolved", auth, "the SWITCHED provider's block resolved at menu open"
+          assert_equal 1, count, "ONE fetch per menu open"
+        end
+      ensure
+        server&.stop
+      end
+    end
+
     def test_live_list_never_fires_at_boot_or_on_the_direct_switch_path
       # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
       # the migrated workers are reactor tasks. Same name, same assertions.
@@ -6399,7 +6518,7 @@ module Tart
     # kernel: injectable (the I38 animation-window pins record animate
     # calls; default IdleKernel unchanged).
     def with_chat(width: 9, screen_height: 12, footer_data: nil, branch_reader: nil, motd: false,
-      models: nil, settings_root: nil, clock: nil, kernel: nil, identity: nil, endpoint: nil)
+      models: nil, settings_root: nil, clock: nil, kernel: nil, identity: nil, endpoint: nil, env: nil)
       TUI.run(headless: true, viewport: :fullscreen, width:, screen_height:) do |session|
         kernel ||= IdleKernel.new
         kwargs = {session:, kernel:, footer_data:, branch_reader: branch_reader || ->(_cwd) { nil }, motd:,
@@ -6407,6 +6526,7 @@ module Tart
         kwargs[:identity] = identity if identity # the I69 move seam (pi-face header pins opt in explicitly)
         kwargs[:clock] = clock if clock # the spinner's fake-time seam (pi's 80ms dwell pinned, zero sleeps)
         kwargs[:endpoint] = endpoint if endpoint # the I71 R5 live-listing fallback tier (nil = no listing)
+        kwargs[:env] = env if env # the I119 listing key-resolution env (injected; never ENV)
         chat = Render::Chat.new(**kwargs)
         yield(chat, session, kernel)
       end

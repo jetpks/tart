@@ -373,6 +373,193 @@ module Tart
       File.join(install, "bin")
     end
 
+    # --- I119 env-templates: `endpoint_facts` resolves the provider block's
+    # apiKey at the USE seam (never at load), on an injected env ---
+
+    # The in-process seam: a pi-copied catalog (`"$FIREWORKS_API_KEY"`) with
+    # the variable in the injected env resolves; the boot's three threadings
+    # (build_chat, the surface, the subagents Manager) all read this hash.
+    def test_env_template_endpoint_facts_resolves_a_templated_api_key_from_the_injected_env
+      launcher
+      home = Dir.mktmpdir("tart-i119-facts-")
+      models = stage_templated_catalog(home, "$FIREWORKS_API_KEY")
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      boot = Models.resolve_boot_model(models, {}, identity: "pi", env: {})
+      facts = Executable.endpoint_facts(models, boot, identity: "pi", resolved:,
+        env: {"FIREWORKS_API_KEY" => "resolved-secret"})
+
+      assert_equal "resolved-secret", facts[:api_key]
+      assert_nil facts[:api_key_error]
+      assert_equal "http://mock.test/v1", facts[:api_base]
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
+    # An unset OR empty-string variable (pi :89) is the NAMED failure carried
+    # for the first request — api_key nil, the error's message is pi's exact
+    # string — and the settings view's apiKey (staged) never fills in.
+    def test_env_template_endpoint_facts_carries_the_named_failure_for_an_unresolvable_template
+      launcher
+      home = Dir.mktmpdir("tart-i119-unres-")
+      models = stage_templated_catalog(home, "$FIREWORKS_API_KEY")
+      resolved = Shapes::ResolvedSettings.from_load({"apiKey" => "settings-key-must-not-fill-in"}, identity: "pi", env: {})
+      boot = Models.resolve_boot_model(models, {}, identity: "pi", env: {})
+
+      facts = Executable.endpoint_facts(models, boot, identity: "pi", resolved:, env: {})
+      assert_nil facts[:api_key], "no key reaches the client"
+      assert_kind_of ConfigValue::UnresolvedError, facts[:api_key_error]
+      assert_equal 'Failed to resolve API key for provider "mock" from environment variable: FIREWORKS_API_KEY',
+        facts[:api_key_error].message
+
+      facts = Executable.endpoint_facts(models, boot, identity: "pi", resolved:, env: {"FIREWORKS_API_KEY" => ""})
+      assert_nil facts[:api_key], "an empty-string variable counts as unset"
+      assert_equal 'Failed to resolve API key for provider "mock" from environment variable: FIREWORKS_API_KEY',
+        facts[:api_key_error].message
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
+    # The `!command` cut: a leading-`!` apiKey is neither executed nor sent —
+    # the carried error is tart's named message and the canary stays uncreated.
+    def test_env_template_endpoint_facts_carries_the_command_cut_error
+      launcher
+      home = Dir.mktmpdir("tart-i119-cmd-")
+      canary = File.join(home, "canary")
+      models = stage_templated_catalog(home, "!touch #{canary}")
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      boot = Models.resolve_boot_model(models, {}, identity: "pi", env: {})
+      facts = Executable.endpoint_facts(models, boot, identity: "pi", resolved:, env: {"PATH" => ENV["PATH"]})
+
+      assert_nil facts[:api_key]
+      assert_kind_of ConfigValue::CommandConfigValueError, facts[:api_key_error]
+      assert_equal 'Failed to resolve API key for provider "mock": "!command" values are not supported — ' \
+        'use a "$VAR" or "${VAR}" reference or the <IDENTITY>_API_KEY environment override',
+        facts[:api_key_error].message
+      refute File.exist?(canary), "the command never ran"
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
+    # Precedence unchanged otherwise (1): the <IDENTITY>_API_KEY env tier wins
+    # BEFORE the provider's key is consulted — a template naming an unset
+    # variable is never even looked at when the env tier is set.
+    def test_env_template_precedence_env_tier_wins_before_the_template
+      launcher
+      home = Dir.mktmpdir("tart-i119-prec1-")
+      models = stage_templated_catalog(home, "$FIREWORKS_API_KEY")
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      boot = Models.resolve_boot_model(models, {}, identity: "pi", env: {})
+      facts = Executable.endpoint_facts(models, boot, identity: "pi", resolved:, env: {"PI_API_KEY" => "env-tier-key"})
+
+      assert_equal "env-tier-key", facts[:api_key]
+      assert_nil facts[:api_key_error], "the unresolvable template was never consulted"
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
+    # Precedence unchanged otherwise (2): a literal key rides verbatim (an
+    # escaped `$$` included); baseUrl never expands; the settings view's
+    # apiKey is reached ONLY when the block declares none, and is itself
+    # never expanded.
+    def test_env_template_precedence_literal_key_settings_fallback_and_base_url_stay_verbatim
+      launcher
+      home = Dir.mktmpdir("tart-i119-prec2-")
+      env = {"BASE" => "http://expanded.test/v1", "SETTINGS_KEY" => "expanded-settings"}
+      literal = stage_templated_catalog(home, "sk-$$literal")
+      resolved = Shapes::ResolvedSettings.from_load({}, identity: "pi", env: {})
+      boot = Models.resolve_boot_model(literal, {}, identity: "pi", env: {})
+      facts = Executable.endpoint_facts(literal, boot, identity: "pi", resolved:, env:)
+      assert_equal "sk-$literal", facts[:api_key], "a literal rides verbatim (the escape is pi's)"
+      assert_nil facts[:api_key_error]
+
+      # The block declares NO apiKey and a templated baseUrl: today's chain
+      # falls to the settings view — literal — and baseUrl never expands.
+      blockless = Models.load(root: stage_blockless_catalog(home))
+      boot2 = Models.resolve_boot_model(blockless, {}, identity: "pi", env: {})
+      resolved2 = Shapes::ResolvedSettings.from_load({"apiKey" => "$SETTINGS_KEY"},
+        identity: "pi", env: {})
+      facts = Executable.endpoint_facts(blockless, boot2, identity: "pi", resolved: resolved2, env:)
+      assert_equal "$SETTINGS_KEY", facts[:api_key], "settings.json is out of scope — never expanded"
+      assert_nil facts[:api_key_error]
+      assert_equal "$BASE", facts[:api_base], "baseUrl never expands (the env has BASE set)"
+    ensure
+      FileUtils.rm_rf(home)
+    end
+
+    # The REAL launcher (print boot, staged HOME, explicit subprocess env):
+    # the hermetic mock receives `Authorization: Bearer <resolved>` — the
+    # owner's pi-copied catalog works (I46 OQ-3 closed).
+    def test_env_template_print_boot_sends_the_resolved_key_on_the_wire
+      server = MockLLMServer.new.start
+      server.script([{type: :message, content: "templated answer"}])
+      home = Dir.mktmpdir("tart-i119-wire-")
+      stage_templated_catalog(home, "$FIREWORKS_API_KEY", base_url: server.url)
+      stdout, stderr, status = Open3.capture3(templated_env(home).merge("FIREWORKS_API_KEY" => "resolved-secret"),
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "say the magic word", chdir: REPO_ROOT)
+
+      assert_equal 0, status.exitstatus, "the templated boot runs (stderr: #{stderr})"
+      assert_equal "templated answer\n", stdout
+      assert_equal "Bearer resolved-secret", server.captured_request_logs.first.fetch(:headers)["authorization"],
+        "the mock receives the RESOLVED key, never the literal template"
+    ensure
+      server&.stop
+      FileUtils.rm_rf(home)
+    end
+
+    # The named failure on print's existing bad-key surface: the FIRST request
+    # fails — exit 1, pi's exact line on stderr, nothing on stdout, NO request
+    # reaches the mock, no fall-through to settings' apiKey (staged).
+    def test_env_template_print_boot_fails_the_first_request_named_without_a_request
+      server = MockLLMServer.new.start
+      home = Dir.mktmpdir("tart-i119-named-")
+      stage_templated_catalog(home, "$FIREWORKS_API_KEY")
+      File.write(File.join(home, ".tart", "settings.json"), JSON.generate("apiKey" => "settings-key-must-not-fall-through"))
+      stdout, stderr, status = Open3.capture3(templated_env(home),
+        RbConfig.ruby, File.join(REPO_ROOT, "bin", "tart"), "-p", "say the magic word", chdir: REPO_ROOT)
+
+      assert_equal 1, status.exitstatus
+      assert_empty stdout
+      assert_equal "Failed to resolve API key for provider \"mock\" from environment variable: FIREWORKS_API_KEY\n", stderr
+      assert_equal 0, server.request_count, "the literal template never reaches the wire"
+    ensure
+      server&.stop
+      FileUtils.rm_rf(home)
+    end
+
+    # A pi-copied catalog under a staged HOME (provider mock, declared default,
+    # the given apiKey) — the only key source in these legs (no env tier).
+    def stage_templated_catalog(home, api_key, base_url: "http://mock.test/v1")
+      FileUtils.mkdir_p(File.join(home, ".tart"))
+      File.write(File.join(home, ".tart", "models.json"), JSON.generate(
+        "default" => "mock/mock-1",
+        "providers" => {"mock" => {"baseUrl" => base_url, "apiKey" => api_key,
+          "models" => [{"id" => "mock-1"}]}}))
+      Models.load(root: File.join(home, ".tart"))
+    end
+
+    def stage_blockless_catalog(home)
+      root = File.join(home, "blockless")
+      FileUtils.mkdir_p(root)
+      File.write(File.join(root, "models.json"), JSON.generate(
+        "default" => "mock/mock-1",
+        "providers" => {"mock" => {"baseUrl" => "$BASE", "models" => [{"id" => "mock-1"}]}}))
+      root
+    end
+
+    # The print-boot subprocess env for the templated legs: staged HOME, the
+    # pi identity, NO <IDENTITY>_API_KEY, the model tiers nil-scrubbed so the
+    # catalog's default decides, MCP absent.
+    # nil-scrubs FIREWORKS_API_KEY too: spawn merges the parent env, and a
+    # CI/agent parent carrying the identity's key would resolve the template
+    # (and hit the network) instead of exercising the named-failure leg.
+    def templated_env(home)
+      {"PATH" => ENV.fetch("PATH", nil), "HOME" => home, "TART_IDENTITY" => "pi",
+       "TART_MCP_CONFIG" => File.join(home, "absent-mcp.json"),
+       "FIREWORKS_API_KEY" => nil,
+       "PI_MODEL" => nil, "PI_PROVIDER" => nil, "TART_MODEL" => nil, "TART_PROVIDER" => nil,
+       "PI_CONTEXT_WINDOW" => nil, "TART_CONTEXT_WINDOW" => nil}
+    end
+
     def smoke_env(home, server)
       {
         "PATH" => ENV.fetch("PATH", nil),

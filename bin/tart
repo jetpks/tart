@@ -33,6 +33,7 @@ end
 require "optparse"
 require_relative "../lib/tart"
 require_relative "../lib/tart/session_sink"
+require_relative "../lib/tart/config_value"
 require_relative "../lib/tart/utf8_boot"
 
 module Tart
@@ -137,7 +138,12 @@ module Tart
           resolves the identity-namespaced MODEL/PROVIDER env (below) > the
           models.json default > the settings defaultModel/defaultProvider;
           a provider's baseUrl/apiKey feed the endpoint (the namespaced
-          API_KEY/API_BASE still override). thinkingLevelMap maps the
+          API_KEY/API_BASE still override). An apiKey may reference the
+          environment instead of holding a literal: "$VAR" or "${VAR}"
+          resolve when the key is used (pi's grammar; an unset or empty
+          variable fails the request by name; "!command" keys are not
+          supported) — mcp.json server "env" values resolve the same way.
+          thinkingLevelMap maps the
           thinking levels onto the model's reasoning_effort values
           ("off"→"low" style; a null marks a level unsupported) — the
           selected level reaches the wire as reasoning_effort through it;
@@ -919,21 +925,45 @@ module Tart
     # Grounds D9: a transient 5xx/429 surfaces immediately); the Chat
     # carries the wire model + the endpoint facts (the subagents Manager
     # threads them to its children).
-    def build_chat(models, boot, identity:, resolved:)
-      endpoint = endpoint_facts(models, boot, identity:, resolved:)
+    def build_chat(models, boot, identity:, resolved:, env: ENV)
+      endpoint = endpoint_facts(models, boot, identity:, resolved:, env:)
+      # I119: the client only ever receives RESOLVED keys — a block apiKey
+      # that names an unset variable (or a `!command` value) builds the client
+      # KEYLESS and the Chat carries the named failure for its first request.
       client = Fast::Completions::Client.new(base_url: endpoint.fetch(:api_base),
         api_key: endpoint.fetch(:api_key), timeout: 120)
-      Agent::Chat.new(client:, model_id: boot.id, provider_key: boot.provider, endpoint:)
+      Agent::Chat.new(client:, model_id: boot.id, provider_key: boot.provider, endpoint:,
+        request_error: endpoint[:api_key_error])
     end
 
     # The endpoint facts (the boot's key/base resolution — the SAME chain
     # build_chat always spoke): identity-namespaced env > the models.json
     # provider config > the resolved-settings view's keys.
-    def endpoint_facts(models, boot, identity:, resolved:)
+    #
+    # I119: the provider block's apiKey resolves HERE, at the use seam —
+    # never at load (the catalog stays byte-untouched; pi resolves at its auth
+    # provider's resolve, provider-composer.ts:462-484). A template naming an
+    # unset or empty variable, or a `!command` value, yields api_key nil +
+    # api_key_error (the named failure the first request raises) — it NEVER
+    # falls through to the settings view's apiKey and NEVER sends the
+    # literal (pi's check: a configured key that does not resolve is a
+    # failure, not an absent key).
+    def endpoint_facts(models, boot, identity:, resolved:, env: ENV)
       provider = models.provider(boot.provider)
+      key = env[Identity.env_key(identity, "API_KEY")]
+      error = nil
+      if key.nil? && provider && !provider.api_key.nil?
+        begin
+          key = ConfigValue.resolve!(provider.api_key, "API key for provider \"#{boot.provider}\"", env:)
+        rescue ConfigValue::Error => e
+          error = e
+        end
+      end
+      key = resolved.api_key if key.nil? && error.nil?
       {
-        api_key: ENV[Identity.env_key(identity, "API_KEY")] || provider&.api_key || resolved.api_key,
-        api_base: ENV[Identity.env_key(identity, "API_BASE")] || provider&.base_url || resolved.api_base
+        api_key: key,
+        api_base: env[Identity.env_key(identity, "API_BASE")] || provider&.base_url || resolved.api_base,
+        api_key_error: error
       }
     end
 

@@ -170,6 +170,123 @@ module Tart
       end
     end
 
+    # --- I119 env-templates: mcp.json server env VALUES resolve at connect ---
+
+    # The connect seam resolves: a templated env value reaches the child
+    # process RESOLVED. A pure-Ruby fixture (no gems) answers the handshake
+    # and reports its OWN MCP_ECHO_TOKEN back through a tool result — the
+    # child's env is the evidence (the parent's env carries the variable;
+    # the child never sees the raw template).
+    def test_env_template_env_values_resolve_at_connect_and_reach_the_child
+      dump = File.join(@dir, "token_server.rb")
+      File.write(dump, <<~RUBY)
+        require "json"
+        while (line = STDIN.gets)
+          message = (JSON.parse(line) rescue nil) or next
+          next unless message.key?("id")
+          result = case message["method"]
+          when "initialize" then {"protocolVersion" => "2025-06-18", "capabilities" => {},
+            "serverInfo" => {"name" => "dump", "version" => "1.0.0"}}
+          when "tools/list" then {"tools" => [{"name" => "token", "description" => "reports its token",
+            "inputSchema" => {"type" => "object", "properties" => {}}}]}
+          when "tools/call" then {"content" => [{"type" => "text", "text" => ENV["MCP_ECHO_TOKEN"].to_s}]}
+          end
+          next unless result
+          puts JSON.generate({"jsonrpc" => "2.0", "id" => message["id"], "result" => result})
+          STDOUT.flush
+        end
+      RUBY
+      servers = Mcp::Config.load(write_config("mcpServers" => {"dump" =>
+        {"command" => RUBY, "args" => [dump], "env" => {"MCP_ECHO_TOKEN" => "tok-$I119_TOKEN"}}}))
+      Sync do
+        tools = Mcp.server_tools("dump", servers.fetch("dump"), used: {},
+          env: {"I119_TOKEN" => "resolved-token", "PATH" => ENV["PATH"]}).value!
+        assert tools.key?("mcp__dump__token"), "the server connected"
+        track_mcp(tools)
+        assert_equal "tok-resolved-token", tools.fetch("mcp__dump__token").execute,
+          "the child process saw the RESOLVED value — never the literal template"
+      end
+    end
+
+    # An unresolvable env value (unset OR empty — pi :89) is THIS server's
+    # connect failure: Failure carrying pi's exact message, on the existing
+    # warn surface, and NO child spawned (a `touch <canary>` command — the
+    # canary stays uncreated). Never the literal template on the child env.
+    def test_env_template_unresolvable_env_value_is_the_connect_failure_without_a_spawn
+      Sync do
+        canary = File.join(@dir, "canary")
+        servers = Mcp::Config.load(write_config("mcpServers" => {"probe" => {"command" => "touch", "args" => [canary],
+          "env" => {"TOKEN" => "$I119_MISSING", "OTHER" => "$I119_MISSING"}}}))
+        result = Mcp.server_tools("probe", servers.fetch("probe"), used: {}, env: {"PATH" => ENV["PATH"]})
+        assert result.failure?, "the server is a Failure value"
+        assert_kind_of ConfigValue::UnresolvedError, result.failure
+        assert_equal 'Failed to resolve MCP server "probe" env "TOKEN" from environment variable: I119_MISSING',
+          result.failure.message, "deduped, the FIRST failing key named"
+        refute File.exist?(canary), "no child spawned"
+
+        empty = Mcp.server_tools("probe", servers.fetch("probe"), used: {}, env: {"I119_MISSING" => ""})
+        assert empty.failure?, "an EMPTY-STRING variable counts as unset (pi :89)"
+        assert_equal 'Failed to resolve MCP server "probe" env "TOKEN" from environment variable: I119_MISSING',
+          empty.failure.message
+
+        capture_stderr do
+          Sync do
+            assert_equal({}, Mcp.tools_for(servers), "tools_for skips the server (the process env names no such variable)")
+          end
+        end
+        assert_equal "tart: mcp server \"probe\" failed to connect: " \
+          "Failed to resolve MCP server \"probe\" env \"TOKEN\" from environment variable: I119_MISSING\n",
+          @captured_stderr, "the connect-failure surface carries the named message"
+        refute File.exist?(canary), "still no child"
+      end
+    end
+
+    # The `!command` cut on MCP env: never executed (canary uncreated), the
+    # connect failure carries tart's named message.
+    def test_env_template_command_env_value_is_the_connect_failure_and_never_executes
+      Sync do
+        canary = File.join(@dir, "canary")
+        servers = Mcp::Config.load(write_config("mcpServers" => {"probe" =>
+          {"command" => "true", "args" => [], "env" => {"TOKEN" => "!touch #{canary}"}}}))
+        result = Mcp.server_tools("probe", servers.fetch("probe"), used: {}, env: {"PATH" => ENV["PATH"]})
+        assert result.failure?
+        assert_kind_of ConfigValue::CommandConfigValueError, result.failure
+        assert_equal 'Failed to resolve MCP server "probe" env "TOKEN": "!command" values are not supported — ' \
+          'use a "$VAR" or "${VAR}" reference or the <IDENTITY>_API_KEY environment override',
+          result.failure.message
+        refute File.exist?(canary), "the command never ran"
+      end
+    end
+
+    # Only env VALUES expand: a literal `command` naming a variable never
+    # does — the env names a WORKING wrapper script, yet the spawn runs the
+    # literal `$I119_ECHO` and the server fails to connect (pi expands
+    # nothing but the env values and the apiKey).
+    def test_env_template_literal_command_never_expands
+      wrapper = File.join(@dir, "echo-wrapper.sh")
+      File.write(wrapper, "#!/bin/sh\nexec \"#{RUBY}\" \"#{ECHO_SERVER}\"\n")
+      File.chmod(0o755, wrapper)
+      servers = Mcp::Config.load(write_config("mcpServers" => {"probe" => {"command" => "$I119_ECHO"}}))
+      Sync do
+        literal = Mcp.server_tools("probe", servers.fetch("probe"), used: {}, env: {"I119_ECHO" => wrapper, "PATH" => ENV["PATH"]})
+        assert literal.failure?, "had the command expanded, the wrapper would have connected"
+        # The control: the SAME wrapper, named literally, connects.
+        servers = Mcp::Config.load(write_config("mcpServers" => {"probe" => {"command" => wrapper}}))
+        assert Mcp.server_tools("probe", servers.fetch("probe"), used: {}, env: {"PATH" => ENV["PATH"]}).success?,
+          "the control connects"
+      end
+    end
+
+    # The loader never resolves: `MCP::Config.load` output carries the raw
+    # template byte-exactly whether or not the variable is set anywhere.
+    def test_env_template_load_output_carries_the_raw_template
+      path = write_config("mcpServers" => {"echo" => {"command" => "/x/echo",
+        "env" => {"TOKEN" => "$I119_TOKEN", "LITERAL" => "plain"}}})
+      servers = Mcp::Config.load(path)
+      assert_equal({"TOKEN" => "$I119_TOKEN", "LITERAL" => "plain"}, servers.fetch("echo").fetch(:env))
+      assert_equal "/x/echo", servers.fetch("echo").fetch(:command), "command untouched"
+    end
+
     def test_server_method_not_found_surfaces_as_a_failure_typed_by_mcp_error
       # I107 (OQ5): the scenario rides a Sync-wrapped host reactor —
       # the migrated workers are reactor tasks. Same name, same assertions.

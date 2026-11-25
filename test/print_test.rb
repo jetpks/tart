@@ -190,6 +190,26 @@ module Tart
       assert_includes @stderr.string, "bad request"
     end
 
+    # I119 AC4: a key failure resolved at boot (an unresolvable `$ENV`
+    # template in the provider block) fails print's FIRST request on its
+    # existing bad-key surface — exit 1 + pi's exact line on stderr, nothing
+    # on stdout, no request ever reaching the wire (the client is keyless).
+    def test_env_template_unresolvable_key_fails_the_first_request_named
+      error = assert_raises(ConfigValue::UnresolvedError) do
+        ConfigValue.resolve!("$FIREWORKS_API_KEY", 'API key for provider "mock"', env: {})
+      end
+      keyless = Agent::Chat.new(client: Fast::Completions::Client.new(base_url: @server.url, api_key: nil, timeout: 10),
+        model_id: "tart-test-model", provider_key: "mock", request_error: error)
+      keyless.with_instructions("test prompt")
+      code = Print.run(prompt: "hello", chat: keyless, tools: {},
+                       stdout: @stdout, stderr: @stderr)
+
+      assert_equal Print::EXIT_ERROR, code
+      assert_empty @stdout.string
+      assert_equal "Failed to resolve API key for provider \"mock\" from environment variable: FIREWORKS_API_KEY\n", @stderr.string
+      assert_equal 0, @server.request_count, "nothing reached the wire"
+    end
+
     private
 
     def chat(tools = {})
