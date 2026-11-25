@@ -220,14 +220,20 @@ module Tart
       landing = stub_write_gate
       answerer = Thread.new do
         Thread.current.report_on_exception = false
+        # The *.json glob (not Dir.children): atomic_write_json stages its
+        # temp as `<id>.json.<pid>.<uuid>.tmp` INSIDE this dir, and a raw
+        # children listing sees it mid-write — a parse of the partial file
+        # kills this thread and the ask burns its full 600 s bound (the
+        # CI flake; the interview leg below and the channel's own sweep
+        # glob *.json for exactly this reason).
         landing.await("the child's ask to land") do
-          !Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.empty?
+          !Dir.glob(File.join(ctrl, "supervisor-requests", "*.json")).empty?
         end
         # The request file cannot vanish under this read: the tool unlinks
         # its consumed request only AFTER the reply exists, and the reply
         # is written below, after this read.
-        file = Dir.children(File.join(ctrl, "supervisor-requests")).reject { |f| f.start_with?(".") }.first
-        id = JSON.parse(File.read(File.join(ctrl, "supervisor-requests", file)))["id"]
+        file = Dir.glob(File.join(ctrl, "supervisor-requests", "*.json")).first
+        id = JSON.parse(File.read(file))["id"]
         Subagents::Supervisor.atomic_write_json(
           File.join(ctrl, "supervisor-replies", "#{id}.json"),
           {type: Subagents::Supervisor::REPLY_TYPE, requestId: id,
@@ -242,6 +248,41 @@ module Tart
     ensure
       answerer.kill if answerer
       restore_write_gate
+    end
+
+    # The regression pin for the CI flake: a temp request file staged
+    # mid-write (the atomic_write_json window) must never satisfy the
+    # answerer's landing predicate. The staged temp sorts BEFORE any
+    # uuid_v7 request id (`0…` < the timestamp-hex prefix) and carries
+    # truncated JSON, so the pre-fix Dir.children answerer picked it,
+    # died on the parse, and the ask burned its bound; the short 500 ms
+    # bound keeps the pre-fix failure FAST instead of 600 s.
+    def test_child_tool_reply_wait_ignores_in_flight_temp_request_files
+      ctrl = new_ctrl
+      tool = tool_for(ctrl, timeout_ms: 500)
+      File.write(File.join(ctrl, "supervisor-requests", "0aa.json.111.probe.tmp"),
+                 '{"id":"0aa","requ')
+      landing = stub_write_gate
+      answerer = Thread.new do
+        Thread.current.report_on_exception = false
+        landing.await("the child's ask to land") do
+          !Dir.glob(File.join(ctrl, "supervisor-requests", "*.json")).empty?
+        end
+        file = Dir.glob(File.join(ctrl, "supervisor-requests", "*.json")).first
+        id = JSON.parse(File.read(file))["id"]
+        Subagents::Supervisor.atomic_write_json(
+          File.join(ctrl, "supervisor-replies", "#{id}.json"),
+          {type: Subagents::Supervisor::REPLY_TYPE, requestId: id,
+           createdAt: Subagents::Supervisor.now_ms, message: "YES PROCEED"})
+      end
+
+      result = tool.execute(reason: "need_decision", message: "may I proceed?")
+
+      assert_equal "**Reply from supervisor:**\nYES PROCEED", result
+    ensure
+      answerer.kill if answerer
+      restore_write_gate
+      File.delete(File.join(ctrl, "supervisor-requests", "0aa.json.111.probe.tmp")) rescue nil
     end
 
     def test_child_tool_is_inert_without_a_channel
