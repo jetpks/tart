@@ -187,6 +187,21 @@ module Tart
         self
       end
 
+      # I120 provider-swap — the swap seam: a cross-provider `/model`
+      # switch replaces the client + endpoint facts (the registry's
+      # per-provider client) and CLEARS any boot-carried request_error (a
+      # resolvable provider's swap retires the old failure; an unresolvable
+      # target never gets here — the switch gate refuses first). The
+      # compaction {summary_chat} inherits the CURRENT client + error by
+      # construction (it reads @client/@request_error at its construction,
+      # and a compaction after the swap sees the swapped pair).
+      def swap_endpoint(client:, endpoint: {}, request_error: nil)
+        @client = client
+        @endpoint = endpoint.empty? ? @endpoint : endpoint
+        @request_error = request_error
+        self
+      end
+
       # The compaction one-shot factory (Specification §5): same client,
       # same wire model + facts, the summarization instructions and an
       # OPTIONAL output cap — nil (the summarize path's shape, #9512) sets

@@ -530,29 +530,102 @@ module Tart
       assert_equal @home, env["HOME"]
     end
 
-    # I119 env-templates (ruling A): the parent's RESOLVED endpoint key —
-    # what the launcher's endpoint_facts threaded onto the Manager, with a
-    # templated catalog key already resolved — is what a child inherits when
-    # the env tier is unset: the child's <IDENTITY>_API_KEY carries it and
-    # the child's OWN request reaches the mock with `Authorization: Bearer <resolved>`
-    # (the mock sees the resolved key; the raw template never crosses to a child).
-    def test_env_template_children_inherit_the_parent_resolved_endpoint_key
-      @server.script([{type: :stream, content: "ok"}])
+    # I119 -> I120 RE-SEAT (the declared flip): the parent's boot endpoint
+    # facts NO LONGER ride the child env — the Manager's endpoint fallback
+    # tier (I49's sanctioned pick-list shape) is superseded: it DEFEATED the
+    # child's own block resolution at its boot (an openrouter-pinned child
+    # under a zai parent posted the openrouter id to api.z.ai with the zai
+    # key). The child env now carries the key ONLY through the explicit
+    # parent-env tier (a legitimate user override that still wins at the
+    # child's boot); with no tier and no block the child resolves its OWN
+    # provider's block through the same registry at its own boot — the
+    # provider_swap cross-provider pin (test_provider_swap_children...)
+    # proves that arm with a real child.
+    def test_env_template_child_env_omits_the_parent_endpoint_fallback
       inherited = default_env.reject { |key, _| key == "PI_API_KEY" || key == "PI_API_BASE" }
       manager = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"), env: inherited,
                                        identity: "pi", hooks: @hooks)
       @managers << manager
-      manager.endpoint = {api_key: "boot-resolved-key", api_base: @server.url}
-      run = manager.spawn_run(agent: "worker", task: "t", async: false, timeout_ms: 0, tool_timeout_ms: 0)
+      run = manager.spawn_run(agent: "worker", task: "t", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+      manager.stop(id: run[:id])
 
-      assert_equal :completed, run[:state], "the child boots on the inherited endpoint"
       _, env = manager.spawn_argv_and_env(run)
-      assert_equal "boot-resolved-key", env["PI_API_KEY"], "the resolved endpoint key rides the child env"
-      assert_equal @server.url, env["PI_API_BASE"]
-      count = @server.request_count
-      log = @server.captured_request_logs.find { |entry| entry[:path].to_s.end_with?("chat/completions") }
-      assert_equal "Bearer boot-resolved-key", log.fetch(:headers)["authorization"],
-        "the child's wire carries the RESOLVED key (#{count} requests seen)"
+      refute env.key?("PI_API_KEY"), "the parent's boot endpoint key never rides the child env"
+      refute env.key?("PI_API_BASE"), "the parent's boot endpoint base never rides the child env"
+    end
+
+    # --- I120 provider-swap: the spawn seat ---
+
+    # The spawn-seat refusal (the named-failure law at this seat): a child
+    # PINNED to a provider whose key would not resolve at the child's own
+    # boot (no env tier, no block, no settings key) refuses the spawn —
+    # the raise rides the existing raise → {error:} path and NO run dir is
+    # created (no child process). The pre-flight mirrors the child's boot
+    # chain exactly (Endpoints.boot_facts over the scrubbed env tier).
+    def test_provider_swap_pinned_child_refuses_the_spawn_when_the_key_wont_resolve
+      keyless = default_env.reject { |key, _| key == "PI_API_KEY" || key == "PI_API_BASE" }
+      manager = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"), env: keyless,
+                                       identity: "pi", hooks: @hooks, root: File.join(@home, ".tart"))
+      @managers << manager
+      before = Dir.children(manager.home)
+
+      error = assert_raises(Tart::Endpoints::Error) do
+        manager.spawn_run(agent: "worker", task: "t", async: false, model: "mock/mock-1",
+                          timeout_ms: 0, tool_timeout_ms: 0)
+      end
+      assert_equal 'No API key for provider "mock"', error.message, "the refusal is NAMED"
+      assert_equal before, Dir.children(manager.home), "no run dir was created (no child spawned)"
+    end
+
+    # The mirror's positive arm: an env-tier key (the legitimate user
+    # override that still wins at the child's boot) satisfies the
+    # pre-flight — no refusal, the spawn proceeds.
+    def test_provider_swap_pinned_child_env_tier_satisfies_the_pre_flight
+      @server.script([{type: :stream, content: "ok"}])
+      manager = new_manager(root: File.join(@home, ".tart"))
+      run = manager.spawn_run(agent: "worker", task: "t", async: false, model: "mock/mock-1",
+                             timeout_ms: 0, tool_timeout_ms: 0)
+      assert_equal :completed, run[:state], "the env-tier key fed the child (no refusal)"
+      _, env = manager.spawn_argv_and_env(run)
+      assert_equal "test-key", env["PI_API_KEY"], "the explicit parent-env tier still rides"
+    end
+
+    # The LIVE parent pair: an unpinned child of a parent that switched
+    # mid-session spawns on the CURRENT pair (the agent callable's
+    # current_model_pair reader), not the frozen boot env pins.
+    def test_provider_swap_unpinned_child_inherits_the_live_parent_pair
+      manager = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"),
+                                       env: default_env.merge("PI_MODEL" => "boot-model", "PI_PROVIDER" => "alpha"),
+                                       identity: "pi", hooks: @hooks)
+      agent = Object.new
+      agent.define_singleton_method(:current_model_pair) { ["beta", "beta-model", "high"] }
+      manager.instance_variable_set(:@agent, agent)
+      @managers << manager
+      run = manager.spawn_run(agent: "worker", task: "t", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+      manager.stop(id: run[:id])
+
+      _, env = manager.spawn_argv_and_env(run)
+      assert_equal "beta", env["PI_PROVIDER"], "the LIVE provider beat the boot env pin"
+      assert_equal "beta-model", env["PI_MODEL"], "the LIVE model beat the boot env pin"
+      assert_equal "high", env["PI_THINKING_LEVEL"], "the live level rode"
+    end
+
+    # The env fallback holds byte-identically where no agent answers
+    # (print parents, bare test Managers): the boot env pins still feed
+    # the inherited arm.
+    def test_provider_swap_unpinned_child_env_fallback_holds_without_an_agent
+      manager = Subagents::Manager.new(cwd: @cwd, home: File.join(@home, "subagents"),
+                                       env: default_env.merge("PI_MODEL" => "boot-model", "PI_PROVIDER" => "alpha",
+                                                              "PI_THINKING_LEVEL" => "low"),
+                                       identity: "pi", hooks: @hooks)
+      @managers << manager
+      run = manager.spawn_run(agent: "worker", task: "t", async: true, timeout_ms: 0, tool_timeout_ms: 0)
+      manager.stop(id: run[:id])
+
+      _, env = manager.spawn_argv_and_env(run)
+      assert_equal "alpha", env["PI_PROVIDER"]
+      assert_equal "boot-model", env["PI_MODEL"]
+      assert_equal "low", env["PI_THINKING_LEVEL"]
     end
 
     # I74 session-sink child capture (AC4): the five identity-namespaced
