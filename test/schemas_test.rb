@@ -171,7 +171,11 @@ module Tart
         '{"mcpServers": {"x": {"command": "c", "args": [1]}}}' => %(server "x": args must be an array of strings),
         '{"mcpServers": {"x": {"command": "c", "env": {"a": 1}}}}' => %(server "x": env must map names to strings),
         '{"mcpServers": {"x": {"cwd": 3}}}' => %(server "x": cwd must be a string),
-        '{"mcpServers": {"x": {"url": "https://e/mcp"}}}' => %(server "x": streamable HTTP transport is not supported (stdio only)),
+        # I122: the `url` arm LOADS as the Streamable HTTP transport now
+        # (the moved pin — pi's http arm); the legacy-SSE type and the
+        # malformed-URL rows keep pi's exact strings.
+        '{"mcpServers": {"x": {"type": "sse", "url": "https://e/mcp"}}}' => %(server "x": legacy SSE transport is not supported; use the streamable HTTP URL),
+        '{"mcpServers": {"x": {"type": "http", "url": "ftp://e/mcp"}}}' => %(server "x": url must be an http or https URL),
         '{"mcpServers": {"x": {"args": []}}}' => %(server "x" needs either "command" (stdio) or "url" (streamable HTTP)),
         # Fail-fast, insertion order: the FIRST invalid server's error wins.
         '{"mcpServers": {"a": "nope", "b": {"command": "c"}}}' => %(server "a" must be an object)
@@ -185,6 +189,9 @@ module Tart
     def test_mcp_accept_table_normalizes_and_tolerates
       assert_equal({}, load_mcp("{}"), "no mcpServers key is no servers, no error")
       assert_equal({"x" => {command: "c", args: [], env: nil, cwd: nil}}, load_mcp('{"mcpServers": {"x": {"command": "c"}}}'))
+      # I122: the http arm normalizes (url wins over command — pi's dispatch).
+      assert_equal({"x" => {url: "https://e/mcp", headers: {"X-A" => "b"}}},
+                   load_mcp('{"mcpServers": {"x": {"url": "https://e/mcp", "command": "c", "headers": {"X-A": "b"}}}}'))
 
       error = assert_raises(Mcp::Config::ConfigError) { load_mcp("{not json") }
       # The prefix is the pin; the parser message itself is passthrough.

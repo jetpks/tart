@@ -373,10 +373,12 @@ module Tart
       end
     end
 
-    def test_url_entries_are_rejected_stdio_only
-      path = write_config("mcpServers" => {"x" => {"url" => "https://example.com/mcp"}})
-      error = assert_raises(Mcp::Config::ConfigError) { Mcp::Config.load(path) }
-      assert_equal %(#{path}: server "x": streamable HTTP transport is not supported (stdio only)), error.message
+    # I122 (the declared pin move): a `url` entry is the Streamable HTTP
+    # arm now (pi config.ts:107-118 — url wins over command); the transport
+    # itself is pinned in test/mcp_http_test.rb.
+    def test_url_entries_load_as_streamable_http
+      path = write_config("mcpServers" => {"x" => {"url" => "https://example.com/mcp", "command" => "c"}})
+      assert_equal({"x" => {url: "https://example.com/mcp", headers: nil}}, Mcp::Config.load(path))
     end
 
     # I43: fail-fast preserved through the contract — with BOTH servers
